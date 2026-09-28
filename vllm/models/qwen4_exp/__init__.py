@@ -27,8 +27,13 @@ def __getattr__(name: str) -> Any:
     }:
         from vllm.platforms import current_platform
 
-        if current_platform.is_xpu() or current_platform.is_tpu():
-            raise NotImplementedError("Qwen4Exp currently supports CUDA and ROCm only")
+        # B70 XPU bring-up: XPU falls through to the nvidia backend below,
+        # whose compute path is XPU-first-class on v0.30 (WnA16 linear/MoE,
+        # GDN, and FA kernels are all registered for XPU upstream).
+        if current_platform.is_tpu():
+            raise NotImplementedError(
+                "Qwen4Exp currently supports CUDA, ROCm, and XPU only"
+            )
         if current_platform.is_rocm():
             from .amd.model import (
                 Qwen4ExpForCausalLM,
