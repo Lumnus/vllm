@@ -13,6 +13,12 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+# GDN convolution uses 64-bit products for page-strided state tensors.
+from pathlib import Path
+import vllm_xpu_kernels
+
+torch.ops.load_library(str(Path(vllm_xpu_kernels.__file__).with_name("libgdn_index64.so")))
+
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
@@ -189,7 +195,7 @@ def _gdn_attention_core_xpu_impl(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
     )
 
-    torch.ops._xpu_C.gdn_attention(
+    torch.ops._gdn_index64.gdn_attention(
         core_attn_out,
         z,
         projected_states_qkvz,
