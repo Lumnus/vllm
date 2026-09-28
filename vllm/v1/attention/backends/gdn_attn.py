@@ -216,6 +216,23 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
+        # Preserve per-builder graph-static buffers and per-group state IDs.
+        # All other batch shapes/backends retain the original implementation.
+        if (
+            self.use_spec_decode
+            and type(self) is GDNAttentionMetadataBuilder
+            and m.query_start_loc.device.type == "xpu"
+        ):
+            from vllm.v1.attention.backends.gdn_spec_metadata import (
+                try_build_uniform_spec_metadata,
+            )
+
+            uniform_metadata = try_build_uniform_spec_metadata(
+                self, m, num_accepted_tokens, num_decode_draft_tokens_cpu
+            )
+            if uniform_metadata is not None:
+                return uniform_metadata
+
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None

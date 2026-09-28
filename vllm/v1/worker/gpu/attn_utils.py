@@ -426,6 +426,28 @@ def build_attn_metadata(
         seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound[:num_reqs]
 
     attn_metadata: dict[str, Any] = {}
+    prebuilt_gdn_metadata: dict[int, Any] = {}
+    if (
+        not for_cudagraph_capture
+        and model_specific_attn_metadata is not None
+        and getattr(model_specific_attn_metadata, "num_decode_draft_tokens_cpu", None)
+        is not None
+    ):
+        from vllm.v1.attention.backends.gdn_spec_metadata_batched import prepare
+
+        prebuilt_gdn_metadata = prepare(
+            dict(
+                attn_groups=attn_groups,
+                num_reqs=num_reqs,
+                num_tokens=num_tokens,
+                query_start_loc_gpu=query_start_loc_gpu,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens=seq_lens,
+                block_tables=block_tables,
+                model_specific_attn_metadata=model_specific_attn_metadata,
+                ubatch_idx=ubatch_idx,
+            )
+        )
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         if not attn_groups[i]:
@@ -477,7 +499,9 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
-            if for_cudagraph_capture:
+            if id(attn_metadata_builder) in prebuilt_gdn_metadata:
+                metadata = prebuilt_gdn_metadata[id(attn_metadata_builder)]
+            elif for_cudagraph_capture:
                 metadata = attn_metadata_builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
