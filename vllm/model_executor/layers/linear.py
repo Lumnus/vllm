@@ -214,6 +214,14 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
         elif current_platform.is_xpu():
+            # Qwen4Exp HC down projections arm their deterministic XPU K-split
+            # here: one-time contiguous K-half prep so the width-gated
+            # two-GEMM branch in GatedResidual is ready before any capture
+            # (only layers carrying the marker are affected; see
+            # vllm/models/qwen4_exp/nvidia/hyperconnection.py).
+            prep = getattr(layer, "hc_ksplit_prepare", None)
+            if prep is not None:
+                prep()
             # Opt-in: F.linear on XPU is faster with an N-contiguous (N, K) weight
             # when K > N, but oneDNN's ab-weights matmul is not run-to-run bitwise
             # bitwise reproducible. Off by default.
