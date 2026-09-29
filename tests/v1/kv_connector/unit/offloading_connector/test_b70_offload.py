@@ -122,3 +122,46 @@ def test_gpu_mamba_manager_retains_state_at_junction():
     )
     assert without == [False, False, True, False]
     assert with_junction == [False, True, True, False]
+
+
+def test_backstep_boundaries_sit_below_the_replay_boundary():
+    from vllm.v1.core.kv_cache_coordinator import b70_backstep_boundaries
+
+    # Flash-Next geometry: 832-token blocks, doc of 59,919 prompt tokens.
+    assert b70_backstep_boundaries(59_919, 832, 2) == (59_072, 58_240)
+    assert b70_backstep_boundaries(59_919, 832, 0) == ()
+    assert b70_backstep_boundaries(900, 832, 3) == ()  # never 0 or below
+
+
+@pytest.mark.parametrize("steps", [0, 2])
+def test_coordinator_replay_boundaries_include_backstep(monkeypatch, steps):
+    from types import SimpleNamespace
+
+    from vllm.v1.core.kv_cache_coordinator import UnitaryKVCacheCoordinator
+
+    coord = object.__new__(UnitaryKVCacheCoordinator)
+    coord.eagle_group_ids = ()
+    coord.scheduler_block_size = 16
+    coord.b70_gdn_backstep = steps
+    request = SimpleNamespace(num_prompt_tokens=64)
+    boundaries = coord.get_replay_boundaries(request)
+    if steps == 0:
+        assert boundaries == (63,)  # upstream behaviour
+    else:
+        assert boundaries == (16, 32, 63)
+        spec = MambaSpec(
+            block_size=16,
+            shapes=((1, 1),),
+            dtypes=(torch.float32,),
+            mamba_cache_mode="align",
+        )
+        mask = MambaManager.reachable_block_mask(
+            start_block=0,
+            end_block=4,
+            alignment_tokens=16,
+            kv_cache_spec=spec,
+            use_eagle=False,
+            retention_interval=0,
+            reachable_boundaries=boundaries,
+        )
+        assert mask == [True, True, True, False]
