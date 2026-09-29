@@ -165,3 +165,83 @@ def test_coordinator_replay_boundaries_include_backstep(monkeypatch, steps):
             reachable_boundaries=boundaries,
         )
         assert mask == [True, True, True, False]
+
+
+def _store_setup(monkeypatch, guard: bool, trace: str = "0"):
+    from types import SimpleNamespace
+
+    from vllm.v1.request import RequestStatus
+
+    env = {"B70_OFFLOAD_TRACE": trace}
+    if guard:
+        env["B70_OFFLOAD_EMPTY_ADVANCE_GUARD"] = "1"
+    scheduler, request = _hybrid(monkeypatch, **env)
+    request.num_computed_tokens = 0
+    request.status = RequestStatus.RUNNING
+    req_status = scheduler._req_status["req"]
+    req_status.group_states[FULL].block_ids[:] = [11]
+    req_status.group_states[MAMBA].block_ids[:] = [99]
+    req_status.update_offload_keys()
+    output = SimpleNamespace(num_scheduled_tokens={"req": 16}, finished_req_ids=set())
+    return scheduler, req_status, output
+
+
+def _present_manager(scheduler, present: set, pending: set):
+    from vllm.v1.kv_offload.base import PrepareStoreOutput
+
+    from tests.v1.kv_connector.unit.offloading_connector.utils import (
+        MockLoadStoreSpec,
+    )
+
+    def prepare_store(keys, req_context):
+        keys = [k for k in keys if k not in present]
+        return PrepareStoreOutput(
+            keys_to_store=keys, store_spec=MockLoadStoreSpec(keys), evicted_keys=[]
+        )
+
+    def lookup(key, req_context):
+        if key in pending:
+            return LookupResult.HIT_PENDING
+        return LookupResult.HIT if key in present else LookupResult.MISS
+
+    scheduler.manager.prepare_store.side_effect = prepare_store
+    scheduler.manager.lookup.side_effect = lookup
+
+
+@pytest.mark.parametrize("trace", ["0", "1"])
+def test_guard_holds_index_while_skipped_key_is_write_pending(monkeypatch, trace):
+    scheduler, req_status, output = _store_setup(monkeypatch, True, trace)
+    key = req_status.group_states[FULL].offload_keys[0]
+    present, pending = {key}, {key}  # stored by another request, not landed yet
+    _present_manager(scheduler, present, pending)
+
+    assert scheduler._build_store_jobs(output) == {}
+    assert req_status.group_states[FULL].next_stored_chunk_idx == 0  # held
+
+    pending.clear()  # the other request's store completed
+    assert scheduler._build_store_jobs(output) == {}
+    assert req_status.group_states[FULL].next_stored_chunk_idx == 1
+
+
+def test_guard_off_keeps_upstream_advance(monkeypatch):
+    scheduler, req_status, output = _store_setup(monkeypatch, False)
+    key = req_status.group_states[FULL].offload_keys[0]
+    _present_manager(scheduler, {key}, {key})
+    assert scheduler._build_store_jobs(output) == {}
+    # upstream (#56795): advances past the not-yet-ready key
+    assert req_status.group_states[FULL].next_stored_chunk_idx == 1
+
+
+def test_guard_reoffers_a_key_whose_pending_store_failed(monkeypatch):
+    scheduler, req_status, output = _store_setup(monkeypatch, True)
+    key = req_status.group_states[FULL].offload_keys[0]
+    present, pending = {key}, {key}
+    _present_manager(scheduler, present, pending)
+    assert scheduler._build_store_jobs(output) == {}
+    # the other store failed and its key was removed: this request stores it
+    present.clear()
+    pending.clear()
+    jobs = scheduler._build_store_jobs(output)
+    assert len(jobs) == 1
+    [job] = scheduler._jobs.values()
+    assert job.keys == {key}
