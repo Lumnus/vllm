@@ -619,6 +619,7 @@ class OffloadingConnectorScheduler:
 
         # B70 0014 (env-gated; every flag off = upstream behaviour).
         self._b70_trace = _b70.trace_enabled()
+        self._b70_junction = _b70.junction_enabled()
         self._b70_counts: Counter | None = None
         self._b70_ctx: dict | None = None
         # req_id -> [stores submitted, stores completed, loads submitted,
@@ -639,13 +640,15 @@ class OffloadingConnectorScheduler:
             slot_bytes = int(getattr(spec, "kv_bytes_per_chunk", 0) or 0)
             _b70.log(
                 "enabled scheduler trace: groups=%s retention_interval=%s "
-                "alignment_tokens=%s partial_tail=%s slot_bytes=%d period_s=%.0f",
+                "alignment_tokens=%s partial_tail=%s slot_bytes=%d period_s=%.0f "
+                "junction=%s",
                 dict(Counter(self._b70_kind_by_group.values())),
                 self.config.retention_interval,
                 self.config.alignment_tokens,
                 self.config.supports_partial_tail,
                 slot_bytes,
                 _b70.trace_period_s(),
+                self._b70_junction,
             )
             self._b70_state_logger = _b70.PeriodicStateLogger(
                 _b70.trace_period_s(), lambda: self._b70_state_line(slot_bytes)
@@ -682,6 +685,43 @@ class OffloadingConnectorScheduler:
             req_id,
             *counts,
         )
+
+    def _b70_maybe_set_junction(
+        self, req_status: RequestOffloadState, result: int, ctx: dict
+    ) -> None:
+        """0014b: pin a shared-prefix junction where the offload hit was cut.
+
+        The full-attention groups are looked up first; the first Mamba group
+        then starts from the boundary they confirmed. If that sparse group has
+        no stored state at or below it, the whole request misses (or hits
+        shorter), and without a junction the recompute stores its only Mamba
+        checkpoint at ``aligned(num_prompt_tokens - 1)`` again -- inside the
+        part that varies -- so the prefix misses forever. Setting
+        ``request.shared_prefix_boundary`` makes the core scheduler stop a
+        prefill chunk there, the Mamba manager retain (hash) that state, and
+        the aligned hand-off store it, so the next revisit hits.
+        """
+        boundary = None
+        fa_seen = False
+        for gidx, _start, _n_keys, n_hit, _counts, max_before in ctx["groups"]:
+            kind = self._b70_kind(gidx)
+            if kind == "full":
+                if n_hit is None:
+                    return  # deferred: the full-attention prefix is unconfirmed
+                fa_seen = True
+                continue
+            if kind == "mamba" and fa_seen:
+                boundary = max_before
+            break
+        if boundary is None:
+            return
+        req = req_status.req
+        if req_status.num_locally_computed_tokens + result >= boundary:
+            return  # the sparse group did not cut the hit
+        if boundary <= req.shared_prefix_boundary:
+            return
+        req.shared_prefix_boundary = boundary
+        ctx["junction"] = boundary
 
     def _b70_log_lookup(
         self, req_status: RequestOffloadState, result: int | None, ctx: dict
@@ -874,7 +914,7 @@ class OffloadingConnectorScheduler:
         req_status: RequestOffloadState,
         max_num_new_tokens: int | None = None,
     ) -> int | None:
-        if not self._b70_trace:
+        if not (self._b70_trace or self._b70_junction):
             return self._lookup_complete_chunks_impl(req_status, max_num_new_tokens)
         ctx: dict = {"groups": [], "junction": None}
         self._b70_ctx = ctx
@@ -883,7 +923,10 @@ class OffloadingConnectorScheduler:
         finally:
             self._b70_ctx = None
             self._b70_counts = None
-        self._b70_log_lookup(req_status, result, ctx)
+        if self._b70_junction and result is not None:
+            self._b70_maybe_set_junction(req_status, result, ctx)
+        if self._b70_trace:
+            self._b70_log_lookup(req_status, result, ctx)
         return result
 
     def _lookup_complete_chunks_impl(
