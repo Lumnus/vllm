@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -27,6 +28,25 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+
+
+def b70_gdn_backstep() -> int:
+    """B70 0014c: ``B70_OFFLOAD_GDN_BACKSTEP=N`` (default 0 = off)."""
+    raw = os.environ.get("B70_OFFLOAD_GDN_BACKSTEP", "").strip()
+    try:
+        return max(0, int(raw)) if raw else 0
+    except ValueError:
+        return 0
+
+
+def b70_backstep_boundaries(
+    num_prompt_tokens: int, block_size: int, steps: int
+) -> tuple[int, ...]:
+    """Block boundaries 1..steps blocks below the replay boundary."""
+    base = (num_prompt_tokens - 1) // block_size * block_size
+    return tuple(
+        base - k * block_size for k in range(1, steps + 1) if base - k * block_size > 0
+    )
 
 logger = init_logger(__name__)
 
@@ -67,6 +87,9 @@ class KVCacheCoordinator(ABC):
     """
     Coordinate the KV cache of different KV cache groups.
     """
+
+    # B70 0014c default (off) for instances built without __init__.
+    b70_gdn_backstep: int = 0
 
     enable_partial_hash_hits = False
 
@@ -167,6 +190,16 @@ class KVCacheCoordinator(ABC):
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
         )
+        # B70 0014c: extra retained Mamba states below the replay boundary.
+        self.b70_gdn_backstep = b70_gdn_backstep()
+        if self.b70_gdn_backstep:
+            logger.info(
+                "B70-OFFLOAD enabled GDN backstep=%d (retain Mamba states up to "
+                "%d blocks below the replay boundary; retention_interval=%s)",
+                self.b70_gdn_backstep,
+                self.b70_gdn_backstep,
+                self.retention_interval,
+            )
 
     def get_num_blocks_to_allocate(
         self,
@@ -325,6 +358,22 @@ class KVCacheCoordinator(ABC):
         resend's hit to 0. The alignment is the scheduler block size, not the
         finer hash granularity, which would over-estimate the reach.
         """
+        if getattr(self, "b70_gdn_backstep", 0):
+            return tuple(
+                sorted(
+                    set(self._get_replay_boundaries(request))
+                    | set(
+                        b70_backstep_boundaries(
+                            request.num_prompt_tokens,
+                            self.scheduler_block_size,
+                            self.b70_gdn_backstep,
+                        )
+                    )
+                )
+            )
+        return self._get_replay_boundaries(request)
+
+    def _get_replay_boundaries(self, request: Request) -> tuple[int, ...]:
         if not self.eagle_group_ids:
             return (request.num_prompt_tokens - 1,)
         block = self.scheduler_block_size
