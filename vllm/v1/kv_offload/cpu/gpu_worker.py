@@ -795,11 +795,18 @@ class CPUOffloadingWorker(OffloadingWorker):
                     device="cpu",
                     pin_memory=pin_memory,
                 )
-                logger.debug(
-                    "torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s",
+                # B70 0013: info, with is_pinned() — XPU silently returns
+                # non-pinned memory above 2^34 B per allocation (0002 note).
+                logger.info(
+                    "KV offload host tensor %d: %d x %d B = %d B (%.3f GiB), "
+                    "pin_memory=%s is_pinned=%s, %.3f s",
+                    t_idx,
                     num_cpu_chunks,
                     cpu_page_size_bytes,
-                    num_cpu_chunks * cpu_page_size_bytes / 1e9,
+                    num_cpu_chunks * cpu_page_size_bytes,
+                    num_cpu_chunks * cpu_page_size_bytes / 2**30,
+                    pin_memory,
+                    cpu_tensor.is_pinned(),
                     time.monotonic() - t0,
                 )
 
