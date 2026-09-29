@@ -1897,6 +1897,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens=input_batch.num_tokens,
         )
 
+        # B70 0013: host-side pre-forward hook (INT8 PLE rows from NVMe).
+        # Real batches only: dummy, profile and capture runs never reach it.
+        if not dummy_run:
+            pre_forward = getattr(self.model_state, "b70_pre_forward", None)
+            if pre_forward is not None:
+                pre_forward(
+                    input_batch,
+                    model_inputs,
+                    batch_desc.cg_mode == CUDAGraphMode.FULL,
+                )
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.

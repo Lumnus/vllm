@@ -112,6 +112,84 @@ class Qwen4ExpModelState(MambaHybridModelState):
         )
         return model_inputs
 
+    def _b70_nvme_modules(self) -> list[nn.Module]:
+        """PLE n-gram modules served by the B70 0013 host path (cached)."""
+        modules = getattr(self, "_b70_nvme_cached", None)
+        if modules is None:
+            from .ngram_embedding import Qwen4ExpNGramEmbedding
+
+            modules = [
+                module
+                for module in self.model.modules()
+                if isinstance(module, Qwen4ExpNGramEmbedding)
+                and module._b70_nvme_active
+            ]
+            self._b70_nvme_cached = modules
+            if modules:
+                self._b70_nvme_stage = torch.empty(
+                    self.max_num_tokens + self.max_num_reqs * self.ngram_context_len,
+                    dtype=torch.int32,
+                    pin_memory=True,
+                )
+        return modules
+
+    def b70_pre_forward(
+        self,
+        input_batch: InputBatch,
+        model_inputs: dict[str, Any],
+        full_graph: bool,
+    ) -> None:
+        """B70 0013: resolve the PLE rows on the host before the forward.
+
+        Called by the V2 runner just before "Run model", on real batches only
+        (never on dummy/profile/capture runs). One D2H of the real tokens and
+        n-gram context (int32, a few KB) and one sync, which waits for the
+        previous step's sampling (the decode token exists only on the
+        device); the n-gram ids are then computed on the host (bit-exact,
+        ple_nvme.host_ngram_ids), resolved against the row cache, the misses
+        read from NVMe, and the gather launched into the static
+        _prefetch_buffer. No-op unless B70_PLE_INT8_NVME is active.
+        """
+        if not self.uses_ngram_embedding:
+            return
+        modules = self._b70_nvme_modules()
+        if not modules:
+            return
+        import time
+
+        num_tokens = input_batch.num_tokens
+        num_reqs = input_batch.num_reqs
+        ctx_len = self.ngram_context_len
+        stage = self._b70_nvme_stage
+        input_ids = model_inputs["input_ids"]
+        if input_ids is None:
+            input_ids = input_batch.input_ids
+        stage[:num_tokens].copy_(input_ids[:num_tokens], non_blocking=True)
+        stage[num_tokens : num_tokens + num_reqs * ctx_len].copy_(
+            model_inputs["ngram_context"][:num_reqs].reshape(-1), non_blocking=True
+        )
+        stream_mod = getattr(torch, input_ids.device.type)
+        stream_mod.current_stream().synchronize()
+        # The GPU is idle from here until the gather + forward are launched:
+        # this is the per-step bubble the stats report.
+        t_start = time.perf_counter()
+        staged = stage.numpy()
+        tokens = staged[:num_tokens]
+        context = staged[num_tokens : num_tokens + num_reqs * ctx_len].reshape(
+            num_reqs, ctx_len
+        )
+        query_start_loc = input_batch.query_start_loc_np[: num_reqs + 1]
+        num_tokens_padded = input_batch.num_tokens_after_padding
+        for module in modules:
+            module.b70_nvme_pre_forward(
+                tokens,
+                query_start_loc,
+                context,
+                num_tokens_padded,
+                full_graph,
+                t_start,
+            )
+
     def prepare_dummy_inputs(
         self,
         num_reqs: int,
