@@ -10,6 +10,10 @@ read from the real table with O_DIRECT. The miss rate is set by pre-installing
 (with dummy bytes, no reads) the complement of each step's rows: 45 % miss on
 bigram ranks, 70 % on trigram ranks (A-design §2.1 planning numbers). Reads
 are capped (~4.5 K per run) — the disk is shared with a serving engine.
+
+0013b: B70_PLE_INT8_NVME_READER=py|native|uring picks the reader (default
+py = v1); PLE_NVME_BENCH_RANKS (default "3,0") and PLE_NVME_BENCH_SHAPES
+(default "decode,prefill") narrow a run to stay under the read budget.
 """
 
 from __future__ import annotations
@@ -28,6 +32,9 @@ pn = t.pn
 ROW = t.ROW
 STEPS = int(os.environ.get("PLE_NVME_BENCH_STEPS", "30"))
 THREADS = int(os.environ.get("B70_PLE_INT8_NVME_IO_THREADS", "16"))
+READER = os.environ.get("B70_PLE_INT8_NVME_READER", "py")
+RANKS = [int(r) for r in os.environ.get("PLE_NVME_BENCH_RANKS", "3,0").split(",")]
+SHAPES = os.environ.get("PLE_NVME_BENCH_SHAPES", "decode,prefill").split(",")
 
 
 def make_step(rng, seqs: int, length: int):
@@ -106,15 +113,21 @@ def run_shape(server, label, seqs, length, miss_rate, steps, rng, io=True):
 def main():
     rng = np.random.default_rng(1)
     data_start, shape, _ = pn.safetensors_tensor_location(t.TABLE, "table")
-    store = pn.PleNvmeRowStore(t.TABLE, data_start, ROW, shape[0], io_threads=THREADS)
+    store = pn.PleNvmeRowStore(t.TABLE, data_start, ROW, shape[0], io_threads=THREADS,
+                               reader=READER)
     total_reads = 0
-    print(f"io_threads={THREADS}, O_DIRECT, table {t.TABLE}")
+    print(f"reader={READER}, io_threads/QD={THREADS}, O_DIRECT, table {t.TABLE}")
     for rank, miss in ((3, 0.70), (0, 0.45)):
+        if rank not in RANKS:
+            continue
         server = server_for(rank, store)
         kind = "trigram" if rank >= 2 else "bigram"
-        for seqs in (1, 4, 8):
-            total_reads += run_shape(server, f"rank {rank} ({kind}) decode {seqs} seq",
-                                     seqs, 1, miss, STEPS, rng)
+        if "decode" in SHAPES:
+            for seqs in (1, 4, 8):
+                total_reads += run_shape(server, f"rank {rank} ({kind}) decode {seqs} seq",
+                                         seqs, 1, miss, STEPS, rng)
+        if "prefill" not in SHAPES:
+            continue
         if rank == 3:
             total_reads += run_shape(server, f"rank {rank} ({kind}) prefill 1024",
                                      1, 1024, miss, 1, rng)
