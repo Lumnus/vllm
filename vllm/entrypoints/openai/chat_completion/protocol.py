@@ -241,6 +241,26 @@ def _b70_presence_penalty(req):
     return float(v) if v else req.presence_penalty
 
 
+def _b70_repetition_detection(req):
+    # B70-0010: server-side default for vLLM's built-in n-gram
+    # repetition stop, so clients that never send `repetition_detection`
+    # (Hermes) still get a bound on degenerate single-token loops.
+    # Env B70_DEFAULT_REPETITION_DETECTION="max=1,min=1,count=128".
+    # A request's own repetition_detection wins (field explicitly set).
+    import os
+    if "repetition_detection" in req.model_fields_set:
+        return req.repetition_detection
+    spec = os.environ.get("B70_DEFAULT_REPETITION_DETECTION")
+    if not spec:
+        return req.repetition_detection
+    kv = dict(x.strip().split("=", 1) for x in spec.split(",") if "=" in x)
+    return RepetitionDetectionParams(
+        max_pattern_size=int(kv.get("max", 1)),
+        min_pattern_size=int(kv.get("min", 1)),
+        min_count=int(kv.get("count", 128)),
+    )
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -792,7 +812,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
-            repetition_detection=self.repetition_detection,
+            repetition_detection=_b70_repetition_detection(self),  # B70-0010
             routed_experts_prompt_start=self.routed_experts_prompt_start,
         )
 
