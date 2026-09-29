@@ -100,6 +100,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
         model_inputs = super().prepare_inputs(input_batch, req_states)
         if not self.uses_ngram_embedding:
             return model_inputs
+        # B70 0013b: the lookahead reads the next prefill chunk's tokens
+        # from here in b70_pre_forward (same step, same stream).
+        self._b70_req_states = req_states
 
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc
@@ -131,7 +134,78 @@ class Qwen4ExpModelState(MambaHybridModelState):
                     dtype=torch.int32,
                     pin_memory=True,
                 )
+                self._b70_lookahead_on = any(m.b70_nvme_lookahead_on for m in modules)
+                if self._b70_lookahead_on:
+                    import os
+
+                    self._b70_lookahead_tokens = int(
+                        os.environ.get("B70_PLE_INT8_NVME_LOOKAHEAD_TOKENS", "0")
+                        or self.max_num_tokens
+                    )
+                    # Next-chunk tokens plus the ngram context before each chunk.
+                    self._b70_lookahead_stage = torch.empty(
+                        self._b70_lookahead_tokens
+                        + self.max_num_reqs * self.ngram_context_len,
+                        dtype=torch.int32,
+                        pin_memory=True,
+                    )
         return modules
+
+    def _b70_lookahead_plan(self, input_batch: InputBatch):
+        """0013b: predict next step's prefill chunks and queue the D2H of
+        their tokens (plus the ngram_context_len tokens before each) into a
+        pinned stage, on the current stream, before the hook's sync."""
+        from .ple_nvme import current_chunk_keys, plan_next_chunks
+
+        num_reqs = input_batch.num_reqs
+        idx = input_batch.idx_mapping_np[:num_reqs]
+        computed = input_batch.num_computed_tokens_np[:num_reqs]
+        scheduled = input_batch.num_scheduled_tokens[:num_reqs]
+        prefill_len = input_batch.prefill_len_np[:num_reqs]
+        keys = current_chunk_keys(idx, computed, scheduled, prefill_len)
+        if not input_batch.has_prefill:
+            return keys, []
+        plan = plan_next_chunks(idx, computed, scheduled, prefill_len,
+                                self._b70_lookahead_tokens)
+        all_tokens = self._b70_req_states.all_token_ids.gpu
+        stage = self._b70_lookahead_stage
+        ctx_len = self.ngram_context_len
+        spans = []
+        offset = 0
+        for req_idx, start, end in plan:
+            lo = max(0, start - ctx_len)
+            count = end - lo
+            stage[offset : offset + count].copy_(
+                all_tokens[req_idx, lo:end], non_blocking=True
+            )
+            spans.append((req_idx, start, end, offset, start - lo))
+            offset += count
+        return keys, spans
+
+    def _b70_lookahead_submit(self, modules, spans) -> None:
+        """0013b: build the predicted chunks' (tokens, qsl, ctx) on the host
+        (after the sync) and hand them to each module's lookahead."""
+        import numpy as np
+
+        if not spans:
+            return
+        staged = self._b70_lookahead_stage.numpy()
+        ctx_len = self.ngram_context_len
+        eos = self.ngram_eos_token_id
+        tokens = []
+        context = np.full((len(spans), ctx_len), eos, dtype=np.int64)
+        qsl = np.zeros(len(spans) + 1, dtype=np.int64)
+        keys = set()
+        for i, (req_idx, start, end, offset, before) in enumerate(spans):
+            # Same rule as _prepare_ngram_context: positions < 0 are EOS.
+            if before:
+                context[i, ctx_len - before :] = staged[offset : offset + before]
+            tokens.append(staged[offset + before : offset + before + end - start])
+            qsl[i + 1] = qsl[i] + (end - start)
+            keys.add((req_idx, start))
+        flat = np.concatenate(tokens).astype(np.int64)
+        for module in modules:
+            module.b70_nvme_lookahead_submit(frozenset(keys), flat, qsl, context)
 
     def b70_pre_forward(
         self,
@@ -168,6 +242,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
         stage[num_tokens : num_tokens + num_reqs * ctx_len].copy_(
             model_inputs["ngram_context"][:num_reqs].reshape(-1), non_blocking=True
         )
+        lookahead_keys = None
+        spans = []
+        if self._b70_lookahead_on:
+            lookahead_keys, spans = self._b70_lookahead_plan(input_batch)
         stream_mod = getattr(torch, input_ids.device.type)
         stream_mod.current_stream().synchronize()
         # The GPU is idle from here until the gather + forward are launched:
@@ -188,7 +266,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 num_tokens_padded,
                 full_graph,
                 t_start,
+                lookahead_keys=lookahead_keys,
             )
+        if spans:
+            # After the gather launch: the lookahead thread works while the
+            # forward of this step runs.
+            self._b70_lookahead_submit(modules, spans)
 
     def prepare_dummy_inputs(
         self,
