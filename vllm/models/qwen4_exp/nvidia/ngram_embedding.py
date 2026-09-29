@@ -484,8 +484,9 @@ class _B70NvmeState:
     """Per-rank state of the B70 0013 host path (see ple_nvme.py)."""
 
     def __init__(self, *, server, slab, cache_view, capacity, host_ids,
-                 host_ids_np, ids_dev, h2d_event, sync_only) -> None:
+                 host_ids_np, ids_dev, h2d_event, sync_only, lookahead=None) -> None:
         self.server = server
+        self.lookahead = lookahead  # 0013b PleLookahead (None = off)
         self.slab = slab  # pinned uint8 [capacity, 164] (None in SYNC_ONLY)
         self.cache_view = cache_view  # its UVA view
         self.capacity = capacity
@@ -1678,9 +1679,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"expected U8 {list(table.shape)}"
             )
         io_threads = int(os.environ.get("B70_PLE_INT8_NVME_IO_THREADS", "16"))
+        reader = os.environ.get("B70_PLE_INT8_NVME_READER", "py")
         try:
             store = PleNvmeRowStore(
-                nvme_path, data_start, storage, shape[0], io_threads=io_threads
+                nvme_path, data_start, storage, shape[0], io_threads=io_threads,
+                reader=reader,
             )
         except OSError as exc:
             raise RuntimeError(
@@ -1688,8 +1691,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ) from exc
         logger.info(
             "PLE INT8 NVMe load (B70_PLE_INT8_NVME=1) starting: %s, data at byte "
-            "%d, %d I/O threads; %s",
-            nvme_path, data_start, io_threads, _host_memory_note(),
+            "%d, %d I/O threads, reader %s; %s",
+            nvme_path, data_start, io_threads, reader, _host_memory_note(),
         )
         # 0008's BF16 cross-check, through the reader, plus byte equality with
         # the mmap on the same rows (tests the reader's offset math at boot).
@@ -1769,6 +1772,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         from vllm.distributed import get_tp_group
 
         from .ple_nvme import (
+            PleLookahead,
+            PleNvmeRowStore,
             PleNvmeServer,
             PleNvmeStats,
             PleRowCache,
@@ -1838,6 +1843,27 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             sync_only=sync_only,
         )
         self._b70_nvme_hash_selftest(server)
+        lookahead = None
+        if os.environ.get("B70_PLE_INT8_NVME_LOOKAHEAD", "0") == "1":
+            if sync_only:
+                logger.info("PLE NVMe lookahead ignored in SYNC_ONLY (no reads)")
+            else:
+                # Its own fd, bounce buffers and reader: the store is used by
+                # one thread at a time. Bounded to one step of own rows.
+                la_store = PleNvmeRowStore(
+                    store.path, store.data_start, store.row_bytes, store.num_rows,
+                    io_threads=store.io_threads, reader=store.reader,
+                    queue_depth=store.queue_depth, max_batch_rows=256,
+                )
+                lookahead = PleLookahead(
+                    server, la_store, sub_batch=256,
+                    max_rows=max_tokens * max(1, own.shape[0]),
+                    name=f"ple-nvme-la{rank}",
+                )
+                logger.info(
+                    "PLE NVMe prefill lookahead on (rank %d, reader %s, <= %d rows/job)",
+                    rank, store.reader, max_tokens * max(1, own.shape[0]),
+                )
         device = embedding._prefetch_buffer.device
         # Dummy/profile/capture runs finalize this buffer without a hook;
         # give them zero rows instead of uninitialised bytes.
@@ -1857,6 +1883,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ids_dev=torch.empty(max_tokens * heads, dtype=torch.int64, device=device),
             h2d_event=embedding._stream_mod.Event(),
             sync_only=sync_only,
+            lookahead=lookahead,
         )
         self._b70_nvme_active = True
         logger.info(
@@ -1919,6 +1946,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         num_tokens_padded: int,
         full_graph: bool,
         t_start: float,
+        lookahead_keys: frozenset | None = None,
     ) -> None:
         """Resolve this step's rows on the host and launch the gather (0013).
 
@@ -1933,11 +1961,29 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # The previous step's H2D of the staging buffer must be done
             # before the host overwrites it.
             state.h2d_event.synchronize()
+        prefetched = None
+        wait_ms = 0.0
+        if state.lookahead is not None:
+            # 0013b: rows the lookahead read for this step (it is ended here
+            # every step: waited for if it predicted this step's chunk,
+            # cancelled otherwise).
+            prefetched, wait_ms = state.lookahead.take(lookahead_keys or frozenset())
         state.server.resolve(
             tokens, query_start_loc, ngram_context, num_tokens_padded,
-            state.host_ids_np, t_start=t_start,
+            state.host_ids_np, t_start=t_start, prefetched=prefetched, wait_ms=wait_ms,
         )
         embedding._b70_nvme_launch(num_tokens_padded, full_graph)
+
+    @property
+    def b70_nvme_lookahead_on(self) -> bool:
+        state = getattr(self.ngram_embedding, "_b70_nvme", None)
+        return state is not None and state.lookahead is not None
+
+    def b70_nvme_lookahead_submit(self, keys, tokens, query_start_loc, ngram_context) -> None:
+        """Start the 0013b lookahead for the predicted next prefill chunks."""
+        self.ngram_embedding._b70_nvme.lookahead.submit(
+            keys, tokens, query_start_loc, ngram_context
+        )
 
     @classmethod
     def _splitmix64(cls, value: int) -> int:
