@@ -211,6 +211,36 @@ class ChatCompletionNamedToolChoiceParam(OpenAIBaseModel):
     type: Literal["function"] = "function"
 
 
+# B70-0009: server-side thinking defaults (env-driven)
+_B70_OFF_EFFORTS = ("none", "off", "false", "0", "disabled")
+
+
+def _b70_thinking_budget(effort, ctk):
+    import os
+    spec = os.environ.get("B70_THINKING_BUDGET")
+    if not spec:
+        return None
+    ctk = ctk or {}
+    if ctk.get("enable_thinking") is False:
+        return None
+    if effort is None:
+        effort = ctk.get("reasoning_effort")
+    e = str(effort).strip().lower() if effort is not None else "default"
+    if e in _B70_OFF_EFFORTS:
+        return None
+    table = dict(kv.strip().split("=", 1) for kv in spec.split(",") if "=" in kv)
+    v = table.get(e, table.get("default"))
+    return int(v) if v not in (None, "", "-1") else None
+
+
+def _b70_presence_penalty(req, resolved=None):
+    import os
+    if "presence_penalty" in req.model_fields_set:
+        return req.presence_penalty
+    v = os.environ.get("B70_DEFAULT_PRESENCE_PENALTY")
+    return float(v) if v else resolved
+
+
 class ChatCompletionRequest(OpenAIBaseModel):
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
@@ -673,6 +703,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
             )
             for name, default in self._DEFAULT_SAMPLING_PARAMS.items()
         }
+        # B70-0009: env default presence penalty when the request did not
+        # set one (main resolves it here instead of a presence_penalty= kwarg).
+        if "presence_penalty" not in self.model_fields_set:
+            sampling_params["presence_penalty"] = _b70_presence_penalty(
+                self, sampling_params["presence_penalty"]
+            )
 
         # Merge server-default stop_token_ids (e.g., model-specific tokens
         # like </call> for gpt-oss) with any request-specified ones
@@ -724,7 +760,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=(  # B70-0009
+                self.thinking_token_budget
+                if self.thinking_token_budget is not None
+                else _b70_thinking_budget(self.reasoning_effort, self.chat_template_kwargs)
+            ),
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
