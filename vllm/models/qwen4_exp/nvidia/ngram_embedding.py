@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
+import os
 from collections.abc import Iterable
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -16,14 +18,19 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.transformers_utils.configs.qwen4_exp import (
     Qwen4ExpTextConfig,
 )
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from ..common.ngram_embedding import (
     Qwen4ExpPLEDeviceEmbedding,
     Qwen4ExpPLEEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
+    Qwen4ExpPLEInt8RowwiseEmbeddingMethod,
+    Qwen4ExpPLENvmeEmbedding,
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
+    _PLENvmeState,
+    ple_int8_nvme_requested,
 )
 from .ops.ple import ple_ngram_ids
 
@@ -213,6 +220,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
+        nvme = ple_int8_nvme_requested()
+        if nvme:
+            if not isinstance(
+                embedding_quant_method, Qwen4ExpPLEInt8RowwiseEmbeddingMethod
+            ):
+                raise RuntimeError("B70_PLE_INT8_NVME=1 requires B70_PLE_INT8=1")
+            embedding_cls = Qwen4ExpPLENvmeEmbedding
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,
@@ -224,6 +238,18 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             max_total_tokens=max_total_tokens,
             data_parallel_rank=data_parallel_rank,
         )
+        # True once the NVMe host path is set up (after the weights load).
+        self._nvme_active = False
+        if nvme:
+            path = os.environ.get("B70_PLE_INT8_NVME_PATH")
+            if not path:
+                raise RuntimeError(
+                    "B70_PLE_INT8_NVME=1 requires B70_PLE_INT8_NVME_PATH "
+                    "(the INT8 PLE table file)"
+                )
+            self.ngram_embedding.open_table(
+                path.format(layer=ple_dense_layer_id) if "{layer}" in path else path
+            )
         if self.ngram_embedding.supports_prefetch:
             # The side-stream lookup outlives eager-break args, whose
             # graph-pool storage later segments may reuse.
@@ -372,7 +398,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> None:
         """Start the pinned lookup while the preceding decoder layer runs."""
         embedding = self.ngram_embedding
-        if not embedding.supports_prefetch:
+        if not embedding.supports_prefetch or self._nvme_active:
+            # NVMe: the host hook gathered the rows before the forward.
             return
         ngram_ids = self.compute_ngram_ids(
             input_ids,
@@ -445,7 +472,272 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        if isinstance(self.ngram_embedding, Qwen4ExpPLENvmeEmbedding):
+            self._nvme_setup()
         return loaded
+
+    # ------------------------------------------------------------------
+    # INT8 PLE table served from NVMe (see common/ple_nvme.py)
+    # ------------------------------------------------------------------
+
+    def _nvme_setup(self) -> None:
+        """Reader, row cache, host hash and (optional) lookahead for this rank.
+
+        Boot checks: layout tensors in the file equal the model's; a random
+        sample of this rank's rows read through the O_DIRECT reader equals
+        the memory-mapped file (offset math) and has finite, non-negative
+        scales; the host n-gram hash equals ``compute_ngram_ids`` on a padded
+        batch. Checkpoint shards were already compared with the file while
+        loading.
+        """
+        from vllm.distributed import get_tp_group
+
+        from ..common.ple_nvme import (
+            PleLookahead,
+            PleNvmeRowStore,
+            PleNvmeServer,
+            PleNvmeStats,
+            PleRowCache,
+            cache_rows_per_rank,
+            owned_heads,
+        )
+
+        embedding = self.ngram_embedding
+        info = embedding.table
+        storage = embedding.storage_dim
+        dim = embedding.embedding_dim
+        rank = get_tp_group().rank_in_group
+        model_layout = {
+            "ngram_heads_offsets": self.ngram_heads_offsets,
+            "ngram_heads_vocab_sizes": self.ngram_heads_vocab_sizes,
+            "layer_multipliers": self.layer_multipliers,
+        }
+        for key, values in info.layout.items():
+            if not np.array_equal(values, model_layout[key].cpu().numpy()):
+                raise ValueError(f"INT8 PLE table {info.path}: {key} differs")
+        io_threads = int(os.environ.get("B70_PLE_INT8_NVME_IO_THREADS", "16"))
+        reader = os.environ.get("B70_PLE_INT8_NVME_READER", "py")
+        try:
+            store = PleNvmeRowStore(
+                info.path,
+                info.data_start,
+                storage,
+                info.num_rows,
+                io_threads=io_threads,
+                reader=reader,
+            )
+        except OSError as exc:
+            raise RuntimeError(
+                f"B70_PLE_INT8_NVME=1: cannot open {info.path} with O_DIRECT: {exc}"
+            ) from exc
+        tp_start = embedding.shard_indices.org_vocab_start_index
+        tp_end = embedding.shard_indices.org_vocab_end_index
+        sample = int(os.environ.get("B70_PLE_INT8_NVME_BOOT_SAMPLE", "65536"))
+        if sample > 0 and tp_end > tp_start:
+            generator = np.random.default_rng(1234 + tp_start)
+            rows = np.unique(generator.integers(tp_start, tp_end, sample))
+            picked = store.read_rows(rows)
+            if not np.array_equal(picked, embedding._table_rows[rows]):
+                raise RuntimeError(
+                    f"PLE NVMe reader rows differ from the file mapping of {info.path}"
+                )
+            scales = picked[:, dim:].copy().view(np.float32)
+            if not np.isfinite(scales).all() or (scales < 0).any():
+                raise ValueError(
+                    f"INT8 PLE table {info.path}: non-finite or negative row scale"
+                )
+        embedding.release_table_map()
+        try:  # the boot checks went through the page cache; drop it
+            fd = os.open(info.path, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
+        max_tokens = int(embedding._prefetch_buffer.shape[0])
+        heads = int(embedding._prefetch_buffer.shape[1])
+        sizes = self.ngram_heads_vocab_sizes.cpu().numpy()
+        offsets = self.ngram_heads_offsets.cpu().numpy()
+        own = owned_heads(sizes, offsets, tp_start, tp_end)
+        total_gib = float(os.environ.get("B70_PLE_INT8_NVME_CACHE_GIB", "8"))
+        capacity = cache_rows_per_rank(total_gib, embedding.tp_size, storage)
+        # This step and the protected previous step must fit, so CLOCK can
+        # always place a step's misses.
+        needed = 2 * max_tokens * max(1, own.shape[0])
+        if capacity < needed:
+            raise RuntimeError(
+                f"B70_PLE_INT8_NVME_CACHE_GIB={total_gib} gives {capacity} "
+                f"rows/rank; need >= {needed} (2 steps x {max_tokens} tokens x "
+                f"{own.shape[0]} own heads)"
+            )
+        slab = torch.empty(capacity, storage, dtype=torch.uint8, pin_memory=True)
+        if not slab.is_pinned():
+            raise RuntimeError("PLE NVMe row cache could not be pinned")
+        cache = PleRowCache(tp_end - tp_start, capacity, storage, slab=slab.numpy())
+        stats = PleNvmeStats(
+            rank,
+            float(os.environ.get("B70_PLE_INT8_NVME_STATS_S", "60")),
+            os.environ.get("B70_PLE_INT8_NVME_STATS", "0") == "1",
+        )
+        server = PleNvmeServer(
+            tp_start=tp_start,
+            tp_end=tp_end,
+            multipliers=self.layer_multipliers.cpu().numpy(),
+            sizes=sizes,
+            offsets=offsets,
+            eos_token_id=self.eos_token_id,
+            heads_per_ngram=self.heads_per_ngram,
+            cache=cache,
+            store=store,
+            stats=stats,
+        )
+        self._nvme_hash_selftest(server)
+        lookahead = None
+        if os.environ.get("B70_PLE_INT8_NVME_LOOKAHEAD", "0") == "1":
+            # Its own fd, bounce buffers and reader: a store is used by one
+            # thread at a time. Bounded to one step of own rows.
+            lookahead_store = PleNvmeRowStore(
+                store.path,
+                store.data_start,
+                store.row_bytes,
+                store.num_rows,
+                io_threads=store.io_threads,
+                reader=store.reader,
+                queue_depth=store.queue_depth,
+                max_batch_rows=256,
+            )
+            lookahead = PleLookahead(
+                server,
+                lookahead_store,
+                sub_batch=256,
+                max_rows=max_tokens * max(1, own.shape[0]),
+                name=f"ple-nvme-la{rank}",
+            )
+        device = embedding._prefetch_buffer.device
+        embedding.nvme = _PLENvmeState(
+            server=server,
+            lookahead=lookahead,
+            slab=slab,
+            cache_view=get_accelerator_view_from_cpu_tensor(slab),
+            capacity=capacity,
+            host_ids=torch.empty(
+                max_tokens * heads, dtype=torch.int64, pin_memory=True
+            ),
+            ids_dev=torch.empty(max_tokens * heads, dtype=torch.int64, device=device),
+        )
+        self._nvme_active = True
+        logger.info(
+            "PLE table served from NVMe %s (rank %d): rows [%d, %d) of %d, %d B/row, "
+            "row cache %d rows (%.2f GiB pinned), own heads %s, reader %s, "
+            "lookahead %s, %d checkpoint rows verified against the file",
+            info.path,
+            rank,
+            tp_start,
+            tp_end,
+            embedding.org_vocab_size,
+            storage,
+            capacity,
+            capacity * storage / 2**30,
+            own.tolist(),
+            reader,
+            "on" if lookahead is not None else "off",
+            embedding.verified_rows,
+        )
+
+    def _nvme_hash_selftest(self, server) -> None:
+        """Host hash == device ``compute_ngram_ids`` on a padded dummy batch."""
+        generator = torch.Generator().manual_seed(4242)
+        lens = [1, 17, 46]
+        real = sum(lens)
+        padded = real + 16
+        max_reqs = 8
+        tokens = torch.randint(
+            0, self.unigram_vocab_size, (padded,), generator=generator
+        )
+        tokens[torch.tensor([0, 5, 30, 31, 50])] = self.eos_token_id
+        tokens = tokens.to(torch.int32)
+        qsl = torch.zeros(max_reqs + 1, dtype=torch.int32)
+        qsl[1 : len(lens) + 1] = torch.cumsum(torch.tensor(lens), 0).to(torch.int32)
+        qsl[len(lens) + 1 :] = real
+        ctx = torch.randint(
+            0,
+            self.unigram_vocab_size,
+            (max_reqs, self.ngram_size - 1),
+            generator=generator,
+        ).to(torch.int32)
+        ctx[1, 0] = self.eos_token_id
+        ctx[len(lens) :] = self.eos_token_id
+        device = self.layer_multipliers.device
+        want = (
+            self.compute_ngram_ids(tokens.to(device), qsl.to(device), ctx.to(device))
+            .cpu()
+            .numpy()[:real]
+        )
+        got = server.hash(
+            tokens[:real].numpy(), qsl[: len(lens) + 1].numpy(), ctx.numpy()
+        )
+        if want.shape != got.shape or not np.array_equal(want, got):
+            raise RuntimeError(
+                "PLE NVMe host n-gram hash differs from the device hash; "
+                "refusing to start"
+            )
+
+    def nvme_pre_forward(
+        self,
+        tokens: np.ndarray,
+        query_start_loc: np.ndarray,
+        ngram_context: np.ndarray,
+        num_tokens_padded: int,
+        t_start: float,
+        lookahead_keys: frozenset | None = None,
+    ) -> None:
+        """Resolve this step's rows on the host and launch the gather.
+
+        Called by ``Qwen4ExpModelState.pre_forward`` on real batches only,
+        before the forward or graph replay. ``tokens`` are the real tokens,
+        ``query_start_loc`` [num_reqs + 1] and ``ngram_context``
+        [num_reqs, ngram_size - 1], all host arrays.
+        """
+        embedding = self.ngram_embedding
+        state = embedding.nvme
+        if state.h2d_pending:
+            # The previous step's H2D copy must be done before the host
+            # overwrites the staging buffer.
+            state.h2d_event.synchronize()
+        prefetched = None
+        wait_ms = 0.0
+        if state.lookahead is not None:
+            prefetched, wait_ms = state.lookahead.take(lookahead_keys or frozenset())
+        state.server.resolve(
+            tokens,
+            query_start_loc,
+            ngram_context,
+            num_tokens_padded,
+            state.host_ids_np,
+            t_start=t_start,
+            prefetched=prefetched,
+            wait_ms=wait_ms,
+        )
+        embedding.nvme_launch(num_tokens_padded)
+
+    @property
+    def nvme_lookahead_on(self) -> bool:
+        state = getattr(self.ngram_embedding, "nvme", None)
+        return state is not None and state.lookahead is not None
+
+    def nvme_lookahead_submit(
+        self,
+        keys: frozenset,
+        tokens: np.ndarray,
+        query_start_loc: np.ndarray,
+        ngram_context: np.ndarray,
+    ) -> None:
+        """Start the lookahead for the predicted next prefill chunks."""
+        self.ngram_embedding.nvme.lookahead.submit(
+            keys, tokens, query_start_loc, ngram_context
+        )
 
 
 __all__ = [

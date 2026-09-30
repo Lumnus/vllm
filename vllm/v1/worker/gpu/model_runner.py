@@ -1951,6 +1951,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_tokens=input_batch.num_tokens,
         )
 
+        if not dummy_run:
+            # Host-side per-step model work, outside any captured region.
+            self.model_state.pre_forward(input_batch, model_inputs)
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.

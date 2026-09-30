@@ -51,6 +51,7 @@ from .ple_int8 import (
 from .ple_int8 import (
     copy_quantized_shard_,
     dequantize_rows,
+    quantize_rows,
 )
 
 logger = init_logger(__name__)
@@ -64,6 +65,17 @@ def ple_int8_requested() -> bool:
     since it applies to both the device-resident and the pinned-host table.
     """
     return os.environ.get("B70_PLE_INT8", "0") == "1"
+
+
+def ple_int8_nvme_requested() -> bool:
+    """Whether the INT8 PLE table should be read from NVMe on demand.
+
+    Opt-in with ``B70_PLE_INT8_NVME=1`` (requires ``B70_PLE_INT8=1``); the
+    table file is ``B70_PLE_INT8_NVME_PATH``. See ``ple_nvme.py``. The
+    upstream shape would be an Engram storage option (e.g.
+    ``EngramConfig.table_storage="nvme"`` plus ``table_path``).
+    """
+    return os.environ.get("B70_PLE_INT8_NVME", "0") == "1"
 
 
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
@@ -674,3 +686,202 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         )
         self._finalize_prefetch(self._prefetch_buffer, output)
         return output
+
+
+class _PLENvmeState:
+    """Per-rank runtime state of the NVMe-backed PLE table."""
+
+    def __init__(
+        self,
+        *,
+        server,
+        lookahead,
+        slab: torch.Tensor,
+        cache_view: torch.Tensor,
+        capacity: int,
+        host_ids: torch.Tensor,
+        ids_dev: torch.Tensor,
+    ) -> None:
+        self.server = server  # ple_nvme.PleNvmeServer
+        self.lookahead = lookahead  # ple_nvme.PleLookahead or None
+        self.slab = slab  # pinned uint8 [capacity, row_bytes] row cache
+        self.cache_view = cache_view  # its UVA view
+        self.capacity = capacity
+        self.host_ids = host_ids  # pinned int64 slot ids of this step
+        self.host_ids_np = host_ids.numpy()
+        self.ids_dev = ids_dev  # static device copy the gather reads
+        self.h2d_event = torch.cuda.Event()
+        self.h2d_pending = False
+
+
+class Qwen4ExpPLENvmeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
+    """INT8 PLE table read from NVMe through a pinned per-rank row cache.
+
+    No table is held in memory. Before each real forward the model state
+    hashes the batch's n-grams on the host, resolves this rank's rows against
+    a pinned row cache (misses are read from the table file with O_DIRECT)
+    and gathers them into ``_prefetch_buffer`` with the pinned-lookup kernel
+    (``nvme_launch``). The forward then only reduces and copies, exactly as
+    for the pinned-host table. The gather runs on the current stream before
+    the forward, so no host work happens inside a captured graph.
+
+    Checkpoint rows are not stored: each shard is spot-checked against the
+    file instead (a sample of this rank's rows is re-quantized and compared
+    byte for byte), which proves the file was built from this checkpoint.
+    """
+
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        params_dtype: torch.dtype,
+        padding_size: int,
+        prefix: str,
+        embedding_method: Qwen4ExpPLEEmbeddingMethod,
+        num_ngram_heads: int = 1,
+        max_total_tokens: int = 0,
+        data_parallel_rank: int = 0,
+    ) -> None:
+        if not isinstance(embedding_method, Qwen4ExpPLEInt8RowwiseEmbeddingMethod):
+            raise RuntimeError(
+                "The NVMe-backed PLE table serves the INT8 row-scale format "
+                "only (set B70_PLE_INT8=1)"
+            )
+        super().__init__(
+            num_embeddings,
+            embedding_dim,
+            params_dtype=params_dtype,
+            padding_size=padding_size,
+            prefix=prefix,
+            embedding_method=embedding_method,
+            num_ngram_heads=num_ngram_heads,
+            max_total_tokens=max_total_tokens,
+            data_parallel_rank=data_parallel_rank,
+        )
+        if self.etp_data_parallel_size > 1:
+            raise RuntimeError(
+                "The NVMe-backed PLE table does not support an embedding "
+                "group spanning DP ranks"
+            )
+        self.weight.weight_loader = self._check_checkpoint_rows
+        # Dummy, profile and capture runs finalize this buffer without the
+        # host hook; give them zero rows instead of uninitialized bytes.
+        self._prefetch_buffer.zero_()
+        self.table = None  # ple_int8_table.TableInfo
+        self._table_rows = None
+        self._verify_rows = int(os.environ.get("B70_PLE_INT8_NVME_VERIFY_ROWS", "64"))
+        self.verified_rows = 0
+        self.nvme: _PLENvmeState | None = None
+
+    def allocate_embedding_weight(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """One pinned placeholder row: the table itself stays on disk."""
+        del num_embeddings
+        return torch.zeros(1, embedding_dim, dtype=dtype, device="cpu", pin_memory=True)
+
+    def open_table(self, path: str) -> None:
+        """Validate the table file and map it for the load-time checks."""
+        from .ple_int8_table import map_rows, table_info
+
+        info = table_info(path, self.embedding_dim)
+        if info.num_rows < self.org_vocab_size:
+            raise ValueError(
+                f"{path}: {info.num_rows} rows, the model needs {self.org_vocab_size}"
+            )
+        self.table = info
+        self._table_rows = map_rows(info)
+
+    def _check_checkpoint_rows(
+        self,
+        param: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        checkpoint_start: int | None = None,
+    ) -> None:
+        """Compare a sample of this shard's own rows with the table file."""
+        del param
+        if self._table_rows is None:
+            raise RuntimeError("open_table() must run before the weights load")
+        checkpoint_start = checkpoint_start or 0
+        begin = max(checkpoint_start, self.shard_indices.org_vocab_start_index)
+        end = min(
+            checkpoint_start + loaded_weight.shape[0],
+            self.shard_indices.org_vocab_end_index,
+        )
+        if begin >= end or self._verify_rows <= 0:
+            return
+        count = min(self._verify_rows, end - begin)
+        rows = torch.linspace(begin, end - 1, count).round().long().unique()
+        source = loaded_weight.index_select(
+            0, (rows - checkpoint_start).to(loaded_weight.device)
+        )
+        want = source if source.dtype == torch.uint8 else quantize_rows(source)
+        got = torch.from_numpy(self._table_rows[rows.numpy()])
+        if not torch.equal(got, want.cpu()):
+            bad = int((got != want.cpu()).any(dim=1).sum())
+            raise ValueError(
+                f"INT8 PLE table {self.table.path} does not match this "
+                f"checkpoint: {bad} of {rows.numel()} sampled rows differ "
+                f"(checkpoint rows [{checkpoint_start}, "
+                f"{checkpoint_start + loaded_weight.shape[0]}))"
+            )
+        self.verified_rows += rows.numel()
+
+    def release_table_map(self) -> None:
+        self._table_rows = None
+
+    def start_prefetch(
+        self,
+        hidden_states: torch.Tensor,
+        ngram_ids: torch.Tensor,
+    ) -> None:
+        """Rows are gathered by ``nvme_launch`` before the forward."""
+        return None
+
+    def nvme_launch(self, num_tokens_padded: int) -> None:
+        """Copy this step's slot ids to the device and gather the rows.
+
+        Slot -1 (a row owned by another rank, or a padding token) writes a
+        zero row, so the ETP all-reduce in ``_finalize_prefetch`` combines
+        the ranks' rows exactly as for the in-memory table.
+        """
+        state = self.nvme
+        assert state is not None
+        heads = self._prefetch_buffer.shape[1]
+        count = num_tokens_padded * heads
+        stream = torch.cuda.current_stream()
+        ids = state.ids_dev[:count]
+        ids.copy_(state.host_ids[:count], non_blocking=True)
+        state.h2d_event.record(stream)
+        state.h2d_pending = True
+        if count:
+            _lookup_ple_embedding_from_pinned_kernel[(count,)](
+                state.cache_view,
+                ids,
+                self._prefetch_buffer[:num_tokens_padded],
+                self._storage_dim,
+                0,
+                state.capacity,
+                BLOCK_D=self._block_d,
+            )
+
+    @eager_break_during_capture
+    def _finalize_prefetch(
+        self,
+        prefetch_output: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Reduce ETP shards and select local rows (gathered on this stream)."""
+        slot_size, slot_offset = self._get_dp_gather_slot(output.shape[0])
+        active_output = prefetch_output[: slot_size * self.etp_data_parallel_size]
+        embeddings = self._reduce_etp_embeddings(active_output)
+        embeddings = self._select_embeddings(
+            embeddings,
+            output.shape[0],
+            slot_offset,
+        )
+        output.copy_(embeddings.flatten(-2))
