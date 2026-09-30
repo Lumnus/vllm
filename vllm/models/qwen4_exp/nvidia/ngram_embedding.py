@@ -28,13 +28,20 @@ from ..common.ngram_embedding import (
     _is_xpu,
     _host_memory_note,
     _ple_direct_pinned_enabled,
-    # B70 PLE helpers (patches 0002/0006-0008 live in common/)
     _b70_mmap_safetensors,
     _b70_ple_fp8_crosscheck,
     _b70_ple_fp8_layout_check,
     _b70_ple_fp8_segments,
     B70PLEFp8PinnedEmbeddingMethod,
     _ple_fp8_enabled,
+    # B70 PLE helpers (patches 0002/0006-0008 live in common/)
+    _b70_ple_int8_crosscheck,
+    _B70_PLE_INT8_FORMATS,
+    _B70_PLE_INT8_SCALE_BYTES,
+    _b70_ple_int8_table,
+    _b70_safetensors_metadata,
+    B70PLEInt8RowPinnedEmbeddingMethod,
+    _ple_int8_enabled,
 )
 from .ops.ple import ple_ngram_ids
 
@@ -69,6 +76,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ``weight_loader(checkpoint_start=...)`` path so only TP-owned rows
         are copied into this rank's pinned storage.
         """
+        if _is_xpu() and _ple_int8_enabled():
+            return self._load_ple_int8_table()
         if _is_xpu() and _ple_fp8_enabled():
             return self._load_ple_fp8_table()
         table_path = os.environ.get("PLE_TABLE_PATH")
@@ -247,6 +256,118 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         return True
 
+    def _load_ple_int8_table(self) -> bool:
+        """B70 0008: fill the pinned slabs with the INT8 row-scale table.
+
+        Reads B70_PLE_INT8_PATH (mmap, zero-copy), refuses on a wrong format
+        tag, dtype, width, row count or n-gram layout, copies only this
+        rank's TP rows (164-byte rows, verbatim) into uint8 pinned slabs (no
+        pageable copy, as 0006/0007), then refuses if any owned row scale is
+        non-finite or negative. When PLE_TABLE_PATH (the BF16 table) is also
+        set, dequantised rows are compared with it on a random sample and the
+        load refuses above B70_PLE_INT8_MAX_REL_ERR (default 0.02).
+        """
+        path = os.environ["B70_PLE_INT8_PATH"]
+        embedding = self.ngram_embedding
+        dim = embedding.embedding_dim
+        if not isinstance(embedding, Qwen4ExpPLEPinnedHostEmbedding):
+            raise RuntimeError("B70_PLE_INT8=1 requires pinned-host PLE storage")
+        if not isinstance(
+            embedding.embedding_method, B70PLEInt8RowPinnedEmbeddingMethod
+        ):
+            raise RuntimeError(
+                "B70_PLE_INT8=1 but the PLE embedding method is "
+                f"{type(embedding.embedding_method).__name__}"
+            )
+        if embedding.weight.dtype != torch.uint8 or (
+            embedding._b70_storage_dim != dim + _B70_PLE_INT8_SCALE_BYTES
+        ):
+            raise RuntimeError(
+                f"B70_PLE_INT8=1 but PLE storage is {embedding.weight.dtype} "
+                f"width {embedding._b70_storage_dim}"
+            )
+        fmt = _b70_safetensors_metadata(path).get("format")
+        if fmt not in _B70_PLE_INT8_FORMATS:
+            raise ValueError(
+                f"INT8 PLE file {path} has format {fmt!r}, expected one of "
+                f"{_B70_PLE_INT8_FORMATS!r}"
+            )
+        tensors = _b70_mmap_safetensors(path)
+        table = _b70_ple_int8_table(tensors, embedding.org_vocab_size, dim)
+        layout = f"table {tuple(table.shape)}"
+        layout_checked = _b70_ple_fp8_layout_check(
+            tensors,
+            {
+                "ngram_heads_offsets": self.ngram_heads_offsets,
+                "ngram_heads_vocab_sizes": self.ngram_heads_vocab_sizes,
+                "layer_multipliers": self.layer_multipliers,
+            },
+        )
+        if layout_checked:
+            layout += f"; layout matches model: {', '.join(layout_checked)}"
+        reference_path = os.environ.get("PLE_TABLE_PATH")
+        if reference_path and os.environ.get("B70_PLE_INT8_CROSSCHECK", "1") == "1":
+            reference_file = torch.load(reference_path, mmap=True, weights_only=True)
+            reference = (
+                reference_file["table"]
+                if isinstance(reference_file, dict)
+                else reference_file
+            )
+            if tuple(reference.shape[1:]) != (dim,):
+                raise ValueError(
+                    f"BF16 PLE table {reference_path} has shape "
+                    f"{tuple(reference.shape)}, cannot cross-check"
+                )
+            limit = min(reference.shape[0], embedding.org_vocab_size)
+            generator = torch.Generator().manual_seed(20260928)
+            rows = torch.randint(0, limit, (4096,), generator=generator)
+            rel_err = _b70_ple_int8_crosscheck(table, dim, reference, rows)
+            max_rel_err = float(os.environ.get("B70_PLE_INT8_MAX_REL_ERR", "0.02"))
+            logger.info(
+                "INT8 PLE cross-check vs %s: relative L2 error %.4f on 4096 "
+                "rows (limit %.3f)",
+                reference_path,
+                rel_err,
+                max_rel_err,
+            )
+            if not rel_err <= max_rel_err:
+                raise ValueError(
+                    f"INT8 PLE table {path} disagrees with the BF16 table "
+                    f"{reference_path}: relative error {rel_err:.4f} > "
+                    f"{max_rel_err} (wrong file, row order or packing?)"
+                )
+            del reference, reference_file
+        logger.info(
+            "PLE INT8 direct-pinned load (B70_PLE_INT8=1) starting: %s",
+            _host_memory_note(),
+        )
+        embedding._materialize_pinned_xpu_slabs(source=[(0, table)])
+        # Every owned row's scale, straight from the pinned slabs.
+        step = 1 << 22
+        for slab in embedding._xpu_slabs or []:
+            for start in range(0, slab.shape[0], step):
+                part = slab.narrow(0, start, min(step, slab.shape[0] - start))
+                scales = part[:, dim:].contiguous().view(torch.float32)
+                if not bool(torch.isfinite(scales).all()) or bool(
+                    (scales < 0).any()
+                ):
+                    raise ValueError(
+                        f"INT8 PLE table {path}: non-finite or negative row "
+                        "scale in this rank's rows"
+                    )
+        logger.info(
+            "Loaded INT8 PLE table from %s (%s): tp rows [%d, %d) of %d, "
+            "storage=pinned-host uint8 slabs, %d B/row; %s",
+            path,
+            layout,
+            embedding.shard_indices.org_vocab_start_index,
+            embedding.shard_indices.org_vocab_end_index,
+            embedding.org_vocab_size,
+            embedding._b70_storage_dim,
+            _host_memory_note(),
+        )
+        return True
+
     @classmethod
     def _splitmix64(cls, value: int) -> int:
         """Mix an integer into a deterministic unsigned 64-bit value."""
@@ -412,6 +533,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                     ".safetensors file)"
                 )
             ple_embedding_dtype = "float8_e4m3fn"
+        b70_ple_int8 = _is_xpu() and _ple_int8_enabled()
+        if b70_ple_int8:
+            # B70 0008: INT8 row-scale table from B70_PLE_INT8_PATH.
+            if b70_ple_fp8:
+                raise RuntimeError("B70_PLE_INT8=1 and B70_PLE_FP8=1 are exclusive")
+            if not os.environ.get("B70_PLE_INT8_PATH"):
+                raise RuntimeError(
+                    "B70_PLE_INT8=1 requires B70_PLE_INT8_PATH (the INT8 PLE "
+                    ".safetensors file)"
+                )
         embedding_quant_method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(
             quant_config,
             embedding_prefix,
@@ -419,12 +550,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         if b70_ple_fp8:
             embedding_quant_method = B70PLEFp8PinnedEmbeddingMethod()
+        if b70_ple_int8:
+            embedding_quant_method = B70PLEInt8RowPinnedEmbeddingMethod()
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
         if engram_config is not None and engram_config.cpu_offload:
             embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
-        elif _is_xpu() and (os.environ.get("PLE_TABLE_PATH") or b70_ple_fp8):
+        elif _is_xpu() and (
+            os.environ.get("PLE_TABLE_PATH") or b70_ple_fp8 or b70_ple_int8
+        ):
             # B70 XPU bring-up: pinned-host PLE table selected by
             # PLE_TABLE_PATH because the Engram route is CUDA-only
             # (config/engram.py rejects non-CUDA platforms) while the stock
