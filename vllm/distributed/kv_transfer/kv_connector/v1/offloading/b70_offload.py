@@ -5,9 +5,14 @@
 Every switch defaults OFF; with all of them unset the connector behaves exactly
 as upstream. Flags are read when the scheduler / coordinator is constructed.
 
-  B70_OFFLOAD_TRACE=1                 per-request lookup/store/job trace lines and
-                                      a periodic CPU-tier state line (prefix
-                                      ``B70-OFFLOAD``)
+  B70_OFFLOAD_TRACE=1                 cheap: a periodic CPU-tier state line plus
+                                      the mechanism events only (junction-set,
+                                      zeroed_by a Mamba group), once per request
+  B70_OFFLOAD_TRACE=2                 also every per-request lookup / store /
+                                      load / handoff / req-done line (prefix
+                                      ``B70-OFFLOAD``). With TRACE=1 these lines
+                                      are emitted at DEBUG instead, so they
+                                      appear only when vLLM logs at DEBUG.
   B70_OFFLOAD_TRACE_PERIOD_S=60       period of the state line (seconds)
   B70_OFFLOAD_JUNCTION=1              (0014b) set a shared-prefix junction when a
                                       sparse (Mamba/GDN) group is what cuts the
@@ -17,7 +22,14 @@ as upstream. Flags are read when the scheduler / coordinator is constructed.
   B70_OFFLOAD_EMPTY_ADVANCE_GUARD=1     (0014d) do not advance the stored index
                                       past keys that are present but still
                                       write-pending (vllm#56795)
+  B70_OFFLOAD_GROUP_EVICT=1           (0014e/f) use the vllm#51787 backport:
+                                      request-scoped recency, tail-before-head
+                                      eviction across KV groups. Unset = the
+                                      upstream v0.30.0 LRU/ARC and per-step
+                                      touch, verbatim.
 """
+
+import logging
 
 import os
 import threading
@@ -47,8 +59,28 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
+def trace_level() -> int:
+    """0 off, 1 cheap (state timer + events), 2 per-request lines.
+    ``true``/``yes``/``on`` count as 1."""
+    raw = os.environ.get("B70_OFFLOAD_TRACE", "").strip().lower()
+    if raw in ("true", "yes", "on"):
+        return 1
+    return max(0, env_int("B70_OFFLOAD_TRACE", 0))
+
+
 def trace_enabled() -> bool:
-    return env_flag("B70_OFFLOAD_TRACE")
+    return trace_level() >= 1
+
+
+def trace_per_request() -> bool:
+    """Whether the per-request lines are built at all (their cost is the
+    formatting, not only the write): TRACE>=2, or TRACE=1 with DEBUG on."""
+    level = trace_level()
+    return level >= 2 or (level >= 1 and logger.isEnabledFor(logging.DEBUG))
+
+
+def group_evict_enabled() -> bool:
+    return env_flag("B70_OFFLOAD_GROUP_EVICT")
 
 
 def junction_enabled() -> bool:
@@ -69,6 +101,10 @@ def trace_period_s() -> float:
 
 def log(fmt: str, *args) -> None:
     logger.info(TAG + " " + fmt, *args)
+
+
+def log_debug(fmt: str, *args) -> None:
+    logger.debug(TAG + " " + fmt, *args)
 
 
 def _policy_chunks(policy) -> list:

@@ -24,6 +24,7 @@ def _hybrid(monkeypatch, **env):
         "B70_OFFLOAD_TRACE",
         "B70_OFFLOAD_JUNCTION",
         "B70_OFFLOAD_EMPTY_ADVANCE_GUARD",
+        "B70_OFFLOAD_GROUP_EVICT",
     ):
         monkeypatch.delenv(name, raising=False)
     for name, value in env.items():
@@ -44,7 +45,7 @@ def _lookup_with(stored: set, full_hits: bool = True):
     return lookup
 
 
-@pytest.mark.parametrize("trace", ["0", "1"])
+@pytest.mark.parametrize("trace", ["0", "1", "2"])
 def test_junction_set_when_mamba_group_zeroes_full_attention_hit(monkeypatch, trace):
     scheduler, request = _hybrid(
         monkeypatch, B70_OFFLOAD_JUNCTION="1", B70_OFFLOAD_TRACE=trace
@@ -245,3 +246,126 @@ def test_guard_reoffers_a_key_whose_pending_store_failed(monkeypatch):
     assert len(jobs) == 1
     [job] = scheduler._jobs.values()
     assert job.keys == {key}
+
+
+# --- 0014f: cheap TRACE=1, GROUP_EVICT opt-in ---------------------------------
+
+
+def _capture_b70(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+        b70_offload,
+    )
+
+    lines: dict[str, list[str]] = {"info": [], "debug": []}
+    monkeypatch.setattr(
+        b70_offload, "log", lambda fmt, *a: lines["info"].append(fmt % a)
+    )
+    monkeypatch.setattr(
+        b70_offload, "log_debug", lambda fmt, *a: lines["debug"].append(fmt % a)
+    )
+    return lines
+
+
+@pytest.mark.parametrize(
+    "raw,level", [("", 0), ("0", 0), ("1", 1), ("true", 1), ("2", 2), ("x", 0)]
+)
+def test_trace_level_parsing(monkeypatch, raw, level):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+        b70_offload,
+    )
+
+    monkeypatch.setenv("B70_OFFLOAD_TRACE", raw)
+    assert b70_offload.trace_level() == level
+    assert b70_offload.trace_enabled() == (level >= 1)
+    if level != 1:  # level 1 also depends on the logger's DEBUG state
+        assert b70_offload.trace_per_request() == (level >= 2)
+
+
+def test_trace1_logs_only_events_once_per_request(monkeypatch):
+    lines = _capture_b70(monkeypatch)
+    scheduler, request = _hybrid(
+        monkeypatch, B70_OFFLOAD_JUNCTION="1", B70_OFFLOAD_TRACE="1"
+    )
+    if scheduler._b70_trace:
+        pytest.skip("vLLM logger at DEBUG: TRACE=1 builds per-request lines")
+    scheduler.manager.lookup.side_effect = _lookup_with(set())
+    for _ in range(3):  # a waiting request is looked up again every step
+        tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
+        assert tokens == 0
+    events = [ln for ln in lines["info"] if not ln.startswith("enabled")]
+    assert any(ln.startswith("junction-set req=req") for ln in events), events
+    assert sum(ln.startswith("zeroed_by req=req") for ln in events) == 1, events
+    assert not any(ln.startswith("lookup req=") for ln in lines["info"])
+    assert not lines["debug"]  # the per-request lines are not even built
+    # no per-key result counting at TRACE=1
+    assert scheduler._b70_counts is None
+
+
+def test_trace2_logs_every_lookup(monkeypatch):
+    lines = _capture_b70(monkeypatch)
+    scheduler, request = _hybrid(monkeypatch, B70_OFFLOAD_TRACE="2")
+    scheduler.manager.lookup.side_effect = _lookup_with(set())
+    for _ in range(2):
+        scheduler.get_num_new_matched_tokens(request, 0)
+    assert sum(ln.startswith("lookup req=req") for ln in lines["info"]) == 2
+
+
+def test_trace_off_builds_nothing(monkeypatch):
+    lines = _capture_b70(monkeypatch)
+    scheduler, request = _hybrid(monkeypatch)
+    scheduler.manager.lookup.side_effect = _lookup_with(set())
+    scheduler.get_num_new_matched_tokens(request, 0)
+    assert lines == {"info": [], "debug": []}
+    assert scheduler._b70_state_logger is None
+
+
+@pytest.mark.parametrize("evict", ["0", "1"])
+def test_group_evict_gates_scheduler_touch(monkeypatch, evict):
+    scheduler, request = _hybrid(monkeypatch, B70_OFFLOAD_GROUP_EVICT=evict)
+    scheduler.manager.lookup.side_effect = _lookup_with(set())
+    scheduler.manager.touch.reset_mock()
+    scheduler.get_num_new_matched_tokens(request, 0)
+    # off = upstream v0.30.0 (per-lookup touch); on = #51787 (no touch)
+    assert scheduler.manager.touch.called == (evict == "0")
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+@pytest.mark.parametrize("evict", ["0", "1"])
+def test_group_evict_selects_policy_class(monkeypatch, policy, evict):
+    from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+    from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
+    from vllm.v1.kv_offload.cpu.policies.arc_group_evict import (
+        GroupEvictARCCachePolicy,
+    )
+    from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+    from vllm.v1.kv_offload.cpu.policies.lru_group_evict import (
+        GroupEvictLRUCachePolicy,
+    )
+
+    monkeypatch.setenv("B70_OFFLOAD_GROUP_EVICT", evict)
+    manager = CPUOffloadingManager(num_chunks=4, cache_policy=policy)
+    expected = {
+        ("lru", "0"): LRUCachePolicy,
+        ("lru", "1"): GroupEvictLRUCachePolicy,
+        ("arc", "0"): ARCCachePolicy,
+        ("arc", "1"): GroupEvictARCCachePolicy,
+    }[(policy, evict)]
+    assert type(manager._policy) is expected
+
+
+def test_group_evict_off_lru_evicts_in_upstream_order(monkeypatch):
+    """Off: touch reorders an evictable chunk immediately (upstream); a
+    finished request does not reorder anything."""
+    from vllm.v1.kv_offload.base import ReqContext, make_offload_key
+    from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+
+    monkeypatch.delenv("B70_OFFLOAD_GROUP_EVICT", raising=False)
+    manager = CPUOffloadingManager(num_chunks=2, cache_policy="lru")
+    ctx = ReqContext(req_id="r")
+    k1, k2, k3 = (make_offload_key(bytes([i]) * 8, 0) for i in (1, 2, 3))
+    manager.prepare_store([k1, k2], ctx)
+    manager.complete_store([k1, k2], ctx)
+    manager.touch([k1], ctx)  # k1 becomes most recent
+    manager.on_request_finished(ctx)  # no-op when off
+    out = manager.prepare_store([k3], ctx)
+    assert out is not None and out.evicted_keys == [k2]

@@ -543,6 +543,8 @@ class OffloadingConnectorScheduler:
     # B70 0014 class-level defaults (all off), so instances built without
     # __init__ (tests, subclasses) see upstream behaviour.
     _b70_trace: bool = False
+    _b70_trace_on: bool = False
+    _b70_group_evict: bool = False
     _b70_junction: bool = False
     _b70_guard: bool = False
     _b70_counts: Counter | None = None
@@ -621,7 +623,15 @@ class OffloadingConnectorScheduler:
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
 
         # B70 0014 (env-gated; every flag off = upstream behaviour).
-        self._b70_trace = _b70.trace_enabled()
+        # TRACE=1: 60 s state line + junction-set / zeroed-by-mamba events.
+        # TRACE=2 (or DEBUG logging): also every per-request lookup / store /
+        # load / handoff / req-done line (0014f; costly under load).
+        self._b70_trace_on = _b70.trace_level() >= 1
+        self._b70_trace = _b70.trace_per_request()
+        self._b70_rlog = _b70.log if _b70.trace_level() >= 2 else _b70.log_debug
+        self._b70_evt_logged: dict[ReqId, set[tuple]] = {}
+        # 0014f: vllm#51787 backport opt-in; off = upstream per-step touch.
+        self._b70_group_evict = _b70.group_evict_enabled()
         self._b70_junction = _b70.junction_enabled()
         self._b70_guard = _b70.guard_enabled()
         self._b70_guard_logged: dict[ReqId, tuple[int, ...]] = {}
@@ -641,12 +651,15 @@ class OffloadingConnectorScheduler:
             )
             for config in self.config.kv_group_configs
         }
-        if self._b70_trace:
+        if self._b70_trace_on:
             slot_bytes = int(getattr(spec, "kv_bytes_per_chunk", 0) or 0)
             _b70.log(
-                "enabled scheduler trace: groups=%s retention_interval=%s "
-                "alignment_tokens=%s partial_tail=%s slot_bytes=%d period_s=%.0f "
-                "junction=%s empty_advance_guard=%s",
+                "enabled scheduler trace: level=%d per_request=%s groups=%s "
+                "retention_interval=%s alignment_tokens=%s partial_tail=%s "
+                "slot_bytes=%d period_s=%.0f junction=%s empty_advance_guard=%s "
+                "group_evict=%s",
+                _b70.trace_level(),
+                self._b70_trace,
                 dict(Counter(self._b70_kind_by_group.values())),
                 self.config.retention_interval,
                 self.config.alignment_tokens,
@@ -655,6 +668,7 @@ class OffloadingConnectorScheduler:
                 _b70.trace_period_s(),
                 self._b70_junction,
                 self._b70_guard,
+                self._b70_group_evict,
             )
             self._b70_state_logger = _b70.PeriodicStateLogger(
                 _b70.trace_period_s(), lambda: self._b70_state_line(slot_bytes)
@@ -685,8 +699,11 @@ class OffloadingConnectorScheduler:
 
     def _b70_req_done(self, req_id: ReqId) -> None:
         self._b70_guard_logged.pop(req_id, None)
+        self._b70_evt_logged.pop(req_id, None)
         counts = self._b70_req_jobs.pop(req_id, [0, 0, 0, 0])
-        _b70.log(
+        if not self._b70_trace:
+            return
+        self._b70_rlog(
             "req-done req=%s store_jobs submitted=%d completed=%d "
             "load_jobs submitted=%d completed=%d",
             req_id,
@@ -770,12 +787,48 @@ class OffloadingConnectorScheduler:
             req_id = req_status.req.request_id
             if self._b70_guard_logged.get(req_id) != sig:
                 self._b70_guard_logged[req_id] = sig
-                _b70.log(
+                self._b70_rlog(
                     "guard-hold req=%s pending_keys=%d held_at_chunks=%s",
                     req_id,
                     len(pending),
                     sorted(set(held)),
                 )
+
+    def _b70_log_events(
+        self, req_status: RequestOffloadState, result: int | None, ctx: dict
+    ) -> None:
+        """0014f, TRACE=1: log only the mechanism events, once per request per
+        distinct value (a waiting request is looked up again every step)."""
+        req = req_status.req
+        junction = ctx.get("junction")
+        zeroed = None
+        if result == 0 and ctx["groups"] and ctx["groups"][-1][3] == 0:
+            gidx, _start, _n, _hit, _counts, max_before = ctx["groups"][-1]
+            if self._b70_kind(gidx) == "mamba":
+                zeroed = f"g{gidx}(mamba)@{max_before}"
+        if junction is None and zeroed is None:
+            return
+        seen = self._b70_evt_logged.setdefault(req.request_id, set())
+        if junction is not None and ("j", junction) not in seen:
+            seen.add(("j", junction))
+            _b70.log(
+                "junction-set req=%s prompt=%d local=%d hit=%s boundary=%d",
+                req.request_id,
+                req.num_prompt_tokens,
+                req_status.num_locally_computed_tokens,
+                result,
+                junction,
+            )
+        if zeroed is not None and ("z", zeroed) not in seen:
+            seen.add(("z", zeroed))
+            _b70.log(
+                "zeroed_by req=%s prompt=%d local=%d %s shared_prefix_boundary=%s",
+                req.request_id,
+                req.num_prompt_tokens,
+                req_status.num_locally_computed_tokens,
+                zeroed,
+                getattr(req, "shared_prefix_boundary", None),
+            )
 
     def _b70_log_lookup(
         self, req_status: RequestOffloadState, result: int | None, ctx: dict
@@ -801,7 +854,7 @@ class OffloadingConnectorScheduler:
         if result == 0 and ctx["groups"] and ctx["groups"][-1][3] == 0:
             gidx, start, n_keys, n_hit, counts, max_before = ctx["groups"][-1]
             zeroed = f"g{gidx}({self._b70_kind(gidx)})@{max_before}"
-        _b70.log(
+        self._b70_rlog(
             "lookup req=%s prompt=%d local=%d hit=%s %s zeroed_by=%s "
             "shared_prefix_boundary=%s junction_set=%s",
             req.request_id,
@@ -932,12 +985,47 @@ class OffloadingConnectorScheduler:
                 )
         return None if defer_lookup or pending_in_window else consecutive_hits
 
+    def _touch(self, req_status: RequestOffloadState):
+        """Upstream v0.30.0 per-step recency touch (B70 0014f: used only
+        when B70_OFFLOAD_GROUP_EVICT is off; the #51787 backport replaces
+        it with one request-scoped access in on_request_finished)."""
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            if group_config.sliding_window_size_in_chunks is None:
+                self.manager.touch(group_state.offload_keys, req_status.req_context)
+            else:
+                # Keep only chunks needed to hit the original request, plus
+                # decoded chunks.
+                chunks_to_skip = max(
+                    0,
+                    group_state.num_hit_chunks
+                    - group_config.sliding_window_size_in_chunks,
+                )
+                self.manager.touch(
+                    group_state.offload_keys[chunks_to_skip:],
+                    req_status.req_context,
+                )
+        if req_status.partial_tail_boundary is not None:
+            self.manager.touch(
+                tuple(
+                    self._make_boundary_key(
+                        req_status.req,
+                        group.group_idx,
+                        req_status.partial_tail_boundary,
+                        req_status.req_context,
+                    )
+                    for group in self.config.kv_group_configs
+                ),
+                req_status.req_context,
+            )
+
     def _lookup_complete_chunks(
         self,
         req_status: RequestOffloadState,
         max_num_new_tokens: int | None = None,
     ) -> int | None:
-        if not (self._b70_trace or self._b70_junction):
+        if not (self._b70_trace_on or self._b70_junction):
             return self._lookup_complete_chunks_impl(req_status, max_num_new_tokens)
         ctx: dict = {"groups": [], "junction": None}
         self._b70_ctx = ctx
@@ -950,6 +1038,8 @@ class OffloadingConnectorScheduler:
             self._b70_maybe_set_junction(req_status, result, ctx)
         if self._b70_trace:
             self._b70_log_lookup(req_status, result, ctx)
+        elif self._b70_trace_on:
+            self._b70_log_events(req_status, result, ctx)
         return result
 
     def _lookup_complete_chunks_impl(
@@ -1040,7 +1130,8 @@ class OffloadingConnectorScheduler:
                 offload_keys = offload_keys[start_chunk_idx:num_chunks]
 
                 if self._b70_ctx is not None:
-                    self._b70_counts = Counter()
+                    # Per-key result counts only feed the per-request line.
+                    self._b70_counts = Counter() if self._b70_trace else None
                     b70_max_before = max_hit_size_tokens
                 # end index (in the sliced offload_keys) up to which we
                 # have backend-confirmed hits
@@ -1296,6 +1387,9 @@ class OffloadingConnectorScheduler:
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
+        if not self._b70_group_evict:
+            self._touch(req_status)
+
         return num_hit_tokens, bool(num_hit_tokens)
 
     def update_state_after_alloc(
@@ -1411,7 +1505,7 @@ class OffloadingConnectorScheduler:
         )
         if self._b70_trace:
             self._b70_job_submitted(request.request_id, False)
-            _b70.log(
+            self._b70_rlog(
                 "load req=%s local=%d external=%d keys=%s job=%d",
                 request.request_id,
                 num_locally_computed_tokens,
@@ -1562,7 +1656,7 @@ class OffloadingConnectorScheduler:
                     (self._b70_kind(g), b) for g, _, b in entries
                 )
                 b70_done = Counter((self._b70_kind(g), b) for g, b, _ in b70_stored)
-                _b70.log(
+                self._b70_rlog(
                     "handoff req=%s prompt=%d max_boundary=%d junction=%s "
                     "offered=%s stored=%s jobs=%s",
                     req_id,
@@ -1677,7 +1771,7 @@ class OffloadingConnectorScheduler:
             )
             if self._b70_trace:
                 self._b70_job_submitted(req_id, True)
-                _b70.log(
+                self._b70_rlog(
                     "partial-tail-store req=%s boundary=%d keys=%d job=%d",
                     req_id,
                     boundary,
@@ -1919,6 +2013,9 @@ class OffloadingConnectorScheduler:
                 req_status.advance_stored_idx(num_offloadable_tokens)
                 continue
 
+            if not self._b70_group_evict:
+                self._touch(req_status)
+
             keys_to_store = set(store_output.keys_to_store)
 
             group_sizes: list[int] = []
@@ -1969,7 +2066,7 @@ class OffloadingConnectorScheduler:
                 group_state.next_stored_chunk_idx = max(
                     group_state.next_stored_chunk_idx, num_chunks
                 )
-            if self._b70_guard:
+            if self._b70_guard and len(keys_to_store) < len(new_offload_keys):
                 pending = self._b70_pending_skipped(
                     req_status, new_offload_keys, keys_to_store
                 )
@@ -2008,7 +2105,7 @@ class OffloadingConnectorScheduler:
                 b70_kinds = Counter(
                     self._b70_kind(get_offload_group_idx(k)) for k in keys_to_store
                 )
-                _b70.log(
+                self._b70_rlog(
                     "store req=%s upto=%d prompt=%d reachable_boundaries=%s "
                     "offered=%d stored=%s job=%d finished=%s",
                     req_id,
@@ -2093,7 +2190,7 @@ class OffloadingConnectorScheduler:
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
                 del self._req_status[req_id]
-                if self._b70_trace:
+                if self._b70_trace_on:
                     self._b70_req_done(req_id)
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
@@ -2189,7 +2286,7 @@ class OffloadingConnectorScheduler:
             req_status.transfer_jobs.remove(job_id)
             if req_status.finished_signaled and not req_status.transfer_jobs:
                 del self._req_status[job_status.req_id]
-                if self._b70_trace:
+                if self._b70_trace_on:
                     self._b70_req_done(job_status.req_id)
 
     def get_stats(self) -> OffloadingConnectorStats | None:
