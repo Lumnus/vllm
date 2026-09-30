@@ -10,6 +10,8 @@ Unified Virtual Addressing on any CUDA-alike platform.
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -55,6 +57,33 @@ def _is_xpu() -> bool:
     from vllm.platforms import current_platform
 
     return current_platform.is_xpu()
+
+
+def _ple_direct_pinned_enabled() -> bool:
+    """B70 0006 gate: fill the XPU pinned PLE slabs straight from the mmap.
+
+    Default OFF (unset or anything but "1"): the default load path runs
+    unchanged. See _materialize_pinned_xpu_slabs(source=...).
+    """
+    return os.environ.get("B70_PLE_DIRECT_PINNED", "0") == "1"
+
+
+def _host_memory_note() -> str:
+    """VmRSS of this rank and node MemAvailable, for the load log line."""
+    fields = {}
+    for path, keys in (
+        ("/proc/self/status", ("VmRSS",)),
+        ("/proc/meminfo", ("MemAvailable",)),
+    ):
+        try:
+            with open(path) as handle:
+                for line in handle:
+                    name, _, value = line.partition(":")
+                    if name in keys:
+                        fields[name] = int(value.split()[0]) / 2**20
+        except OSError:
+            pass
+    return ", ".join(f"{k}={v:.1f} GiB" for k, v in fields.items()) or "n/a"
 
 
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
@@ -503,8 +532,19 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             pin_memory=True,
         )
 
-    def _materialize_pinned_xpu_slabs(self) -> None:
-        """Copy the loaded shard into pinned slabs with UVA views (XPU)."""
+    def _materialize_pinned_xpu_slabs(
+        self, source: torch.Tensor | None = None
+    ) -> None:
+        """Copy the loaded shard into pinned slabs with UVA views (XPU).
+
+        With ``source`` (the full mmap'd PLE table, B70 0006, gated by
+        B70_PLE_DIRECT_PINNED=1) each slab is filled straight from the
+        table's TP-owned rows, so the pageable ``self.weight`` shard is never
+        written and never becomes resident: the per-rank host peak drops from
+        pageable shard + pinned slabs to pinned slabs alone. Rows past the
+        TP-owned range (vocab padding) are zeroed, which is what the stock
+        path reads from the never-written pageable pages.
+        """
         if self._xpu_slabs is not None:
             return
         shard = self.weight
@@ -531,7 +571,17 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
                     f"PLE pinned slab {index} ({rows * dim * itemsize / 2**30:.1f}"
                     " GiB) silently failed to pin on XPU"
                 )
-            slab.copy_(shard.narrow(0, start, rows))
+            if source is None:
+                slab.copy_(shard.narrow(0, start, rows))
+            else:
+                owned = self.shard_indices.org_vocab_end_index - tp_start
+                valid = max(0, min(rows, owned - start))
+                if valid:
+                    slab.narrow(0, 0, valid).copy_(
+                        source.narrow(0, tp_start + start, valid)
+                    )
+                if valid < rows:
+                    slab.narrow(0, valid, rows - valid).zero_()
             slabs.append(slab)
             views.append(get_accelerator_view_from_cpu_tensor(slab))
         self._xpu_slabs = slabs

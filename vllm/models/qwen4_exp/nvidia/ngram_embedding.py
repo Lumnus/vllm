@@ -25,8 +25,10 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
-    # B70 PLE helpers (patches 0002/0006-0008 live in common/)
     _is_xpu,
+    # B70 PLE helpers (patches 0002/0006-0008 live in common/)
+    _host_memory_note,
+    _ple_direct_pinned_enabled,
 )
 from .ops.ple import ple_ngram_ids
 
@@ -81,6 +83,35 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"PLE table at {table_path} has shape {tuple(table.shape)}, "
                 f"expected >= [{org_vocab_size}, {embedding.embedding_dim}]"
             )
+        if (
+            _is_xpu()
+            and _ple_direct_pinned_enabled()
+            and isinstance(
+                embedding.embedding_method, Qwen4ExpPLEUnquantizedEmbeddingMethod
+            )
+        ):
+            # B70 0006: the weight_loader loop below would first fill the
+            # 23.8 GiB/rank pageable shard and only then copy it into the
+            # pinned slabs (47.7 GiB/rank transient, ~191 GiB over 4 ranks
+            # at once). Copy the TP-owned rows from the mmap into the slabs
+            # directly instead. Same rows, same dtype cast (copy_), same slab
+            # layout; the pageable shard is released untouched.
+            logger.info(
+                "PLE direct-pinned load (B70_PLE_DIRECT_PINNED=1) starting: %s",
+                _host_memory_note(),
+            )
+            embedding._materialize_pinned_xpu_slabs(source=table)
+            logger.info(
+                "Loaded PLE table from %s: direct-pinned, tp rows [%d, %d) of "
+                "%d, dtype=%s, storage=pinned-host slabs; %s",
+                table_path,
+                embedding.shard_indices.org_vocab_start_index,
+                embedding.shard_indices.org_vocab_end_index,
+                org_vocab_size,
+                table.dtype,
+                _host_memory_note(),
+            )
+            return True
         shard_size = (
             org_vocab_size + self.split_ngram_parts - 1
         ) // self.split_ngram_parts
