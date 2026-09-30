@@ -16,6 +16,35 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+
+# B70-0005: optional GDN library built with 64-bit conv-state offsets.
+# B70_GDN_INDEX64=1 loads it and routes gdn_attention to it; unset, the
+# stock torch.ops._xpu_C.gdn_attention runs and nothing extra is loaded.
+# B70_GDN_INDEX64_LIB overrides the default path (libgdn_index64.so next to
+# the vllm_xpu_kernels package).
+_b70_gdn_op: Callable | None = None
+
+
+def _b70_gdn_attention_op() -> Callable:
+    global _b70_gdn_op
+    if _b70_gdn_op is None:
+        import os
+
+        if os.environ.get("B70_GDN_INDEX64", "0") == "1":
+            from pathlib import Path
+
+            import vllm_xpu_kernels
+
+            lib = os.environ.get("B70_GDN_INDEX64_LIB") or str(
+                Path(vllm_xpu_kernels.__file__).with_name("libgdn_index64.so")
+            )
+            torch.ops.load_library(lib)
+            logger.info("B70-0005: gdn_attention from %s", lib)
+            _b70_gdn_op = torch.ops._gdn_index64.gdn_attention
+        else:
+            _b70_gdn_op = torch.ops._xpu_C.gdn_attention
+    return _b70_gdn_op
+
 if TYPE_CHECKING:
 
     def register_fake(fn):
@@ -190,7 +219,7 @@ def _gdn_attention_core_xpu_impl(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
     )
 
-    torch.ops._xpu_C.gdn_attention(
+    _b70_gdn_attention_op()(
         core_attn_out,
         z,
         projected_states_qkvz,
