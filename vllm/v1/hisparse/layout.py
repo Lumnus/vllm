@@ -363,4 +363,7 @@ def get_hisparse_kv_cache_config(
         prefix_cache_retention_interval=(
             vllm_config.cache_config.prefix_cache_retention_interval
         ),
+        prefix_cache_retention_tail_blocks=(
+            vllm_config.cache_config.prefix_cache_retention_tail_blocks
+        ),
     )

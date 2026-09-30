@@ -35,6 +35,7 @@ from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
 )
+from vllm.v1.core.kv_cache_coordinator import get_retention_tail_boundaries
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -385,6 +386,13 @@ class Scheduler(SchedulerInterface):
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_shared_prefix_checkpoint
         )
+        # Retained tail boundaries below the replay boundary: a state is only
+        # materialized where a prefill chunk ends, so stop there too.
+        self.mamba_retention_tail_blocks = (
+            self.kv_cache_manager.coordinator.retention_tail_blocks
+            if self.need_mamba_block_aligned_split
+            else 0
+        )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -505,7 +513,7 @@ class Scheduler(SchedulerInterface):
             and junction <= request.num_prompt_tokens
             else block_floored
         )
-        stops = (
+        stops: tuple[int, ...] = (
             # Same invariant: a chunk starting mid-block stops at the boundary
             # rather than running past it.
             next_block_boundary
@@ -522,6 +530,13 @@ class Scheduler(SchedulerInterface):
             # requests sharing the prefix can reuse it.
             junction_stop if start < junction < end else 0,
         )
+        if self.mamba_retention_tail_blocks:
+            replay_tokens = request.num_prompt_tokens
+            if self.use_eagle_block_drop:
+                replay_tokens = (replay_tokens - 1) // block_size * block_size
+            stops += get_retention_tail_boundaries(
+                replay_tokens, block_size, self.mamba_retention_tail_blocks
+            )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)

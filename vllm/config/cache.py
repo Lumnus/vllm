@@ -164,6 +164,16 @@ class CacheConfig:
     retain periodic checkpoints at the specified interval, which must be a
     multiple of the scheduler block size. ``None`` retains checkpoints densely.
     Applies only to sliding-window and Mamba cache groups."""
+    prefix_cache_retention_tail_blocks: int = Field(default=0, ge=0)
+    """Number of extra sliding-window and Mamba checkpoints to retain at the
+    scheduler-block boundaries directly below each request's replay boundary,
+    when ``prefix_cache_retention_interval`` is not ``None``. A later request
+    that shares the prompt but diverges within its last N blocks (for example,
+    the same document followed by a different question) then hits on its
+    first visit instead of only after a shared-prefix junction has been
+    learned. Costs up to N extra retained Mamba states (or sliding-window
+    runs) per request in the prefix cache; a KV offload connector also
+    stores the extra Mamba states it is handed."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
@@ -286,6 +296,7 @@ class CacheConfig:
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
+            "prefix_cache_retention_tail_blocks",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "enable_mamba_shared_prefix_checkpoint",

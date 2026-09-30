@@ -2310,6 +2310,7 @@ def test_hybrid_cache_mamba_align_shared_prefix_detection():
         use_eagle_block_drop=False,
         hash_block_size=block_size,
         mamba_partial_cache_hit=False,
+        mamba_retention_tail_blocks=0,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
     )
@@ -5681,6 +5682,81 @@ def test_mamba_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 2 * block_size
+
+
+def test_mamba_retention_tail_blocks_retain_states_below_replay_boundary():
+    block_size = 16
+    # 16-block prompt; replay boundary 255 keeps state block 14 (token 240).
+    token_ids = [i for i in range(16) for _ in range(block_size)]
+
+    def cached_mamba_blocks(tail_blocks):
+        kv_cache_config = replace(
+            _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba"]),
+            prefix_cache_retention_tail_blocks=tail_blocks,
+        )
+        manager = make_kv_cache_manager(
+            kv_cache_config,
+            max_model_len=8192,
+            enable_caching=True,
+            hash_block_size=block_size,
+            retention_interval=0,
+        )
+        req = make_request("r", token_ids, block_size, sha256)
+        computed_blocks, num_computed, _ = manager.get_computed_blocks(req)
+        assert manager.allocate_slots(
+            req, len(token_ids), num_computed, computed_blocks
+        )
+        return {
+            i
+            for i in range(16)
+            if manager.block_pool.get_cached_block(
+                req.block_hashes[i], kv_cache_group_ids=[1]
+            )
+            is not None
+        }
+
+    assert cached_mamba_blocks(0) == {14}
+    assert cached_mamba_blocks(2) == {12, 13, 14}
+
+
+@pytest.mark.parametrize(
+    ("retention", "tail_blocks", "expected_hit"),
+    [(0, 0, 0), (0, 1, 32), (None, 1, 32)],
+)
+def test_mamba_retention_tail_blocks_first_revisit_hits(
+    retention, tail_blocks, expected_hit
+):
+    """Same document, different trailing question that starts inside the
+    prompt's last block. Under retention 0 the only Mamba state sits past the
+    divergence, so the first revisit misses; one tail block retains the state
+    below it."""
+    block_size = 16
+    kv_cache_config = replace(
+        _make_hybrid_kv_cache_config(block_size, 200, ["full", "mamba_align"]),
+        prefix_cache_retention_tail_blocks=tail_blocks,
+    )
+    manager = make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        retention_interval=retention,
+    )
+    doc = [7] * 40  # shared prefix ends inside block 2 (tokens 32..48)
+
+    req0 = make_request("0", doc + [50] * 18, block_size, sha256)
+    cb, nc, _ = manager.get_computed_blocks(req0)
+    # Block-sized chunks materialize every state; retention decides which
+    # ones stay cached.
+    for start in range(0, len(req0.all_token_ids), block_size):
+        num_new = min(block_size, len(req0.all_token_ids) - start)
+        assert manager.allocate_slots(req0, num_new, nc, cb) is not None
+        req0.num_computed_tokens += num_new
+        cb, nc = manager.empty_kv_cache_blocks, 0
+
+    req1 = make_request("1", doc + [60] * 18, block_size, sha256)
+    _, nc1, _ = manager.get_computed_blocks(req1)
+    assert nc1 == expected_hit
 
 
 @pytest.mark.skip_global_cleanup

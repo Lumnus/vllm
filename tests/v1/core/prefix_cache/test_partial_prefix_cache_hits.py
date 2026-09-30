@@ -188,6 +188,7 @@ def test_mamba_align_split_partial_tail_schedule(dcp_world_size: int):
         dcp_world_size=dcp_world_size,
         scheduler_block_size=scheduler_block_size,
         mamba_partial_cache_hit=True,
+        mamba_retention_tail_blocks=0,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
     )
@@ -236,6 +237,7 @@ def test_mamba_align_split_when_block_exceeds_scheduling_budget():
         use_eagle_block_drop=False,
         hash_block_size=32,
         mamba_partial_cache_hit=False,
+        mamba_retention_tail_blocks=0,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
     )
@@ -277,6 +279,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
         use_eagle_block_drop=False,
         hash_block_size=32,
         mamba_partial_cache_hit=False,
+        mamba_retention_tail_blocks=0,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
     )
@@ -1826,6 +1829,7 @@ def test_mamba_align_split_stops_below_eagle_proof_boundary():
         use_eagle_block_drop=True,
         hash_block_size=hash_block_size,
         mamba_partial_cache_hit=True,
+        mamba_retention_tail_blocks=0,
         mamba_shared_prefix_checkpoint=False,
         mamba_has_prefill_checkpoint_blocks=False,
     )
