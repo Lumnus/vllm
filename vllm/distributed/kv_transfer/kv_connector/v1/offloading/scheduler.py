@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
 from itertools import chain, islice
@@ -10,6 +11,9 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+    b70_offload as _b70,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
@@ -564,6 +568,11 @@ def _create_req_context(req: Request) -> ReqContext:
 class OffloadingConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
+    # B70-0014a trace defaults (off), so instances built without __init__
+    # (tests, subclasses) behave as upstream.
+    _b70_trace_on: bool = False
+    _b70_trace: bool = False
+
     def __init__(
         self,
         spec: OffloadingSpec,
@@ -635,6 +644,111 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+
+        # B70-0014a: env-gated trace (B70_OFFLOAD_TRACE; off = upstream).
+        self._b70_trace_on = _b70.trace_level() >= 1
+        self._b70_trace = _b70.trace_per_request()
+        if self._b70_trace_on:
+            self._b70_init_trace(spec)
+
+    # --- B70-0014a trace helpers (only called with B70_OFFLOAD_TRACE set) ---
+
+    def _b70_init_trace(self, spec: OffloadingSpec) -> None:
+        self._b70_rlog = _b70.log if _b70.trace_level() >= 2 else _b70.log_debug
+        self._b70_evt_logged: dict[ReqId, set[tuple]] = {}
+        self._b70_kind_by_group: dict[int, str] = {
+            config.group_idx: (
+                "mamba"
+                if isinstance(config.kv_cache_spec, MambaSpec)
+                else "full"
+                if config.sliding_window_size_in_chunks is None
+                else "swa"
+            )
+            for config in self.config.kv_group_configs
+        }
+        slot_bytes = int(getattr(spec, "kv_bytes_per_chunk", 0) or 0)
+        _b70.log(
+            "enabled scheduler trace: level=%d per_request=%s groups=%s "
+            "retention_interval=%s alignment_tokens=%s partial_tail=%s "
+            "slot_bytes=%d period_s=%.0f",
+            _b70.trace_level(),
+            self._b70_trace,
+            dict(Counter(self._b70_kind_by_group.values())),
+            self.config.retention_interval,
+            self.config.alignment_tokens,
+            self.config.supports_partial_tail,
+            slot_bytes,
+            _b70.trace_period_s(),
+        )
+        self._b70_state_logger = _b70.PeriodicStateLogger(
+            _b70.trace_period_s(), lambda: self._b70_state_line(slot_bytes)
+        )
+
+    def _b70_kind(self, group_idx: int) -> str:
+        return self._b70_kind_by_group.get(group_idx, "?")
+
+    def _b70_state_line(self, slot_bytes: int) -> str:
+        jobs = list(self._jobs.values())
+        n_store = sum(1 for j in jobs if j.is_store)
+        return (
+            _b70.cpu_tier_snapshot(self.manager, self._b70_kind, slot_bytes)
+            + f" inflight_store_jobs={n_store}"
+            f" inflight_load_jobs={len(jobs) - n_store}"
+            f" tracked_reqs={len(self._req_status)}"
+        )
+
+    def _b70_trace_lookup(
+        self,
+        req_status: "RequestOffloadState",
+        num_hit_tokens: int,
+        boundary_before: int,
+    ) -> None:
+        """Log the mechanism events once per request per value (TRACE>=1)
+        and, at TRACE=2 (or DEBUG), a line per lookup."""
+        req = req_status.req
+        local = req_status.num_locally_computed_tokens
+        fa_boundary = req_status.full_attention_hit_boundary
+        boundary = req.shared_prefix_boundary
+        seen = self._b70_evt_logged.setdefault(req.request_id, set())
+        if boundary != boundary_before and ("j", boundary) not in seen:
+            seen.add(("j", boundary))
+            _b70.log(
+                "junction-set req=%s prompt=%d local=%d hit=%d boundary=%d",
+                req.request_id,
+                req.num_prompt_tokens,
+                local,
+                num_hit_tokens,
+                boundary,
+            )
+        if (
+            num_hit_tokens == 0
+            and fa_boundary > local
+            and ("z", fa_boundary) not in seen
+        ):
+            seen.add(("z", fa_boundary))
+            _b70.log(
+                "zeroed_by_sparse_group req=%s prompt=%d local=%d "
+                "full_attention_hit=%d shared_prefix_boundary=%s",
+                req.request_id,
+                req.num_prompt_tokens,
+                local,
+                fa_boundary,
+                boundary,
+            )
+        if self._b70_trace:
+            self._b70_rlog(
+                "lookup req=%s prompt=%d local=%d hit=%d full_attention_hit=%d "
+                "shared_prefix_boundary=%s",
+                req.request_id,
+                req.num_prompt_tokens,
+                local,
+                num_hit_tokens,
+                fa_boundary,
+                boundary,
+            )
+
+    def _b70_req_done(self, req_id: ReqId) -> None:
+        self._b70_evt_logged.pop(req_id, None)
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -1126,7 +1240,12 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
+                b70_boundary_before = request.shared_prefix_boundary
                 self._maybe_register_shared_prefix_junction(req_status, num_hit_tokens)
+                if self._b70_trace_on:
+                    self._b70_trace_lookup(
+                        req_status, num_hit_tokens, b70_boundary_before
+                    )
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         return num_hit_tokens, bool(num_hit_tokens)
@@ -1863,6 +1982,8 @@ class OffloadingConnectorScheduler:
             self.manager.on_request_finished(req_status.req_context)
             if not req_status.transfer_jobs:
                 del self._req_status[req_id]
+                if self._b70_trace_on:
+                    self._b70_req_done(req_id)
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
@@ -1955,6 +2076,8 @@ class OffloadingConnectorScheduler:
             req_status.transfer_jobs.remove(job_id)
             if req_status.finished_signaled and not req_status.transfer_jobs:
                 del self._req_status[job_status.req_id]
+                if self._b70_trace_on:
+                    self._b70_req_done(job_status.req_id)
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats: OffloadingConnectorStats | None = None
@@ -2041,6 +2164,8 @@ class OffloadingConnectorScheduler:
                 if not status.finished_signaled:
                     self.manager.on_request_finished(status.req_context)
                 del self._req_status[req_id]
+                if self._b70_trace_on:
+                    self._b70_req_done(req_id)
 
         # Reset offloading manager cache
         self.manager.reset_cache()
