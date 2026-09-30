@@ -63,6 +63,19 @@ def _validate_prefix_cache_retention_interval(
         )
 
 
+def get_retention_tail_boundaries(
+    num_prompt_tokens: int, block_size: int, num_tail_blocks: int
+) -> tuple[int, ...]:
+    """Block boundaries 1..``num_tail_blocks`` blocks below the last block
+    boundary a replay of the prompt can resume at."""
+    replay = (num_prompt_tokens - 1) // block_size * block_size
+    return tuple(
+        replay - k * block_size
+        for k in range(1, num_tail_blocks + 1)
+        if replay - k * block_size > 0
+    )
+
+
 class KVCacheCoordinator(ABC):
     """Coordinate the KV cache of different KV cache groups."""
 
@@ -162,6 +175,11 @@ class KVCacheCoordinator(ABC):
         self.retention_interval = kv_cache_config.prefix_cache_retention_interval
         _validate_prefix_cache_retention_interval(
             self.retention_interval, self.scheduler_block_size, kv_cache_config
+        )
+        self.retention_tail_blocks = (
+            kv_cache_config.prefix_cache_retention_tail_blocks
+            if self.retention_interval is not None
+            else 0
         )
 
     def get_num_blocks_to_allocate(
@@ -320,13 +338,20 @@ class KVCacheCoordinator(ABC):
         block-aligned prompt, where retaining just the higher one collapses the
         resend's hit to 0. The alignment is the scheduler block size, not the
         finer hash granularity, which would over-estimate the reach.
+
+        ``prefix_cache_retention_tail_blocks`` adds the block boundaries just
+        below, for siblings that diverge inside the prompt's last blocks.
         """
-        if not self.eagle_group_ids:
-            return (request.num_prompt_tokens - 1,)
         block = self.scheduler_block_size
+        if not self.eagle_group_ids:
+            tail = get_retention_tail_boundaries(
+                request.num_prompt_tokens, block, self.retention_tail_blocks
+            )
+            return (*tail, request.num_prompt_tokens - 1)
         resend = (request.num_prompt_tokens - 1) // block * block
         extension = request.num_prompt_tokens // block * block
-        return tuple(sorted({max(resend - block, 0), max(extension - block, 0)}))
+        tail = get_retention_tail_boundaries(resend, block, self.retention_tail_blocks)
+        return tuple(sorted({max(resend - block, 0), max(extension - block, 0), *tail}))
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """Cache the blocks for the request.

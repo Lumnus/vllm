@@ -1472,6 +1472,9 @@ class KVCacheConfig:
     """
     prefix_cache_retention_interval: int | None = None
     """Resolved retention policy for local prefix-cache checkpoints."""
+    prefix_cache_retention_tail_blocks: int = 0
+    """Extra checkpoints retained below each replay boundary under sparse
+    retention; see ``CacheConfig.prefix_cache_retention_tail_blocks``."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
     hisparse_host_num_blocks: int | None = None

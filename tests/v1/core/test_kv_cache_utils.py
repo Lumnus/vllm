@@ -138,6 +138,7 @@ def test_hisparse_hma_uses_resolved_gpu_block_size(
         cache_config=SimpleNamespace(
             num_gpu_blocks_override=7,
             prefix_cache_retention_interval=None,
+            prefix_cache_retention_tail_blocks=0,
             get_resolved_kv_cache_layout=lambda: KVCacheLayout.BLHNC,
         ),
     )

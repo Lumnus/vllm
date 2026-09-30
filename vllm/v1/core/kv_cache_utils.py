@@ -1704,6 +1704,9 @@ def get_kv_cache_config_from_groups(
             prefix_cache_retention_interval=(
                 vllm_config.cache_config.prefix_cache_retention_interval
             ),
+            prefix_cache_retention_tail_blocks=(
+                vllm_config.cache_config.prefix_cache_retention_tail_blocks
+            ),
         )
 
     if vllm_config.attention_config.hisparse_config is not None:
@@ -1773,6 +1776,9 @@ def get_kv_cache_config_from_groups(
             prefix_cache_retention_interval=(
                 vllm_config.cache_config.prefix_cache_retention_interval
             ),
+            prefix_cache_retention_tail_blocks=(
+                vllm_config.cache_config.prefix_cache_retention_tail_blocks
+            ),
         )
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
@@ -1836,6 +1842,9 @@ def get_kv_cache_config_from_groups(
         kv_cache_groups=kv_cache_groups,
         prefix_cache_retention_interval=(
             vllm_config.cache_config.prefix_cache_retention_interval
+        ),
+        prefix_cache_retention_tail_blocks=(
+            vllm_config.cache_config.prefix_cache_retention_tail_blocks
         ),
     )
 

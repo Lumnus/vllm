@@ -132,6 +132,7 @@ def _split(
     partial_hit: bool = False,
     num_prefill_checkpoint_blocks: int = 0,
     max_num_scheduled_tokens: int = 16384,
+    tail_blocks: int = 0,
 ) -> int:
     """Call the real `Scheduler._mamba_block_aligned_split` on a stub self."""
     if use_eagle_block_drop is None:
@@ -144,6 +145,7 @@ def _split(
         scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         # `prefix_match_unit` finer than the block size (#46384).
         mamba_partial_cache_hit=partial_hit,
+        mamba_retention_tail_blocks=tail_blocks,
         mamba_shared_prefix_checkpoint=False,
         hash_block_size=ATTN_BLOCK_SIZE,
         mamba_has_prefill_checkpoint_blocks=(num_prefill_checkpoint_blocks > 0),
@@ -178,6 +180,17 @@ def test_internal_checkpoint_split(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("tail_blocks", "expected"), [(0, 3 * MAMBA_BLOCK_SIZE), (1, 2 * MAMBA_BLOCK_SIZE)]
+)
+def test_retention_tail_blocks_stop_below_replay_boundary(
+    tail_blocks: int, expected: int
+) -> None:
+    # A retained tail state is only materialized where a chunk ends.
+    (request,) = create_requests(1, num_tokens=5000, block_size=ATTN_BLOCK_SIZE)
+    assert _split(request, 5000, use_eagle=False, tail_blocks=tail_blocks) == expected
 
 
 def test_partial_checkpoint_resume_stops_at_mamba_block_boundary() -> None:
