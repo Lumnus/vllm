@@ -42,6 +42,7 @@ from ..common.ngram_embedding import (
     _b70_safetensors_metadata,
     B70PLEInt8RowPinnedEmbeddingMethod,
     _ple_int8_enabled,
+    ple_int8_quantize_at_load_requested,
 )
 from .ops.ple import ple_ngram_ids
 
@@ -280,11 +281,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"{type(embedding.embedding_method).__name__}"
             )
         if embedding.weight.dtype != torch.uint8 or (
-            embedding._b70_storage_dim != dim + _B70_PLE_INT8_SCALE_BYTES
+            embedding._storage_dim != dim + _B70_PLE_INT8_SCALE_BYTES
         ):
             raise RuntimeError(
                 f"B70_PLE_INT8=1 but PLE storage is {embedding.weight.dtype} "
-                f"width {embedding._b70_storage_dim}"
+                f"width {embedding._storage_dim}"
             )
         fmt = _b70_safetensors_metadata(path).get("format")
         if fmt not in _B70_PLE_INT8_FORMATS:
@@ -363,7 +364,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             embedding.shard_indices.org_vocab_start_index,
             embedding.shard_indices.org_vocab_end_index,
             embedding.org_vocab_size,
-            embedding._b70_storage_dim,
+            embedding._storage_dim,
             _host_memory_note(),
         )
         return True
@@ -538,6 +539,12 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # B70 0008: INT8 row-scale table from B70_PLE_INT8_PATH.
             if b70_ple_fp8:
                 raise RuntimeError("B70_PLE_INT8=1 and B70_PLE_FP8=1 are exclusive")
+            if ple_int8_quantize_at_load_requested():
+                raise RuntimeError(
+                    "B70_PLE_INT8=1 (load a prebuilt INT8 table) and "
+                    "B70_PLE_INT8_QUANTIZE_AT_LOAD=1 (quantize at load) are "
+                    "exclusive"
+                )
             if not os.environ.get("B70_PLE_INT8_PATH"):
                 raise RuntimeError(
                     "B70_PLE_INT8=1 requires B70_PLE_INT8_PATH (the INT8 PLE "

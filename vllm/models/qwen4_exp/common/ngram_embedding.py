@@ -8,6 +8,7 @@ Unified Virtual Addressing on any CUDA-alike platform.
 """
 
 from abc import ABC, abstractmethod
+from functools import partial
 from typing import ClassVar
 
 import os
@@ -49,6 +50,13 @@ from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 from .ple import PLEVocabParallelEmbedding
+from .ple_int8 import (
+    SCALE_BYTES as _INT8_SCALE_BYTES,
+)
+from .ple_int8 import (
+    copy_quantized_shard_,
+    dequantize_rows,
+)
 
 logger = init_logger(__name__)
 
@@ -108,6 +116,20 @@ def _ple_int8_enabled() -> bool:
     B70_PLE_FP8.
     """
     return os.environ.get("B70_PLE_INT8", "0") == "1"
+
+
+def ple_int8_quantize_at_load_requested() -> bool:
+    """Whether to quantize the checkpoint's PLE table to INT8 at load time.
+
+    Opt-in with ``B70_PLE_INT8_QUANTIZE_AT_LOAD=1``: INT8 with one float32
+    scale per row, quantized from the checkpoint's (or PLE_TABLE_PATH's)
+    rows as they stream in; no prebuilt file. ``B70_PLE_INT8=1`` is the
+    other INT8 option (load a prebuilt table file); the two are exclusive.
+    The upstream shape would be an Engram storage option (e.g.
+    ``EngramConfig.table_dtype``), since it applies to both the
+    device-resident and the pinned-host table.
+    """
+    return os.environ.get("B70_PLE_INT8_QUANTIZE_AT_LOAD", "0") == "1"
 
 
 # B70 0008: bytes of the per-row float32 scale packed after the int8 values.
@@ -491,6 +513,15 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
             )
         self.etp_data_parallel_size = self.tp_size // tp_size
 
+    @property
+    def storage_dim(self) -> int:
+        """Bytes-or-elements per stored row.
+
+        Equal to ``embedding_dim`` except for packed formats whose rows carry
+        extra bytes (INT8 rows carry their float32 scale).
+        """
+        return int(self.weight.shape[1])
+
     @abstractmethod
     def allocate_embedding_weight(
         self,
@@ -575,6 +606,26 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
         embedding_dtype: str | None = None,
     ) -> "Qwen4ExpPLEEmbeddingMethod":
         """Select the concrete PLE embedding format for a layer."""
+        method = Qwen4ExpPLEEmbeddingMethod._from_checkpoint_format(
+            quant_config, prefix, embedding_dtype
+        )
+        if not ple_int8_quantize_at_load_requested():
+            return method
+        if not isinstance(method, Qwen4ExpPLEUnquantizedEmbeddingMethod):
+            raise NotImplementedError(
+                "INT8 PLE storage quantizes an unquantized (BF16/FP16/FP32) "
+                f"PLE table; this checkpoint's PLE table uses "
+                f"{type(method).__name__}"
+            )
+        return Qwen4ExpPLEInt8RowwiseEmbeddingMethod()
+
+    @staticmethod
+    def _from_checkpoint_format(
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+        embedding_dtype: str | None = None,
+    ) -> "Qwen4ExpPLEEmbeddingMethod":
+        """Select the PLE method that matches the checkpoint's storage."""
         if embedding_dtype == "float8_e4m3fn":
             return Qwen4ExpPLEFp8EmbeddingMethod()
         if quant_config is None:
@@ -826,6 +877,85 @@ class B70PLEInt8RowPinnedEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         return _b70_int8_dequantize(embeddings, layer.embedding_dim, output_dtype)
 
 
+class Qwen4ExpPLEInt8RowwiseEmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
+    """INT8 PLE table with one float32 scale per row, quantized at load time.
+
+    Storage is uint8 ``[rows, embedding_dim + 4]``: each row's int8 values
+    followed by its float32 scale (see ``ple_int8``). The scale travels with
+    the row through the lookup, the ETP all-reduce (one owner per row, so a
+    byte sum is exact) and the output copy; ``dequantize`` expands looked-up
+    rows to the activation dtype. ``layer.embedding_dim`` stays the logical
+    width; ``layer.storage_dim`` is the packed width.
+
+    Checkpoint rows arrive in their original dtype and are quantized on the
+    loader's device as they are copied, so only this rank's rows are
+    quantized and the full-precision table is never held.
+    """
+
+    def create_weights(
+        self,
+        layer: Qwen4ExpPLEEmbedding,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        del input_size, output_size, params_dtype
+        weight = nn.Parameter(
+            layer.allocate_embedding_weight(
+                sum(output_partition_sizes),
+                input_size_per_partition + _INT8_SCALE_BYTES,
+                torch.uint8,
+            ),
+            requires_grad=False,
+        )
+        attrs = dict(extra_weight_attrs)
+        attrs["weight_loader"] = partial(self._load_rows, layer)
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        set_weight_attrs(weight, attrs)
+        layer.register_parameter("weight", weight)
+
+    @staticmethod
+    def _load_rows(
+        layer: Qwen4ExpPLEEmbedding,
+        param: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        checkpoint_start: int | None = None,
+    ) -> None:
+        """Quantize the rows of a checkpoint (shard) owned by this rank."""
+        if checkpoint_start is None:
+            # A single unsharded table tensor.
+            if loaded_weight.shape[0] != layer.org_vocab_size:
+                raise ValueError(
+                    f"PLE table has {loaded_weight.shape[0]} rows, expected "
+                    f"{layer.org_vocab_size}"
+                )
+            checkpoint_start = 0
+        copy_quantized_shard_(
+            param.data,
+            loaded_weight,
+            checkpoint_start=checkpoint_start,
+            tp_start=layer.shard_indices.org_vocab_start_index,
+            tp_end=layer.shard_indices.org_vocab_end_index,
+        )
+
+    def embedding(self, layer: nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        # Byte rows: index_select supports every dtype on every backend.
+        rows = layer.weight.index_select(0, input_.reshape(-1))
+        return rows.view(*input_.shape, layer.weight.shape[1])
+
+    def dequantize(
+        self,
+        layer: nn.Module,
+        embeddings: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return dequantize_rows(embeddings, layer.embedding_dim, output_dtype)
+
+
+
 class Qwen4ExpPLEDeviceEmbedding(Qwen4ExpPLEEmbedding):
     """PLE table allocated on the active model device."""
 
@@ -930,8 +1060,8 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         # B70 0008: the row width in storage can exceed the logical
         # embedding_dim (INT8 rows carry their float32 scale: 160 + 4 bytes).
         # Every storage-side size below uses it; for BF16/FP8 it is equal.
-        self._b70_storage_dim = int(self.weight.shape[1])
-        self._block_d = triton.next_power_of_2(self._b70_storage_dim)
+        self._storage_dim = self.storage_dim
+        self._block_d = triton.next_power_of_2(self._storage_dim)
         # XPU mirrors the CUDA stream API (Stream/current_stream/stream and
         # Tensor.record_stream all exist on torch 2.13.0+xpu). XPU pins at
         # most 16 GiB (2^34 B) per allocation, so a TP shard larger than
@@ -954,11 +1084,11 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         self._prefetch_buffer = torch.empty(
             max_total_tokens * self.etp_data_parallel_size,
             num_ngram_heads,
-            self._b70_storage_dim,
+            self._storage_dim,
             dtype=self.weight.dtype,
             device=("xpu" if _is_xpu() else self._uva_weight.device),
         )
-        self._output_dim = num_ngram_heads * self._b70_storage_dim
+        self._output_dim = num_ngram_heads * self._storage_dim
 
     def allocate_embedding_weight(
         self,
@@ -1079,7 +1209,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         output: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Look up local ETP rows while preserving the weight storage dtype."""
-        expected_shape = (*input_ids.shape, self._b70_storage_dim)
+        expected_shape = (*input_ids.shape, self._storage_dim)
         if output is None:
             output = torch.empty(
                 expected_shape,
@@ -1120,7 +1250,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
                         view,
                         flat_ids,
                         kernel_output,
-                        self._b70_storage_dim,
+                        self._storage_dim,
                         slab_start,
                         slab_end,
                         slab_start,
@@ -1132,7 +1262,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
                     self._uva_weight,
                     flat_ids,
                     output,
-                    self._b70_storage_dim,
+                    self._storage_dim,
                     tp_start,
                     tp_end,
                     tp_start,
