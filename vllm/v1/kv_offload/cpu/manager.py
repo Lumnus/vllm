@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import OrderedDict
 from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
@@ -43,6 +44,33 @@ class _RequestCacheAccess:
     finished: bool = False
 
 
+def b70_group_evict_enabled() -> bool:
+    """B70 0014f: ``B70_OFFLOAD_GROUP_EVICT=1`` selects the vllm#51787
+    backport (request-scoped recency, tail-before-head eviction across KV
+    groups). Unset (default): upstream v0.30.0 per-step touch + plain LRU/ARC.
+    """
+    return os.environ.get("B70_OFFLOAD_GROUP_EVICT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+# Built-in policies with a vllm#51787 variant (0014e/f): lru.py / arc.py keep
+# the upstream v0.30.0 classes (the default); the backport's live alongside.
+_GROUP_EVICT_POLICIES = {
+    "lru": (
+        "vllm.v1.kv_offload.cpu.policies.lru_group_evict",
+        "GroupEvictLRUCachePolicy",
+    ),
+    "arc": (
+        "vllm.v1.kv_offload.cpu.policies.arc_group_evict",
+        "GroupEvictARCCachePolicy",
+    ),
+}
+
+
 class CPUOffloadingManager(OffloadingManager):
     """
     An OffloadingManager with a pluggable CachePolicy, resolved by name via
@@ -69,9 +97,22 @@ class CPUOffloadingManager(OffloadingManager):
         self._num_allocated_chunks: int = 0
         self._free_list: list[int] = []
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
-        policy_cls = CachePolicyFactory.get_cache_policy_cls(
-            cache_policy, cache_policy_module_path
-        )
+        # B70 0014f: the #51787 backport is opt-in. Off (default) = the
+        # upstream v0.30.0 policy classes and store/load paths, verbatim.
+        self._b70_group_evict: bool = b70_group_evict_enabled()
+        if (
+            self._b70_group_evict
+            and cache_policy_module_path is None
+            and cache_policy in _GROUP_EVICT_POLICIES
+        ):
+            import importlib
+
+            module_name, class_name = _GROUP_EVICT_POLICIES[cache_policy]
+            policy_cls = getattr(importlib.import_module(module_name), class_name)
+        else:
+            policy_cls = CachePolicyFactory.get_cache_policy_cls(
+                cache_policy, cache_policy_module_path
+            )
         self._policy: CachePolicy = policy_cls(cache_capacity=num_chunks)
         # Track the number of chunks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_chunks: int = 0
@@ -182,7 +223,8 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
-        self._get_request_cache_access(req_context)
+        if self._b70_group_evict:
+            self._get_request_cache_access(req_context)
         return RequestOffloadingContext()
 
     @override
@@ -220,7 +262,7 @@ class CPUOffloadingManager(OffloadingManager):
                 assert self._num_evictable_cache_chunks >= 0
             chunk.ref_cnt += 1
             chunks.append(chunk)
-        if record_access:
+        if record_access and self._b70_group_evict:
             self._record_request_cache_access(keys, req_context, reused_keys=keys)
         return self._get_load_store_spec(keys, chunks)
 
@@ -247,6 +289,8 @@ class CPUOffloadingManager(OffloadingManager):
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
+        if not self._b70_group_evict:
+            return self._prepare_store_upstream(keys, req_context)
         keys = list(keys)
         if self.counts is not None:
             self._record_accesses(keys)
@@ -355,6 +399,80 @@ class CPUOffloadingManager(OffloadingManager):
             evicted_keys=to_evict,
         )
 
+    def _prepare_store_upstream(
+        self,
+        keys: Collection[OffloadKey],
+        req_context: ReqContext,
+    ) -> PrepareStoreOutput | None:
+        """B70 0014f: upstream v0.30.0 prepare_store, verbatim (flag off)."""
+        if self.counts is not None:
+            num_keys = len(keys)
+            self._record_accesses(keys)
+            keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
+            self.stores_skipped_in_current_batch += num_keys - len(keys)
+        # filter out chunks that are already stored
+        keys_to_store = [k for k in keys if self._policy.get(k) is None]
+
+        if not keys_to_store:
+            return PrepareStoreOutput(
+                keys_to_store=[],
+                store_spec=self._get_load_store_spec([], []),
+                evicted_keys=[],
+            )
+
+        self.allocation_sizes_in_current_batch.append(len(keys_to_store))
+        num_chunks_to_evict = len(keys_to_store) - self._get_num_free_chunks()
+
+        to_evict: list[OffloadKey] = []
+        if num_chunks_to_evict > 0:
+            if num_chunks_to_evict > self._num_evictable_cache_chunks:
+                # Eviction will fail.
+                return None
+            # There is a still a chance for eviction failure as some of the
+            # idle chunks might be in the protected list.
+
+            # Chunks from the original input are excluded from eviction candidates:
+            # a chunk that was already stored must remain in the cache after this call.
+            protected = set(keys)
+            evicted = self._policy.evict(num_chunks_to_evict, protected)
+            if evicted is None:
+                return None
+
+            # cache-policy removes only idle chunks.
+            self._num_evictable_cache_chunks -= len(evicted)
+            assert self._num_evictable_cache_chunks >= 0
+
+            for key, chunk in evicted:
+                self._free_chunk(chunk)
+                to_evict.append(key)
+
+        if to_evict and self.events is not None:
+            self.events.append(
+                OffloadingEvent(
+                    keys=to_evict,
+                    medium=self.medium,
+                    removed=True,
+                )
+            )
+
+        chunks = self._allocate_chunks(keys_to_store)
+        assert len(chunks) == len(keys_to_store), (
+            "Chunk pool did not allocate the expected number of chunks"
+        )
+
+        for key, chunk in zip(keys_to_store, chunks):
+            self._policy.insert(key, chunk)
+        self._num_write_pending_chunks += len(keys_to_store)
+
+        # build store specs for allocated chunks
+        store_spec = self._get_load_store_spec(keys_to_store, chunks)
+
+        return PrepareStoreOutput(
+            keys_to_store=keys_to_store,
+            store_spec=store_spec,
+            evicted_keys=to_evict,
+        )
+
     @override
     def complete_store(
         self,
@@ -392,6 +510,8 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
+        if not self._b70_group_evict:
+            return  # upstream v0.30.0: recency comes from the scheduler's touch
         state = req_context.get_state(_RequestCacheAccess)
         if (
             state is None

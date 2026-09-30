@@ -77,6 +77,15 @@ from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
+# B70 0014f: this module is the vllm#51787 backport's own test suite
+# (0014e), which is opt-in behind B70_OFFLOAD_GROUP_EVICT=1. The upstream
+# v0.30.0 suite for the default (flag off) is in test_scheduler.py.
+@pytest.fixture(autouse=True, scope="module")
+def _b70_group_evict_on():
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("B70_OFFLOAD_GROUP_EVICT", "1")
+        yield
+
 
 @pytest.mark.parametrize("boundary", [3840, 3904])
 @pytest.mark.parametrize("eagle", [False, True])
@@ -242,6 +251,9 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     jobs = scheduler._build_partial_tail_store_jobs(output)
 
     assert len(jobs) == 1
+    offered_keys = scheduler.manager.prepare_store.call_args.args[0]
+    req_context = scheduler._req_status["req"].req_context
+    assert all(req_context.get_offload_key_position(key) == 28 for key in offered_keys)
     [job_id] = jobs
     src_spec = jobs[job_id].src_spec
     assert isinstance(src_spec, GPULoadStoreSpec)
@@ -364,6 +376,13 @@ def test_normal_store_excludes_align_mode_mamba_sources():
     req_status.group_states[0].block_ids[:] = [11]
     req_status.group_states[1].block_ids[:] = [99]
     req_status.update_offload_keys()
+    for group_config, group_state in zip(
+        scheduler.config.kv_group_configs, req_status.group_states
+    ):
+        assert (
+            req_status.req_context.get_offload_key_position(group_state.offload_keys[0])
+            == group_config.tokens_per_chunk
+        )
     scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
@@ -858,7 +877,6 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     runner.run(decoded_tokens=[0] * (tokens_per_chunk + 1))
 
     # 1 more block (+ token for kicking off offloading)
-    # now check touch was called with all 6 blocks
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
@@ -866,9 +884,6 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
         decoded_tokens=[0] * (tokens_per_chunk + 1),
         expected_stored=(15, 16, 17),
     )
-    runner.manager.touch.assert_called()
-    block_hashes1 = list(runner.manager.touch.call_args.args[0])
-    assert len(block_hashes1) == 6
 
     # terminate request
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
@@ -876,13 +891,7 @@ def test_offloading_connector(request_runner, async_scheduling: bool):
     # create a new request differing only on the last token
     runner.new_request(token_ids=[0] * (tokens_per_chunk * 6 - 1) + [1])
     runner.run(decoded_tokens=[0])
-    runner.manager.touch.assert_called()
-    block_hashes2 = list(runner.manager.touch.call_args.args[0])
-    assert len(block_hashes2) == 6
-
-    # verify hashes are the same, except for the last block
-    assert block_hashes1[:5] == block_hashes2[:5]
-    assert block_hashes1[5] != block_hashes2[5]
+    runner.manager.touch.assert_not_called()
 
     # terminate request
     runner.run(
@@ -1290,14 +1299,7 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
         generate_store_output(keys)
     )
     runner.run(decoded_tokens=[0])
-    # _touch called from get_num_new_matched_tokens (2 groups) and
-    # _get_reqs_to_store (2 groups) → 4 touch calls total.
-    touch_calls = runner.manager.touch.call_args_list
-    assert len(touch_calls) == 4
-    assert len(touch_calls[0].args[0]) == 3
-    assert len(touch_calls[1].args[0]) == 3
-    assert len(touch_calls[2].args[0]) == 3
-    assert len(touch_calls[3].args[0]) == 3
+    runner.manager.touch.assert_not_called()
 
     # store 3 more block
     runner.manager.prepare_store.side_effect = lambda keys, req_context: (
@@ -1308,9 +1310,7 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
         expected_stored=(0, 1, 2, 3, 4, 5),
     )
 
-    # touch called from _get_reqs_to_store * 3 blocks, once for each group
-    touch_calls = runner.manager.touch.call_args_list
-    assert len(touch_calls) == 6
+    runner.manager.touch.assert_not_called()
 
     # EOS lands in the last slot of the 7th block (offset 6). No forward pass
     # writes that slot, so the finishing step declines the block.
@@ -1329,13 +1329,7 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
         expected_loaded=((0, 0), (0, 1), (0, 2), (1, 1), (1, 2)),
     )
 
-    # 2 touch calls from get_num_new_matched_tokens (2 groups)
-    touch_calls = runner.manager.touch.call_args_list
-    assert len(touch_calls) == 2
-    # full attention group touched all 3 blocks
-    assert len(touch_calls[0].args[0]) == 3
-    # sliding window group touched just the last 2 blocks
-    assert len(touch_calls[1].args[0]) == 2
+    runner.manager.touch.assert_not_called()
 
     # 3 blocks are hit on GPU [0, 1, 2]
     # 1 block loaded [3,]
@@ -1401,15 +1395,7 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
         generate_store_output(keys)
     )
     runner.run(decoded_tokens=[0])
-    # _touch called from get_num_new_matched_tokens (2 groups) and
-    # _get_reqs_to_store (2 groups) → 4 touch calls total.
-    # Group 0 has 2 offload keys, group 1 has 1.
-    touch_calls = runner.manager.touch.call_args_list
-    assert len(touch_calls) == 4
-    assert len(touch_calls[0].args[0]) == 2
-    assert len(touch_calls[1].args[0]) == 1
-    assert len(touch_calls[2].args[0]) == 2
-    assert len(touch_calls[3].args[0]) == 1
+    runner.manager.touch.assert_not_called()
 
     # Get to 31 tokens
     # No further blocks offloaded
@@ -1419,11 +1405,7 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
     # Group 0 blocks: [0, 1], ending_token_offset = 24
     # Group 1 blocks: [0, 1], ending_token_offset = 32
     runner.run(decoded_tokens=[0])
-    # _get_reqs_to_store touch: only group 1 has a new block to store
-    touch_calls = runner.manager.touch.call_args_list
-    assert len(touch_calls) == 2
-    assert len(touch_calls[0].args[0]) == 2
-    assert len(touch_calls[1].args[0]) == 2
+    runner.manager.touch.assert_not_called()
 
     # Get to 35 tokens
     # No further blocks offloaded
@@ -1433,11 +1415,7 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
     # Group 0 blocks: [0, 1, 2], ending_token_offset = 36
     # Group 1 blocks: [0, 1], ending_token_offset = 32
     runner.run(decoded_tokens=[0])
-    # _get_reqs_to_store touch: only group 0 has a new block to store
-    touch_calls = runner.manager.touch.call_args_list
-    assert len(touch_calls) == 2
-    assert len(touch_calls[0].args[0]) == 3
-    assert len(touch_calls[1].args[0]) == 2
+    runner.manager.touch.assert_not_called()
 
     # Get to 47 tokens
     # No further blocks offloaded
@@ -1447,11 +1425,7 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
     # Group 0 blocks: [0, 1, 2, 3], ending_token_offset = 4
     # Group 1 blocks: [0, 1, 2], ending_token_offset = 48
     runner.run(decoded_tokens=[0])
-    # _get_reqs_to_store touch: both groups have a new block, each with 1 key
-    touch_calls = runner.manager.touch.call_args_list
-    assert len(touch_calls) == 2
-    assert len(touch_calls[0].args[0]) == 4
-    assert len(touch_calls[1].args[0]) == 3
+    runner.manager.touch.assert_not_called()
 
     runner.run(decoded_tokens=[0], expected_stored=((0, 3), (1, 2)))
 
