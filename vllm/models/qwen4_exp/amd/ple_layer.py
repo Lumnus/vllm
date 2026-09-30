@@ -387,9 +387,13 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             id_blocks.append(ids[request_indices, adjusted_columns])
         ngram_ids = torch.cat(id_blocks, dim=-1)
         embedding = self.ngram_embedding
+        # Packed formats (INT8 rows with their scale) store wider rows and
+        # are expanded later by dequantize(); keep their bytes as stored.
+        packed = embedding.storage_dim != embedding.embedding_dim
+        output_dim = self.ngram_heads * embedding.storage_dim
         if embedding.supports_prefetch:
             output = ngram_ids.new_empty(
-                (ngram_ids.shape[0], self.embedding_dim),
+                (ngram_ids.shape[0], output_dim),
                 dtype=embedding.weight.dtype,
             )
             torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding_pinned(
@@ -399,8 +403,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             )
             return output
         output = ngram_ids.new_empty(
-            (ngram_ids.shape[0], self.embedding_dim),
-            dtype=embedding.params_dtype,
+            (ngram_ids.shape[0], output_dim),
+            dtype=embedding.weight.dtype if packed else embedding.params_dtype,
         )
         torch.ops.vllm.qwen4_exp_amd_ple_ngram_embedding(
             ngram_ids,
