@@ -262,6 +262,25 @@ def _b70_repetition_detection(req):
 
 
 class ChatCompletionRequest(OpenAIBaseModel):
+    # B70-0012: OpenRouter-style clients (Hermes) send the effort as
+    # {"reasoning": {"effort": "medium"}} (extra_body), which vLLM ignores, so
+    # B70-0009 budgets and the template effort fell back to the default.
+    # Map it onto reasoning_effort when the request did not set that field.
+    # Env B70_REASONING_EFFORT_ALIAS=1 enables it (unset = upstream).
+    @model_validator(mode="before")
+    @classmethod
+    def _b70_reasoning_effort_alias(cls, data):
+        import os
+        if os.environ.get("B70_REASONING_EFFORT_ALIAS", "0") != "1":
+            return data
+        if isinstance(data, dict) and data.get("reasoning_effort") is None:
+            r = data.get("reasoning")
+            if isinstance(r, dict) and isinstance(r.get("effort"), str):
+                e = r["effort"].strip().lower()
+                if e in ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
+                    data = {**data, "reasoning_effort": e}
+        return data
+
     # Ordered by official OpenAI API documentation
     # https://platform.openai.com/docs/api-reference/chat/create
     messages: list[ChatCompletionMessageParam]
