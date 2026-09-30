@@ -607,6 +607,11 @@ class Qwen4ExpModel(nn.Module):
             "token_lookup",
             "hyper_connection_mixer.block_inject_weight",
         )
+        # Dense-QSA configs (no indexer_n_heads) build no indexer module.
+        # Some checkpoints (e.g. AWQ exports) still ship the
+        # `*.self_attn.indexer.*` tensors; drop them instead of failing.
+        if getattr(self.config, "indexer_n_heads", None) is None:
+            skip_substrs += (".self_attn.indexer.",)
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
             orig_to_new_substr={substr: None for substr in skip_substrs}
         )
