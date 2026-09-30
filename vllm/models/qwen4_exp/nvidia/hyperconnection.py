@@ -23,9 +23,11 @@ Typical usage inside a transformer decoder layer::
 """
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -45,6 +47,38 @@ from .ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
+
+logger = init_logger(__name__)
+
+
+def _is_xpu() -> bool:
+    from vllm.platforms import current_platform
+
+    return current_platform.is_xpu()
+
+
+# ---------------------------------------------------------------------------
+# XPU HC down-GEMM determinism (K-split)
+#
+# The skinny BF16 HC down projection (K = hyper_hidden_size = 10240 -> N in
+# {336 merged, 320 final mixer}) is run-to-run racy on XPU for row widths
+# > 64: the oneDNN accumulation re-samples its split-K draw every execution,
+# which is what made PIECEWISE-256 prefill replay diverge from eager
+# (bitwise-equal inputs, few-ULP output flips). Replacing the single GEMM
+# with two K=5120 GEMMs over contiguous weight halves is bitwise-deterministic
+# in eager, fresh-clone and graph capture+replay at every width tested
+# (M in {64, 128, 256}; 0/512 flips at M=256). See
+# docs/HC_DOWN_GEMM_FIX_RECON.md for the offline campaign.
+#
+# Widths <= 64 keep the stock single GEMM (bitwise-clean there, and decode
+# graphs never exceed 8 rows, so M1 FULL decode keeps stock numerics).
+# CUDA is untouched: the halves are prepared only on XPU
+# (UnquantizedLinearMethod.process_weights_after_loading calls the
+# ``hc_ksplit_prepare`` marker set below), so the split branch is never
+# armed on non-XPU platforms.
+# ---------------------------------------------------------------------------
+_HC_KSPLIT_MAX_STOCK_WIDTH = 64
+_HC_KSPLIT_WIDTHS_LOGGED: set[int] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +168,86 @@ class GatedResidual(nn.Module):
             return_bias=False,
         )
 
+        # -- XPU deterministic K-split state --------------------------------
+        # Contiguous K=5120 halves of the down weight, prepared once at load
+        # time on XPU only (see _prepare_kdown_ksplit). ``None`` everywhere
+        # else, which keeps the stock single GEMM armed.
+        self._kdown_lo: torch.Tensor | None = None
+        self._kdown_hi: torch.Tensor | None = None
+        self._kdown_k = 0
+        down_linear = (
+            self.input_mix_weight_down_block_inject
+            if use_combine
+            else self.input_mix_weight_down
+        )
+        # Marker consumed by
+        # UnquantizedLinearMethod.process_weights_after_loading (XPU only).
+        down_linear.hc_ksplit_prepare = self._prepare_kdown_ksplit
+
+    def _prepare_kdown_ksplit(self) -> None:
+        """One-time contiguous K-half prep for the deterministic XPU split."""
+        if self._kdown_lo is not None:
+            return
+        down_linear = (
+            self.input_mix_weight_down_block_inject
+            if self.use_combine
+            else self.input_mix_weight_down
+        )
+        weight = down_linear.weight
+        if weight is None or weight.ndim != 2 or weight.shape[1] % 2 != 0:
+            logger.debug(
+                "HC down GEMM %s: unexpected weight geometry %s; "
+                "K-split left disarmed",
+                type(down_linear).__name__,
+                None if weight is None else tuple(weight.shape),
+            )
+            return
+        self._kdown_k = weight.shape[1] // 2
+        self._kdown_lo = weight.data[:, : self._kdown_k].contiguous()
+        self._kdown_hi = weight.data[:, self._kdown_k :].contiguous()
+        logger.debug(
+            "HC down GEMM: K-split halves prepared (K=%d -> 2x%d, N=%d)",
+            weight.shape[1],
+            self._kdown_k,
+            weight.shape[0],
+        )
+
+    def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
+        """Down projection; width-gated deterministic K-split on XPU.
+
+        Row widths <= 64 (all decode graphs) keep the stock single GEMM,
+        which is bitwise-clean there. Wider rows (prefill chunks) take the
+        two-GEMM split over the contiguous K-halves. The branch conditions
+        are shape/attribute reads only, so stream capture bakes the correct
+        arm per graph and replays deterministically.
+        """
+        if (
+            self._kdown_lo is not None
+            and _is_xpu()
+            and xn.shape[0] > _HC_KSPLIT_MAX_STOCK_WIDTH
+        ):
+            width = xn.shape[0]
+            if width not in _HC_KSPLIT_WIDTHS_LOGGED:
+                _HC_KSPLIT_WIDTHS_LOGGED.add(width)
+                logger.info(
+                    "HC down GEMM: deterministic K-split engaged at row width "
+                    "%d (stock single GEMM kept for widths <= %d)",
+                    width,
+                    _HC_KSPLIT_MAX_STOCK_WIDTH,
+                )
+            return F.linear(xn[..., : self._kdown_k], self._kdown_lo) + F.linear(
+                xn[..., self._kdown_k :], self._kdown_hi
+            )
+        if self.use_combine:
+            return self.input_mix_weight_down_block_inject(xn)
+        return self.input_mix_weight_down(xn)
+
     def _down_and_inject(
         self, xn: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Down projection + SiLU; also returns injection logits if combined."""
         if not self.use_combine:
-            return hc_silu(self.input_mix_weight_down(xn), self.hc_count), None
+            return hc_silu(self._down_gemm(xn), self.hc_count), None
 
         use_fused = (
             self._use_hc_down_silu
@@ -153,7 +261,7 @@ class GatedResidual(nn.Module):
                 self.lora_rank,
                 self.hc_count,
             )
-        down_and_injection = self.input_mix_weight_down_block_inject(xn)
+        down_and_injection = self._down_gemm(xn)
         split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
         lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
         return hc_silu(lora, self.hc_count), injection
