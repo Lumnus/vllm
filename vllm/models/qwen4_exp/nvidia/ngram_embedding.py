@@ -26,9 +26,15 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
     _is_xpu,
-    # B70 PLE helpers (patches 0002/0006-0008 live in common/)
     _host_memory_note,
     _ple_direct_pinned_enabled,
+    # B70 PLE helpers (patches 0002/0006-0008 live in common/)
+    _b70_mmap_safetensors,
+    _b70_ple_fp8_crosscheck,
+    _b70_ple_fp8_layout_check,
+    _b70_ple_fp8_segments,
+    B70PLEFp8PinnedEmbeddingMethod,
+    _ple_fp8_enabled,
 )
 from .ops.ple import ple_ngram_ids
 
@@ -63,6 +69,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ``weight_loader(checkpoint_start=...)`` path so only TP-owned rows
         are copied into this rank's pinned storage.
         """
+        if _is_xpu() and _ple_fp8_enabled():
+            return self._load_ple_fp8_table()
         table_path = os.environ.get("PLE_TABLE_PATH")
         if not table_path:
             return False
@@ -140,6 +148,102 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             rows_loaded,
             org_vocab_size,
             table.dtype,
+        )
+        return True
+
+    def _load_ple_fp8_table(self) -> bool:
+        """B70 0007: fill the pinned slabs with the FP8 table, raw bytes.
+
+        Reads B70_PLE_FP8_PATH (mmap, zero-copy), refuses on any shape,
+        dtype or scale mismatch, copies only this rank's TP rows into the
+        FP8 pinned slabs (no pageable copy, as 0006) and sets the global
+        scale. When PLE_TABLE_PATH (the BF16 table) is also set, dequantised
+        FP8 rows are compared with it on a random sample and the load refuses
+        above B70_PLE_FP8_MAX_REL_ERR (default 0.25).
+        """
+        path = os.environ["B70_PLE_FP8_PATH"]
+        embedding = self.ngram_embedding
+        if not isinstance(embedding, Qwen4ExpPLEPinnedHostEmbedding):
+            raise RuntimeError("B70_PLE_FP8=1 requires pinned-host PLE storage")
+        if not isinstance(embedding.embedding_method, Qwen4ExpPLEFp8EmbeddingMethod):
+            raise RuntimeError(
+                "B70_PLE_FP8=1 but the PLE embedding method is "
+                f"{type(embedding.embedding_method).__name__}"
+            )
+        if embedding.weight.dtype != torch.float8_e4m3fn:
+            raise RuntimeError(
+                f"B70_PLE_FP8=1 but PLE storage dtype is {embedding.weight.dtype}"
+            )
+        tensors = _b70_mmap_safetensors(path)
+        segments, scale, layout = _b70_ple_fp8_segments(
+            tensors,
+            embedding.org_vocab_size,
+            embedding.embedding_dim,
+            self.split_ngram_parts,
+        )
+        layout_checked = _b70_ple_fp8_layout_check(
+            tensors,
+            {
+                "ngram_heads_offsets": self.ngram_heads_offsets,
+                "ngram_heads_vocab_sizes": self.ngram_heads_vocab_sizes,
+                "layer_multipliers": self.layer_multipliers,
+            },
+        )
+        if layout_checked:
+            layout += f"; layout matches model: {', '.join(layout_checked)}"
+        reference_path = os.environ.get("PLE_TABLE_PATH")
+        if reference_path and os.environ.get("B70_PLE_FP8_CROSSCHECK", "1") == "1":
+            reference_file = torch.load(reference_path, mmap=True, weights_only=True)
+            reference = (
+                reference_file["table"]
+                if isinstance(reference_file, dict)
+                else reference_file
+            )
+            if tuple(reference.shape[1:]) != (embedding.embedding_dim,):
+                raise ValueError(
+                    f"BF16 PLE table {reference_path} has shape "
+                    f"{tuple(reference.shape)}, cannot cross-check"
+                )
+            limit = min(reference.shape[0], embedding.org_vocab_size)
+            generator = torch.Generator().manual_seed(20260928)
+            rows = torch.randint(0, limit, (4096,), generator=generator)
+            rel_err = _b70_ple_fp8_crosscheck(segments, scale, reference, rows)
+            max_rel_err = float(os.environ.get("B70_PLE_FP8_MAX_REL_ERR", "0.25"))
+            logger.info(
+                "FP8 PLE cross-check vs %s: relative L2 error %.4f on 4096 "
+                "rows (limit %.2f)",
+                reference_path,
+                rel_err,
+                max_rel_err,
+            )
+            if not rel_err <= max_rel_err:
+                raise ValueError(
+                    f"FP8 PLE table {path} disagrees with the BF16 table "
+                    f"{reference_path}: relative error {rel_err:.4f} > "
+                    f"{max_rel_err} (wrong file, row order or scale?)"
+                )
+            del reference, reference_file
+        logger.info(
+            "PLE FP8 direct-pinned load (B70_PLE_FP8=1) starting: %s", _host_memory_note()
+        )
+        embedding._materialize_pinned_xpu_slabs(source=segments)
+        with torch.no_grad():
+            embedding.weight_scale.data.copy_(
+                scale.to(
+                    device=embedding.weight_scale.device,
+                    dtype=embedding.weight_scale.dtype,
+                ).reshape(embedding.weight_scale.shape)
+            )
+        logger.info(
+            "Loaded FP8 PLE table from %s (%s): tp rows [%d, %d) of %d, "
+            "scale=%g, storage=pinned-host FP8 slabs; %s",
+            path,
+            layout,
+            embedding.shard_indices.org_vocab_start_index,
+            embedding.shard_indices.org_vocab_end_index,
+            embedding.org_vocab_size,
+            float(scale[0]),
+            _host_memory_note(),
         )
         return True
 
@@ -296,17 +400,31 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         divisor = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab_size = ((total_vocab_size + divisor - 1) // divisor) * divisor
         embedding_prefix = f"{prefix}.ngram_embedding"
+        ple_embedding_dtype = getattr(config, "ple_embedding_dtype", None)
+        b70_ple_fp8 = _is_xpu() and _ple_fp8_enabled()
+        if b70_ple_fp8:
+            # B70 0007: the served checkpoint (W4A16, PLE excluded from
+            # quantization) carries no PLE rows; the FP8 table and its global
+            # scale come from B70_PLE_FP8_PATH instead of PLE_TABLE_PATH.
+            if not os.environ.get("B70_PLE_FP8_PATH"):
+                raise RuntimeError(
+                    "B70_PLE_FP8=1 requires B70_PLE_FP8_PATH (the FP8 PLE "
+                    ".safetensors file)"
+                )
+            ple_embedding_dtype = "float8_e4m3fn"
         embedding_quant_method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(
             quant_config,
             embedding_prefix,
-            getattr(config, "ple_embedding_dtype", None),
+            ple_embedding_dtype,
         )
+        if b70_ple_fp8:
+            embedding_quant_method = B70PLEFp8PinnedEmbeddingMethod()
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
         if engram_config is not None and engram_config.cpu_offload:
             embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
-        elif _is_xpu() and os.environ.get("PLE_TABLE_PATH"):
+        elif _is_xpu() and (os.environ.get("PLE_TABLE_PATH") or b70_ple_fp8):
             # B70 XPU bring-up: pinned-host PLE table selected by
             # PLE_TABLE_PATH because the Engram route is CUDA-only
             # (config/engram.py rejects non-CUDA platforms) while the stock
@@ -552,6 +670,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             # the pinned-host table from the external PLE_TABLE_PATH file.
             if self._load_ple_table_from_path():
                 loaded.add("ngram_embedding.weight")
+                if _is_xpu() and _ple_fp8_enabled():
+                    loaded.add("ngram_embedding.weight_scale")
         return loaded
 
 

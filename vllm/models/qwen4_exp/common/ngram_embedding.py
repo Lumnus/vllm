@@ -86,6 +86,270 @@ def _host_memory_note() -> str:
     return ", ".join(f"{k}={v:.1f} GiB" for k, v in fields.items()) or "n/a"
 
 
+def _ple_fp8_enabled() -> bool:
+    """B70 0007 gate: keep the XPU pinned PLE table in FP8 (E4M3).
+
+    Default OFF (unset or anything but "1"): the table loads as today. On:
+    the table comes from B70_PLE_FP8_PATH (a .safetensors file), the pinned
+    slabs hold its raw FP8 bytes, and each looked-up row is dequantised
+    after the gather (Qwen4ExpPLELayer._dequantize_embeddings).
+    """
+    return os.environ.get("B70_PLE_FP8", "0") == "1"
+
+
+_B70_SAFETENSORS_DTYPES = {
+    "F8_E4M3": torch.float8_e4m3fn,
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "I64": torch.int64,
+    "I32": torch.int32,
+    "I16": torch.int16,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
+
+
+def _b70_mmap_safetensors(path: str) -> dict[str, torch.Tensor]:
+    """Map every tensor of a .safetensors file without reading it (B70 0007).
+
+    Zero-copy views over one private (copy-on-write, never written) mmap, so
+    rows only become resident as clean, evictable page cache when copied.
+    Tensors whose dtype is outside _B70_SAFETENSORS_DTYPES are skipped (not
+    mapped); callers refuse later only if a tensor they need is absent.
+    Malformed offsets refuse for every tensor.
+    """
+    import json
+    import mmap
+
+    with open(path, "rb") as handle:
+        header_len = int.from_bytes(handle.read(8), "little")
+        size = os.fstat(handle.fileno()).st_size
+        if header_len <= 0 or 8 + header_len > size:
+            raise ValueError(f"{path}: not a safetensors file (header {header_len})")
+        header = json.loads(handle.read(header_len))
+        mapped = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_COPY)
+    data_start = 8 + header_len
+    tensors: dict[str, torch.Tensor] = {}
+    for name, info in header.items():
+        if name == "__metadata__":
+            continue
+        dtype = _B70_SAFETENSORS_DTYPES.get(info["dtype"])
+        begin, end = (int(v) for v in info["data_offsets"])
+        if dtype is None:
+            if begin < 0 or end < begin or data_start + end > size:
+                raise ValueError(f"{path}: tensor {name} offsets [{begin}, {end}) outside the file")
+            continue
+        shape = [int(v) for v in info["shape"]]
+        numel = 1
+        for dim in shape:
+            numel *= dim
+        itemsize = torch.empty((), dtype=dtype).element_size()
+        if begin < 0 or end < begin or data_start + end > size:
+            raise ValueError(f"{path}: tensor {name} offsets [{begin}, {end}) outside the file")
+        if end - begin != numel * itemsize:
+            raise ValueError(
+                f"{path}: tensor {name} is {end - begin} bytes, shape {shape} x "
+                f"{itemsize} needs {numel * itemsize}"
+            )
+        raw = torch.frombuffer(
+            mapped, dtype=torch.uint8, count=end - begin, offset=data_start + begin
+        ) if end > begin else torch.empty(0, dtype=torch.uint8)
+        tensors[name] = raw.view(dtype).reshape(shape)
+    return tensors
+
+
+def _b70_copy_rows(
+    destination: torch.Tensor,
+    segments: list[tuple[int, torch.Tensor]],
+    first_row: int,
+) -> int:
+    """Fill ``destination`` with table rows [first_row, first_row + len) (0007).
+
+    ``segments`` are (global start row, rows) pieces of one logical table;
+    same-dtype pieces are copied as raw bytes (no numeric conversion, also
+    for FP8). Rows no segment covers are zeroed (0x00 = +0.0 in E4M3).
+    Returns the number of rows copied from the segments.
+    """
+    count = destination.shape[0]
+    covered = torch.zeros(count, dtype=torch.bool)
+    copied = 0
+    for seg_start, seg in segments:
+        lo = max(first_row, seg_start)
+        hi = min(first_row + count, seg_start + seg.shape[0])
+        if lo >= hi:
+            continue
+        src = seg.narrow(0, lo - seg_start, hi - lo)
+        dst = destination.narrow(0, lo - first_row, hi - lo)
+        if src.dtype == dst.dtype and src.element_size() == 1:
+            dst.view(torch.uint8).copy_(src.view(torch.uint8))
+        else:
+            dst.copy_(src)
+        covered[lo - first_row : hi - first_row] = True
+        copied += hi - lo
+    if not bool(covered.all()):
+        destination.view(torch.uint8)[~covered] = 0
+    return copied
+
+
+def _b70_fp8_lut(scale: torch.Tensor) -> torch.Tensor:
+    """256-entry float32 table: E4M3 code -> value * scale (0007).
+
+    Every E4M3 value (3 mantissa bits) times a BF16/F32 scale (<= 24 bits)
+    is exact in float32, so rounding lut[code] to BF16 once equals the stock
+    ``embeddings.to(bf16) * scale.to(bf16)`` bit for bit.
+    """
+    codes = torch.arange(256, dtype=torch.int32).to(torch.uint8)
+    values = codes.view(torch.float8_e4m3fn).to(torch.float32)
+    return values * scale.detach().to(device="cpu", dtype=torch.float32).reshape(())
+
+
+def _b70_fp8_dequantize_lut(
+    lut: torch.Tensor, embeddings: torch.Tensor, output_dtype: torch.dtype
+) -> torch.Tensor:
+    """Dequantise gathered FP8 PLE rows with the code LUT (0007)."""
+    codes = embeddings.view(torch.uint8)
+    values = torch.index_select(lut, 0, codes.reshape(-1).to(torch.int64))
+    return values.reshape(codes.shape).to(output_dtype)
+
+
+def _b70_ple_fp8_segments(
+    tensors: dict[str, torch.Tensor],
+    org_vocab_size: int,
+    embedding_dim: int,
+    split_ngram_parts: int,
+) -> tuple[list[tuple[int, torch.Tensor]], torch.Tensor, str]:
+    """Resolve the FP8 PLE rows and global scale in a mapped file (0007).
+
+    Accepted layouts (the file written by the table-extraction step):
+      * ``table`` [>= org_vocab_size, dim] F8_E4M3 + ``weight_scale``;
+      * the checkpoint's own keys, any prefix: ``...shard_<i>.weight``
+        (i < split_ngram_parts, ceil(org_vocab_size / parts) rows each, the
+        last one shorter) + ``...weight_scale``.
+    The scale must be one element (the FP8 checkpoint's single global
+    scale). Anything else refuses to start.
+    """
+    scale_keys = [k for k in tensors if k == "weight_scale" or k.endswith(".weight_scale")]
+    if len(scale_keys) != 1:
+        raise ValueError(
+            f"FP8 PLE file must hold exactly one weight_scale, found {scale_keys}"
+        )
+    scale = tensors[scale_keys[0]]
+    if scale.numel() != 1:
+        raise ValueError(
+            f"FP8 PLE scale {scale_keys[0]} has shape {tuple(scale.shape)}; "
+            "only one global scale is supported"
+        )
+    scale = scale.reshape(1).to(torch.float32)
+    if not bool(torch.isfinite(scale).all()) or float(scale[0]) <= 0.0:
+        raise ValueError(f"FP8 PLE scale must be finite and > 0, got {float(scale[0])}")
+
+    def check(name: str, tensor: torch.Tensor, rows: int | None) -> None:
+        if tensor.dtype != torch.float8_e4m3fn:
+            raise ValueError(f"FP8 PLE tensor {name} is {tensor.dtype}, expected float8_e4m3fn")
+        if tensor.ndim != 2 or tensor.shape[1] != embedding_dim:
+            raise ValueError(
+                f"FP8 PLE tensor {name} has shape {tuple(tensor.shape)}, "
+                f"expected [*, {embedding_dim}]"
+            )
+        if rows is not None and tensor.shape[0] != rows:
+            raise ValueError(
+                f"FP8 PLE tensor {name} has {tensor.shape[0]} rows, expected {rows}"
+            )
+
+    if "table" in tensors:
+        table = tensors["table"]
+        check("table", table, None)
+        if table.shape[0] < org_vocab_size:
+            raise ValueError(
+                f"FP8 PLE table has {table.shape[0]} rows, expected >= {org_vocab_size}"
+            )
+        return [(0, table)], scale, f"table {tuple(table.shape)}"
+
+    import re
+
+    shard_re = re.compile(r"(?:^|\.)shard_(\d+)\.weight$")
+    shards: dict[int, str] = {}
+    for name in tensors:
+        match = shard_re.search(name)
+        if match:
+            index = int(match.group(1))
+            if index in shards:
+                raise ValueError(f"FP8 PLE shard {index} appears twice ({shards[index]}, {name})")
+            shards[index] = name
+    shard_size = (org_vocab_size + split_ngram_parts - 1) // split_ngram_parts
+    expected = [
+        i for i in range(split_ngram_parts)
+        if min(shard_size, org_vocab_size - i * shard_size) > 0
+    ]
+    if sorted(shards) != expected:
+        raise ValueError(
+            f"FP8 PLE file needs 'table' or shards {expected[0]}..{expected[-1]} "
+            f"(split_ngram_parts={split_ngram_parts}); found {len(shards)} shard keys"
+        )
+    segments = []
+    for index in expected:
+        start = index * shard_size
+        rows = min(shard_size, org_vocab_size - start)
+        check(shards[index], tensors[shards[index]], rows)
+        segments.append((start, tensors[shards[index]]))
+    return segments, scale, f"{len(segments)} shards x {shard_size} rows"
+
+
+def _b70_ple_fp8_layout_check(
+    tensors: dict[str, torch.Tensor], buffers: dict[str, torch.Tensor]
+) -> list[str]:
+    """Compare the file's optional n-gram layout tensors with the model (0007).
+
+    For each of ngram_heads_offsets / ngram_heads_vocab_sizes /
+    layer_multipliers present in the file (any prefix), the values must equal
+    the model's loaded buffer, else the table rows index a different hash
+    layout. Absent ones are skipped. Returns the names that were compared.
+    """
+    compared = []
+    for leaf, buffer in buffers.items():
+        keys = [k for k in tensors if k == leaf or k.endswith("." + leaf)]
+        if not keys:
+            continue
+        if len(keys) != 1:
+            raise ValueError(f"FP8 PLE file has {len(keys)} '{leaf}' tensors: {keys}")
+        got = tensors[keys[0]]
+        want = buffer.detach().to("cpu")
+        if tuple(got.shape) != tuple(want.shape) or not torch.equal(
+            got.to(torch.int64), want.to(torch.int64)
+        ):
+            raise ValueError(
+                f"FP8 PLE file {leaf} {got.tolist()} does not match the model's "
+                f"{want.tolist()}: the table was built for a different n-gram layout"
+            )
+        compared.append(leaf)
+    return compared
+
+
+def _b70_ple_fp8_crosscheck(
+    segments: list[tuple[int, torch.Tensor]],
+    scale: torch.Tensor,
+    reference: torch.Tensor,
+    rows: torch.Tensor,
+) -> float:
+    """Relative L2 error of dequantised FP8 rows against the BF16 table (0007).
+
+    A table from the same parent weights lands near the FP8 rounding error
+    (a few percent); a misaligned, wrong-scale or foreign table lands near
+    or above 1.0.
+    """
+    picked = torch.empty(rows.numel(), reference.shape[1], dtype=torch.float8_e4m3fn)
+    for out_row, row in enumerate(rows.tolist()):
+        _b70_copy_rows(picked.narrow(0, out_row, 1), segments, int(row))
+    lut = _b70_fp8_lut(scale)
+    got = _b70_fp8_dequantize_lut(lut, picked, torch.float32)
+    want = reference.index_select(0, rows).to(torch.float32)
+    denom = float(torch.linalg.vector_norm(want))
+    return float(torch.linalg.vector_norm(got - want)) / max(denom, 1e-30)
+
+
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding, ABC):
     """ETP-sharded PLE table shared by device and pinned-host backends."""
 
@@ -376,6 +640,44 @@ class Qwen4ExpPLEFp8EmbeddingMethod(Qwen4ExpPLEEmbeddingMethod):
         return embeddings.to(output_dtype) * weight_scale.to(output_dtype)
 
 
+class B70PLEFp8PinnedEmbeddingMethod(Qwen4ExpPLEFp8EmbeddingMethod):
+    """B70 0007: FP8 PLE held in XPU pinned slabs, LUT dequant after gather.
+
+    Same storage and scale contract as the stock FP8 method. Dequantisation
+    goes through a 256-entry code table (value x global scale, float32) so
+    the XPU never has to cast float8 tensors; the result is bitwise equal to
+    the stock cast-and-multiply (see _b70_fp8_lut). B70_PLE_FP8_DEQUANT=cast
+    selects the stock path instead.
+    """
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        scale = layer.weight_scale
+        if not bool(torch.isfinite(scale).all()) or not bool((scale > 0).all()):
+            raise ValueError(
+                f"FP8 PLE global scale must be finite and > 0, got {scale.tolist()}"
+            )
+        # Read once here, not per forward (keeps env reads out of the
+        # compiled graph).
+        use_lut = os.environ.get("B70_PLE_FP8_DEQUANT", "lut") != "cast"
+        layer._b70_ple_fp8_lut = (
+            _b70_fp8_lut(scale).to(scale.device) if use_lut else None
+        )
+
+    def dequantize(
+        self,
+        layer: nn.Module,
+        embeddings: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        lut = getattr(layer, "_b70_ple_fp8_lut", None)
+        if lut is None:
+            return super().dequantize(layer, embeddings, output_dtype)
+        if lut.device != embeddings.device:
+            raise RuntimeError("FP8 PLE dequant table must be on the output device")
+        return _b70_fp8_dequantize_lut(lut, embeddings, output_dtype)
+
+
 class Qwen4ExpPLEDeviceEmbedding(Qwen4ExpPLEEmbedding):
     """PLE table allocated on the active model device."""
 
@@ -533,7 +835,8 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         )
 
     def _materialize_pinned_xpu_slabs(
-        self, source: torch.Tensor | None = None
+        self,
+        source: torch.Tensor | list[tuple[int, torch.Tensor]] | None = None,
     ) -> None:
         """Copy the loaded shard into pinned slabs with UVA views (XPU).
 
@@ -544,6 +847,11 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
         pageable shard + pinned slabs to pinned slabs alone. Rows past the
         TP-owned range (vocab padding) are zeroed, which is what the stock
         path reads from the never-written pageable pages.
+
+        B70 0007: ``source`` may also be a list of (global start row,
+        rows) segments (a sharded FP8 file). FP8 slabs are filled as raw
+        bytes and exposed to the lookup kernel as uint8 views, so no float8
+        tensor reaches the XPU UVA op or Triton.
         """
         if self._xpu_slabs is not None:
             return
@@ -573,6 +881,15 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
                 )
             if source is None:
                 slab.copy_(shard.narrow(0, start, rows))
+            elif isinstance(source, list):
+                owned = self.shard_indices.org_vocab_end_index - tp_start
+                valid = max(0, min(rows, owned - start))
+                if valid:
+                    _b70_copy_rows(
+                        slab.narrow(0, 0, valid), source, tp_start + start
+                    )
+                if valid < rows:
+                    slab.narrow(0, valid, rows - valid).view(torch.uint8).zero_()
             else:
                 owned = self.shard_indices.org_vocab_end_index - tp_start
                 valid = max(0, min(rows, owned - start))
@@ -583,7 +900,12 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
                 if valid < rows:
                     slab.narrow(0, valid, rows - valid).zero_()
             slabs.append(slab)
-            views.append(get_accelerator_view_from_cpu_tensor(slab))
+            if slab.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                views.append(
+                    get_accelerator_view_from_cpu_tensor(slab.view(torch.uint8))
+                )
+            else:
+                views.append(get_accelerator_view_from_cpu_tensor(slab))
         self._xpu_slabs = slabs
         self._xpu_slab_views = views
         logger.info(
@@ -631,7 +953,12 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
                 # the all-reduce; no slab stores them, so zero first. Each
                 # slab launch indexes rows against the slab's own bounds:
                 # local_idx = id - slab_start stays inside the slab view.
-                output.zero_()
+                # B70 0007: FP8 slabs are exposed as uint8 views; the
+                # kernel copies bytes, so the output is viewed the same way.
+                kernel_output = output
+                if output.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    kernel_output = output.view(torch.uint8)
+                kernel_output.zero_()
                 for index, view in enumerate(self._xpu_slab_views):
                     slab_start = tp_start + index * self._xpu_slab_rows
                     slab_end = tp_start + min(
@@ -640,7 +967,7 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
                     _lookup_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
                         view,
                         flat_ids,
-                        output,
+                        kernel_output,
                         self.embedding_dim,
                         slab_start,
                         slab_end,
@@ -741,6 +1068,12 @@ class Qwen4ExpPLEPinnedHostEmbedding(Qwen4ExpPLEEmbedding):
             output.shape[0],
             slot_offset,
         )
+        if output.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # B70 0007: move FP8 rows as bytes (no float8 copy kernel).
+            output.view(torch.uint8).copy_(
+                embeddings.flatten(-2).view(torch.uint8)
+            )
+            return
         output.copy_(embeddings.flatten(-2))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
