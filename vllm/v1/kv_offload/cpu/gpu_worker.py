@@ -77,11 +77,95 @@ class Transfer:
     batch_sizes: torch.Tensor
 
 
+class ChunkedHostTensor:
+    """A logical (num_rows, row_bytes) int8 host buffer stored as several
+    row-aligned tensors.
+
+    Used only when one tensor of the full size cannot be allocated as pinned
+    memory (see _allocate_cpu_kv_buffer). Every chunk but the last holds
+    rows_per_chunk rows, so row r lives in chunk r // rows_per_chunk at row
+    r % rows_per_chunk. A row never straddles two chunks, so each copy
+    descriptor stays inside one allocation.
+
+    It exposes the tensor attributes the offloading handler checks (shape,
+    dtype, ndim, device, stride) but deliberately no data_ptr(): code that
+    assumes a single base pointer fails loudly instead of addressing past the
+    first chunk.
+    """
+
+    def __init__(self, chunks: list[torch.Tensor]):
+        assert chunks
+        row_bytes = chunks[0].shape[1]
+        rows_per_chunk = chunks[0].shape[0]
+        for i, chunk in enumerate(chunks):
+            assert chunk.ndim == 2 and chunk.shape[1] == row_bytes
+            assert chunk.dtype == chunks[0].dtype
+            assert chunk.device == chunks[0].device
+            assert chunk.is_contiguous()
+            if i < len(chunks) - 1:
+                assert chunk.shape[0] == rows_per_chunk
+            else:
+                assert 0 < chunk.shape[0] <= rows_per_chunk
+        self.chunks = chunks
+        self.rows_per_chunk = rows_per_chunk
+        self.shape = torch.Size((sum(chunk.shape[0] for chunk in chunks), row_bytes))
+        self.dtype = chunks[0].dtype
+        self.device = chunks[0].device
+        self.ndim = 2
+        self._row_stride = row_bytes
+        self._chunk_ptrs = np.array(
+            [chunk.data_ptr() for chunk in chunks], dtype=np.uint64
+        )
+
+    def stride(self, dim: int) -> int:
+        return (self._row_stride, 1)[dim]
+
+    def is_pinned(self) -> bool:
+        return all(chunk.is_pinned() for chunk in self.chunks)
+
+    def locate(self, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(chunk index, row within the chunk) for each row id."""
+        rows = np.asarray(rows, dtype=np.uint64)
+        rows_per_chunk = np.uint64(self.rows_per_chunk)
+        return rows // rows_per_chunk, rows % rows_per_chunk
+
+    def row_ptrs(self, rows: np.ndarray) -> np.ndarray:
+        """Byte address of the start of each row."""
+        chunk_idx, row_in_chunk = self.locate(rows)
+        return self._chunk_ptrs[chunk_idx] + row_in_chunk * np.uint64(self._row_stride)
+
+    def row(self, row: int) -> torch.Tensor:
+        """View of one row (for tests and debugging)."""
+        return self.chunks[row // self.rows_per_chunk][row % self.rows_per_chunk]
+
+
+def _compute_chunked_sub_block_ptrs(
+    block_ids: np.ndarray,
+    blocks_per_chunk: int,
+    output: np.ndarray,
+    tensor: ChunkedHostTensor,
+    skip_count: int,
+) -> None:
+    """compute_sub_block_ptrs for a ChunkedHostTensor: resolve each block's
+    row base through its chunk, then add the sub-block offsets."""
+    num_sub_blocks = len(output)
+    if blocks_per_chunk == 1:
+        output[:] = tensor.row_ptrs(block_ids[:num_sub_blocks])
+        return
+
+    assert tensor.shape[1] % blocks_per_chunk == 0
+    block_page_size = tensor.shape[1] // blocks_per_chunk
+    sub_offsets = np.arange(blocks_per_chunk, dtype=np.uint64) * block_page_size
+    all_ptrs = tensor.row_ptrs(block_ids)[:, np.newaxis] + sub_offsets[np.newaxis, :]
+    flat = all_ptrs.ravel()
+    output[:] = flat[skip_count : skip_count + num_sub_blocks]
+
+
 def compute_sub_block_ptrs(
     block_ids: np.ndarray,
     blocks_per_chunk: int,
     output: np.ndarray,
-    tensor: torch.Tensor,
+    tensor: torch.Tensor | ChunkedHostTensor,
     skip_count: int = 0,
 ):
     """Compute byte pointers for sub-blocks of the given block IDs.
@@ -93,7 +177,8 @@ def compute_sub_block_ptrs(
     where block_page_size = tensor.shape[1] // blocks_per_chunk (gpu page size).
 
     This handles tensors where row_stride != blocks_per_chunk * block_page_size
-    (e.g. non-contiguous CPU tensors).
+    (e.g. non-contiguous CPU tensors). For a ChunkedHostTensor, base_ptr is
+    the base of the chunk that holds block b.
 
     Args:
         block_ids: array of block IDs at the tensor's native granularity.
@@ -106,6 +191,12 @@ def compute_sub_block_ptrs(
     assert skip_count < blocks_per_chunk
 
     num_sub_blocks = len(output)
+    if isinstance(tensor, ChunkedHostTensor):
+        _compute_chunked_sub_block_ptrs(
+            block_ids, blocks_per_chunk, output, tensor, skip_count
+        )
+        return
+
     base_ptr = tensor.data_ptr()
     row_stride = tensor.stride(0)
 
@@ -270,6 +361,122 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     )
 
 
+def _max_pinned_host_alloc_bytes() -> int | None:
+    """Largest single pinned host allocation the platform reports, or None if
+    it reports no limit.
+
+    Level Zero refuses a zeMemAllocHost larger than the device's
+    maxMemAllocSize, which is about the size of the card's local memory. CUDA
+    has no such per-allocation cap for pinned host memory.
+    """
+    if not current_platform.is_xpu():
+        return None
+    props = torch.xpu.get_device_properties(torch.xpu.current_device())
+    limit = getattr(props, "max_mem_alloc_size", None)
+    return int(limit) if limit else None
+
+
+class PinnedHostAllocationError(RuntimeError):
+    """A pinned host allocation failed without torch raising (it returned a
+    null pointer)."""
+
+
+def _empty_host_tensor(num_rows: int, row_bytes: int, pin_memory: bool) -> torch.Tensor:
+    tensor = torch.empty(
+        (num_rows, row_bytes), dtype=torch.int8, device="cpu", pin_memory=pin_memory
+    )
+    # Some torch versions return a null tensor when the pinned allocation is
+    # refused (torch 2.13 on XPU); writing to it would fill from address 0.
+    if tensor.numel() > 0 and tensor.data_ptr() == 0:
+        raise PinnedHostAllocationError(
+            f"Pinned host allocation of {num_rows * row_bytes} bytes returned a "
+            "null pointer. The device may cap a single host allocation below "
+            "this size (Level Zero: maxMemAllocSize)."
+        )
+    return tensor
+
+
+def _num_host_chunks(num_rows: int, row_bytes: int, max_alloc_bytes: int) -> int:
+    """Smallest power-of-two number of equal row-aligned chunks such that each
+    chunk fits in max_alloc_bytes. Power-of-two counts keep chunks aligned with
+    the caching host allocator's power-of-two size rounding."""
+    if row_bytes > max_alloc_bytes:
+        raise ValueError(
+            f"One CPU KV offload row of {row_bytes} bytes exceeds the maximum "
+            f"single pinned host allocation of {max_alloc_bytes} bytes."
+        )
+    num_chunks = 1
+    while cdiv(num_rows, num_chunks) * row_bytes > max_alloc_bytes:
+        num_chunks *= 2
+    return num_chunks
+
+
+def _allocate_chunked(
+    num_rows: int, row_bytes: int, num_chunks: int, pin_memory: bool
+) -> ChunkedHostTensor:
+    rows_per_chunk = cdiv(num_rows, num_chunks)
+    chunks = [
+        _empty_host_tensor(min(rows_per_chunk, num_rows - start), row_bytes, pin_memory)
+        for start in range(0, num_rows, rows_per_chunk)
+    ]
+    for chunk in chunks:
+        chunk.zero_()
+    return ChunkedHostTensor(chunks)
+
+
+def _allocate_cpu_kv_buffer(
+    num_rows: int, row_bytes: int, pin_memory: bool
+) -> torch.Tensor | ChunkedHostTensor:
+    """Allocate a zeroed (num_rows, row_bytes) int8 host buffer.
+
+    One tensor when it fits the platform's per-allocation limit (always on
+    CUDA); otherwise equal row-aligned chunks, each within the limit.
+    """
+    total_bytes = num_rows * row_bytes
+    max_alloc_bytes = _max_pinned_host_alloc_bytes() if pin_memory else None
+    if max_alloc_bytes is not None and total_bytes > max_alloc_bytes and num_rows > 1:
+        num_chunks = _num_host_chunks(num_rows, row_bytes, max_alloc_bytes)
+        buffer = _allocate_chunked(num_rows, row_bytes, num_chunks, pin_memory)
+        _log_host_split(total_bytes, max_alloc_bytes, buffer)
+        return buffer
+
+    try:
+        tensor = _empty_host_tensor(num_rows, row_bytes, pin_memory)
+    except RuntimeError:
+        # A platform that caps pinned host allocations without reporting the
+        # cap: halve the chunk size until the allocation succeeds.
+        if not (pin_memory and current_platform.is_xpu() and num_rows > 1):
+            raise
+        num_chunks = 2
+        while True:
+            try:
+                buffer = _allocate_chunked(num_rows, row_bytes, num_chunks, pin_memory)
+                break
+            except RuntimeError:
+                if cdiv(num_rows, num_chunks) == 1:
+                    raise
+                num_chunks *= 2
+        _log_host_split(total_bytes, None, buffer)
+        return buffer
+    tensor.zero_()
+    return tensor
+
+
+def _log_host_split(
+    total_bytes: int, max_alloc_bytes: int | None, buffer: ChunkedHostTensor
+) -> None:
+    logger.info_once(
+        "CPU KV offload buffer of %.2f GiB exceeds the largest single pinned "
+        "host allocation (%s); allocating it as %d chunks of %.2f GiB.",
+        total_bytes / 2**30,
+        f"{max_alloc_bytes / 2**30:.2f} GiB"
+        if max_alloc_bytes is not None
+        else "refused by the driver",
+        len(buffer.chunks),
+        buffer.chunks[0].nbytes / 2**30,
+    )
+
+
 def _new_descriptor_buffers(
     num_copy_ops: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -293,7 +500,7 @@ class SingleDirectionOffloadingHandler:
     def __init__(
         self,
         gpu_tensors: list[torch.Tensor],
-        cpu_tensors: list[torch.Tensor],
+        cpu_tensors: list[torch.Tensor | ChunkedHostTensor],
         blocks_per_chunk: int,
         layer_refs_per_group: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
@@ -343,12 +550,12 @@ class SingleDirectionOffloadingHandler:
             else:
                 assert cpu_page_size == gpu_page_size * blocks_per_chunk
 
-        self.src_tensors: list[torch.Tensor] = (
-            gpu_tensors if gpu_to_cpu else cpu_tensors
-        )
-        self.dst_tensors: list[torch.Tensor] = (
-            cpu_tensors if gpu_to_cpu else gpu_tensors
-        )
+        self.src_tensors: (
+            list[torch.Tensor] | list[torch.Tensor | ChunkedHostTensor]
+        ) = gpu_tensors if gpu_to_cpu else cpu_tensors
+        self.dst_tensors: (
+            list[torch.Tensor] | list[torch.Tensor | ChunkedHostTensor]
+        ) = cpu_tensors if gpu_to_cpu else gpu_tensors
         self.gpu_to_cpu: bool = gpu_to_cpu
         self.layer_refs_per_group = layer_refs_per_group
         self._swap_blocks_batch = _select_swap_blocks_fn(
@@ -828,7 +1035,7 @@ class CPUOffloadingWorker(OffloadingWorker):
         )
 
         gpu_tensors: list[torch.Tensor] = []
-        cpu_tensors: list[torch.Tensor] = []
+        cpu_tensors: list[torch.Tensor | ChunkedHostTensor] = []
         for t_idx, kv_cache_tensor in enumerate(kv_caches.tensors):
             gpu_page_size_bytes = kv_cache_tensor.page_size_bytes
             gpu_tensor = kv_cache_tensor.tensor.view(torch.int8).view(
@@ -845,14 +1052,11 @@ class CPUOffloadingWorker(OffloadingWorker):
                 cpu_tensor = mmap_region.create_next_worker_view(cpu_page_size_bytes)
             else:
                 t0 = time.monotonic()
-                cpu_tensor = torch.zeros(
-                    (num_cpu_chunks, cpu_page_size_bytes),
-                    dtype=torch.int8,
-                    device="cpu",
-                    pin_memory=pin_memory,
+                cpu_tensor = _allocate_cpu_kv_buffer(
+                    num_cpu_chunks, cpu_page_size_bytes, pin_memory
                 )
                 logger.debug(
-                    "torch.zeros pinned tensor %d×%d (%.2f GB): %.3f s",
+                    "CPU KV buffer %d×%d (%.2f GB): %.3f s",
                     num_cpu_chunks,
                     cpu_page_size_bytes,
                     num_cpu_chunks * cpu_page_size_bytes / 1e9,
