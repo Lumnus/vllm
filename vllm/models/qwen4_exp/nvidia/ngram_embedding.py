@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -24,6 +25,8 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEFp8EmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
+    # B70 PLE helpers (patches 0002/0006-0008 live in common/)
+    _is_xpu,
 )
 from .ops.ple import ple_ngram_ids
 
@@ -46,6 +49,68 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
     _SPLITMIX_M2 = 0x94D049BB133111EB
     _PLE_LAYER_PRIME = 10007
+
+    def _load_ple_table_from_path(self) -> bool:
+        """Fill the pinned-host PLE table from the PLE_TABLE_PATH mmap file.
+
+        XPU bring-up: this checkpoint carries no embedding rows; the full
+        [org_vocab_size, head_dim] bf16 table lives in one external file
+        (``{"table": Tensor}`` mmap) whose rows already follow the exact
+        layout the shard branch of ``load_weights`` consumes. Slice it into
+        ``split_ngram_parts`` virtual shards and run each through the same
+        ``weight_loader(checkpoint_start=...)`` path so only TP-owned rows
+        are copied into this rank's pinned storage.
+        """
+        table_path = os.environ.get("PLE_TABLE_PATH")
+        if not table_path:
+            return False
+        embedding = self.ngram_embedding
+        if not isinstance(embedding, Qwen4ExpPLEPinnedHostEmbedding):
+            raise RuntimeError(
+                "PLE_TABLE_PATH is set but the PLE table is device-resident; "
+                "XPU requires pinned-host table storage"
+            )
+        table_file = torch.load(table_path, mmap=True, weights_only=True)
+        table = table_file["table"] if isinstance(table_file, dict) else table_file
+        org_vocab_size = embedding.org_vocab_size
+        if (
+            table.shape[0] < org_vocab_size
+            or table.shape[1] != embedding.embedding_dim
+        ):
+            raise ValueError(
+                f"PLE table at {table_path} has shape {tuple(table.shape)}, "
+                f"expected >= [{org_vocab_size}, {embedding.embedding_dim}]"
+            )
+        shard_size = (
+            org_vocab_size + self.split_ngram_parts - 1
+        ) // self.split_ngram_parts
+        rows_loaded = 0
+        for shard_index in range(self.split_ngram_parts):
+            checkpoint_start = shard_index * shard_size
+            expected_rows = max(
+                0, min(shard_size, org_vocab_size - checkpoint_start)
+            )
+            if expected_rows == 0:
+                break
+            shard = table.narrow(0, checkpoint_start, expected_rows)
+            embedding.weight.weight_loader(
+                embedding.weight,
+                shard,
+                checkpoint_start=checkpoint_start,
+            )
+            rows_loaded += expected_rows
+        if _is_xpu():
+            embedding._materialize_pinned_xpu_slabs()
+        logger.info(
+            "Loaded PLE table from %s: %d shards, %d/%d rows, dtype=%s, "
+            "storage=pinned-host slabs",
+            table_path,
+            self.split_ngram_parts,
+            rows_loaded,
+            org_vocab_size,
+            table.dtype,
+        )
+        return True
 
     @classmethod
     def _splitmix64(cls, value: int) -> int:
@@ -208,11 +273,17 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         engram_config = get_current_vllm_config().engram_config
-        embedding_cls = (
-            Qwen4ExpPLEPinnedHostEmbedding
-            if engram_config is not None and engram_config.cpu_offload
-            else Qwen4ExpPLEDeviceEmbedding
-        )
+        if engram_config is not None and engram_config.cpu_offload:
+            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
+        elif _is_xpu() and os.environ.get("PLE_TABLE_PATH"):
+            # B70 XPU bring-up: pinned-host PLE table selected by
+            # PLE_TABLE_PATH because the Engram route is CUDA-only
+            # (config/engram.py rejects non-CUDA platforms) while the stock
+            # XPU default would allocate the table device-resident (~26
+            # GB/rank at TP4) and OOM the 32 GB cards.
+            embedding_cls = Qwen4ExpPLEPinnedHostEmbedding
+        else:
+            embedding_cls = Qwen4ExpPLEDeviceEmbedding
         self.ngram_embedding = embedding_cls(
             padded_vocab_size,
             self.head_dim,
@@ -445,6 +516,11 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        if "ngram_embedding.weight" not in loaded:
+            # XPU bring-up: the checkpoint has no embedding rows, so fill
+            # the pinned-host table from the external PLE_TABLE_PATH file.
+            if self._load_ple_table_from_path():
+                loaded.add("ngram_embedding.weight")
         return loaded
 
 
