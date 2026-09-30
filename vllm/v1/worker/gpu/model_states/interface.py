@@ -211,6 +211,21 @@ class ModelState(ABC):
     def prepare_dummy_inputs(self, num_reqs: int, num_tokens: int) -> dict[str, Any]:
         raise NotImplementedError
 
+    def pre_forward(
+        self,
+        input_batch: InputBatch,
+        model_inputs: dict[str, Any],
+    ) -> None:
+        """Host-side work right before the forward (or graph replay).
+
+        Called on real batches only, never on dummy, profile or capture
+        runs, after the inputs are staged and before the model runs. Models
+        that resolve host-resident state per step (e.g. an embedding table
+        read from disk) do it here, outside any captured region. No-op by
+        default.
+        """
+        return None
+
     @abstractmethod
     def prepare_attn(
         self,

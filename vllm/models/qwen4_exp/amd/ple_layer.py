@@ -38,6 +38,7 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEDeviceEmbedding,
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEPinnedHostEmbedding,
+    ple_int8_nvme_requested,
 )
 
 logger = init_logger(__name__)
@@ -246,6 +247,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             embedding_prefix,
             getattr(config, "ple_embedding_dtype", None),
         )
+        if ple_int8_nvme_requested():
+            raise NotImplementedError(
+                "The NVMe-backed PLE table is wired for the NVIDIA Qwen4Exp path only"
+            )
         engram_config = get_current_vllm_config().engram_config
         embedding_cls = (
             Qwen4ExpPLEPinnedHostEmbedding
