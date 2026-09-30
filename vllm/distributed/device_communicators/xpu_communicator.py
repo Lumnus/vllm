@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import os
 
 import torch
 import torch.distributed as dist
@@ -13,28 +12,6 @@ from vllm.logger import init_logger
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
-
-# B70-0017: keep oneCCL collectives out of XPU graphs. With torch 2.14 the XCCL
-# backend always uses oneCCL's NCCL-like (v2) API; recording an all-reduce into
-# an XPU graph fails there on some oneCCL/runtime combinations ("[onecclAllReduce]
-# caught std::exception: ext_oneapi_get_graph() can only be called on recording
-# queues"), the exception is swallowed and the graph is replayed without the
-# reduction. With B70_XPU_AR_EAGER_BREAK=1 an all-reduce issued inside a breakable
-# graph capture ends the current segment, runs eagerly (and again eagerly at every
-# replay, in place on the same buffer), and starts a new segment. Default off.
-_AR_EAGER_BREAK = os.environ.get("B70_XPU_AR_EAGER_BREAK", "0") == "1"
-_ar_eager_break_logged = False
-
-
-def _active_breakable_capture():
-    if not _AR_EAGER_BREAK:
-        return None
-    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
-
-    capture = BreakableCUDAGraphCapture.current()
-    if capture is None or not capture._capturing:
-        return None
-    return capture
 
 
 class XpuCommunicator(DeviceCommunicatorBase):
@@ -89,24 +66,6 @@ class XpuCommunicator(DeviceCommunicatorBase):
             return self._fixed_rank_sum(input_)
 
         output = input_.clone()
-        capture = _active_breakable_capture()
-        if capture is not None:
-            # The clone is captured into the graph segment (fixed address in the
-            # graph pool); the in-place all-reduce on that buffer is an eager
-            # break, replayed eagerly between segments.
-            from vllm.utils.torch_utils import weak_ref_tensor
-
-            global _ar_eager_break_logged
-            if not _ar_eager_break_logged:
-                _ar_eager_break_logged = True
-                logger.info(
-                    "B70_XPU_AR_EAGER_BREAK=1: all-reduce runs as an eager break "
-                    "in breakable XPU graphs (not recorded into the graph)."
-                )
-            out_ref = weak_ref_tensor(output)
-            group = self.device_group
-            capture.add_eager(lambda: dist.all_reduce(out_ref, group=group))
-            return output
         dist.all_reduce(output, group=self.device_group)
         return output
 
