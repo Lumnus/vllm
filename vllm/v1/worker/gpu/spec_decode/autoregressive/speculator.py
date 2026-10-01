@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any
 
 import torch
@@ -9,6 +10,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -125,11 +127,33 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
+        # B70-0021: on XPU the draft prefill's breakable PIECEWISE capture
+        # fails at its first capture_begin ("Cannot register the state during
+        # capturing stage": the default XPU generator state is still flagged
+        # capturing). B70_MTP_DRAFT_PREFILL_NO_PIECEWISE=1 drops PIECEWISE for
+        # the draft prefill only: FULL graphs stay for uniform-decode batches,
+        # mixed batches run the one-layer draft eagerly. Target unchanged.
+        prefill_mode = cudagraph_mode
+        if (
+            os.environ.get("B70_MTP_DRAFT_PREFILL_NO_PIECEWISE", "0") == "1"
+            and current_platform.is_xpu()
+            and cudagraph_mode.has_piecewise_cudagraphs()
+        ):
+            prefill_mode = (
+                CUDAGraphMode.FULL_DECODE_ONLY
+                if cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+                else CUDAGraphMode.NONE
+            )
+            logger.info(
+                "B70-0021: draft prefill cudagraph mode %s -> %s",
+                cudagraph_mode.name,
+                prefill_mode.name,
+            )
         # Initialize cudagraph manager for draft prefill (draft position 0).
         self.prefill_cudagraph_manager = SpeculatorCudaGraphManager(
             self.vllm_config,
             self.device,
-            cudagraph_mode,
+            prefill_mode,
             self.num_speculative_steps + 1,
         )
 
