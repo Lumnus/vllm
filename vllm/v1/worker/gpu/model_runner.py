@@ -230,7 +230,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Size the UVA buffer pools to the max number of concurrent in-flight
         # steps. Must run before any pooled buffer is constructed
-        set_default_max_concurrency(vllm_config.max_concurrent_batches)
+        # B70-0025: deeper pools on XPU with spec decoding (see buffer_utils).
+        from vllm.platforms import current_platform as _b70_platform
+        from vllm.v1.worker.gpu.buffer_utils import b70_uva_pool_depth
+
+        set_default_max_concurrency(
+            b70_uva_pool_depth(
+                vllm_config.max_concurrent_batches,
+                _b70_platform.is_xpu(),
+                vllm_config.speculative_config is not None,
+            )
+        )
 
         # PP broadcast/recv helper. Runs the collective on a side stream.
         self.pp_handler: PPHandler | None = None
