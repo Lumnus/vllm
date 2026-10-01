@@ -353,9 +353,13 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             n_shared_experts=1,
             ckpt_prefix="mlp.shared_expert",
         )
-        mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={"hyper_connection_mixer.block_inject_weight": None}
-        )
+        skip = {"hyper_connection_mixer.block_inject_weight": None}
+        # B70-0020 (= 0019 for the draft model): dense-QSA configs build no
+        # indexer; the wtdcode AWQ model_mtp.safetensors still ships
+        # mtp.layers.0.self_attn.indexer.* tensors. Drop them.
+        if getattr(self.config, "indexer_n_heads", None) is None:
+            skip[".self_attn.indexer."] = None
+        mapper = self.hf_to_vllm_mapper | WeightsMapper(orig_to_new_substr=skip)
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
@@ -447,9 +451,11 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
                 if remapped_name is not None:
                     yield remapped_name, weight
 
-        mapper = WeightsMapper(
-            orig_to_new_substr={"hyper_connection_mixer.block_inject_weight": None}
-        )
+        skip = {"hyper_connection_mixer.block_inject_weight": None}
+        # B70-0020: see Qwen4ExpMultiTokenPredictor.load_weights.
+        if getattr(self.config, "indexer_n_heads", None) is None:
+            skip[".self_attn.indexer."] = None
+        mapper = WeightsMapper(orig_to_new_substr=skip)
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
