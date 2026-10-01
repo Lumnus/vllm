@@ -125,6 +125,13 @@ class KVCacheCoordinator(ABC):
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
         )
+        # B70-0024: withhold one scratch block per recurrent group for the
+        # FULL-graph padding rows (see vllm/v1/core/b70_pad_scratch.py).
+        from vllm.v1.core import b70_pad_scratch
+
+        self.b70_pad_scratch_blocks = b70_pad_scratch.reserve_in_block_pool(
+            self.block_pool, kv_cache_config
+        )
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
