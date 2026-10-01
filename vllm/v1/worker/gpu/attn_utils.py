@@ -250,6 +250,9 @@ def init_attn_backend(
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
     # Phase 3: create metadata builders and determine cudagraph support.
+    from vllm.v1.core.b70_pad_scratch import pad_scratch_block_ids
+
+    b70_pad_scratch_ids = pad_scratch_block_ids(kv_cache_config)
     attn_backend_workspace: torch.Tensor | None = None
     for kv_cache_group_id, groups in enumerate(attn_groups):
         kernel_block_size = None
@@ -268,7 +271,12 @@ def init_attn_backend(
             # The microbatches' builders share the workspace: they all issue
             # attention on the one compute stream the threads hand off, so the
             # buffer is written serially, as it already is across steps.
+            # B70-0024: padding rows of this group's FULL-graph metadata use
+            # the group's reserved scratch block instead of block 0.
+            pad_state = b70_pad_scratch_ids.get(kv_cache_group_id)
             for builder in group.metadata_builders:
+                if pad_state is not None:
+                    builder.b70_pad_state_index = pad_state
                 if attn_backend_workspace is None:
                     if hasattr(builder, "_get_workspace_buffer"):
                         attn_backend_workspace = builder._get_workspace_buffer()
@@ -356,6 +364,10 @@ def init_kv_cache(
                 vllm_config.cache_config.get_resolved_kv_cache_layout(),
                 kernel_block_sizes,
             )
+    # B70-0024: the padding-row scratch pages start (and stay) zeroed.
+    from vllm.v1.core.b70_pad_scratch import zero_scratch_pages
+
+    zero_scratch_pages(kv_caches, kv_cache_config)
     for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
         kv_caches[layer_name] = kv_caches[target]
     # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per

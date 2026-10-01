@@ -455,7 +455,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_state_indices_tensor, non_blocking=True
             )
             spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
-            spec_state_indices_tensor[num_spec_decodes:].fill_(NULL_BLOCK_ID)
+            spec_state_indices_tensor[num_spec_decodes:].fill_(
+                getattr(self, "b70_pad_state_index", NULL_BLOCK_ID)
+            )
 
             self.spec_sequence_masks[:num_spec_decodes].copy_(
                 spec_sequence_masks[:num_spec_decodes], non_blocking=True
@@ -501,7 +503,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
                 :batch_size
             ]
-            non_spec_state_indices_tensor[num_decodes:].fill_(NULL_BLOCK_ID)
+            non_spec_state_indices_tensor[num_decodes:].fill_(
+                getattr(self, "b70_pad_state_index", NULL_BLOCK_ID)
+            )
 
             self.non_spec_query_start_loc[: num_decodes + 1].copy_(
                 non_spec_query_start_loc, non_blocking=True

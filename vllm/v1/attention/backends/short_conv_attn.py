@@ -464,7 +464,9 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
                 spec_state_indices_tensor, non_blocking=True
             )
             spec_state_indices_tensor = self.spec_state_indices_tensor[:batch_size]
-            spec_state_indices_tensor[num_spec_decodes:].fill_(NULL_BLOCK_ID)
+            spec_state_indices_tensor[num_spec_decodes:].fill_(
+                getattr(self, "b70_pad_state_index", NULL_BLOCK_ID)
+            )
 
             self.spec_sequence_masks[:batch_size].copy_(
                 spec_sequence_masks[:batch_size], non_blocking=True

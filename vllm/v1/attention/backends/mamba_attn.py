@@ -778,7 +778,9 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 state_indices_tensor_d, non_blocking=True
             )
             state_indices_tensor_d = self.state_indices_tensor_d[:padded_bs]
-            state_indices_tensor_d[metadata.num_decodes :] = NULL_BLOCK_ID
+            state_indices_tensor_d[metadata.num_decodes :] = getattr(
+                self, "b70_pad_state_index", NULL_BLOCK_ID
+            )
 
             if self.use_spec_decode and num_accepted_tokens is not None:
                 assert query_start_loc_d is not None

@@ -10,7 +10,7 @@ import numpy as np
 from vllm.triton_utils import triton, tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["PAD_STATE"])
 def _stage(
     BT,
     SEQ,
@@ -33,6 +33,7 @@ def _stage(
     ACTIVE: tl.constexpr,
     NUM_TOKENS: tl.constexpr,
     TILE: tl.constexpr,
+    PAD_STATE=0,
 ):
     x = tl.arange(0, TILE)
     row = x // K
@@ -43,6 +44,8 @@ def _stage(
     state = tl.load(
         BT + row * BT_STRIDE + (start + col) * BT_COL, mask=row < ACTIVE, other=0
     )
+    # B70-0024: padding rows use the group's scratch block, not block 0.
+    state = tl.where(row < ACTIVE, state, PAD_STATE)
     tl.store(STATE + row * STATE_STRIDE + col, state, mask=row < N)
     tl.store(TOKENS + x, x, mask=x < NUM_TOKENS)
     tl.store(MASK + x, x < ACTIVE, mask=x < N)
@@ -117,6 +120,7 @@ def try_build_uniform_spec_metadata(
         active,
         nt,
         triton.next_power_of_2(max(n * k, n + 1)),
+        PAD_STATE=getattr(b, "b70_pad_state_index", 0),
         num_warps=4,
     )
     return metadata_result(b, m, active)
