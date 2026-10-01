@@ -26,6 +26,31 @@ def set_default_max_concurrency(n: int) -> None:
     _DEFAULT_MAX_CONCURRENCY = max(2, n)
 
 
+def b70_uva_pool_depth(
+    max_concurrent_batches: int, is_xpu: bool, uses_spec_decode: bool
+) -> int:
+    """B70-0025: UVA pool depth for this runner.
+
+    A pooled UVA buffer is host memory the GPU reads when the consuming kernel
+    *runs*, so a slot may only be rewritten once every kernel that reads it has
+    executed. Under async scheduling the host stages step N+1 (block tables,
+    num_blocks, num_computed staging) while step N's sample_tokens kernels -
+    the rejection sampler and the drafter's propose, which exist only with
+    spec decoding - may still be queued. Measured on XPU + MTP: async ON with
+    PIECEWISE target 3/90 dirty, async OFF 0/90. A depth of
+    ``max_concurrent_batches`` (2) leaves no slack for that tail, so on XPU
+    with spec decoding the pools default to ``B70_UVA_POOL_DEPTH`` (8).
+    Set ``B70_UVA_POOL_DEPTH=0`` to keep the stock depth.
+    """
+    import os
+
+    depth = max(2, max_concurrent_batches)
+    if is_xpu and uses_spec_decode:
+        extra = int(os.environ.get("B70_UVA_POOL_DEPTH", "8") or 0)
+        depth = max(depth, extra)
+    return depth
+
+
 class UvaBuffer:
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         if not is_uva_available():
