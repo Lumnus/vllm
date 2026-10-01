@@ -688,6 +688,17 @@ class Scheduler(SchedulerInterface):
                 - request.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
             )
+            # B70-0026: never schedule a partial draft list (see update_draft_token_ids).
+            if _b70_uniform_drafts_on() and request.spec_token_ids:
+                _sched_spec = (
+                    num_new_tokens
+                    + request.num_computed_tokens
+                    - request.num_tokens
+                    - request.num_output_placeholders
+                )
+                if 0 < _sched_spec < self.num_spec_tokens:
+                    num_new_tokens -= _sched_spec
+                    request.spec_token_ids = []
 
             # Apply Mamba alignment before encoder caps.
             if self.need_mamba_block_aligned_split:
@@ -2437,6 +2448,14 @@ class Scheduler(SchedulerInterface):
             request.spec_token_ids = self.structured_output_manager.validate_tokens(
                 request, spec_token_ids
             )
+            # B70-0026: the XPU GDN kernel requires every spec row to carry exactly
+            # 1 + num_spec_tokens tokens. A grammar-trimmed partial draft list
+            # would crash it, so run this step as a plain decode instead.
+            if (
+                _b70_uniform_drafts_on()
+                and 0 < len(request.spec_token_ids) < self.num_spec_tokens
+            ):
+                request.spec_token_ids = []
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput
@@ -3264,3 +3283,21 @@ class Scheduler(SchedulerInterface):
         self.failed_recving_kv_req_ids |= async_failed_req_ids
         # Return sync affected IDs to skip in update_from_output
         return sync_failed_req_ids
+
+
+_B70_UD = {"v": True, "t": 0.0}
+
+
+def _b70_uniform_drafts_on() -> bool:
+    """B70-0026 switch: on unless B70_MTP_UNIFORM_DRAFTS=0 or the file
+    /work/probes/uniform-drafts-off exists (re-read every 2 s)."""
+    import os
+    import time
+
+    now = time.monotonic()
+    if now - _B70_UD["t"] > 2.0:
+        _B70_UD["v"] = os.environ.get("B70_MTP_UNIFORM_DRAFTS", "1") != "0" and not (
+            os.path.exists("/work/probes/uniform-drafts-off")
+        )
+        _B70_UD["t"] = now
+    return _B70_UD["v"]
