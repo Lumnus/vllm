@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     should_ignore_layer,
 )
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+from vllm.model_executor.layers.quantization.inc import INCConfig
 from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptMixedPrecisionConfig,
     ModelOptQuantConfigBase,
@@ -648,6 +649,19 @@ class Qwen4ExpPLEEmbeddingMethod(QuantizeMethodBase):
                 "Qwen4Exp PLE embedding is not in the compressed-tensors "
                 "ignore list; compressed-tensors PLE quantization is not "
                 "supported"
+            )
+        if isinstance(quant_config, INCConfig):
+            # B70-0028: auto-round checkpoints (e.g. Intel/Qwen3.8-Flash-Next-
+            # W4A16-AutoRound) keep the PLE table BF16 and mark it 16-bit in
+            # extra_config (".*ple.*"). Resolve the layer through INC's own
+            # parser; a 16-bit PLE loads unquantized. An INC-quantized table
+            # has no supported serialization here.
+            bits, _, _ = quant_config.get_layer_config(torch.nn.Module(), prefix)
+            if bits >= 16:
+                return Qwen4ExpPLEUnquantizedEmbeddingMethod()
+            raise NotImplementedError(
+                f"Qwen4Exp PLE embedding {prefix} is {bits}-bit in the INC "
+                "extra_config; INC PLE quantization is not supported"
             )
         if not isinstance(quant_config, Fp8Config):
             raise NotImplementedError(
