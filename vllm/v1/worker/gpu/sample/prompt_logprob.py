@@ -1,16 +1,51 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Callable
 
 import numpy as np
 import torch
 
 from vllm.config.model import LogprobsMode
+from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.triton_utils import tl, triton
 from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
+
+
+logger = init_logger(__name__)
+
+# B70-0029b: rows per prompt-logprobs chunk on Model Runner V2. Upstream hardcodes
+# 1024, which equals --max-num-batched-tokens here, so every prompt-logprobs step
+# materialised the [num_tokens, vocab] logits in one piece on every TP rank:
+# lm_head shard [N, V/tp] + all-gather output [tp*N, V/tp] + the movedim copy
+# [N, V] (bf16, V = 248,320: 0.12 + 0.47 + 0.47 GiB at N = 1024). With < 1 GiB
+# of VRAM headroom, xe places the overflow in host RAM and it stays there
+# (crusher 2026-10-03 02:09Z, 02:21Z, 06:10Z). Rows are independent, so the
+# result does not depend on the chunk size. 0 = upstream (1024).
+def _b70_prompt_logprobs_chunk() -> int:
+    try:
+        value = int(os.environ.get("B70_PROMPT_LOGPROBS_CHUNK", "128"))
+    except ValueError:
+        value = 128
+    return value if value > 0 else 1024
+
+
+_B70_CHUNK_LOGGED = False
+
+
+def _b70_log_chunk_once(chunk: int, num_rows: int) -> None:
+    global _B70_CHUNK_LOGGED
+    if not _B70_CHUNK_LOGGED:
+        _B70_CHUNK_LOGGED = True
+        logger.info(
+            "B70-0029b: prompt logprobs on Model Runner V2, %d rows per chunk "
+            "(first step: %d rows)",
+            chunk,
+            num_rows,
+        )
 
 
 class PromptLogprobsWorker:
@@ -205,7 +240,8 @@ def compute_prompt_logprobs_with_chunking(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Since materializing the full prompt logits can take too much memory,
     # we compute it in chunks.
-    CHUNK_SIZE = 1024
+    CHUNK_SIZE = _b70_prompt_logprobs_chunk()
+    _b70_log_chunk_once(CHUNK_SIZE, int(prompt_token_ids.shape[0]))
     token_ids = []
     scores = []
     ranks = []
