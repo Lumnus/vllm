@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -252,6 +253,14 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+
+def _b70_prompt_logprobs_chunk() -> int:
+    """B70-0029: rows per prompt-logprobs sub-chunk (0 = upstream single pass)."""
+    try:
+        return max(0, int(os.environ.get("B70_PROMPT_LOGPROBS_CHUNK", "128")))
+    except ValueError:
+        return 128
 
 
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
@@ -5708,34 +5717,63 @@ class GPUModelRunner(
             # then there is prompt logprob generated for each index.
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
+            # B70-0029: compute prompt logprobs in row sub-chunks. One pass over
+            # num_logits rows (up to max_num_batched_tokens) materialises
+            # [rows, vocab] logits (bf16, all-gathered on every TP rank) plus a
+            # float32 log-softmax and a [rows, vocab] rank mask: ~2.5 GiB per
+            # rank at 1024 rows x 248,320 vocab. profile_run() never sizes this
+            # path (its dummy sampler runs on max_num_reqs rows), so the demand
+            # lands on top of the KV budget. On CUDA that is an OOM; on xe it is
+            # silent: the driver spills device BOs to host RAM, which ramguard
+            # sees as MemAvailable collapsing (2026-10-03 02:09Z and 02:21Z).
+            # Sub-chunking bounds the transient to sub_rows x vocab. The loop is
+            # identical on every TP rank (same num_logits), so the all-gather in
+            # compute_logits stays collective-safe. B70_PROMPT_LOGPROBS_CHUNK=0
+            # restores the upstream single pass.
+            sub_rows = _b70_prompt_logprobs_chunk() or num_logits
+            for sub_start in range(0, num_logits, sub_rows):
+                sub_end = min(num_logits, sub_start + sub_rows)
+                prompt_hidden_states = hidden_states[
+                    offset + sub_start : offset + sub_end
+                ]
+                logits = self.model.compute_logits(prompt_hidden_states)
 
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+                # Get the "target" tokens for each index. For prompt at index
+                # i, the token at prompt index i+1 is the "sampled" token we
+                # want to gather the logprob for.
+                tgt_token_ids = prompt_token_ids[
+                    start_tok + sub_start : start_tok + sub_end
+                ]
 
-            # Compute prompt scores respecting logprobs_mode.
-            # NOTE: prompt tokens skip sampling processors, so
-            # processed_* and raw_* yield the same scores here.
-            if self.model_config.logprobs_mode in ("raw_logits", "processed_logits"):
-                scores = logits.to(torch.float32)
-            else:
-                scores = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, *_ = self.sampler.gather_logprobs(
-                scores, num_prompt_logprobs, tgt_token_ids
-            )
+                # Compute prompt scores respecting logprobs_mode.
+                # NOTE: prompt tokens skip sampling processors, so
+                # processed_* and raw_* yield the same scores here.
+                if self.model_config.logprobs_mode in (
+                    "raw_logits",
+                    "processed_logits",
+                ):
+                    scores = logits.to(torch.float32)
+                else:
+                    scores = self.sampler.compute_logprobs(logits)
+                del logits
+                token_ids, logprobs, ranks, *_ = self.sampler.gather_logprobs(
+                    scores, num_prompt_logprobs, tgt_token_ids
+                )
+                del scores
 
-            # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
-            logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
-                token_ids, non_blocking=True
-            )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
-            logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
-                ranks, non_blocking=True
-            )
+                # Transfer GPU->CPU async. Sources are freed back to the
+                # device caching allocator on this stream, so their reuse is
+                # ordered after these copies.
+                chunk_slice = slice(start_idx + sub_start, start_idx + sub_end)
+                logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
+                    token_ids, non_blocking=True
+                )
+                logprobs_tensors.logprobs[chunk_slice].copy_(
+                    logprobs, non_blocking=True
+                )
+                logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
+                    ranks, non_blocking=True
+                )
 
         # Remove requests that have completed prefill from the batch
         # num_prompt_logprobs_dict.
