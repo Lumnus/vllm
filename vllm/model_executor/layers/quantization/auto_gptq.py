@@ -694,6 +694,9 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             backend=self.wna16_moe_backend,
             routing_tables=layer._expert_routing_tables(),
         )
+        # B70 0040: repack the cold experts and hand them to the XPU kernel.
+        if getattr(layer, "b70_hotcold", None) is not None:
+            layer.b70_hotcold.finalize(layer, self.moe_kernel)
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
         if self.wna16_moe_backend == WNA16MoEBackend.HUMMING:

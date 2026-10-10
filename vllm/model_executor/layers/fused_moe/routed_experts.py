@@ -168,7 +168,18 @@ class RoutedExperts(PluggableLayer):
             "global_num_experts": moe_config.num_experts,
         }
 
+        # B70 0040: hot experts become the params; cold ones load into CPU twins.
+        from vllm.model_executor.layers.fused_moe.b70_hotcold import maybe_plan
+
+        self.b70_hotcold = maybe_plan(
+            self.layer_name, moe_config, expert_map_manager, quant_config
+        )
+        if self.b70_hotcold is not None:
+            moe_quant_params["num_experts"] = self.b70_hotcold.num_hot
+
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+        if self.b70_hotcold is not None:
+            self.b70_hotcold.attach_twins(self)
 
         self.lora_base_layer_prefix = ""
 
@@ -606,6 +617,12 @@ class RoutedExperts(PluggableLayer):
             # Failed to load this param since it's not local to this rank
             return False if return_success else None
         # Hereafter, `expert_id` is local physical id
+
+        # B70 0040: a hot expert goes to its VRAM slot, a cold one to the twin.
+        if self.b70_hotcold is not None and expert_id != -1:
+            if len(loaded_weight.shape) == 3:
+                raise NotImplementedError("B70 hot/cold: fused 3-D expert tensors")
+            param, expert_id = self.b70_hotcold.route(param, expert_id)
 
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors
