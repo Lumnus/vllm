@@ -151,6 +151,11 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        if getattr(self, "b70_hotcold", None) is not None:
+            self.b70_apply_hotcold(
+                output, hidden_states, w1, w2, topk_weights, topk_ids, activation
+            )
+            return
         if self.fused_moe_impl is None:
             topk = topk_ids.size(-1)
             if (
@@ -400,6 +405,35 @@ class XPUExpertsWNA16(XPUExperts):
             (kInt4Static, None),
             (kInt4Static32, None),
         )
+
+
+    def b70_apply_hotcold(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        activation: MoEActivation,
+    ) -> None:
+        """B70 0040: VRAM experts + pinned-host experts, summed (b70_hotcold.py)."""
+        hot, cold = self.b70_hotcold.impls(
+            w1, self.w1_scale, w2, self.w2_scale, topk_ids.size(-1),
+            activation.value, {"gemm1_clamp_limit": self.gemm1_clamp_limit},
+        )
+        if self.moe_config.ep_size > 1:
+            # 0.32: the stock path remaps topk_ids == -1 to an expert this rank does not own;
+            # it is -1 in both the hot and the cold map, so both calls skip it.
+            sentinel = topk_ids.new_tensor(
+                self.b70_hotcold.num_global - 1 if self.moe_config.ep_rank == 0 else 0)
+            topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
+        hot.apply(output=output, hidden_states=hidden_states,
+                  topk_weights=topk_weights, topk_ids=topk_ids)
+        cold_out = torch.empty_like(output)
+        cold.apply(output=cold_out, hidden_states=hidden_states,
+                   topk_weights=topk_weights, topk_ids=topk_ids)
+        output.add_(cold_out)
 
 
 class XPUExpertsMxFp4(XPUExperts):
