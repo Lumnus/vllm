@@ -259,7 +259,7 @@ class _Swapper:
 
     Every B70_MOE_HOTCOLD_SWAP_S seconds each rank turns the prefill route
     counts of the last period into a decayed score per (layer, local expert)
-    (plus a small prior from the rankings file) and swaps up to
+    (plus B70_MOE_HOTCOLD_SWAP_PRIOR x the rankings-file order) and swaps up to
     B70_MOE_HOTCOLD_SWAP_BUDGET experts per layer whose cold score beats a hot
     one by 10 %: the hot slot's bytes go to the cold expert's pinned slot and
     vice versa, and the two expert maps are rewritten in place. The decode
@@ -310,10 +310,11 @@ class _Swapper:
         self.plans = plans
         self.period = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_S", "5"))
         self.decay = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_DECAY", "0.95"))
-        self.budget = int(os.environ.get("B70_MOE_HOTCOLD_SWAP_BUDGET", "4"))
+        self.budget = int(os.environ.get("B70_MOE_HOTCOLD_SWAP_BUDGET", "8"))
+        self.prior_weight = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_PRIOR", "0.01"))
         self.total = 0
-        logger.info("B70 hot/cold swap on: every %.0f s, decay %.2f, up to %d swaps per layer",
-                    self.period, self.decay, self.budget)
+        logger.info("B70 hot/cold swap on: every %.0f s, decay %.2f, up to %d swaps per layer, prior %.3f",
+                    self.period, self.decay, self.budget, self.prior_weight)
         return True
 
     def _swap(self, plan, a: int, b: int) -> None:
@@ -359,7 +360,7 @@ class _Swapper:
         top = max(float(p.ema.max()) for p in self.plans) or 1.0
         moves = []
         for plan in self.plans:
-            score = plan.ema / top + 0.05 * plan.prior
+            score = plan.ema / top + self.prior_weight * plan.prior
             hot_g, cold_g = plan.hot_owner, plan.cold_owner
             cold_best = cold_g[np.argsort(-score[cold_g])][: self.budget]
             hot_worst = hot_g[np.argsort(score[hot_g])][: self.budget]
