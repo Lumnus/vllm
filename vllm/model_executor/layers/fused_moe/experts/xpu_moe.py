@@ -434,6 +434,11 @@ class XPUExpertsWNA16(XPUExperts):
         cold.apply(output=cold_out, hidden_states=hidden_states,
                    topk_weights=topk_weights, topk_ids=topk_ids)
         output.add_(cold_out)
+        counts = self.b70_hotcold.route_counts
+        if counts is not None:
+            ids = topk_ids.reshape(-1).long()
+            ids = torch.where(ids >= 0, ids, counts.shape[0] - 1)
+            counts.index_add_(0, ids, torch.ones_like(ids))
 
 
 class XPUExpertsMxFp4(XPUExperts):
