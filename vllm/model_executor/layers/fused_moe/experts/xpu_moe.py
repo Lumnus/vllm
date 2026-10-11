@@ -435,9 +435,16 @@ class XPUExpertsWNA16(XPUExperts):
         output.add_(cold_out)
         counts = self.b70_hotcold.route_counts
         if counts is not None:
-            ids = topk_ids.reshape(-1).long()
-            ids = torch.where(ids >= 0, ids, counts.shape[0] - 1)
-            counts.index_add_(0, ids, torch.ones_like(ids))
+            # row 0: eager batches (prefill, mixed); row 1: captured graphs (decode)
+            from vllm.model_executor.layers.fused_moe import b70_hotcold as _hc
+
+            graph = torch.xpu.is_current_stream_capturing()
+            # eager counting starts with the first real batch: the memory-profiling run must not pay for it
+            if (graph and self.b70_hotcold.count_graphs) or (not graph and _hc._LIVE["on"]):
+                row = counts[1 if graph else 0]
+                ids = topk_ids.reshape(-1).long()
+                ids = torch.where(ids >= 0, ids, row.shape[0] - 1)
+                row.index_add_(0, ids, torch.ones_like(ids))
 
 
 class XPUExpertsMxFp4(XPUExperts):
