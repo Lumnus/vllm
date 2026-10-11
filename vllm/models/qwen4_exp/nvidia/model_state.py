@@ -120,6 +120,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
         from vllm.model_executor.layers.fused_moe import b70_hotcold
 
         b70_hotcold.maybe_dump_routes()
+        # B70 0043: every B70_MOE_HOTCOLD_SWAP_S; its first .cpu() waits for the previous step.
+        b70_hotcold.maybe_swap()
         if not self.uses_ngram_embedding:
             return model_inputs
 
