@@ -248,6 +248,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
             lookahead_keys, spans = self._b70_lookahead_plan(input_batch)
         stream_mod = getattr(torch, input_ids.device.type)
         stream_mod.current_stream().synchronize()
+        from vllm.model_executor.layers.fused_moe import b70_hotcold
+
+        b70_hotcold.maybe_dump_routes()
         # The GPU is idle from here until the gather + forward are launched:
         # this is the per-step bubble the stats report.
         t_start = time.perf_counter()
