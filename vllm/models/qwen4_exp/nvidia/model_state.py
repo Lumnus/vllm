@@ -251,6 +251,7 @@ class Qwen4ExpModelState(MambaHybridModelState):
         from vllm.model_executor.layers.fused_moe import b70_hotcold
 
         b70_hotcold.maybe_dump_routes()
+        b70_hotcold.maybe_swap()
         # The GPU is idle from here until the gather + forward are launched:
         # this is the per-step bubble the stats report.
         t_start = time.perf_counter()

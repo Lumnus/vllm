@@ -95,6 +95,7 @@ _ARENA = _PinnedArena()
 _FINALIZED: list[str] = []
 _COUNTED: list["HotColdPlan"] = []  # plans with a route counter (B70_MOE_ROUTE_COUNT)
 _DUMP = {"t": 0.0}
+_LIVE = {"on": False}  # set by the runner's first real step (maybe_dump_routes)
 
 
 _PLANS: dict[int, "HotColdPlan"] = {}  # finalized plans by layer index
@@ -173,8 +174,14 @@ class _ColdPrefetcher:
 _PREFETCH = _ColdPrefetcher()
 
 
+def swap_enabled() -> bool:
+    return os.environ.get("B70_MOE_HOTCOLD_SWAP", "0") == "1"
+
+
 def route_count_enabled() -> bool:
-    return os.environ.get("B70_MOE_ROUTE_COUNT", "0") == "1"
+    """B70_MOE_ROUTE_COUNT: 1 = count eager batches and decode graphs; prefill = eager batches only
+    (nothing is added to the decode graphs). B70_MOE_HOTCOLD_SWAP=1 implies prefill counting."""
+    return os.environ.get("B70_MOE_ROUTE_COUNT", "0") in ("1", "prefill") or swap_enabled()
 
 
 def maybe_dump_routes() -> None:
@@ -185,6 +192,7 @@ def maybe_dump_routes() -> None:
 
     if not _COUNTED:
         return
+    _LIVE["on"] = True
     now = time.monotonic()
     period = float(os.environ.get("B70_MOE_ROUTE_COUNT_S", "60"))
     if _DUMP["t"] == 0.0:
@@ -198,22 +206,23 @@ def maybe_dump_routes() -> None:
         rank = get_tensor_model_parallel_rank()
     except Exception:
         rank = 0
-    out, local_all, cold_all, per_layer = {}, 0, 0, []
+    out = {}
+    local_all, cold_all = [0, 0], [0, 0]
     for plan in _COUNTED:
-        counts = plan.route_counts[:-1].cpu()
+        counts = plan.route_counts[:, :-1].cpu()
+        # this period only, against the placement now in effect (it changes with B70_MOE_HOTCOLD_SWAP)
+        delta = counts - getattr(plan, "dump_last", torch.zeros_like(counts))
+        plan.dump_last = counts
         local = (plan.hot_map >= 0).cpu() | (plan.cold_map >= 0).cpu()
         cold = (plan.cold_map >= 0).cpu()
-        n_local, n_cold = int(counts[local].sum()), int(counts[cold].sum())
-        local_all += n_local
-        cold_all += n_cold
-        per_layer.append((n_cold / n_local) if n_local else 0.0)
-        match = _LAYER_RE.search(plan.layer_name)
-        out[match.group(1) if match else plan.layer_name] = counts.tolist()
-    share = cold_all / local_all if local_all else 0.0
-    worst = sorted(range(len(per_layer)), key=lambda i: -per_layer[i])[:3]
-    logger.info("B70 routes rank %d: %d local routes, cold share %.3f (layers min %.3f max %.3f; "
-                "worst %s)", rank, local_all, share, min(per_layer), max(per_layer),
-                ", ".join(f"{i}:{per_layer[i]:.2f}" for i in worst))
+        for row in (0, 1):
+            local_all[row] += int(delta[row][local].sum())
+            cold_all[row] += int(delta[row][cold].sum())
+        out[str(plan.layer_idx)] = counts.tolist()
+    share = [c / n if n else 0.0 for c, n in zip(cold_all, local_all)]
+    logger.info("B70 routes rank %d (last period): prefill %d local routes, cold share %.3f; decode %d, "
+                "cold share %.3f",
+                rank, local_all[0], share[0], local_all[1], share[1])
     path = os.environ.get("B70_MOE_ROUTE_COUNT_PATH", "")
     if path:
         with open(f"{path}-rank{rank}.json", "w") as handle:
@@ -243,6 +252,149 @@ def _repack_int4_pinned(qweight: torch.Tensor, device: torch.device) -> torch.Te
         packed = chunk.transpose(1, 2).contiguous().view(torch.uint8)
         out[i : i + step].copy_(implement_zp(packed))
     return out
+
+
+class _Swapper:
+    """B70 0043: the hot set follows the traffic.
+
+    Every B70_MOE_HOTCOLD_SWAP_S seconds each rank turns the prefill route
+    counts of the last period into a decayed score per (layer, local expert)
+    (plus a small prior from the rankings file) and swaps up to
+    B70_MOE_HOTCOLD_SWAP_BUDGET experts per layer whose cold score beats a hot
+    one by 10 %: the hot slot's bytes go to the cold expert's pinned slot and
+    vice versa, and the two expert maps are rewritten in place. The decode
+    graphs read weights and maps through the same pointers, so nothing is
+    recaptured. Runs on the host right after the runner's per-step sync and
+    synchronizes after the copies, so no forward ever sees a half-swapped
+    layer. Results do not depend on placement (hot + cold is exact)."""
+
+    KEYS = ("w13", "w2", "w13_scales", "w2_scales")
+
+    def __init__(self) -> None:
+        self.t = 0.0
+        self.ready = False
+        self.disabled = False
+
+    def _setup(self) -> bool:
+        import numpy as np
+
+        plans = [_PLANS[k] for k in sorted(_PLANS)]
+        if not plans or any(p._impls is None or p.route_counts is None for p in plans):
+            return False  # impls are built on the first forward
+        for plan in plans:
+            hot, _ = plan._impls
+            plan.hot_tensors = {"w13": hot.w13.view(torch.uint8), "w2": hot.w2.view(torch.uint8),
+                                "w13_scales": hot.gemm1_wei_scales, "w2_scales": hot.gemm2_wei_scales}
+            for key in self.KEYS:
+                h, c = plan.hot_tensors[key], plan.cold[key]
+                if h.shape[1:] != c.shape[1:] or h.element_size() != c.element_size():
+                    logger.warning("B70 hot/cold swap off: %s %s hot %s/%s vs cold %s/%s", plan.layer_name,
+                                   key, tuple(h.shape), h.dtype, tuple(c.shape), c.dtype)
+                    self.disabled = True
+                    return False
+            hot_map, cold_map = plan.hot_map.cpu().numpy(), plan.cold_map.cpu().numpy()
+            plan.hot_owner = np.full(plan.num_hot, -1, np.int64)
+            plan.cold_owner = np.full(plan.num_cold, -1, np.int64)
+            for g in np.nonzero(hot_map >= 0)[0]:
+                plan.hot_owner[hot_map[g]] = g
+            for g in np.nonzero(cold_map >= 0)[0]:
+                plan.cold_owner[cold_map[g]] = g
+            plan.local_globals = np.sort(np.concatenate([plan.hot_owner, plan.cold_owner]))
+            plan.last_counts = plan.route_counts[0, :-1].cpu().numpy().copy()
+            plan.ema = np.zeros(plan.num_global)
+            ranked = [g for g in _rankings().get(plan.layer_idx, []) if g in set(plan.local_globals.tolist())]
+            plan.prior = np.zeros(plan.num_global)
+            for i, g in enumerate(ranked):
+                plan.prior[g] = 1 - i / max(len(ranked), 1)
+            plan.tmp = {k: torch.empty_like(plan.hot_tensors[k][0]) for k in self.KEYS}
+        self.plans = plans
+        self.period = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_S", "5"))
+        self.decay = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_DECAY", "0.95"))
+        self.budget = int(os.environ.get("B70_MOE_HOTCOLD_SWAP_BUDGET", "4"))
+        self.total = 0
+        logger.info("B70 hot/cold swap on: every %.0f s, decay %.2f, up to %d swaps per layer",
+                    self.period, self.decay, self.budget)
+        return True
+
+    def _swap(self, plan, a: int, b: int) -> None:
+        """a: global id of a hot expert, b: global id of a cold expert."""
+        i = int(plan.hot_map_np[a])
+        j = int(plan.cold_map_np[b])
+        for key in self.KEYS:
+            h, c, tmp = plan.hot_tensors[key], plan.cold[key], plan.tmp[key]
+            tmp.copy_(h[i])
+            h[i].copy_(c[j].view(h.dtype), non_blocking=True)
+            c[j].view(h.dtype).copy_(tmp, non_blocking=True)
+        plan.hot_map[a] = -1
+        plan.hot_map[b] = i
+        plan.cold_map[b] = -1
+        plan.cold_map[a] = j
+        plan.hot_map_np[a], plan.hot_map_np[b] = -1, i
+        plan.cold_map_np[b], plan.cold_map_np[a] = -1, j
+        plan.hot_owner[i], plan.cold_owner[j] = b, a
+
+    def maybe_swap(self) -> None:
+        import time
+
+        import numpy as np
+
+        if self.disabled:
+            return
+        now = time.monotonic()
+        if not self.ready:
+            if not self._setup():
+                return
+            self.ready = True
+            self.t = now
+            return
+        if now - self.t < self.period:
+            return
+        self.t = now
+        t0 = time.perf_counter()
+        scores = []
+        for plan in self.plans:
+            counts = plan.route_counts[0, :-1].cpu().numpy()
+            delta, plan.last_counts = counts - plan.last_counts, counts.copy()
+            plan.ema = self.decay * plan.ema + delta
+        top = max(float(p.ema.max()) for p in self.plans) or 1.0
+        moves = []
+        for plan in self.plans:
+            score = plan.ema / top + 0.05 * plan.prior
+            hot_g, cold_g = plan.hot_owner, plan.cold_owner
+            cold_best = cold_g[np.argsort(-score[cold_g])][: self.budget]
+            hot_worst = hot_g[np.argsort(score[hot_g])][: self.budget]
+            pairs = [(int(a), int(b)) for a, b in zip(hot_worst, cold_best) if score[b] > 1.1 * score[a]]
+            if pairs:
+                moves.append((plan, pairs))
+        if not moves:
+            return
+        if _PREFETCH.stream is not None:
+            torch.xpu.current_stream().wait_stream(_PREFETCH.stream)
+            _PREFETCH.owner = [None, None]  # staged copies may hold swapped-out experts
+        n = 0
+        for plan, pairs in moves:
+            plan.hot_map_np = plan.hot_map.cpu().numpy()
+            plan.cold_map_np = plan.cold_map.cpu().numpy()
+            for a, b in pairs:
+                self._swap(plan, a, b)
+                n += 1
+        torch.xpu.current_stream().synchronize()
+        self.total += n
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+            rank = get_tensor_model_parallel_rank()
+        except Exception:
+            rank = 0
+        logger.info("B70 hot/cold swap rank %d: %d experts in %d layers in %.1f ms (%d since start)",
+                    rank, n, len(moves), (time.perf_counter() - t0) * 1e3, self.total)
+
+
+_SWAPPER = _Swapper()
+
+
+def maybe_swap() -> None:
+    if swap_enabled():
+        _SWAPPER.maybe_swap()
 
 
 class HotColdPlan:
@@ -345,8 +497,9 @@ class HotColdPlan:
         self.route_counts = None
         if route_count_enabled():
             # one bucket per global expert + one for negative (padding) ids
-            self.route_counts = torch.zeros(self.num_global + 1, dtype=torch.int64,
+            self.route_counts = torch.zeros(2, self.num_global + 1, dtype=torch.int64,
                                             device=device)
+            self.count_graphs = os.environ.get("B70_MOE_ROUTE_COUNT") == "1"
             _COUNTED.append(self)
 
         experts = getattr(moe_kernel, "fused_experts", None)
