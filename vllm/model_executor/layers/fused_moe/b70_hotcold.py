@@ -97,6 +97,82 @@ _COUNTED: list["HotColdPlan"] = []  # plans with a route counter (B70_MOE_ROUTE_
 _DUMP = {"t": 0.0}
 
 
+_PLANS: dict[int, "HotColdPlan"] = {}  # finalized plans by layer index
+
+
+def cold_prefetch_min_tokens() -> int:
+    """0 = off; else batches with at least this many tokens run the cold experts from VRAM staging."""
+    if os.environ.get("B70_MOE_COLD_PREFETCH", "0") != "1":
+        return 0
+    return max(64, int(os.environ.get("B70_MOE_COLD_PREFETCH_MIN_TOKENS", "512")))
+
+
+class _ColdPrefetcher:
+    """Two VRAM slots, each holding one layer's cold experts (kernel layout).
+
+    Large batches (prefill) run the cold experts from a slot instead of reading
+    pinned host memory through UVA: layer L computes from one slot while a
+    copy stream DMAs layer L+1's cold experts into the other. Events order the
+    two streams: a slot is refilled only after the GEMM that read it, and a
+    GEMM starts only after its slot's copy. The math is unchanged (same kernel,
+    same bytes); only where the kernel reads the weights from differs."""
+
+    def __init__(self) -> None:
+        self.bufs: list[dict[str, torch.Tensor]] | None = None
+        self.owner: list[int | None] = [None, None]
+        self.ready: list = [None, None]
+        self.free: list = [None, None]
+        self.last = 1
+        self.stream = None
+
+    def _ensure(self, plan: "HotColdPlan", device) -> None:
+        if self.bufs is not None:
+            return
+        self.bufs = [{k: torch.empty(t.shape, dtype=t.dtype, device=device)
+                      for k, t in plan.cold.items()} for _ in range(2)]
+        self.stream = torch.xpu.Stream(device)
+        gib = 2 * sum(t.numel() * t.element_size() for t in plan.cold.values()) / 2**30
+        logger.info("B70 hot/cold: cold prefetch on (batches >= %d tokens), 2 VRAM slots, %.2f GiB",
+                    cold_prefetch_min_tokens(), gib)
+
+    def _load(self, slot: int, plan: "HotColdPlan") -> None:
+        compute = torch.xpu.current_stream()
+        with torch.xpu.stream(self.stream):
+            if self.free[slot] is not None:
+                self.stream.wait_event(self.free[slot])
+            for key, src in plan.cold.items():
+                self.bufs[slot][key].copy_(src, non_blocking=True)
+            event = torch.xpu.Event()
+            event.record(self.stream)
+        self.ready[slot] = event
+        self.owner[slot] = plan.layer_idx
+        del compute
+
+    def acquire(self, plan: "HotColdPlan", device) -> dict[str, torch.Tensor]:
+        self._ensure(plan, device)
+        if plan.layer_idx in self.owner:
+            slot = self.owner.index(plan.layer_idx)
+        else:
+            slot = 1 - self.last
+            self._load(slot, plan)
+        torch.xpu.current_stream().wait_event(self.ready[slot])
+        self.last = slot
+        return self.bufs[slot]
+
+    def release_and_prefetch(self, plan: "HotColdPlan") -> None:
+        slot = self.last
+        event = torch.xpu.Event()
+        event.record(torch.xpu.current_stream())
+        self.free[slot] = event
+        keys = sorted(_PLANS)
+        nxt = _PLANS[keys[(keys.index(plan.layer_idx) + 1) % len(keys)]]
+        if nxt.layer_idx not in self.owner:
+            self._load(1 - slot, nxt)
+
+
+_PREFETCH = _ColdPrefetcher()
+
+
 def route_count_enabled() -> bool:
     return os.environ.get("B70_MOE_ROUTE_COUNT", "0") == "1"
 
@@ -263,6 +339,9 @@ class HotColdPlan:
             (cold_map if is_cold else hot_map)[self.local_to_global[local_id]] = slot
         self.hot_map = hot_map.to(device)
         self.cold_map = cold_map.to(device)
+        match = _LAYER_RE.search(self.layer_name)
+        self.layer_idx = int(match.group(1)) if match else len(_PLANS)
+        _PLANS[self.layer_idx] = self
         self.route_counts = None
         if route_count_enabled():
             # one bucket per global expert + one for negative (padding) ids
@@ -291,6 +370,23 @@ class HotColdPlan:
                         torch.xpu.memory_reserved(device) / 2**30, free / 2**30)
 
     # -- forward ---------------------------------------------------------------
+
+    def apply_cold(self, cold, output, hidden_states, topk_weights, topk_ids) -> None:
+        """The cold experts' share: UVA reads (decode, graphs) or a VRAM slot (large batches)."""
+        min_tokens = cold_prefetch_min_tokens()
+        if not min_tokens or hidden_states.shape[0] < min_tokens:
+            cold.apply(output=output, hidden_states=hidden_states,
+                       topk_weights=topk_weights, topk_ids=topk_ids)
+            return
+        import copy
+
+        buf = _PREFETCH.acquire(self, hidden_states.device)
+        staged = copy.copy(cold)
+        staged.w13, staged.w2 = buf["w13"].view(torch.int8), buf["w2"].view(torch.int8)
+        staged.gemm1_wei_scales, staged.gemm2_wei_scales = buf["w13_scales"], buf["w2_scales"]
+        staged.apply(output=output, hidden_states=hidden_states,
+                     topk_weights=topk_weights, topk_ids=topk_ids)
+        _PREFETCH.release_and_prefetch(self)
 
     def impls(self, w1, w1_scale, w2, w2_scale, topk, activation, extra):
         """(hot, cold) XpuFusedMoe, built on first use like the stock path."""
