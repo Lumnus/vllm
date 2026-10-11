@@ -89,8 +89,43 @@ class BaseModelLoader(ABC):
                 finalize_layerwise_processing(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)
+            _b70_maybe_embed_uva(model)
 
         return model.eval()
+
+
+def _b70_maybe_embed_uva(model: nn.Module) -> None:
+    """B70 0044: keep the input embedding table in pinned host RAM (B70_EMBED_UVA=1).
+
+    The lookup reads a few rows per token through a UVA view (a few KB over
+    PCIe), so the table's VRAM can hold more hot experts instead. Only the
+    target's embed_tokens moves; lm_head (a full GEMM over every row) and the
+    MTP draft's own copy (replaced by the target's when shared) stay put."""
+    import os
+
+    if os.environ.get("B70_EMBED_UVA", "0") != "1" or not current_platform.is_xpu():
+        return
+    if "MTP" in type(model).__name__:
+        return
+    from vllm.model_executor.layers.fused_moe.b70_hotcold import _ARENA
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+    from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+    for name, module in model.named_modules():
+        if (not isinstance(module, VocabParallelEmbedding) or isinstance(module, ParallelLMHead)
+                or not name.endswith("embed_tokens")):
+            continue
+        weight = module.weight
+        pinned = _ARENA.empty(weight.shape, weight.dtype)
+        pinned.copy_(weight.data)
+        weight.data = get_accelerator_view_from_cpu_tensor(pinned)
+        weight._vllm_is_uva_offloaded = True
+        torch.accelerator.empty_cache()
+        logger.info("B70 embed UVA: %s %s %s (%.2f GiB) now in pinned host RAM", name,
+                    tuple(weight.shape), weight.dtype, pinned.numel() * pinned.element_size() / 2**30)
 
 
 def log_model_inspection(model: nn.Module) -> None:
