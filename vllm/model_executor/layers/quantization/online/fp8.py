@@ -786,3 +786,34 @@ class Fp8PtpcOnlineMoEMethod(_Fp8OnlineMoEBase):
         )
 
         layer._already_called_process_weights_after_loading = True
+
+
+class B70XpuFp8W8A16OnlineLinearMethod(Fp8PtpcOnlineLinearMethod):
+    """B70 0045: per-output-channel FP8 weights quantized at load time, run by the
+    XPU weight-only kernel (fp8_gemm_w8a16); activations are not quantized."""
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        from vllm.model_executor.kernels.linear.scaled_mm.xpu import XPUW8A16FP8LinearKernel
+
+        OnlineLinearBase.create_weights(
+            self, layer, input_size_per_partition, output_partition_sizes, input_size,
+            output_size, params_dtype, **extra_weight_attrs,
+        )
+        self.fp8_linear = init_fp8_linear_kernel(
+            activation_quant_key=self.activation_quant_key,
+            weight_quant_key=self.weight_quant_key,
+            weight_shape=layer.weight.shape,
+            input_dtype=self.input_dtype,
+            out_dtype=self.out_dtype,
+            force_kernel=XPUW8A16FP8LinearKernel,
+            module_name=self.__class__.__name__,
+        )

@@ -328,7 +328,7 @@ class INCConfig(QuantizationConfig):
                     layer_name == prefix or layer_name == f"model.{prefix}"
                 ) and self.extra_config[layer_name].get("bits", 16) >= 16:
                     if isinstance(layer, (LinearBase, ParallelLMHead)):
-                        return UnquantizedLinearMethod()
+                        return _b70_dense_method(layer, prefix)
                     if isinstance(layer, RoutedExperts):
                         return UnquantizedFusedMoEMethod(layer.moe_config)
                     return None
@@ -336,7 +336,7 @@ class INCConfig(QuantizationConfig):
         layer_config = self.config_parser.resolve(layer, prefix)
         if not layer_config.quantized:
             if isinstance(layer, (LinearBase, ParallelLMHead)):
-                return UnquantizedLinearMethod()
+                return _b70_dense_method(layer, prefix)
             if isinstance(layer, RoutedExperts):
                 return UnquantizedFusedMoEMethod(layer.moe_config)
             return None
@@ -366,3 +366,24 @@ class INCConfig(QuantizationConfig):
         if is_auto_round_format:
             return cls.get_name()
         return None
+
+
+def _b70_dense_method(layer: torch.nn.Module, prefix: str):
+    """B70 0045: a 16-bit linear layer whose name matches B70_DENSE_FP8 (a regex) is
+    quantized at load time to FP8 E4M3 with one scale per output channel and run
+    by the XPU weight-only kernel (activations stay BF16). lm_head never."""
+    import os
+    import re
+
+    from vllm.platforms import current_platform
+
+    pattern = os.environ.get("B70_DENSE_FP8", "")
+    if (pattern and not isinstance(layer, ParallelLMHead) and re.search(pattern, prefix)
+            and current_platform.is_xpu()):
+        from vllm.model_executor.layers.quantization.online.fp8 import (
+            B70XpuFp8W8A16OnlineLinearMethod,
+        )
+
+        logger.info_once("B70 dense FP8: 16-bit linear layers matching %r run as FP8 W8A16", pattern)
+        return B70XpuFp8W8A16OnlineLinearMethod()
+    return UnquantizedLinearMethod()
