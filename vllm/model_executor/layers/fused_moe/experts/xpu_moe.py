@@ -431,8 +431,7 @@ class XPUExpertsWNA16(XPUExperts):
         hot.apply(output=output, hidden_states=hidden_states,
                   topk_weights=topk_weights, topk_ids=topk_ids)
         cold_out = torch.empty_like(output)
-        cold.apply(output=cold_out, hidden_states=hidden_states,
-                   topk_weights=topk_weights, topk_ids=topk_ids)
+        self.b70_hotcold.apply_cold(cold, cold_out, hidden_states, topk_weights, topk_ids)
         output.add_(cold_out)
         counts = self.b70_hotcold.route_counts
         if counts is not None:
