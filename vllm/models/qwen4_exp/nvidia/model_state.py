@@ -114,6 +114,12 @@ class Qwen4ExpModelState(MambaHybridModelState):
         req_states: RequestState,
     ) -> dict[str, Any]:
         model_inputs = super().prepare_inputs(input_batch, req_states)
+        # B70 0041 (0.32 port): hot/cold route counts, read on the host every B70_MOE_ROUTE_COUNT_S.
+        # Returns at once when no layer counts; its .cpu() syncs once per period (0.30 called it
+        # right after the NVMe PLE host sync, which 0.32 does not have in that form).
+        from vllm.model_executor.layers.fused_moe import b70_hotcold
+
+        b70_hotcold.maybe_dump_routes()
         if not self.uses_ngram_embedding:
             return model_inputs
 
