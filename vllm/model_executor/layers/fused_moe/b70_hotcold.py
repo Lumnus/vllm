@@ -184,6 +184,40 @@ def route_count_enabled() -> bool:
     return os.environ.get("B70_MOE_ROUTE_COUNT", "0") in ("1", "prefill") or swap_enabled()
 
 
+_TRACE = {"f": None, "last": None, "steps": 0}
+
+
+def maybe_trace_routes() -> None:
+    """B70_MOE_ROUTE_TRACE=<path>: one JSON line per decode step with the experts each
+    layer's decode graph routed to in that step (needs B70_MOE_ROUTE_COUNT=1). Measurement only."""
+    path = os.environ.get("B70_MOE_ROUTE_TRACE", "")
+    if not path or not _COUNTED or not _COUNTED[0].count_graphs:
+        return
+    import numpy as np
+
+    counts = np.stack([p.route_counts[1, :-1].cpu().numpy() for p in _COUNTED])
+    if _TRACE["f"] is None:
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+            rank = get_tensor_model_parallel_rank()
+        except Exception:
+            rank = 0
+        _TRACE["f"] = open(f"{path}-rank{rank}.jsonl", "w")
+        cold = {str(p.layer_idx): np.nonzero(p.cold_map.cpu().numpy() >= 0)[0].tolist() for p in _COUNTED}
+        _TRACE["f"].write(json.dumps({"cold": cold}) + "\n")
+        _TRACE["last"] = counts
+        return
+    delta = counts - _TRACE["last"]
+    _TRACE["last"] = counts
+    if delta.sum() == 0:
+        return
+    step = {str(p.layer_idx): np.nonzero(delta[i])[0].tolist() for i, p in enumerate(_COUNTED)}
+    _TRACE["f"].write(json.dumps(step) + "\n")
+    _TRACE["steps"] += 1
+    if _TRACE["steps"] % 200 == 0:
+        _TRACE["f"].flush()
+
+
 def maybe_dump_routes() -> None:
     """Log the cold share of routes and write the cumulative counts (every
     B70_MOE_ROUTE_COUNT_S seconds). Called by the runner on the host right
