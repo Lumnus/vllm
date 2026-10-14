@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any
@@ -238,6 +239,18 @@ def warmup_kernels(
         rejection_sampler.enable_adaptive_verification = False
     try:
         _warmup_kernels(model_runner, worker_execute_model, worker_sample_tokens)
+        # All PP ranks must run the same forwards to match sends and receives.
+        # B70-V6x: the greedy round is opt-in (B70_SPEC_GREEDY_WARMUP=1); the
+        # env is process-wide, so every PP rank takes the same branch.
+        if (
+            model_runner.speculative_config is not None
+            and os.environ.get("B70_SPEC_GREEDY_WARMUP", "0") == "1"
+        ):
+            # Greedy batches skip logits processing, so rejection kernels
+            # also see model-dtype logits instead of FP32.
+            _warmup_kernels(
+                model_runner, worker_execute_model, worker_sample_tokens, greedy=True
+            )
     finally:
         model_runner.adaptive_verification = adaptive_verification
         if adaptive_sampling:
@@ -256,6 +269,7 @@ def _warmup_kernels(
     model_runner: GPUModelRunner,
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
+    greedy: bool = False,
 ) -> None:
     if model_runner.vllm_config.is_mm_encoder_only:
         return
@@ -328,7 +342,11 @@ def _warmup_kernels(
         pooling_params = PoolingParams(task=pooling_task)
         pooling_params.verify(model_runner.model_config)
     else:
-        sampling_params = SamplingParams.for_sampler_warmup()
+        sampling_params = (
+            SamplingParams(temperature=0)
+            if greedy
+            else SamplingParams.for_sampler_warmup()
+        )
         pooling_params = None
 
     # Assign distinct block IDs per request per group. 0 null block, start from 1.
