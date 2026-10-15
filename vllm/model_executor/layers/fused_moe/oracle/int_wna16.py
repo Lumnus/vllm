@@ -206,6 +206,12 @@ def _backend_incompatibility_reason(
     from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
     from vllm.model_executor.layers.quantization.moe_wna16 import MoeWNA16Config
 
+    if backend == WNA16MoEBackend.XPU:
+        if may_have_zp:
+            return "zero points are not supported (kernel assumes uint4b8)"
+        if isinstance(quant_config, AutoAWQConfig):
+            return "the AWQ (N-packed) weight layout is not repacked for XPU"
+
     if backend == WNA16MoEBackend.ZEN_CPU:
         if not envs.VLLM_CPU_INT4_W4A8:
             return "VLLM_CPU_INT4_W4A8=0 disables the dynamic-activation path"
