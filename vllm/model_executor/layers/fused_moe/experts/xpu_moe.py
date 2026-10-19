@@ -336,9 +336,10 @@ class XPUExpertsWNA16(XPUExperts):
             # eager counting starts with the first real batch: the memory-profiling run must not pay for it
             if (graph and self.b70_hotcold.count_graphs) or (not graph and _hc._LIVE["on"]):
                 row = counts[1 if graph else 0]
-                ids = topk_ids.reshape(-1).long()
-                ids = torch.where(ids >= 0, ids, row.shape[0] - 1)
-                row.index_add_(0, ids, torch.ones_like(ids))
+                # two kernels (inside the decode graphs too): negative (padding) ids land in the last
+                # bucket via remainder, and the ones come from a shared static buffer
+                ids = topk_ids.reshape(-1).remainder(row.shape[0])
+                row.index_add_(0, ids, _hc.route_ones(ids.numel(), row.device))
 
 
 class XPUExpertsMxFp4(XPUExperts):
