@@ -469,7 +469,50 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
     def compute_logits(
         self, hidden_states: torch.Tensor, spec_step_idx: int = 0
     ) -> torch.Tensor | None:
+        head8 = getattr(self, "_b70_head8", None)
+        if head8 is None and not getattr(self, "_b70_head8_done", False):
+            # Lazily, on the first (eager: profile / warm-up) call: by then the proposer has shared the target's head.
+            self._b70_head8_done = True
+            self._b70_prepare_draft_head()
+            head8 = getattr(self, "_b70_head8", None)
+        if head8 is not None:
+            return self.logits_processor(head8.bind(self.lm_head), hidden_states)
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def _b70_prepare_draft_head(self) -> None:
+        """B70 0048: an FP8 (E4M3, one scale per vocab row) copy of this rank's lm_head shard for the draft passes.
+
+        The draft head only proposes tokens; the target verifies every one with its own BF16 head, so outputs are
+        unchanged and only the acceptance rate can move. At decode the head is a pure weight stream (635 MB per card
+        and pass in BF16); fp8_gemm_w8a16 reads half of it at ~93 % of the B70's bandwidth (1.08 -> 0.56 ms per pass).
+        Built on the first compute_logits call, which is the eager memory-profile run (after the proposer shared the
+        target's head), so the KV size accounts for the extra ~320 MB per card."""
+        import os
+
+        from vllm.logger import init_logger
+        from vllm.platforms import current_platform
+
+        logger = init_logger(__name__)
+
+        if os.environ.get("B70_DRAFT_HEAD_FP8", "0") != "1" or not current_platform.is_xpu():
+            return
+        weight = getattr(getattr(self, "lm_head", None), "weight", None)
+        if weight is None or weight.dim() != 2 or weight.dtype != torch.bfloat16:
+            logger.warning("B70 draft head FP8: no BF16 lm_head weight on the draft; off")
+            return
+        rows, k = weight.shape
+        w8 = torch.empty((k, rows), dtype=torch.float8_e4m3fn, device=weight.device)
+        scale = torch.empty((1, rows), dtype=torch.float32, device=weight.device)
+        step = 8192
+        for i in range(0, rows, step):
+            chunk = weight[i : i + step].float()
+            s = chunk.abs().amax(dim=1).clamp(min=1e-12) / 448.0
+            w8[:, i : i + step] = (chunk / s[:, None]).t().to(torch.float8_e4m3fn)
+            scale[0, i : i + step] = s
+            del chunk
+        self._b70_head8 = _B70Fp8Head(w8, scale)
+        logger.info("B70 draft head FP8: %d x %d vocab shard as FP8 W8A16 for the draft passes (%.0f MB)",
+                    rows, k, w8.numel() / 1e6)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
@@ -488,6 +531,28 @@ class Qwen4ExpMTP(nn.Module, SupportsHCSP, SupportsPP, Qwen4ExpMixtureOfExperts)
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(remap_weight_names(), mapper=mapper)
+
+
+class _B70Fp8Head:
+    """B70 0048: what LogitsProcessor needs of an lm_head (tp_size, shard_indices, quant_method.apply), backed by
+    an FP8 W8A16 copy of the vocab shard."""
+
+    def __init__(self, w8: torch.Tensor, scale: torch.Tensor) -> None:
+        self.w8, self.scale = w8, scale
+        self.quant_method = self
+        self.tp_size = 1
+        self.shard_indices = None
+
+    def bind(self, head) -> "_B70Fp8Head":
+        self.tp_size, self.shard_indices = head.tp_size, head.shard_indices
+        return self
+
+    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        shape = x.shape
+        out = torch.ops._xpu_C.fp8_gemm_w8a16(x.reshape(-1, shape[-1]), self.w8, self.scale, None)
+        if bias is not None:
+            out = out + bias
+        return out.reshape(*shape[:-1], -1)
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]
