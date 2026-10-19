@@ -223,6 +223,29 @@ def route_count_enabled() -> bool:
     return os.environ.get("B70_MOE_ROUTE_COUNT", "0") in ("1", "prefill") or swap_enabled()
 
 
+_DECODE_OP = {"max_rows": None}
+
+
+def decode_op_max_rows() -> int:
+    """B70 0048: B70_MOE_DECODE_OP=<path to libb70_moe_decode.so> (or 1 = the image's copy) runs batches of at most
+    B70_MOE_DECODE_OP_MAX_ROWS (default 16) tokens through one fused hot+cold kernel set instead of two stock
+    XpuFusedMoe calls; 0 = off (no library loaded)."""
+    rows = _DECODE_OP["max_rows"]
+    if rows is None:
+        rows, lib = 0, os.environ.get("B70_MOE_DECODE_OP", "0")
+        if lib not in ("", "0"):
+            if lib == "1":
+                lib = os.path.join(os.path.dirname(__file__), "libb70_moe_decode.so")
+            try:
+                torch.ops.load_library(lib)
+                rows = min(16, int(os.environ.get("B70_MOE_DECODE_OP_MAX_ROWS", "16")))
+                logger.info("B70 decode op: %s, batches of <= %d tokens", lib, rows)
+            except (OSError, RuntimeError) as e:
+                logger.warning("B70 decode op: cannot load %s (%s); stock path", lib, e)
+        _DECODE_OP["max_rows"] = rows
+    return rows
+
+
 _ONES: dict = {}  # device -> static int64 ones for the route counter (allocated at load time)
 _ONES_N = 1 << 16
 
@@ -587,6 +610,7 @@ class HotColdPlan:
         self.hot_map: torch.Tensor | None = None
         self.cold_map: torch.Tensor | None = None
         self._impls = None
+        self._decode_args = None
 
     @property
     def num_hot(self) -> int:
@@ -708,6 +732,29 @@ class HotColdPlan:
         staged.apply(output=output, hidden_states=hidden_states,
                      topk_weights=topk_weights, topk_ids=topk_ids)
         _PREFETCH.release_and_prefetch(self)
+
+    def apply_decode_op(self, output, hidden_states, topk_weights, topk_ids) -> bool:
+        """B70 0048: small batches through the fused hot+cold decode op (b70moe.moe_decode); False = not taken."""
+        if hidden_states.shape[0] > decode_op_max_rows() or hidden_states.dtype != torch.bfloat16:
+            return False
+        args = self._decode_args
+        if args is False:
+            return False
+        if args is None:
+            hot, cold = self._impls
+            args = (self.hot_map, self.cold_map,
+                    hot.w13, hot.gemm1_wei_scales, hot.w2, hot.gemm2_wei_scales,
+                    cold.w13, cold.gemm1_wei_scales, cold.w2, cold.gemm2_wei_scales)
+            if any(t is None or not t.is_contiguous() for t in args) or any(
+                    t.dtype != torch.bfloat16 for t in args[3::2]):
+                logger.warning("B70 decode op: %s: unexpected weight layout; stock path", self.layer_name)
+                self._decode_args = False
+                return False
+            self._decode_args = args
+        ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+        torch.ops.b70moe.moe_decode(output, hidden_states.contiguous(), topk_weights.contiguous(),
+                                    ids.contiguous(), *args)
+        return True
 
     def impls(self, w1, w1_scale, w2, w2_scale, topk, activation, extra):
         """(hot, cold) XpuFusedMoe, built on first use like the stock path."""

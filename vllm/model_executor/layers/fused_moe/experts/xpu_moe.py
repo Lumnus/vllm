@@ -322,11 +322,13 @@ class XPUExpertsWNA16(XPUExperts):
             w1, self.w1_scale, w2, self.w2_scale, topk_ids.size(-1),
             activation.value, {"gemm1_clamp_limit": self.gemm1_clamp_limit},
         )
-        hot.apply(output=output, hidden_states=hidden_states,
-                  topk_weights=topk_weights, topk_ids=topk_ids)
-        cold_out = torch.empty_like(output)
-        self.b70_hotcold.apply_cold(cold, cold_out, hidden_states, topk_weights, topk_ids)
-        output.add_(cold_out)
+        if not (activation.value == "silu" and self.gemm1_clamp_limit is None
+                and self.b70_hotcold.apply_decode_op(output, hidden_states, topk_weights, topk_ids)):
+            hot.apply(output=output, hidden_states=hidden_states,
+                      topk_weights=topk_weights, topk_ids=topk_ids)
+            cold_out = torch.empty_like(output)
+            self.b70_hotcold.apply_cold(cold, cold_out, hidden_states, topk_weights, topk_ids)
+            output.add_(cold_out)
         counts = self.b70_hotcold.route_counts
         if counts is not None:
             # row 0: eager batches (prefill, mixed); row 1: captured graphs (decode)
