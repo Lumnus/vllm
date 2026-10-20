@@ -702,6 +702,7 @@ class Qwen4ExpForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        self._b70_head_fp8_once()
         # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
         # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
         return self.model(
@@ -839,7 +840,50 @@ class Qwen4ExpForCausalLM(
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        self._b70_head_fp8_once()
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def _b70_head_fp8_once(self) -> None:
+        """B70 0053: run _b70_prepare_head_fp8 once, at the first forward (or compute_logits) call.
+
+        That is the eager memory-profile run, after load_model (the drafter has shared this head by then) and before
+        any activation: released there, the BF16 shard leaves both the profile's consumed memory and its torch peak
+        (released inside compute_logits it would still count in the peak, i.e. no KV gain)."""
+        if not getattr(self, "_b70_head_fp8_checked", False):
+            self._b70_head_fp8_checked = True
+            self._b70_prepare_head_fp8()
+
+    def _b70_prepare_head_fp8(self) -> None:
+        """B70 0053 (B70_HEAD_FP8=1): the target's lm_head shard runs as FP8 W8A16 and its BF16 weight is released.
+
+        The FP8 copy is 0048's (E4M3, one scale per vocab row, fp8_gemm_w8a16), shared with the MTP draft through
+        the shared head module, so the draft's own copy is not built twice. Saves the BF16 shard (0.59 GiB per card
+        at TP 2) and ~0.5 ms per verify pass (1.07 -> 0.55 ms at 1-4 rows). Changes the target's logits (rel L2
+        ~2.5e-2 per GEMM): a quality-gated switch, off by default."""
+        import os
+
+        from vllm.logger import init_logger
+        from vllm.platforms import current_platform
+
+        if os.environ.get("B70_HEAD_FP8", "0") != "1" or not current_platform.is_xpu():
+            return
+        from .mtp import b70_fp8_head_of
+
+        logger = init_logger(__name__)
+        head = self.lm_head
+        weight = head.weight
+        released = weight.numel() * weight.element_size()
+        alloc0 = torch.accelerator.memory_allocated(weight.device)
+        head8 = b70_fp8_head_of(head, release_bf16=True)
+        if head8 is None:
+            logger.warning("B70 head FP8: no BF16 lm_head weight; off")
+            return
+        head.quant_method = head8
+        alloc1 = torch.accelerator.memory_allocated(weight.device)
+        logger.info("B70 head FP8: target lm_head %d x %d as FP8 W8A16 (%.0f MB), BF16 shard released (%.0f MB); "
+                    "torch allocated %.2f -> %.2f GiB",
+                    head8.w8.shape[1], head8.w8.shape[0], head8.w8.numel() / 1e6, released / 1e6,
+                    alloc0 / 2**30, alloc1 / 2**30)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.model._mtp_hidden_buffer
@@ -1033,6 +1077,7 @@ class Qwen4ExpForConditionalGeneration(
         else:
             deepstack_input_embeds = None
 
+        self.language_model._b70_head_fp8_once()
         hidden_states = self.language_model.model(
             input_ids=input_ids,
             positions=positions,

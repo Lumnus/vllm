@@ -469,23 +469,16 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
 
         if os.environ.get("B70_DRAFT_HEAD_FP8", "0") != "1" or not current_platform.is_xpu():
             return
-        weight = getattr(getattr(self, "lm_head", None), "weight", None)
-        if weight is None or weight.dim() != 2 or weight.dtype != torch.bfloat16:
+        head = getattr(self, "lm_head", None)
+        shared = getattr(head, "_b70_fp8_head", None) is not None
+        head8 = b70_fp8_head_of(head) if head is not None else None
+        if head8 is None:
             logger.warning("B70 draft head FP8: no BF16 lm_head weight on the draft; off")
             return
-        rows, k = weight.shape
-        w8 = torch.empty((k, rows), dtype=torch.float8_e4m3fn, device=weight.device)
-        scale = torch.empty((1, rows), dtype=torch.float32, device=weight.device)
-        step = 8192
-        for i in range(0, rows, step):
-            chunk = weight[i : i + step].float()
-            s = chunk.abs().amax(dim=1).clamp(min=1e-12) / 448.0
-            w8[:, i : i + step] = (chunk / s[:, None]).t().to(torch.float8_e4m3fn)
-            scale[0, i : i + step] = s
-            del chunk
-        self._b70_head8 = _B70Fp8Head(w8, scale)
-        logger.info("B70 draft head FP8: %d x %d vocab shard as FP8 W8A16 for the draft passes (%.0f MB)",
-                    rows, k, w8.numel() / 1e6)
+        self._b70_head8 = head8
+        rows, k = head8.w8.shape[1], head8.w8.shape[0]
+        logger.info("B70 draft head FP8: %d x %d vocab shard as FP8 W8A16 for the draft passes (%.0f MB%s)",
+                    rows, k, head8.w8.numel() / 1e6, ", the target's (0053)" if shared else "")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         def remap_weight_names():
@@ -526,6 +519,42 @@ class _B70Fp8Head:
         if bias is not None:
             out = out + bias
         return out.reshape(*shape[:-1], -1)
+
+
+def b70_fp8_head_of(lm_head, release_bf16: bool = False) -> "_B70Fp8Head | None":
+    """B70 0048/0053: the FP8 (E4M3, one scale per vocab row) copy of an lm_head shard.
+
+    Built once per head module and cached on it (``lm_head._b70_fp8_head``), so the target (0053, B70_HEAD_FP8) and
+    the draft (0048, B70_DRAFT_HEAD_FP8), which share the module, share one copy whichever asks first. None when the
+    module has no BF16 weight. release_bf16 (0053): the BF16 weight is moved to host memory and released on the
+    device before the FP8 copy is built, so the two never coexist in VRAM (no extra torch peak during the
+    memory-profile run, which vLLM would otherwise reserve as activation memory)."""
+    head8 = getattr(lm_head, "_b70_fp8_head", None)
+    weight = getattr(lm_head, "weight", None)
+    if head8 is None:
+        if weight is None or weight.dim() != 2 or weight.dtype != torch.bfloat16 or weight.numel() == 0:
+            return None
+        rows, k = weight.shape
+        device = weight.device
+        src = weight.data
+        if release_bf16:
+            src = weight.data.to("cpu")
+            weight.data = torch.empty((0, k), dtype=weight.dtype, device=device)
+        w8 = torch.empty((k, rows), dtype=torch.float8_e4m3fn, device=device)
+        scale = torch.empty((1, rows), dtype=torch.float32, device=device)
+        step = 8192
+        for i in range(0, rows, step):
+            chunk = src[i : i + step].to(device).float()
+            s = chunk.abs().amax(dim=1).clamp(min=1e-12) / 448.0
+            w8[:, i : i + step] = (chunk / s[:, None]).t().to(torch.float8_e4m3fn)
+            scale[0, i : i + step] = s
+            del chunk
+        del src
+        head8 = _B70Fp8Head(w8, scale)
+        lm_head._b70_fp8_head = head8
+    if release_bf16 and weight is not None and weight.numel() != 0:
+        weight.data = torch.empty((0, weight.shape[1]), dtype=weight.dtype, device=weight.device)
+    return head8
 
 
 __all__ = ["Qwen4ExpMTP", "Qwen4ExpMultiTokenPredictor"]
