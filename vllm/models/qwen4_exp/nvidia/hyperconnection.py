@@ -22,6 +22,8 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -76,6 +78,18 @@ def _is_xpu() -> bool:
 # ---------------------------------------------------------------------------
 _HC_KSPLIT_MAX_STOCK_WIDTH = 64
 _HC_KSPLIT_WIDTHS_LOGGED: set[int] = set()
+
+
+def _hc_ksplit_views() -> bool:
+    """B70 0052 gate: K-halves as strided views of the one down weight.
+
+    Default ON. The halves W[:, :K] and W[:, K:] (row stride 2K) give results
+    bitwise equal to contiguous copies of them at every prefill width, also
+    graph-replayed, with no hidden copy (oneDNN takes the leading dimension),
+    so the second copy of every HC down weight (0.68 GiB per card) is dropped.
+    0 = the contiguous copies of 0003.
+    """
+    return os.environ.get("B70_HC_KSPLIT_VIEWS", "1") != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -194,13 +208,20 @@ class GatedResidual(nn.Module):
             )
             return
         self._kdown_k = weight.shape[1] // 2
-        self._kdown_lo = weight.data[:, : self._kdown_k].contiguous()
-        self._kdown_hi = weight.data[:, self._kdown_k :].contiguous()
+        views = _hc_ksplit_views()
+        lo = weight.data[:, : self._kdown_k]
+        hi = weight.data[:, self._kdown_k :]
+        # Views share the weight's storage; if the weight is later replaced
+        # (VLLM_XPU_FORCE_N_CONTIG_WEIGHT), they keep the old storage alive:
+        # still correct, just no saving.
+        self._kdown_lo = lo if views else lo.contiguous()
+        self._kdown_hi = hi if views else hi.contiguous()
         logger.debug(
-            "HC down GEMM: K-split halves prepared (K=%d -> 2x%d, N=%d)",
+            "HC down GEMM: K-split halves prepared (K=%d -> 2x%d, N=%d, %s)",
             weight.shape[1],
             self._kdown_k,
             weight.shape[0],
+            "views of the weight" if views else "contiguous copies",
         )
 
     def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
