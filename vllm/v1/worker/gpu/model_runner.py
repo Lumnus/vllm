@@ -2041,7 +2041,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+                    from vllm.models.qwen4_exp.nvidia import c1_verify
+
+                    if c1_verify.enabled(self, input_batch):
+                        model_output = c1_verify.verify(
+                            self, input_batch, attn_metadata, model_inputs
+                        )
+                    else:
+                        model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
 

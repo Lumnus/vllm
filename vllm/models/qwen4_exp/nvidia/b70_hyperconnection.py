@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -68,8 +69,9 @@ def _is_xpu() -> bool:
 # (M in {64, 128, 256}; 0/512 flips at M=256). See
 # docs/HC_DOWN_GEMM_FIX_RECON.md for the offline campaign.
 #
-# Widths <= 64 keep the stock single GEMM (bitwise-clean there, and decode
-# graphs never exceed 8 rows, so M1 FULL decode keeps stock numerics).
+# The v0.32 Torch 2.14 BF16 path also changes valid outputs at M=1.
+# DFlash2 therefore uses an explicitly ordered projection at every width.
+# The legacy target-only split policy below remains unchanged.
 # CUDA is untouched: the halves are prepared only on XPU
 # (UnquantizedLinearMethod.process_weights_after_loading calls the
 # ``hc_ksplit_prepare`` marker set below), so the split branch is never
@@ -110,6 +112,19 @@ class GatedResidual(nn.Module):
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.use_combine = use_combine
+        spec = get_current_vllm_config().speculative_config
+        self._ordered_hc = (
+            spec is not None
+            and spec.method == "dflash"
+            and spec.draft_model_config.architectures == ["DFlash2DraftModel"]
+            and config.params_dtype == torch.bfloat16
+            and _is_xpu()
+        )
+        if self._ordered_hc:
+            logger.info_once(
+                "DFlash2 target HC uses fixed-order BF16 down projection "
+                "with FP32 accumulation"
+            )
 
         norm_size = (
             self.hyper_hidden_size if config.hc_per_branch_norm else config.hidden_size
@@ -178,7 +193,7 @@ class GatedResidual(nn.Module):
 
     def _prepare_kdown_ksplit(self) -> None:
         """One-time contiguous K-half prep for the deterministic XPU split."""
-        if self._kdown_lo is not None:
+        if self._ordered_hc or self._kdown_lo is not None:
             return
         down_linear = (
             self.input_mix_weight_down_block_inject
@@ -204,14 +219,17 @@ class GatedResidual(nn.Module):
         )
 
     def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
-        """Down projection; width-gated deterministic K-split on XPU.
+        """Use ordered DFlash2 projection or the legacy target-only policy."""
+        if self._ordered_hc:
+            from .b70_hc_gemm import ordered_hc_gemm
 
-        Row widths <= 64 (all decode graphs) keep the stock single GEMM,
-        which is bitwise-clean there. Wider rows (prefill chunks) take the
-        two-GEMM split over the contiguous K-halves. The branch conditions
-        are shape/attribute reads only, so stream capture bakes the correct
-        arm per graph and replays deterministically.
-        """
+            linear = (
+                self.input_mix_weight_down_block_inject
+                if self.use_combine
+                else self.input_mix_weight_down
+            )
+            valid = self.lora_rank + (self.hc_count if self.use_combine else 0)
+            return ordered_hc_gemm(xn, linear.weight, valid)
         if (
             self._kdown_lo is not None
             and _is_xpu()
@@ -222,7 +240,7 @@ class GatedResidual(nn.Module):
                 _HC_KSPLIT_WIDTHS_LOGGED.add(width)
                 logger.info(
                     "HC down GEMM: deterministic K-split engaged at row width "
-                    "%d (stock single GEMM kept for widths <= %d)",
+                    "%d (stock single GEMM only at widths <= %d)",
                     width,
                     _HC_KSPLIT_MAX_STOCK_WIDTH,
                 )

@@ -948,10 +948,26 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
         if multimodal_config is not None and multimodal_config.language_model_only:
             _strip_qwen4_exp_mrope(vllm_config.model_config)
         spec_config = vllm_config.speculative_config
+        if spec_config is not None and spec_config.method == "dflash":
+            draft = spec_config.draft_model_config.hf_config
+            if (
+                draft.architectures != ["DFlash2DraftModel"]
+                or draft.dflash_config.get("target_layer_ids") != [5, 15, 25, 35, 45]
+                or draft.hidden_size != text_config.hidden_size
+                or draft.vocab_size != text_config.vocab_size
+                or text_config.hc_count != 4
+                or text_config.num_hidden_layers != 48
+                or spec_config.num_speculative_tokens != 3
+            ):
+                raise NotImplementedError(
+                    "Qwen4Exp DFlash2 requires the five-layer HC4 Flash-Next "
+                    "feature contract and three proposals"
+                )
         if spec_config is not None and spec_config.method not in {
             "mtp",
             "ngram",
             "ngram_gpu",
+            "dflash",
         }:
             raise NotImplementedError(
                 "Qwen4Exp speculative decoding supports only its native MTP "

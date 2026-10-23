@@ -46,11 +46,29 @@ def _validate_disk_bf16_config(embedding_method, params_dtype, max_total_tokens)
         or p.decode_context_parallel_size != 1
         or p.prefill_context_parallel_size != 1
         or s.max_num_seqs != 4
-        or config.speculative_config is not None
     ):
         raise ValueError(
-            "Phase 1 Disk PLE requires target-only BF16 TP4+EP/PP1/DP1, four slots"
+            "Disk PLE requires BF16 TP4+EP/PP1/DP1, four slots"
         )
+    spec = config.speculative_config
+    if spec is not None:
+        draft = spec.draft_model_config
+        if (
+            spec.method != "dflash"
+            or draft.architectures != ["DFlash2DraftModel"]
+            or draft.dtype != torch.bfloat16
+            or draft.quantization is not None
+            or spec.draft_parallel_config.tensor_parallel_size != 4
+            or spec.num_speculative_tokens != 3
+            or spec.draft_sample_method != "probabilistic"
+            or spec.rejection_sample_method != "standard"
+            or spec.uses_dynamic_speculative_decoding()
+            or spec.enable_adaptive_verification
+        ):
+            raise ValueError(
+                "Disk PLE speculation requires BF16 TP4 DFlash2, three fixed "
+                "proposals, conditional probabilistic drafting and standard rejection"
+            )
     if any(
         os.environ.get(n) == "1"
         for n in (
