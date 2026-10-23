@@ -32,6 +32,11 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+import os as _b70_os
+
+_B70_SKIP_PARTIAL_PREFILL = _b70_os.environ.get("B70_DFLASH2_SKIP_PARTIAL_PREFILL", "0") == "1"
+
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -425,6 +430,28 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.context_positions[:num_target_tokens],
             context_slots,
         )
+
+        # B70-0058 (port of wu1ff/B70-LLM-Controller 1.0.5 prefill-serving.patch; Copyright (c) 2026 wu1ff, MIT, see LICENSES/wu1ff-B70-LLM-Controller-MIT.txt): when every request in
+        # the step is an unfinished prompt chunk, no draft from this step can be verified. Keep every context
+        # K/V write above (the next step's queries attend to it) and skip the draft forward.
+        # B70_DFLASH2_SKIP_PARTIAL_PREFILL=1 turns it on; unset/0 = upstream.
+        if (
+            _B70_SKIP_PARTIAL_PREFILL
+            and not dummy_run
+            and self.dp_size == 1
+            and self._speculator_name == "DFlash2"
+            and input_batch.has_prefill
+            and bool(input_batch.is_prefilling_np[:num_reqs].all())
+            and bool(
+                (
+                    input_batch.num_computed_prefill_tokens_np[:num_reqs]
+                    + input_batch.num_scheduled_tokens[:num_reqs]
+                    < input_batch.prefill_len_np[:num_reqs]
+                ).all()
+            )
+        ):
+            self.draft_tokens[:num_reqs].fill_(-1)
+            return self.draft_tokens[:num_reqs]
 
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
