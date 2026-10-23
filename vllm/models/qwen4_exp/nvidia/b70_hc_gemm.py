@@ -2,10 +2,13 @@
 """Fixed-order BF16 HC down projection with FP32 accumulation."""
 
 import os
+from pathlib import Path
 
 import torch
 
 from vllm.triton_utils import tl, triton
+
+_large_hc = None
 
 
 @triton.jit(do_not_specialize=["M"])
@@ -50,10 +53,31 @@ def _ordered_hc_gemm(
 
 
 def ordered_hc_gemm(x, weight, valid_columns):
+    global _large_hc
     assert x.dtype == weight.dtype == torch.bfloat16
     rows, inner = x.shape
     columns = weight.shape[0]
     assert inner == weight.shape[1] and 0 < valid_columns <= columns
+    if (
+        256 < rows <= 1024
+        and inner == 10240
+        and columns in (320, 336)
+        and valid_columns == (324 if columns == 336 else 320)
+        and x.device.type == "xpu"
+        and x.is_contiguous()
+        and weight.is_contiguous()
+    ):
+        # Block loads and DPAS consume the existing BF16 checkpoint layout.
+        # The native FP32 accumulation matches the ordered projection exactly;
+        # neither a transposed weight copy nor padded token rows are needed.
+        if _large_hc is None:
+            import vllm_xpu_kernels
+
+            torch.ops.load_library(str(
+                Path(vllm_xpu_kernels.__file__).with_name("liblong_hc.so")
+            ))
+            _large_hc = torch.ops.long_hc.forward
+        return _large_hc(x, weight, valid_columns, 1)
     if (
         (1 <= rows <= 8 or (9 <= rows <= 32 and inner == 10240))
         and x.stride(1) == weight.stride(1) == 1
