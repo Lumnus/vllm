@@ -49,6 +49,26 @@ def prepare_fp8_moe_layer_for_xpu(
     )
 
 
+def b70_resident_maps(n_local, kernel_map, vllm_map, device):
+    """B70-0054: (hot_map, cold_map) for b70moe.moe_decode on the all-resident MoE, or a reason string.
+
+    hot_map [E_global] int32 = the stock kernel's expert map (global id -> local slot, -1 = another rank), or
+    arange(n_local) without EP; cold_map = all -1. Refuses when vLLM's own expert_map (if passed) differs from the
+    kernel's, or when the map does not name exactly n_local local experts with slots 0..n_local-1."""
+    hot_map = kernel_map
+    if hot_map is None:  # no EP: global id == local slot
+        hot_map = torch.arange(n_local, dtype=torch.int32, device=device)
+    hot_map = hot_map.to(torch.int32).contiguous()
+    if vllm_map is not None and (vllm_map.numel() != hot_map.numel() or not torch.equal(
+            vllm_map.to(device=hot_map.device, dtype=torch.int32), hot_map)):
+        return "vLLM's expert_map differs from the stock kernel's"
+    local = hot_map[hot_map >= 0]
+    if local.numel() != n_local or not torch.equal(
+            torch.sort(local).values.cpu(), torch.arange(n_local, dtype=torch.int32)):
+        return f"expert map names {local.numel()} local slots, kernel has {n_local}"
+    return hot_map, torch.full_like(hot_map, -1)
+
+
 class XPUExperts(mk.FusedMoEExpertsModular):
     def __init__(
         self,
@@ -179,6 +199,10 @@ class XPUExperts(mk.FusedMoEExpertsModular):
                 gemm1_clamp_limit=self.gemm1_clamp_limit,
             )
         assert self.fused_moe_impl is not None
+        if self._b70_resident_decode_op(
+            output, hidden_states, topk_weights, topk_ids, activation, expert_map
+        ):
+            return
         self.fused_moe_impl.apply(
             output=output,
             hidden_states=hidden_states,
@@ -186,6 +210,90 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             topk_ids=topk_ids,
             a1q_scale=a1q_scale,
         )
+
+    # B70-0054: None = not decided yet, False = stock path, tuple = the op's weight arguments
+    _b70_decode_args = None
+
+    def _b70_resident_decode_op(
+        self, output, hidden_states, topk_weights, topk_ids, activation, expert_map
+    ) -> bool:
+        """B70-0054 (B70_MOE_DECODE_OP_RESIDENT=1 + B70_MOE_DECODE_OP): decode-sized batches of the ordinary,
+        all-in-VRAM int4 MoE (no hot/cold split, any EP size) through 0048's fused op, b70moe.moe_decode, instead of
+        one XpuFusedMoe call. Every local expert is "hot": hot_map = the stock kernel's own expert map (global id ->
+        local slot, -1 = another rank), cold_map = all -1, so the op's cold path never runs and the cold weight
+        arguments (the hot tensors again) are never read. Decided once, on the first eager call (the memory-profile
+        run); anything unexpected keeps the stock path with one log line. False = not taken."""
+        args = self._b70_decode_args
+        if args is False:
+            return False
+        if args is None:
+            if torch.xpu.is_current_stream_capturing():
+                return False  # never decide inside a capture (the eager profile run comes first)
+            args = self._b70_resident_setup(activation, expert_map)
+            self._b70_decode_args = args
+            if args is False:
+                return False
+        from vllm.model_executor.layers.fused_moe import b70_hotcold as _hc
+
+        m = hidden_states.shape[0]
+        if (m == 0 or m > _hc.decode_op_max_rows() or m * topk_ids.size(-1) > 256
+                or hidden_states.dtype != torch.bfloat16 or output.dtype != torch.bfloat16
+                or not output.is_contiguous()):
+            return False
+        ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+        torch.ops.b70moe.moe_decode(output, hidden_states.contiguous(), topk_weights.contiguous(),
+                                    ids.contiguous(), *args)
+        return True
+
+    def _b70_resident_setup(self, activation, expert_map):
+        import os
+
+        from vllm.logger import init_logger
+        from vllm.model_executor.layers.fused_moe import b70_hotcold as _hc
+
+        logger = init_logger(__name__)
+        if os.environ.get("B70_MOE_DECODE_OP_RESIDENT", "0") != "1":
+            return False
+        name = type(self).__name__
+        impl = self.fused_moe_impl
+        why = None
+        if _hc.decode_op_max_rows() <= 0:
+            why = "B70_MOE_DECODE_OP not set or the library did not load"
+        elif not getattr(impl, "is_int4", False):
+            why = "not an int4 MoE"
+        elif activation.value != "silu" or self.gemm1_clamp_limit is not None:
+            why = f"activation {activation.value} / clamp {self.gemm1_clamp_limit}"
+        elif impl.w13_bias is not None or impl.w2_bias is not None:
+            why = "expert biases"
+        if why is None:
+            w = (impl.w13, impl.gemm1_wei_scales, impl.w2, impl.gemm2_wei_scales)
+            if any(t is None or not t.is_contiguous() or t.device.type != "xpu" for t in w):
+                why = "weights not contiguous on the device"
+            elif w[1].dtype != torch.bfloat16 or w[3].dtype != torch.bfloat16:
+                why = f"scales {w[1].dtype}"
+            elif w[0].element_size() != 1 or w[0].dim() != 3:
+                why = f"w13 {w[0].dtype} {tuple(w[0].shape)}"
+            elif (w[1].shape[-1] * 128 != w[0].shape[-1] * 2
+                    or w[3].shape[-1] * 128 != w[2].shape[-1] * 2):
+                why = f"quant group size is not 128 (scales {tuple(w[1].shape)}, {tuple(w[3].shape)})"
+        if why is None:
+            n_local = impl.num_experts
+            maps = b70_resident_maps(n_local, impl.expert_map, expert_map, impl.w13.device)
+            if isinstance(maps, str):
+                why = maps
+            else:
+                hot_map, cold_map = maps
+        if why is not None:
+            if not getattr(XPUExperts, "_b70_resident_warned", False):
+                XPUExperts._b70_resident_warned = True
+                logger.warning("B70-0054 resident decode op: %s (%s); stock path", why, name)
+            return False
+        args = (hot_map, cold_map, *w, *w)  # cold weights: never read (cold_map is all -1)
+        if not getattr(XPUExperts, "_b70_resident_logged", False):
+            XPUExperts._b70_resident_logged = True
+            logger.info("B70-0054 resident decode op: on (%s): %d local of %d experts, batches of <= %d tokens, "
+                        "w13 %s", name, n_local, hot_map.numel(), _hc.decode_op_max_rows(), tuple(w[0].shape))
+        return args
 
 
 class XPUExpertsFp8(XPUExperts):
