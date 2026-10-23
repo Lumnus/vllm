@@ -38,6 +38,7 @@ from vllm.model_executor.models.interfaces import (
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
+    SupportsEagle3,
     SupportsHCSP,
     SupportsLoRA,
     SupportsMRoPE,
@@ -77,12 +78,17 @@ from vllm.models.common.ops.sequence_parallel import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from .hyperconnection import GatedResidual, HyperConnectionConfig
+if current_platform.is_xpu():
+    from .b70_hyperconnection import GatedResidual, HyperConnectionConfig
+else:
+    from .hyperconnection import GatedResidual, HyperConnectionConfig
+from .dflash2_features import AUX_LAYER_BOUNDARIES, DFlash2FeatureCapture
 from .low_latency_gemm import enable_qwen4_exp_low_latency_gemm
 from .ops.cute_dsl.hc_down_silu import request_hc_down_silu_warmup
 from .ple_layer import Qwen4ExpPLELayer
@@ -411,7 +417,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class Qwen4ExpModel(nn.Module):
+class Qwen4ExpModel(nn.Module, DFlash2FeatureCapture):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -547,6 +553,7 @@ class Qwen4ExpModel(nn.Module):
                 raise ValueError("pipeline stage requires intermediate tensors")
             hidden_states = intermediate_tensors["hidden_states"]
 
+        aux_hidden_states: list[torch.Tensor] = []
         full_num_tokens = positions.shape[-1]
         block_output = None
         injection = None
@@ -603,6 +610,14 @@ class Qwen4ExpModel(nn.Module):
                 block_output = None
                 injection = None
                 hidden_states = hidden_states + deepstack_embed
+            self.capture_completed_layer(
+                aux_hidden_states,
+                layer_idx,
+                layer,
+                hidden_states,
+                block_output,
+                injection,
+            )
 
         if not get_pp_group().is_last_rank:
             # PP transports one tensor, not the delayed HC tuple. Materialize
@@ -644,6 +659,8 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if self.aux_hidden_state_layers:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -653,6 +670,11 @@ class Qwen4ExpModel(nn.Module):
                 weight,
             )
             for name, weight in weights
+            if not (
+                current_platform.is_xpu()
+                and getattr(self.config, "indexer_n_heads", None) is None
+                and ".self_attn.indexer." in name
+            )
         )
         weights = maybe_fuse_shared_experts(
             weights,
@@ -692,6 +714,7 @@ class Qwen4ExpModel(nn.Module):
 
 class Qwen4ExpForCausalLM(
     nn.Module,
+    SupportsEagle3,
     HasInnerState,
     SupportsHCSP,
     SupportsLoRA,
@@ -745,7 +768,7 @@ class Qwen4ExpForCausalLM(
         )
         self.set_moe_parameters(self.model.layers)
         enable_qwen4_exp_low_latency_gemm(self, self.model_config.dtype)
-        if self.model_config.dtype == torch.bfloat16:
+        if self.model_config.dtype == torch.bfloat16 and current_platform.is_cuda():
             # Precompile the fused HC down+SiLU kernels for every CUDA-graph
             # capture size in the fused dispatch range, so no CuTe-DSL JIT
             # happens during graph capture.
@@ -755,6 +778,9 @@ class Qwen4ExpForCausalLM(
                 self.config.hc_count,
                 self.config.hidden_size * self.config.hc_count,
             )
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return AUX_LAYER_BOUNDARIES
 
     @staticmethod
     def get_model_state_cls():
@@ -960,6 +986,9 @@ class Qwen4ExpForConditionalGeneration(
             "_input_mix_padding",
         ],
     }
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return AUX_LAYER_BOUNDARIES
 
     @staticmethod
     def get_model_state_cls():

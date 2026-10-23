@@ -218,6 +218,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
             # Opt-in: F.linear on XPU is faster with an N-contiguous (N, K) weight
             # when K > N, but oneDNN's ab-weights matmul is not run-to-run bitwise
             # bitwise reproducible. Off by default.
+            prepare_hc = getattr(layer, "hc_ksplit_prepare", None)
+            if prepare_hc is not None:
+                prepare_hc()
             weight = layer.weight.data
             if (
                 envs.VLLM_XPU_FORCE_N_CONTIG_WEIGHT

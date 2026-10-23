@@ -1,3 +1,4 @@
+# Modified by Wulf for B70 Flash-Next Disk; upstream terms are retained.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Model-runner state for Qwen4Exp PLE inputs."""
@@ -26,6 +27,19 @@ class Qwen4ExpModelState(MambaHybridModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
+        from .ngram_embedding import (
+            Qwen4ExpNGramEmbedding,
+            Qwen4ExpPLEDiskBF16Embedding,
+        )
+
+        self._disk_ple_modules = tuple(
+            module
+            for module in model.modules()
+            if isinstance(module, Qwen4ExpNGramEmbedding)
+            and isinstance(module.ngram_embedding, Qwen4ExpPLEDiskBF16Embedding)
+        )
+        if self._disk_ple_modules and len(self._disk_ple_modules) != 1:
+            raise RuntimeError("Disk BF16 PLE requires exactly one target PLE module")
         self.uses_ngram_embedding = bool(config.ple_layer_ids)
         if not self.uses_ngram_embedding:
             self.ngram_context_len = 0
@@ -110,6 +124,25 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=self._prepare_ngram_context(input_batch, req_states),
         )
+        for module in self._disk_ple_modules:
+            num_tokens_padded = input_batch.num_tokens_after_padding
+            module.ngram_embedding._check_capacity(num_tokens_padded)
+            if input_batch.input_ids.shape[0] != num_tokens_padded:
+                raise ValueError("Disk BF16 PLE input length differs from dispatch")
+            if num_tokens_padded == 0:
+                continue
+            # Existing GPU IDs use the authoritative committed context above.
+            # This producer runs before FULL replay as well as ordinary forward.
+            ids = module.compute_ngram_ids(
+                input_batch.input_ids,
+                query_start_loc,
+                model_inputs["ngram_context"],
+            )
+            module.ngram_embedding.prepare(
+                ids,
+                input_batch.num_tokens,
+                num_tokens_padded,
+            )
         return model_inputs
 
     def prepare_dummy_inputs(
@@ -141,6 +174,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+        for module in self._disk_ple_modules:
+            module.ngram_embedding.prepare(None, 0, num_tokens)
         return model_inputs
 
 

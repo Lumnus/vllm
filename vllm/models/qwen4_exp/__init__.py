@@ -27,7 +27,7 @@ def __getattr__(name: str) -> Any:
     }:
         from vllm.platforms import current_platform
 
-        if current_platform.is_xpu() or current_platform.is_tpu():
+        if current_platform.is_tpu():
             raise NotImplementedError("Qwen4Exp currently supports CUDA and ROCm only")
         if current_platform.is_rocm():
             from .amd.model import (

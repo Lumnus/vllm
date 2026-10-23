@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen4Exp n-gram embeddings with device and pinned-host storage."""
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -27,6 +28,7 @@ from ..common.ngram_embedding import (
     Qwen4ExpPLEUnquantizedEmbeddingMethod,
 )
 from ..common.ops.ple import ple_ngram_ids
+from .b70_disk import Qwen4ExpPLEDiskBF16Embedding
 
 logger = init_logger(__name__)
 
@@ -216,6 +218,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             if engram_config is not None and engram_config.cpu_offload
             else Qwen4ExpPLEDeviceEmbedding
         )
+        if os.environ.get("B70_PLE_DISK_BF16") == "1":
+            embedding_cls = Qwen4ExpPLEDiskBF16Embedding
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (
             self.use_sequence_parallel
@@ -400,6 +404,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> None:
         """Start the pinned lookup while the preceding decoder layer runs."""
         embedding = self.ngram_embedding
+        if isinstance(embedding, Qwen4ExpPLEDiskBF16Embedding):
+            return  # ModelState staged the authoritative inputs before replay.
         if not embedding.supports_prefetch:
             return
         ngram_ids = self.compute_ngram_ids(
@@ -417,11 +423,16 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             "ngram_heads_offsets": self.ngram_heads_offsets,
             "ngram_heads_vocab_sizes": self.ngram_heads_vocab_sizes,
         }
+        disk = isinstance(self.ngram_embedding, Qwen4ExpPLEDiskBF16Embedding)
+        if disk and self.ngram_embedding._mmap_owner is not None:
+            raise RuntimeError("Disk BF16 PLE rejects reload")
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = "ngram_embedding.shard_"
 
         for name, loaded_weight in weights:
+            if disk and name.startswith("ngram_embedding."):
+                raise RuntimeError("Disk PLE rows must not enter the model loader")
             leaf_name = name.rsplit(".", 1)[-1]
             if leaf_name.startswith("hashstats_") or leaf_name == "token_lookup":
                 continue
@@ -473,4 +484,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
 
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
+        if disk:
+            self.ngram_embedding.load_mmap(os.environ["PLE_TABLE_PATH"])
+            loaded.add("ngram_embedding.weight")
         return loaded

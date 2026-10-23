@@ -2,9 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+import vllm_xpu_kernels
 from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
 from vllm_xpu_kernels.rotary import apply_rotary_emb
 
@@ -15,6 +17,11 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+# Rebuilt against the pinned 0.1.15.4 headers and Torch 2.14 ABI.
+torch.ops.load_library(
+    str(Path(vllm_xpu_kernels.__file__).with_name("libgdn_index64.so"))
+)
 
 if TYPE_CHECKING:
 
@@ -230,7 +237,7 @@ def _gdn_attention_core_xpu_impl(
         self.conv1d.weight.size(0), self.conv1d.weight.size(2)
     )
 
-    torch.ops._xpu_C.gdn_attention(
+    torch.ops._gdn_index64.gdn_attention(
         core_attn_out,
         z,
         projected_states_qkvz,
