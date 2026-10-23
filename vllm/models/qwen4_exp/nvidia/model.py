@@ -801,6 +801,9 @@ class Qwen4ExpForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        from .b70_fp8_head import maybe_prepare_head_fp8
+
+        maybe_prepare_head_fp8(self)
         # Forward kwargs unchanged so the runner's _maybe_add_ngram_kwargs
         # path (query_start_loc / ngram_context) reaches Qwen4ExpModel.
         return self.model(
@@ -938,6 +941,9 @@ class Qwen4ExpForCausalLM(
         )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        from .b70_fp8_head import maybe_prepare_head_fp8
+
+        maybe_prepare_head_fp8(self)
         return self.logits_processor(self.lm_head, hidden_states)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
@@ -1144,6 +1150,9 @@ class Qwen4ExpForConditionalGeneration(
         else:
             deepstack_input_embeds = None
 
+        from .b70_fp8_head import maybe_prepare_head_fp8
+
+        maybe_prepare_head_fp8(self.language_model)
         hidden_states = self.language_model.model(
             input_ids=input_ids,
             positions=positions,
