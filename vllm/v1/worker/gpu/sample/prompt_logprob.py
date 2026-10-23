@@ -17,21 +17,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
     compute_topk_scores,
 )
 
-# B70-0029b (L32 port): rows per prompt-logprobs chunk on Model Runner V2.
-# Upstream 1024 = the whole step at --max-num-batched-tokens 1024; the
-# [rows, vocab] transients (~1.07 GiB/rank) spilled into host RAM on B70 at
-# util 0.88. Rows are independent, so the result does not depend on the chunk.
-# B70_PROMPT_LOGPROBS_CHUNK (default 128; 0 = upstream 1024).
-def _b70_chunk() -> int:
-    import os
-    try:
-        v = int(os.environ.get("B70_PROMPT_LOGPROBS_CHUNK", "128"))
-    except ValueError:
-        v = 128
-    return v if v > 0 else 1024
-
-
-CHUNK_SIZE = _b70_chunk()
+CHUNK_SIZE = 1024
 
 
 @dataclass
