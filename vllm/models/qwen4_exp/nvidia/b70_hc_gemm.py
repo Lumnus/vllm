@@ -55,7 +55,7 @@ def ordered_hc_gemm(x, weight, valid_columns):
     columns = weight.shape[0]
     assert inner == weight.shape[1] and 0 < valid_columns <= columns
     if (
-        1 <= rows <= 8
+        (1 <= rows <= 8 or (9 <= rows <= 32 and inner == 10240))
         and x.stride(1) == weight.stride(1) == 1
         and os.getenv("VLLM_XPU_C1_PARALLEL_HC", "1") == "1"
     ):
@@ -119,6 +119,22 @@ def _hc_finish(partials, output, M: tl.constexpr, N: tl.constexpr, TILES: tl.con
     tl.store(output + offsets, value, offsets < M * N)
 
 
+@triton.jit
+def _hc_partials_batched(x, weight, out, M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+             VALID: tl.constexpr, XS: tl.constexpr, WS: tl.constexpr,
+             BK: tl.constexpr, BN: tl.constexpr):
+    rows = tl.program_id(2) * 16 + tl.arange(0, 16)
+    cols = tl.program_id(1) * BN + tl.arange(0, BN)
+    kk = tl.program_id(0) * BK + tl.arange(0, BK)
+    a = tl.load(x + rows[:, None] * XS + kk[None, :],
+                (rows[:, None] < M) & (kk[None, :] < K), other=0)
+    b = tl.load(weight + cols[None, :] * WS + kk[:, None],
+                (cols[None, :] < VALID) & (kk[:, None] < K), other=0)
+    y = tl.dot(a, b)
+    tl.store(out + tl.program_id(0) * M * N + rows[:, None] * N + cols[None, :],
+             y, (rows[:, None] < M) & (cols[None, :] < N))
+
+
 def parallel_hc_gemm(x, weight, valid_columns):
     """BF16 products with deterministic, batch-invariant FP32 tile summation.
 
@@ -127,21 +143,28 @@ def parallel_hc_gemm(x, weight, valid_columns):
     """
     rows, inner = x.shape
     columns = weight.shape[0]
-    tiles = triton.cdiv(inner, 128)
+    block_k = 64 if rows > 8 else 128
+    tiles = triton.cdiv(inner, block_k)
     partials = torch.empty((tiles, rows, columns), dtype=torch.float32, device=x.device)
     output = torch.empty((rows, columns), dtype=x.dtype, device=x.device)
-    _hc_partials[(tiles, triton.cdiv(columns, 32))](
-        x,
-        weight,
-        partials,
-        rows,
-        columns,
-        inner,
-        valid_columns,
-        x.stride(0),
-        weight.stride(0),
-        num_warps=4,
-    )
+    if rows > 8:
+        _hc_partials_batched[(tiles, triton.cdiv(columns, 32), triton.cdiv(rows, 16))](
+            x, weight, partials, rows, columns, inner, valid_columns,
+            x.stride(0), weight.stride(0), block_k, 32, num_warps=4,
+        )
+    else:
+        _hc_partials[(tiles, triton.cdiv(columns, 32))](
+            x,
+            weight,
+            partials,
+            rows,
+            columns,
+            inner,
+            valid_columns,
+            x.stride(0),
+            weight.stride(0),
+            num_warps=4,
+        )
     _hc_finish[(triton.cdiv(rows * columns, 256),)](
         partials,
         output,

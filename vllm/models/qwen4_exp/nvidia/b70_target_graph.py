@@ -68,14 +68,14 @@ def native_rows(width):
         if x.ndim == 2 and x.shape[0] == width and x.dtype == torch.bfloat16:
             if (
                 comm.world_size == 4
-                and width == 8
+                and width % 8 == 0
                 and x.shape[1] == 2560
                 and os.getenv("CCL_SYCL_ALLREDUCE_LL_THRESHOLD") == "65536"
                 and os.getenv("VLLM_XPU_C1_PARTITIONED_REDUCE", "1") == "1"
             ):
                 # The native ring changes its BF16 summation order by partition.
                 # Keep each row's quarters in the same rank-owned partition.
-                # Both 5 KiB rows and this 40 KiB batch use the LL ring path.
+                # Full 8/16/24/32-row batches preserve this partition order.
                 packed = x.reshape(width, 4, -1).transpose(0, 1).contiguous()
                 dist.all_reduce(packed, group=comm.device_group)
                 return packed.transpose(0, 1).contiguous().reshape_as(x)
@@ -156,11 +156,19 @@ class TargetGraphs:
         self.disabled = set()
         self.replays = 0
         self.fallbacks = 0
+        self.fallback_reasons = {}
         self.pool = torch.xpu.graph_pool_handle()
 
+    def fallback(self, reason, key):
+        self.fallbacks += 1
+        count = self.fallback_reasons.get(reason, 0) + 1
+        self.fallback_reasons[reason] = count
+        if count == 1 or count % 1024 == 0:
+            logger.warning("Target graph fallback: key=%s reason=%s count=%d", key, reason, count)
+
     def run(self, runner, batch, metadata, inputs, eager):
-        # The runner admits one uniform C1 verification. Partial blocks use eager.
-        if batch.num_tokens != 8:
+        # Uniform eight-row verification for one through four requests.
+        if batch.num_tokens != 8 * batch.num_reqs:
             return eager(runner, batch, metadata, inputs)
         if os.getenv("VLLM_XPU_DFLASH_FIXED_SPLITS", "0") in ("32", "64"):
             # The target split schedule no longer depends on this host bound.
@@ -170,20 +178,24 @@ class TargetGraphs:
             bound = max(
                 512, 1 << (int(batch.seq_lens_cpu_upper_bound[0]) - 1).bit_length()
             )
-        if bound in self.disabled:
-            self.fallbacks += 1
+        key = (batch.num_reqs, bound)
+        if key in self.disabled:
+            self.fallback("disabled", key)
             return eager(runner, batch, metadata, inputs)
         context = get_forward_context()
         current = (inputs, metadata, context.slot_mapping, context.is_padding)
-        entry = self.entries.get(bound)
+        entry = self.entries.get(key)
         if entry is not None:
             try:
                 update(entry[2], current, set())
-            except (AssertionError, TypeError, AttributeError):
-                self.fallbacks += 1
+            except (AssertionError, TypeError, AttributeError) as exc:
+                self.fallback(type(exc).__name__ + ": " + str(exc), key)
                 return eager(runner, batch, metadata, inputs)
             entry[0].replay()
             self.replays += 1
+            if self.replays % 1024 == 0:
+                logger.info("Target graph counters: replays=%d fallbacks=%d key=%s",
+                            self.replays, self.fallbacks, key)
             return entry[1]
 
         # Capture must never advance the accepted-prefix state. Several layers
@@ -198,7 +210,7 @@ class TargetGraphs:
         try:
             with (
                 staged_context(context, model_metadata, slots, padding),
-                native_rows(8),
+                native_rows(batch.num_tokens),
             ):
                 runner.model(**model_inputs)
                 torch.xpu.synchronize()
@@ -207,21 +219,24 @@ class TargetGraphs:
                 with torch.xpu.graph(graph, pool=self.pool):
                     output = runner.model(**model_inputs)
             restore(routes, initial)
+            del initial
             graph.replay()
             torch.xpu.synchronize()
-            observed_state = save(routes)
+            # Check every state exactly without another full observed-state copy.
             passed = compare(expected, output) and all(
-                torch.equal(a, b) for a, b in zip(expected_state, observed_state)
+                torch.equal(value, tensor[indices])
+                for (_, tensor, indices), value in zip(routes, expected_state)
             )
             verdict = torch.tensor(int(passed), dtype=torch.int32)
             dist.all_reduce(
                 verdict, op=dist.ReduceOp.MIN, group=get_tp_group().cpu_group
             )
             if verdict.item():
-                self.entries[bound] = (graph, output, static)
+                self.entries[key] = (graph, output, static)
                 self.replays += 1
                 logger.info(
-                    "C1 native target graph ready: width=8, context bound=%d", bound
+                    "Target graph ready: requests=%d, width=%d, context bound=%d",
+                    batch.num_reqs, batch.num_tokens, bound
                 )
                 return output
             logger.warning(
@@ -230,6 +245,6 @@ class TargetGraphs:
         except Exception:
             logger.exception("C1 target graph capture failed at bound %d", bound)
         restore(routes, expected_state)
-        self.disabled.add(bound)
-        self.fallbacks += 1
+        self.disabled.add(key)
+        self.fallback("capture_or_equality_failure", key)
         return expected

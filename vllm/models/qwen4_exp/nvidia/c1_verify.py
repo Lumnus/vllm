@@ -20,9 +20,11 @@ def enabled(runner, batch) -> bool:
         and spec.draft_model_config.architectures == ["DFlash2DraftModel"]
         and runner.device.type == "xpu"
         and runner.model_config.hf_text_config.model_type == "qwen4_exp_text"
-        and batch.num_reqs == 1
+        and 1 <= batch.num_reqs <= 4
         and not batch.has_prefill
-        and 1 < batch.num_tokens <= 8
+        and ((batch.num_reqs == 1 and 1 < batch.num_tokens <= 8)
+             or (batch.num_tokens == 8 * batch.num_reqs
+                 and (batch.num_scheduled_tokens == 8).all()))
     )
 
 
@@ -68,7 +70,7 @@ def verify_eager(runner, batch, metadata, model_inputs):
 
 
 def verify(runner, batch, metadata, model_inputs):
-    if batch.num_tokens == 8 and os.getenv("VLLM_XPU_C1_TARGET_GRAPH", "1") == "1":
+    if batch.num_tokens == 8 * batch.num_reqs and os.getenv("VLLM_XPU_C1_TARGET_GRAPH", "1") == "1":
         from .b70_target_graph import TargetGraphs
 
         graphs = getattr(runner, "_c1_target_graphs", None)

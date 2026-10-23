@@ -85,11 +85,11 @@ def _validate_disk_bf16_config(embedding_method, params_dtype, max_total_tokens)
     captures = config.compilation_config.cudagraph_capture_sizes or []
     if (
         max_total_tokens != s.max_num_batched_tokens
-        or max_total_tokens != 256
+        or max_total_tokens not in (256, 512, 1024)
         or any(n <= 0 or n > max_total_tokens for n in captures)
     ):
         raise ValueError(
-            "Phase 1 Disk PLE requires bounded 256-token dispatch/capture capacity"
+            "Disk PLE requires bounded 256/512/1024-token dispatch/capture capacity"
         )
     return max_total_tokens
 
@@ -275,7 +275,9 @@ class Qwen4ExpPLEDiskBF16Embedding(Qwen4ExpPLEPinnedHostEmbedding):
 
     def _fill_stage(self, ids_cpu: torch.Tensor, num_tokens: int) -> None:
         """CPU-only selected-row gather; pads/non-owned contributions are zero."""
-        self._stage.zero_()
+        # Only this prefix is copied to the device and consumed by forward.
+        # Clearing unused capacity made decode cost grow with prefill capacity.
+        self._stage[: ids_cpu.shape[0]].zero_()
         ids = ids_cpu[:num_tokens].reshape(-1)
         if ids.numel() and (ids.min() < 0 or ids.max() >= self.org_vocab_size):
             raise ValueError("Disk BF16 PLE received an out-of-table row ID")
@@ -321,7 +323,7 @@ class Qwen4ExpPLEDiskBF16Embedding(Qwen4ExpPLEPinnedHostEmbedding):
             self._owner_stream, self._owner_thread = stream, thread
             if ngram_ids is None:
                 # Deterministic dummy contents before warmup/capture; no table IO.
-                self._stage.zero_()
+                self._stage[:num_tokens_padded].zero_()
             else:
                 if (
                     self._table is None

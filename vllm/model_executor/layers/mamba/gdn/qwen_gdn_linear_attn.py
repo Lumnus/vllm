@@ -475,6 +475,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
+        self._deterministic_prefill_gates = config.model_type == "qwen4_exp_text"
         self.num_k_heads = config.linear_num_key_heads
         self.num_v_heads = config.linear_num_value_heads
         self.head_k_dim = config.linear_key_head_dim
@@ -1071,7 +1072,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 1: Input Projection
         # ============================================================
         projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        projected_states_ba, _ = self.in_proj_ba(hidden_states)
+        if (
+            self._deterministic_prefill_gates
+            and hidden_states.shape[0] > 8
+            and type(self.in_proj_ba.quant_method).__name__ == "UnquantizedLinearMethod"
+            and self.in_proj_ba.weight.dtype == torch.bfloat16
+            and self.in_proj_ba.bias is None
+        ):
+            # oneDNN's 85-row gate GEMM changes results for identical inputs.
+            # Fixed K order makes cached and fresh prefill reproducible.
+            from vllm.models.qwen4_exp.nvidia.b70_hc_gemm import ordered_hc_gemm
+
+            weight = self.in_proj_ba.weight
+            projected_states_ba = ordered_hc_gemm(hidden_states, weight, weight.shape[0])
+        else:
+            projected_states_ba, _ = self.in_proj_ba(hidden_states)
 
         # ============================================================
         # Part 2: Core Attention

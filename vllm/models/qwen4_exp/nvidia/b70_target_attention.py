@@ -38,10 +38,10 @@ def fixed_splits(
         or q.dtype != torch.bfloat16
         or k.dtype != q.dtype
         or v.dtype != q.dtype
-        or cu.numel() != 2
-        or used.numel() != 1
+        or not 1 <= used.numel() <= 4
+        or cu.numel() != used.numel() + 1
         or not 1 <= max_query <= 8
-        or q.shape != (max_query, 6, 256)
+        or q.shape != (max_query * used.numel(), 6, 256)
         or k.ndim != 4
         or k.shape[1:] != (832, 1, 256)
         or v.shape != k.shape
@@ -60,9 +60,10 @@ def forward(q, k, v, out, used, blocks, max_seq_len, scale, splits):
         scale = q.shape[-1] ** -0.5
     cu = torch.arange(width + 1, dtype=torch.int32, device=q.device)
     dummy = torch.zeros_like(cu)
-    positions = torch.arange(width, dtype=used.dtype, device=q.device)
-    lengths = (used.reshape(1) - (width - 1 - positions)).clamp_min(1).int()
-    tables = blocks.repeat_interleave(width, dim=0)
+    per_request = width // used.numel()
+    positions = torch.arange(per_request, dtype=used.dtype, device=q.device)
+    lengths = (used.reshape(-1, 1) - (per_request - 1 - positions)).reshape(-1).clamp_min(1).int()
+    tables = blocks.repeat_interleave(per_request, dim=0)
     result, _ = torch.ops._vllm_fa2_C.varlen_fwd(
         q,
         k,
