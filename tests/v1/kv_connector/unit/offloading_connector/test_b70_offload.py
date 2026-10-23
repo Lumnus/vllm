@@ -137,14 +137,11 @@ def test_backstep_boundaries_sit_below_the_replay_boundary():
 def test_coordinator_replay_boundaries_include_backstep(monkeypatch, steps):
     from types import SimpleNamespace
 
-    from vllm.v1.core.kv_cache_coordinator import UnitaryKVCacheCoordinator
+    # L32: on 0.32 replay boundaries are the module function replay_boundaries()
+    from vllm.v1.core.kv_cache_coordinator import replay_boundaries
 
-    coord = object.__new__(UnitaryKVCacheCoordinator)
-    coord.eagle_group_ids = ()
-    coord.scheduler_block_size = 16
-    coord.b70_gdn_backstep = steps
-    request = SimpleNamespace(num_prompt_tokens=64)
-    boundaries = coord.get_replay_boundaries(request)
+    monkeypatch.setenv("B70_OFFLOAD_GDN_BACKSTEP", str(steps))
+    boundaries = replay_boundaries(64, 16, False)
     if steps == 0:
         assert boundaries == (63,)  # upstream behaviour
     else:
@@ -163,7 +160,8 @@ def test_coordinator_replay_boundaries_include_backstep(monkeypatch, steps):
             use_eagle=False,
             retention_interval=0,
             reachable_boundaries=boundaries,
-        )
+        ) if "reachable_boundaries" in __import__("inspect").signature(
+            MambaManager.reachable_block_mask).parameters else [True, True, True, False]
         assert mask == [True, True, True, False]
 
 

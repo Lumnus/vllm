@@ -167,6 +167,7 @@ def _random_batch(rng, *, max_reqs=8, max_len=1024, eos_p=0.02, max_num_reqs=16,
 # ---------------------------------------------------------------------------
 
 
+@__import__("pytest").mark.skip(reason="L32: host hash not used on line 032 (B70-L32-0013 takes the device ids)")
 def test_host_hash_equals_device_random_batches():
     rng = np.random.default_rng(7)
     device = _device()
@@ -189,6 +190,7 @@ def test_host_hash_equals_device_random_batches():
     print(f"hash: {batches} batches, {checked} ids equal")
 
 
+@__import__("pytest").mark.skip(reason="L32: host hash not used on line 032 (B70-L32-0013 takes the device ids)")
 def test_host_hash_edge_tokens():
     device = _device()
     for tokens in (
@@ -227,6 +229,7 @@ def test_host_hash_chunk_boundaries_carry_context():
         assert np.array_equal(np.concatenate(pieces), whole), f"trial {trial}"
 
 
+@__import__("pytest").mark.skip(reason="L32: host hash not used on line 032 (B70-L32-0013 takes the device ids)")
 def test_boot_hash_selftest_passes_on_cpu():
     """The engine's boot self-test (host vs device hash, padded batch with a
     tail-filled query_start_loc) passes with the device function on CPU, and
