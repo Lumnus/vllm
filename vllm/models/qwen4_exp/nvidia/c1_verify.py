@@ -4,8 +4,11 @@
 from contextlib import contextmanager
 
 import torch
+import torch.distributed as dist
 
 from vllm.distributed import get_tp_group
+
+from .b70_c1_graph import hc_graph_scope
 
 
 def enabled(runner, batch) -> bool:
@@ -39,7 +42,15 @@ def canonical_reductions(width):
             and input_.ndim == 2
             and input_.shape[0] == width
         ):
-            return torch.cat([original(row) for row in input_.split(1)], dim=0)
+            output = input_.clone()
+            # XCCL keeps each row's arithmetic, while grouping submission and
+            # completion. This collective remains outside every captured graph.
+            with dist._coalescing_manager(
+                group=comm.device_group, device=input_.device
+            ):
+                for row in output.split(1):
+                    dist.all_reduce(row, group=comm.device_group)
+            return output
         return original(input_)
 
     comm.all_reduce = reduce
@@ -51,5 +62,5 @@ def canonical_reductions(width):
 
 def verify(runner, batch, metadata, model_inputs):
     """Run anchor plus proposals once and retain every native accepted prefix."""
-    with canonical_reductions(batch.num_tokens):
+    with canonical_reductions(batch.num_tokens), hc_graph_scope(batch.num_tokens):
         return runner.model(**model_inputs)

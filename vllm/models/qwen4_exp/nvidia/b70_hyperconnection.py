@@ -254,6 +254,15 @@ class GatedResidual(nn.Module):
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if self._ordered_hc:
+            from .b70_c1_graph import replay_hc
+
+            return replay_hc(self, "mix", self._mix_eager, (hidden_states,))
+        return self._mix_eager(hidden_states)
+
+    def _mix_eager(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         xn = grouped_gemma_rmsnorm(
             hidden_states,
             self.hc_norm.weight,
@@ -277,6 +286,25 @@ class GatedResidual(nn.Module):
         return hidden_states, block_input, injection
 
     def combine_and_mix(
+        self,
+        hidden_states: torch.Tensor,
+        prev_block_output: torch.Tensor,
+        prev_injection: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if self._ordered_hc:
+            from .b70_c1_graph import replay_hc
+
+            return replay_hc(
+                self,
+                "combine_and_mix",
+                self._combine_and_mix_eager,
+                (hidden_states, prev_block_output, prev_injection),
+            )
+        return self._combine_and_mix_eager(
+            hidden_states, prev_block_output, prev_injection
+        )
+
+    def _combine_and_mix_eager(
         self,
         hidden_states: torch.Tensor,
         prev_block_output: torch.Tensor,
