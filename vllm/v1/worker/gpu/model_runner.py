@@ -442,6 +442,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             time_after_load - time_before_load,
         )
 
+        from vllm.model_executor import b70_step_trace
+
+        if b70_step_trace.enabled():
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            b70_step_trace.install(
+                self.model,
+                getattr(self.speculator, "model", None),
+                self.device,
+                get_tensor_model_parallel_rank(),
+            )
+
         # Initialize the components that require the model.
         self.model_state = init_model_state(
             self.vllm_config, self.model, self.encoder_cache, self.device
@@ -1654,6 +1666,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
         if not dummy_run:
+            from vllm.model_executor import b70_step_trace
+
+            b70_step_trace.on_step()
             # Update the request states.
             self.update_pp_decode_requests()
             self.finish_requests(scheduler_output)
