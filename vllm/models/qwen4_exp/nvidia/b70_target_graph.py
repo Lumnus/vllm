@@ -3,6 +3,7 @@
 
 import copy
 import dataclasses
+import os
 from contextlib import contextmanager
 
 import torch
@@ -65,6 +66,19 @@ def native_rows(width):
 
     def reduce(x):
         if x.ndim == 2 and x.shape[0] == width and x.dtype == torch.bfloat16:
+            if (
+                comm.world_size == 4
+                and width == 8
+                and x.shape[1] == 2560
+                and os.getenv("CCL_SYCL_ALLREDUCE_LL_THRESHOLD") == "65536"
+                and os.getenv("VLLM_XPU_C1_PARTITIONED_REDUCE", "1") == "1"
+            ):
+                # The native ring changes its BF16 summation order by partition.
+                # Keep each row's quarters in the same rank-owned partition.
+                # Both 5 KiB rows and this 40 KiB batch use the LL ring path.
+                packed = x.reshape(width, 4, -1).transpose(0, 1).contiguous()
+                dist.all_reduce(packed, group=comm.device_group)
+                return packed.transpose(0, 1).contiguous().reshape_as(x)
             return torch.cat([original(row) for row in x.split(1)])
         return original(x)
 
