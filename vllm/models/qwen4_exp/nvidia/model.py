@@ -30,12 +30,14 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
     HasInnerState,
     IsHybrid,
     MixtureOfExperts,
     MultiModalEmbeddings,
     SupportsLoRA,
     SupportsMRoPE,
+    SupportsEagle3,
     SupportsPP,
     _require_is_multimodal,
 )
@@ -380,7 +382,16 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class Qwen4ExpModel(nn.Module):
+# B70-0057: DFlash2 target features. The incoai Flash-Next DFlash2 draft was trained on the outputs of the
+# completed zero-based layers 5/15/25/35/45, each averaged over the four hyper-connection streams
+# (incoai/Qwen3.8-Flash-Next-DFlash2@a22a1744 patches/qwen38-dflash2-capture.patch, Apache-2.0; the same contract
+# as wu1ff/B70-LLM-Controller 1.0.5 dflash2_features.py, MIT). vLLM converts DFlash's completed-layer ids to
+# "after layer" boundaries by +1 (eagle3_utils.get_eagle3_aux_layers_from_config).
+_B70_DFLASH2_TARGET_LAYER_IDS = (5, 15, 25, 35, 45)
+_B70_DFLASH2_AUX_BOUNDARIES = tuple(i + 1 for i in _B70_DFLASH2_TARGET_LAYER_IDS)
+
+
+class Qwen4ExpModel(nn.Module, EagleModelMixin):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -508,6 +519,10 @@ class Qwen4ExpModel(nn.Module):
         block_output = None
         injection = None
         last_layer = None
+        # B70-0057: only allocated when a DFlash/Eagle3 drafter asked for target features.
+        aux_hidden_states: list[torch.Tensor] | None = (
+            [] if self.aux_hidden_state_layers else None
+        )
         if self.start_layer < self.end_layer:
             self._start_layer_ple_prefetch(
                 self.layers[self.start_layer],
@@ -560,6 +575,10 @@ class Qwen4ExpModel(nn.Module):
                 block_output = None
                 injection = None
                 hidden_states = hidden_states + deepstack_embed
+            if aux_hidden_states is not None and (layer_idx + 1) in self.aux_hidden_state_layers:
+                self._b70_capture_completed_layer(
+                    aux_hidden_states, layer, hidden_states, block_output, injection
+                )
 
         if not get_pp_group().is_last_rank:
             # PP transports one tensor, not the delayed HC tuple. Materialize
@@ -583,7 +602,54 @@ class Qwen4ExpModel(nn.Module):
             # this tensor is needed by the final mixer regardless).
             num_tokens = multi_hidden.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(multi_hidden)
+        if aux_hidden_states is not None:
+            return sample_hidden_states, aux_hidden_states
         return sample_hidden_states
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """B70-0057: accept only the DFlash2 feature contract this model was validated for."""
+        layers = tuple(sorted(set(layers)))
+        if layers and layers != _B70_DFLASH2_AUX_BOUNDARIES:
+            raise ValueError(
+                f"Qwen4Exp target features are validated only for the DFlash2 boundaries "
+                f"{_B70_DFLASH2_AUX_BOUNDARIES} (completed layers {_B70_DFLASH2_TARGET_LAYER_IDS}), got {layers}"
+            )
+        if layers and (
+            self.config.hc_count != 4
+            or self.config.num_hidden_layers != 48
+            or self.start_layer != 0
+            or self.end_layer != self.config.num_hidden_layers
+        ):
+            raise ValueError("Qwen4Exp DFlash2 features need HC4, 48 layers and PP=1")
+        super()._set_aux_hidden_state_layers(layers)
+        if layers:
+            from vllm.logger import init_logger
+
+            init_logger(__name__).info(
+                "B70-0057 DFlash2 target features: completed layers %s, mean over %d HC streams -> %d x %d",
+                _B70_DFLASH2_TARGET_LAYER_IDS, self.config.hc_count, len(layers), self.config.hidden_size,
+            )
+
+    def _b70_capture_completed_layer(
+        self,
+        aux_hidden_states: list[torch.Tensor],
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        block_output: torch.Tensor | None,
+        injection: torch.Tensor | None,
+    ) -> None:
+        """B70-0057: the completed multi-stream state of this layer, averaged over HC streams.
+
+        The decoder returns a delayed MLP combine; materialize it for the feature without consuming the tuple
+        passed to the next layer. HC is replicated across TP ranks, so every rank holds full-width rows. ``mean``
+        allocates fresh storage, so later workspace reuse cannot overwrite the snapshot (the V2 cudagraph wrapper
+        copies it into its own static buffer on capture/replay)."""
+        completed = hidden_states
+        if block_output is not None:
+            completed = layer.mlp_hyper_connection.combine(hidden_states, block_output, injection)
+        aux_hidden_states.append(
+            completed.unflatten(-1, (self.config.hc_count, self.config.hidden_size)).mean(dim=-2)
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = (
@@ -637,6 +703,7 @@ class Qwen4ExpModel(nn.Module):
 class Qwen4ExpForCausalLM(
     nn.Module,
     HasInnerState,
+    SupportsEagle3,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsPP,
@@ -888,6 +955,13 @@ class Qwen4ExpForCausalLM(
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.model._mtp_hidden_buffer
 
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model._set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # B70-0057: the DFlash2 boundaries; the draft config's dflash_config wins when present.
+        return _B70_DFLASH2_AUX_BOUNDARIES
+
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
@@ -1059,6 +1133,13 @@ class Qwen4ExpForConditionalGeneration(
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         return self.language_model.get_mtp_target_hidden_states()
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        # B70-0057: Qwen4Exp's decoder is language_model.model, not a Qwen3-VL text model.
+        self.language_model.set_aux_hidden_state_layers(layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return _B70_DFLASH2_AUX_BOUNDARIES
 
     def forward(
         self,
