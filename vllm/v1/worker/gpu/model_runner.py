@@ -1595,6 +1595,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
+        from vllm.v1.worker.gpu.astra_greedy import eligible, sample as greedy_sample
+        if eligible(self, input_batch, grammar_output):
+            return greedy_sample(self, hidden_states, input_batch)
+
         shard_metadata = None
         global_input_batch = input_batch
         if self.batch_sharder is not None:
