@@ -277,12 +277,17 @@ class Scheduler(SchedulerInterface):
         # reserve between a chunk boundary and the prefill end.
         self.num_prefill_lookahead = 0
         self.dynamic_sd_lookup: list[int] | None = None
+        self._b70_dyn_k = self.num_spec_tokens  # B70-0058
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
+                )
+                logger.info(
+                    "B70-0058 dynamic MTP depth: K by batch size %s",
+                    self.dynamic_sd_lookup[1:],
                 )
             self.use_eagle = speculative_config.use_eagle()
             if self.use_eagle:
@@ -696,7 +701,9 @@ class Scheduler(SchedulerInterface):
                     - request.num_tokens
                     - request.num_output_placeholders
                 )
-                if 0 < _sched_spec < self.num_spec_tokens:
+                if 0 < _sched_spec < min(
+                    len(request.spec_token_ids), self.num_spec_tokens
+                ):
                     num_new_tokens -= _sched_spec
                     request.spec_token_ids = []
 
@@ -1421,6 +1428,9 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+            # B70-0058: K of the drafts the runner returns next (B70-0057 / #57053);
+            # update_draft_token_ids trims to it and the 0026 guard compares with it.
+            self._b70_dyn_k = num_spec_tokens_to_schedule
 
         scheduled_encoder_input_stats = None
         if (
@@ -2444,17 +2454,22 @@ class Scheduler(SchedulerInterface):
                     request.spec_token_ids = []
                 continue
 
+            # B70-0058: dynamic depth: keep only this step's K drafts.
+            _b70_k = self.num_spec_tokens
+            if self.dynamic_sd_lookup is not None:
+                _b70_k = min(self._b70_dyn_k, self.num_spec_tokens)
+                if _b70_k <= 0:
+                    request.spec_token_ids = []
+                    continue
+                spec_token_ids = spec_token_ids[:_b70_k]
             # Add newly generated spec token ids to the request.
             request.spec_token_ids = self.structured_output_manager.validate_tokens(
                 request, spec_token_ids
             )
             # B70-0026: the XPU GDN kernel requires every spec row to carry exactly
-            # 1 + num_spec_tokens tokens. A grammar-trimmed partial draft list
-            # would crash it, so run this step as a plain decode instead.
-            if (
-                _b70_uniform_drafts_on()
-                and 0 < len(request.spec_token_ids) < self.num_spec_tokens
-            ):
+            # 1 + K tokens. A grammar-trimmed partial draft list would crash it,
+            # so run this step as a plain decode instead.
+            if _b70_uniform_drafts_on() and 0 < len(request.spec_token_ids) < _b70_k:
                 request.spec_token_ids = []
 
     def update_draft_token_ids_in_output(
