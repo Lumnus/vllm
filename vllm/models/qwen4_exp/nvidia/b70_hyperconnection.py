@@ -112,6 +112,8 @@ class GatedResidual(nn.Module):
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
         self.use_combine = use_combine
+        self._astra_hc_up_weight = None
+        self._astra_hc_up_prepared = False
         spec = get_current_vllm_config().speculative_config
         self._ordered_hc = (
             spec is not None
@@ -218,6 +220,20 @@ class GatedResidual(nn.Module):
             weight.shape[0],
         )
 
+    def _mix_up(self, lora: torch.Tensor, normalized: torch.Tensor) -> torch.Tensor:
+        if self._ordered_hc and not self._astra_hc_up_prepared:
+            from vllm_xpu_kernels.astra_structural import prepare_hc_weight
+
+            # Resolve the supported checkpoint layout before graph capture.
+            # This aliases the loaded weight and allocates no duplicate table.
+            self._astra_hc_up_weight = prepare_hc_weight(self.input_mix_weight_up.weight)
+            self._astra_hc_up_prepared = True
+        if self._astra_hc_up_weight is not None and 1 <= lora.shape[0] <= 8:
+            from vllm_xpu_kernels.astra_structural import hc_up_mix
+
+            return hc_up_mix(lora, self._astra_hc_up_weight, normalized)
+        return hc_gate_mix(normalized, self.input_mix_weight_up(lora), self.hc_count)
+
     def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
         """Use ordered DFlash2 projection or the legacy target-only policy."""
         if self._ordered_hc:
@@ -280,8 +296,7 @@ class GatedResidual(nn.Module):
             injection = None
 
         lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = self._mix_up(lora, xn)
 
         return hidden_states, block_input, injection
 
@@ -336,8 +351,7 @@ class GatedResidual(nn.Module):
             injection = None
 
         lora = hc_silu(lora, self.hc_count)
-        gate = self.input_mix_weight_up(lora)  # [M, D]
-        block_input = hc_gate_mix(xn, gate, self.hc_count)
+        block_input = self._mix_up(lora, xn)
 
         return hidden_states, block_input, injection
 
