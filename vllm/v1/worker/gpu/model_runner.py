@@ -1732,6 +1732,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
     @torch.inference_mode()
+    def _b70_c1_eager_route(self, batch_req_state, num_reqs, uniform_tok_count) -> bool:
+        """B70-V32-01: send the batches wu1ff's C1 path serves (DFlash2 K=7 verify,
+        1-4 decode requests) eager, so c1_verify's guarded target graphs run them,
+        while the FULL graphs keep every other shape. B70_C1_EAGER_ROUTE=1."""
+        if not getattr(self, "_b70_c1_route_on", None):
+            if getattr(self, "_b70_c1_route_on", None) is None:
+                import os
+                spec = self.speculative_config
+                self._b70_c1_route_on = (
+                    os.environ.get("B70_C1_EAGER_ROUTE", "0") == "1"
+                    and spec is not None
+                    and spec.method == "dflash"
+                    and spec.num_speculative_tokens == 7
+                    and self.device.type == "xpu"
+                )
+                if self._b70_c1_route_on:
+                    logger.info("B70-V32-01: C1-shaped batches (1-4 reqs, K=7) dispatch eager")
+            if not self._b70_c1_route_on:
+                return False
+        if batch_req_state is None or batch_req_state.has_prefill:
+            return False
+        n = batch_req_state.num_tokens
+        if not 1 <= num_reqs <= 4:
+            return False
+        return (num_reqs == 1 and 1 < n <= 8) or (n == 8 * num_reqs and uniform_tok_count == 8)
+
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1807,7 +1833,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile
+            or skip_compiled
+            or self._b70_c1_eager_route(batch_req_state, num_reqs, uniform_tok_count),
             num_active_loras=num_active_loras,
             parallel_config=self.parallel_config,
             allow_ubatching=(
