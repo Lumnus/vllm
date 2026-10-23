@@ -29,6 +29,8 @@ from ..common.ngram_embedding import (
 )
 from ..common.ops.ple import ple_ngram_ids
 from .b70_disk import Qwen4ExpPLEDiskBF16Embedding
+from .b70_ple_nvme import Qwen4ExpPLEInt8NVMeEmbedding
+from .b70_ple_nvme import enabled as _b70_ple_int8_nvme
 
 logger = init_logger(__name__)
 
@@ -220,6 +222,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         if os.environ.get("B70_PLE_DISK_BF16") == "1":
             embedding_cls = Qwen4ExpPLEDiskBF16Embedding
+        if _b70_ple_int8_nvme():  # B70 0013 (L32 port): INT8 rows from NVMe
+            embedding_cls = Qwen4ExpPLEInt8NVMeEmbedding
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (
             self.use_sequence_parallel
@@ -404,7 +408,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     ) -> None:
         """Start the pinned lookup while the preceding decoder layer runs."""
         embedding = self.ngram_embedding
-        if isinstance(embedding, Qwen4ExpPLEDiskBF16Embedding):
+        if getattr(embedding, "host_prepared", False):
             return  # ModelState staged the authoritative inputs before replay.
         if not embedding.supports_prefetch:
             return
@@ -423,9 +427,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             "ngram_heads_offsets": self.ngram_heads_offsets,
             "ngram_heads_vocab_sizes": self.ngram_heads_vocab_sizes,
         }
-        disk = isinstance(self.ngram_embedding, Qwen4ExpPLEDiskBF16Embedding)
-        if disk and self.ngram_embedding._mmap_owner is not None:
-            raise RuntimeError("Disk BF16 PLE rejects reload")
+        disk = getattr(self.ngram_embedding, "host_prepared", False)
+        if disk and self.ngram_embedding.host_loaded():
+            raise RuntimeError("Host-prepared PLE rejects reload")
         loaded: set[str] = set()
         regular_weights: list[tuple[str, torch.Tensor]] = []
         shard_prefix = "ngram_embedding.shard_"
@@ -485,6 +489,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         if regular_weights:
             loaded.update(AutoWeightsLoader(self).load_weights(regular_weights))
         if disk:
-            self.ngram_embedding.load_mmap(os.environ["PLE_TABLE_PATH"])
+            self.ngram_embedding.load_host_table(self)
             loaded.add("ngram_embedding.weight")
         return loaded

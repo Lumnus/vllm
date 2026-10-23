@@ -27,16 +27,13 @@ class Qwen4ExpModelState(MambaHybridModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         config = self.model_config.hf_text_config
-        from .ngram_embedding import (
-            Qwen4ExpNGramEmbedding,
-            Qwen4ExpPLEDiskBF16Embedding,
-        )
+        from .ngram_embedding import Qwen4ExpNGramEmbedding
 
         self._disk_ple_modules = tuple(
             module
             for module in model.modules()
             if isinstance(module, Qwen4ExpNGramEmbedding)
-            and isinstance(module.ngram_embedding, Qwen4ExpPLEDiskBF16Embedding)
+            and getattr(module.ngram_embedding, "host_prepared", False)
         )
         if self._disk_ple_modules and len(self._disk_ple_modules) != 1:
             raise RuntimeError("Disk BF16 PLE requires exactly one target PLE module")

@@ -139,6 +139,14 @@ class Qwen4ExpPLEDiskBF16Embedding(Qwen4ExpPLEPinnedHostEmbedding):
     """
 
     disk_bf16: ClassVar[bool] = True
+    host_prepared: ClassVar[bool] = True  # B70 (L32): ModelState prepares it
+
+    def host_loaded(self) -> bool:
+        return self._mmap_owner is not None
+
+    def load_host_table(self, owner) -> None:
+        del owner
+        self.load_mmap(os.environ["PLE_TABLE_PATH"])
 
     def __init__(
         self,
