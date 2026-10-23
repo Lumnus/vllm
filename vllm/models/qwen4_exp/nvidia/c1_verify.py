@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Eager C1 DFlash2 verification with native speculative prefix-state kernels."""
 
+import os
 from contextlib import contextmanager
 
 import torch
@@ -21,7 +22,7 @@ def enabled(runner, batch) -> bool:
         and runner.model_config.hf_text_config.model_type == "qwen4_exp_text"
         and batch.num_reqs == 1
         and not batch.has_prefill
-        and 1 < batch.num_tokens <= 4
+        and 1 < batch.num_tokens <= 8
     )
 
 
@@ -60,7 +61,18 @@ def canonical_reductions(width):
         comm.all_reduce = original
 
 
-def verify(runner, batch, metadata, model_inputs):
+def verify_eager(runner, batch, metadata, model_inputs):
     """Run anchor plus proposals once and retain every native accepted prefix."""
     with canonical_reductions(batch.num_tokens), hc_graph_scope(batch.num_tokens):
         return runner.model(**model_inputs)
+
+
+def verify(runner, batch, metadata, model_inputs):
+    if batch.num_tokens == 8 and os.getenv("VLLM_XPU_C1_TARGET_GRAPH", "1") == "1":
+        from .b70_target_graph import TargetGraphs
+
+        graphs = getattr(runner, "_c1_target_graphs", None)
+        if graphs is None:
+            graphs = runner._c1_target_graphs = TargetGraphs()
+        return graphs.run(runner, batch, metadata, model_inputs, verify_eager)
+    return verify_eager(runner, batch, metadata, model_inputs)

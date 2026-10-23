@@ -13,7 +13,7 @@ _scope = threading.local()
 @contextmanager
 def hc_graph_scope(width):
     previous = getattr(_scope, "active", False)
-    _scope.active = width == 4 and os.getenv("VLLM_XPU_C1_HC_GRAPH", "1") == "1"
+    _scope.active = width in (4, 8) and os.getenv("VLLM_XPU_C1_HC_GRAPH", "1") == "1"
     try:
         yield
     finally:

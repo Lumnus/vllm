@@ -59,14 +59,15 @@ def _validate_disk_bf16_config(embedding_method, params_dtype, max_total_tokens)
             or draft.dtype != torch.bfloat16
             or draft.quantization is not None
             or spec.draft_parallel_config.tensor_parallel_size != 4
-            or spec.num_speculative_tokens != 3
+            or not 1 <= spec.num_speculative_tokens
+            < spec.draft_model_config.hf_config.dflash_config.get("block_size", 0)
             or spec.draft_sample_method != "probabilistic"
             or spec.rejection_sample_method != "standard"
             or spec.uses_dynamic_speculative_decoding()
             or spec.enable_adaptive_verification
         ):
             raise ValueError(
-                "Disk PLE speculation requires BF16 TP4 DFlash2, three fixed "
+                "Disk PLE speculation requires BF16 TP4 DFlash2, trained-width "
                 "proposals, conditional probabilistic drafting and standard rejection"
             )
     if any(

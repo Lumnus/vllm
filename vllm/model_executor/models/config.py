@@ -957,11 +957,12 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
                 or draft.vocab_size != text_config.vocab_size
                 or text_config.hc_count != 4
                 or text_config.num_hidden_layers != 48
-                or spec_config.num_speculative_tokens != 3
+                or not 1 <= spec_config.num_speculative_tokens
+                < draft.dflash_config.get("block_size", 0)
             ):
                 raise NotImplementedError(
                     "Qwen4Exp DFlash2 requires the five-layer HC4 Flash-Next "
-                    "feature contract and three proposals"
+                    "feature contract and proposals within the trained block"
                 )
         if spec_config is not None and spec_config.method not in {
             "mtp",
