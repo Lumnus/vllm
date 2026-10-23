@@ -900,6 +900,7 @@ class Scheduler(SchedulerInterface):
         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
+            alignment_reserved_slot = 0
 
             def skip_request(from_queue: RequestQueue) -> None:
                 request_to_skip = from_queue.pop_request()
@@ -920,7 +921,7 @@ class Scheduler(SchedulerInterface):
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
-                if num_running >= self.max_num_active_reqs:
+                if num_running >= self.max_num_active_reqs - alignment_reserved_slot:
                     break
 
                 request = request_queue.peek_request()
@@ -1178,6 +1179,17 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
+                            # An aligned chunk cannot use the remaining budget.
+                            # Reuse the skipped-request queue and keep a slot for
+                            # its first request when its next chunk can fit.
+                            if (
+                                num_scheduled_tokens
+                                and num_running < self.max_num_active_reqs - 1
+                                and not self._holds_kv_blocks(request)
+                            ):
+                                alignment_reserved_slot = 1
+                                skip_request(request_queue)
+                                continue
                             break
                         if (
                             pad_spec_decode
