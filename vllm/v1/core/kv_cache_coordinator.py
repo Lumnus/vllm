@@ -62,7 +62,39 @@ def _validate_prefix_cache_retention_interval(
         )
 
 
+def b70_gdn_backstep() -> int:
+    """B70 0014c: ``B70_OFFLOAD_GDN_BACKSTEP=N`` (default 0 = off)."""
+    import os
+    raw = os.environ.get("B70_OFFLOAD_GDN_BACKSTEP", "").strip()
+    try:
+        return max(0, int(raw)) if raw else 0
+    except ValueError:
+        return 0
+
+
+def b70_backstep_boundaries(
+    num_prompt_tokens: int, block_size: int, steps: int
+) -> tuple[int, ...]:
+    """Block boundaries 1..steps blocks below the replay boundary."""
+    base = (num_prompt_tokens - 1) // block_size * block_size
+    return tuple(
+        base - k * block_size for k in range(1, steps + 1) if base - k * block_size > 0
+    )
+
+
 def replay_boundaries(
+    num_prompt_tokens: int, scheduler_block_size: int, use_eagle: bool
+) -> tuple[int, ...]:
+    """B70 0014c wrapper: upstream boundaries plus N backstep boundaries."""
+    base = _replay_boundaries(num_prompt_tokens, scheduler_block_size, use_eagle)
+    steps = b70_gdn_backstep()
+    if not steps:
+        return base
+    return tuple(sorted(set(base) | set(
+        b70_backstep_boundaries(num_prompt_tokens, scheduler_block_size, steps))))
+
+
+def _replay_boundaries(
     num_prompt_tokens: int, scheduler_block_size: int, use_eagle: bool
 ) -> tuple[int, ...]:
     """Positions a later request replaying a prompt can resume at.

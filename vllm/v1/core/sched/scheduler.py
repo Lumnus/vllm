@@ -82,6 +82,9 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # B70 0014c default (off) for instances built without __init__.
+    b70_gdn_backstep: int = 0
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -377,6 +380,10 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        # B70 0014c: prefill chunks also stop at the backstep boundaries so
+        # their Mamba states are materialized (they are block aligned).
+        from vllm.v1.core.kv_cache_coordinator import b70_gdn_backstep
+        self.b70_gdn_backstep = b70_gdn_backstep()
         # TODO: Support models with multiple Mamba specs that require different
         # prefill checkpoint alignments instead of selecting the first one.
         self.mamba_prefill_checkpoint_alignment = next(
@@ -551,6 +558,13 @@ class Scheduler(SchedulerInterface):
             # requests sharing the prefix can reuse it.
             junction_stop if start < junction < end else 0,
         )
+        # B70 0014c; getattr: some callers pass a namespace instead of a Scheduler.
+        b70_steps = getattr(self, "b70_gdn_backstep", 0)
+        if b70_steps:
+            from vllm.v1.core.kv_cache_coordinator import b70_backstep_boundaries
+            stops += b70_backstep_boundaries(
+                request.num_prompt_tokens, block_size, b70_steps
+            )
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
