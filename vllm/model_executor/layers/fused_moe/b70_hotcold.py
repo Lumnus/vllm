@@ -224,6 +224,30 @@ def route_count_enabled() -> bool:
 
 
 _DECODE_OP = {"max_rows": None}
+_GLUE = {"on": None}
+
+
+def glue_part(name: str) -> bool:
+    """B70_MOE_GLUE_PARTS (default "count,topk"): which glue pieces run when B70_MOE_GLUE=1."""
+    return glue_enabled() and name in os.environ.get("B70_MOE_GLUE_PARTS", "count,topk").split(",")
+
+
+def glue_enabled() -> bool:
+    """B70 0051: B70_MOE_GLUE=1 moves two pieces of MoE glue at decode into the decode op's library: the 0047 route
+    count goes into the op's plan kernel (moe_decode_counted, replaces remainder + index_add_), and top-k softmax
+    runs as b70moe.topk_softmax (same ids, weights within a few fp32 ulp; replaces _moe_C.topk_softmax, ~12 us fixed
+    per call). Needs the decode op (B70_MOE_DECODE_OP)."""
+    on = _GLUE["on"]
+    if on is None:
+        on = (os.environ.get("B70_MOE_GLUE") == "1" and decode_op_max_rows() > 0
+              and hasattr(torch.ops.b70moe, "moe_decode_counted") and hasattr(torch.ops.b70moe, "topk_softmax"))
+        if os.environ.get("B70_MOE_GLUE") == "1" and not on:
+            logger.warning("B70 MoE glue: the decode op library has no glue ops; stock path")
+        elif on:
+            logger.info("B70 MoE glue: route count in the decode op, b70moe.topk_softmax for <= %d tokens",
+                        decode_op_max_rows())
+        _GLUE["on"] = on
+    return on
 
 
 def _cpu_has_avx512_bf16() -> bool:
@@ -778,8 +802,9 @@ class HotColdPlan:
                      topk_weights=topk_weights, topk_ids=topk_ids)
         _PREFETCH.release_and_prefetch(self)
 
-    def apply_decode_op(self, output, hidden_states, topk_weights, topk_ids) -> bool:
-        """B70 0048: small batches through the fused hot+cold decode op (b70moe.moe_decode); False = not taken."""
+    def apply_decode_op(self, output, hidden_states, topk_weights, topk_ids, counts_row=None) -> bool:
+        """B70 0048: small batches through the fused hot+cold decode op (b70moe.moe_decode); False = not taken.
+        counts_row (0051): also add this batch's routes to the 0047 count row inside the op."""
         if hidden_states.shape[0] > decode_op_max_rows() or hidden_states.dtype != torch.bfloat16:
             return False
         args = self._decode_args
@@ -797,8 +822,12 @@ class HotColdPlan:
                 return False
             self._decode_args = args
         ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
-        torch.ops.b70moe.moe_decode(output, hidden_states.contiguous(), topk_weights.contiguous(),
-                                    ids.contiguous(), *args)
+        if counts_row is not None:
+            torch.ops.b70moe.moe_decode_counted(output, hidden_states.contiguous(), topk_weights.contiguous(),
+                                                ids.contiguous(), *args, counts_row)
+        else:
+            torch.ops.b70moe.moe_decode(output, hidden_states.contiguous(), topk_weights.contiguous(),
+                                        ids.contiguous(), *args)
         return True
 
     def impls(self, w1, w1_scale, w2, w2_scale, topk, activation, extra):

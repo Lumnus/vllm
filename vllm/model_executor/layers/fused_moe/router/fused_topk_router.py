@@ -30,6 +30,18 @@ def vllm_topk_softmax(
     gating_output: torch.Tensor,
     renormalize: bool = False,
 ) -> tuple[torch.Tensor, ...]:
+    if _b70_topk_ok(topk_weights, topk_indices, gating_output):
+        # B70 0051: same ids, weights within a few fp32 ulp; token_expert_indices is not written (all callers of
+        # fused_topk discard it)
+        pad = _get_padding_mask(topk_indices.shape[0])
+        torch.ops.b70moe.topk_softmax(
+            topk_weights,
+            topk_indices,
+            gating_output,
+            renormalize,
+            pad,
+        )
+        return topk_weights, topk_indices
     ops.topk_softmax(
         topk_weights,
         topk_indices,
@@ -40,6 +52,21 @@ def vllm_topk_softmax(
     )
 
     return topk_weights, topk_indices
+
+
+def _b70_topk_ok(topk_weights, topk_indices, gating_output) -> bool:
+    """B70 0051 (B70_MOE_GLUE=1): decode-sized bf16 routing on XPU goes to b70moe.topk_softmax."""
+    if not gating_output.is_xpu:
+        return False
+    from vllm.model_executor.layers.fused_moe.b70_hotcold import decode_op_max_rows, glue_part
+
+    return (glue_part("topk") and gating_output.dtype == torch.bfloat16
+            and gating_output.data_ptr() % 16 == 0
+            and gating_output.shape[0] <= decode_op_max_rows()
+            and gating_output.shape[1] in (512, 1024) and gating_output.stride(1) == 1
+            and gating_output.stride(0) % 8 == 0 and topk_weights.dtype == torch.float32
+            and topk_indices.dtype == torch.int32 and topk_weights.shape[1] <= 16
+            and topk_weights.is_contiguous() and topk_indices.is_contiguous())
 
 
 def vllm_topk_sigmoid(

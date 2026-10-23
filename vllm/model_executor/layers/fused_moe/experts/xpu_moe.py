@@ -322,26 +322,31 @@ class XPUExpertsWNA16(XPUExperts):
             w1, self.w1_scale, w2, self.w2_scale, topk_ids.size(-1),
             activation.value, {"gemm1_clamp_limit": self.gemm1_clamp_limit},
         )
-        if not (activation.value == "silu" and self.gemm1_clamp_limit is None
-                and self.b70_hotcold.apply_decode_op(output, hidden_states, topk_weights, topk_ids)):
+        from vllm.model_executor.layers.fused_moe import b70_hotcold as _hc
+
+        row = None
+        counts = self.b70_hotcold.route_counts
+        if counts is not None:
+            # row 0: eager batches (prefill, mixed); row 1: captured graphs (decode)
+            graph = torch.xpu.is_current_stream_capturing()
+            # eager counting starts with the first real batch: the memory-profiling run must not pay for it
+            if (graph and self.b70_hotcold.count_graphs) or (not graph and _hc._LIVE["on"]):
+                row = counts[1 if graph else 0]
+        in_op = row if _hc.glue_part("count") else None  # 0051: the op counts in its plan kernel
+        took_op = (activation.value == "silu" and self.gemm1_clamp_limit is None
+                   and self.b70_hotcold.apply_decode_op(output, hidden_states, topk_weights, topk_ids,
+                                                        counts_row=in_op))
+        if not took_op:
             hot.apply(output=output, hidden_states=hidden_states,
                       topk_weights=topk_weights, topk_ids=topk_ids)
             cold_out = torch.empty_like(output)
             self.b70_hotcold.apply_cold(cold, cold_out, hidden_states, topk_weights, topk_ids)
             output.add_(cold_out)
-        counts = self.b70_hotcold.route_counts
-        if counts is not None:
-            # row 0: eager batches (prefill, mixed); row 1: captured graphs (decode)
-            from vllm.model_executor.layers.fused_moe import b70_hotcold as _hc
-
-            graph = torch.xpu.is_current_stream_capturing()
-            # eager counting starts with the first real batch: the memory-profiling run must not pay for it
-            if (graph and self.b70_hotcold.count_graphs) or (not graph and _hc._LIVE["on"]):
-                row = counts[1 if graph else 0]
-                # two kernels (inside the decode graphs too): negative (padding) ids land in the last
-                # bucket via remainder, and the ones come from a shared static buffer
-                ids = topk_ids.reshape(-1).remainder(row.shape[0])
-                row.index_add_(0, ids, _hc.route_ones(ids.numel(), row.device))
+        if row is not None and not (took_op and in_op is not None):
+            # two kernels (inside the decode graphs too): negative (padding) ids land in the last
+            # bucket via remainder, and the ones come from a shared static buffer
+            ids = topk_ids.reshape(-1).remainder(row.shape[0])
+            row.index_add_(0, ids, _hc.route_ones(ids.numel(), row.device))
 
 
 class XPUExpertsMxFp4(XPUExperts):
