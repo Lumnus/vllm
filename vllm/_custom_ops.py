@@ -2860,6 +2860,16 @@ def swap_blocks(
     torch.ops._C_cache_ops.swap_blocks(src, dst, block_size_in_bytes, block_mapping)
 
 
+@cache
+def _xpu_swap_blocks_batch_has_snapshot_src() -> bool:
+    """Whether the XPU kernels' swap_blocks_batch takes snapshot_src."""
+    try:
+        schema = torch.ops._C_cache_ops.swap_blocks_batch.default._schema
+    except (AttributeError, RuntimeError):
+        return False
+    return any(a.name == "snapshot_src" for a in schema.arguments)
+
+
 def swap_blocks_batch(
     src_ptrs: torch.Tensor,
     dst_ptrs: torch.Tensor,
@@ -2882,7 +2892,16 @@ def swap_blocks_batch(
         is always safe.
     """
     if current_platform.is_xpu():
-        torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
+        if is_src_access_order_any and _xpu_swap_blocks_batch_has_snapshot_src():
+            # The caller guarantees no stream writes the source while the
+            # copy is queued (the CPU->GPU direction of the KV offload pool),
+            # so pinned sources need no call-time snapshot: they are copied
+            # directly in stream order (vllm-xpu-kernels snapshot_src=False).
+            torch.ops._C_cache_ops.swap_blocks_batch(
+                src_ptrs, dst_ptrs, sizes, False
+            )
+        else:
+            torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
     else:
         torch.ops._C_cache_ops.swap_blocks_batch(
             src_ptrs, dst_ptrs, sizes, is_src_access_order_any
