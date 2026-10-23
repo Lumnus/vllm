@@ -378,10 +378,27 @@ class Qwen3NextAttention(nn.Module):
         self.use_fused_qk_norm_rope_gate = (
             self.attn_output_gate
             and getattr(self.rotary_emb, "is_neox_style", False)
-            and current_platform.is_cuda()
+            # B70-0059 (vllm #56096): XPU too; B70_XPU_FUSED_QK_NORM=0 keeps the eager path.
+            and (
+                current_platform.is_cuda()
+                or (
+                    current_platform.is_xpu()
+                    and __import__("os").environ.get("B70_XPU_FUSED_QK_NORM", "1") != "0"
+                )
+            )
             and supports_dtype
             and (text_only or supports_mrope)
         )
+        if current_platform.is_xpu():
+            from vllm.logger import init_logger as _b70_init_logger
+
+            _b70_init_logger(__name__).info_once(
+                "B70-0059 fused QK-norm/RoPE/gate on XPU: %s (gate %s, neox %s, "
+                "dtype ok %s, text_only %s, mrope ok %s)",
+                self.use_fused_qk_norm_rope_gate, self.attn_output_gate,
+                getattr(self.rotary_emb, "is_neox_style", False), supports_dtype,
+                text_only, supports_mrope,
+            )
 
     def _project_qkv_gate(
         self,
