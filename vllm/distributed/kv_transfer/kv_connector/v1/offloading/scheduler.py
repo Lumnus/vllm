@@ -384,6 +384,9 @@ class RequestOffloadState:
     # Loaded attention keys cover their token positions. Recurrent state
     # supports the whole reused external prefix.
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
+    # Hit boundary proven by the full-attention groups in the latest lookup,
+    # before any sliding-window/Mamba group narrowed it; 0 if not reached.
+    full_attention_hit_boundary: int = 0
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
 
@@ -994,6 +997,7 @@ class OffloadingConnectorScheduler:
         happens until num_hit_tokens converges.
         """
         num_computed_tokens = req_status.num_locally_computed_tokens
+        req_status.full_attention_hit_boundary = 0
         max_hit_size_tokens: int = req_status.req.num_tokens
         if max_num_new_tokens is not None:
             max_hit_size_tokens = min(
@@ -1023,6 +1027,8 @@ class OffloadingConnectorScheduler:
         # in the current convergence iteration. Reset when a non-eagle group
         # tightens the hit boundary, requiring a fresh pop.
         eagle_verified: set[int] = set()
+        full_attention_confirmed = False
+        full_attention_boundary_recorded = False
         while lookup_groups:
             looked_up_sliding_window: bool = False
             groups_iter = iter(lookup_groups)
@@ -1058,6 +1064,14 @@ class OffloadingConnectorScheduler:
                 sliding_window_size_in_chunks = (
                     group_config.sliding_window_size_in_chunks
                 )
+                if (
+                    sliding_window_size_in_chunks is not None
+                    and not full_attention_boundary_recorded
+                ):
+                    # Groups before the first sparse group are full attention.
+                    full_attention_boundary_recorded = True
+                    if full_attention_confirmed and not defer_lookup:
+                        req_status.full_attention_hit_boundary = max_hit_size_tokens
 
                 # For eagle groups, query one extra chunk that will be popped.
                 # Widening applies to every group type: without it, the pop
@@ -1133,6 +1147,8 @@ class OffloadingConnectorScheduler:
                         max_hit_size_tokens,
                         tokens_per_chunk * (start_chunk_idx + num_hit_chunks),
                     )
+                    if sliding_window_size_in_chunks is None:
+                        full_attention_confirmed = True
 
                 new_num_hit_tokens = max_hit_size_tokens - num_computed_tokens
                 if new_num_hit_tokens < tokens_per_chunk:
@@ -1270,6 +1286,27 @@ class OffloadingConnectorScheduler:
             return None
         return complete_hit
 
+    def _maybe_register_shared_prefix_junction(
+        self, req_status: RequestOffloadState, num_hit_tokens: int
+    ) -> None:
+        """Pin a shared-prefix junction where a sparse group cut the hit.
+
+        Offload-tier counterpart of the junction ``get_computed_blocks`` pins
+        for a local hit: under sparse retention the recompute then retains
+        (and hands off for offload) the sliding-window/Mamba state at the
+        boundary the full-attention groups proved, instead of storing it
+        again at its replay boundary inside the part that differs.
+        """
+        if self.config.retention_interval is None:
+            return
+        boundary = req_status.full_attention_hit_boundary
+        if boundary <= req_status.num_locally_computed_tokens + num_hit_tokens:
+            return
+        request = req_status.req
+        # Never lower a junction the local prefix cache already set.
+        if boundary > request.shared_prefix_boundary:
+            request.shared_prefix_boundary = boundary
+
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
         req_context = _create_req_context(request)
@@ -1338,6 +1375,7 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
+                self._maybe_register_shared_prefix_junction(req_status, num_hit_tokens)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         return num_hit_tokens, bool(num_hit_tokens)
