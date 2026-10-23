@@ -109,7 +109,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         self._prefetch_buffer = torch.empty(self._capacity, self._heads, self._storage,
                                             dtype=torch.uint8, device="xpu")
         self._stage = torch.zeros(self._capacity, self._heads, self._storage,
-                                  dtype=torch.uint8, pin_memory=True)
+                                  dtype=torch.uint8, device="cpu", pin_memory=True)
         if not self._stage.is_pinned():
             raise RuntimeError("B70 PLE NVMe stage failed to pin")
         self._stage_np = self._stage.numpy()
@@ -192,7 +192,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         if capacity < needed:
             raise RuntimeError(f"B70_PLE_INT8_NVME_CACHE_GIB={total_gib}: {capacity} rows/rank "
                                f"< {needed} (2 steps x {self._capacity} tokens x own heads)")
-        slab = torch.empty(capacity, self._storage, dtype=torch.uint8, pin_memory=True)
+        slab = torch.empty(capacity, self._storage, dtype=torch.uint8, device="cpu", pin_memory=True)
         self._slab = slab
         self._slab_np = slab.numpy()
         cache = PleRowCache(tp_end - tp_start, capacity, self._storage, slab=self._slab_np)
