@@ -80,6 +80,11 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+import os as _b70_os
+
+_B70_SCHED_ALIGN_SKIP = _b70_os.environ.get("B70_SCHED_ALIGN_SKIP", "0") == "1"
+
+
 class Scheduler(SchedulerInterface):
     # B70 0014c default (off) for instances built without __init__.
     b70_gdn_backstep: int = 0
@@ -881,6 +886,10 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
+            # B70-0060 (hand-adapted from wu1ff/B70-LLM-Controller qwen3.8-flash-next-v1.0.5 integrated-serving.patch; Copyright (c) 2026 wu1ff, MIT (LICENSES/wu1ff-B70-LLM-Controller-MIT.txt)): a request whose Mamba-aligned
+            # chunk cannot use the rest of this step's budget is set aside for the step, and one request slot is
+            # kept for it, so the remaining budget goes to the next waiting request. B70_SCHED_ALIGN_SKIP=1.
+            alignment_reserved_slot = 0
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if input_budget <= draft_slots:
@@ -888,7 +897,7 @@ class Scheduler(SchedulerInterface):
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
-                if num_running >= self.max_num_running_reqs:
+                if num_running >= self.max_num_running_reqs - alignment_reserved_slot:
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -1116,6 +1125,20 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
+                            # B70-0060: only a fresh request that holds nothing (no computed or external
+                            # tokens, plain WAITING) is set aside; anything else keeps the upstream break.
+                            if (
+                                _B70_SCHED_ALIGN_SKIP
+                                and num_scheduled_tokens
+                                and num_running < self.max_num_running_reqs - 1
+                                and request.status == RequestStatus.WAITING
+                                and request.num_computed_tokens == 0
+                                and num_external_computed_tokens == 0
+                            ):
+                                alignment_reserved_slot = 1
+                                request_queue.pop_request()
+                                step_skipped_waiting.prepend_request(request)
+                                continue
                             break
                         if (
                             pad_spec_decode

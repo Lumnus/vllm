@@ -104,7 +104,8 @@ def _update_min_larger_stats(data, above_mask, min_larger, num_min_larger, senti
     return min_larger, num_min_larger
 
 
-@triton.jit
+# B70-0060 (wu1ff/B70-LLM-Controller qwen3.8-flash-next-v1.0.5 integrated-serving.patch; Copyright (c) 2026 wu1ff, MIT (LICENSES/wu1ff-B70-LLM-Controller-MIT.txt)): BATCH_SIZE is not a specialization key.
+@triton.jit(do_not_specialize=["BATCH_SIZE"])
 def _topk_topp_kernel(
     LOGITS,
     LOGITS_STRIDE_0,

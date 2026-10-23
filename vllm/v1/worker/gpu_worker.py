@@ -925,6 +925,12 @@ class Worker(WorkerBase):
 
             trigger_inductor_lazy_init(self.device)
 
+        # B70-0060 (wu1ff 1.0.5 integrated-serving, MIT): warm the XPU sampling filter before serving.
+        if self.device.type == "xpu" and getattr(self, "use_v2_model_runner", False):
+            from vllm.v1.worker.gpu.sample.xpu_filter_warmup import warmup_filter
+
+            warmup_filter(self.model_runner)
+
         # All warmup is done — start monitoring for unexpected JIT
         # compilations that would cause latency spikes during inference.
         from vllm.utils.jit_monitor import activate as activate_jit_monitor
