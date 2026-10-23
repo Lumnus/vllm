@@ -112,28 +112,39 @@ def stage(value, memo, bound):
 
 
 def update(destination, source, seen):
-    if id(destination) in seen:
-        return
-    seen.add(id(destination))
-    if isinstance(destination, torch.Tensor):
-        assert destination.shape == source.shape and destination.dtype == source.dtype
-        destination.copy_(source)
-    elif isinstance(destination, dict):
-        assert destination.keys() == source.keys()
-        for key in destination:
-            update(destination[key], source[key], seen)
-    elif dataclasses.is_dataclass(destination):
-        for field in dataclasses.fields(destination):
-            if field.name == "max_seq_len":
-                assert getattr(source, field.name) <= destination.max_seq_len
-                continue
-            update(getattr(destination, field.name), getattr(source, field.name), seen)
-    elif isinstance(destination, (tuple, list)):
-        assert len(destination) == len(source)
-        for a, b in zip(destination, source):
-            update(a, b, seen)
-    else:
-        assert destination == source, (destination, source)
+    """Validate the schema, then submit required device copies together."""
+    destinations, sources = [], []
+    def visit(destination, source):
+        if id(destination) in seen:
+            return
+        seen.add(id(destination))
+        if isinstance(destination, torch.Tensor):
+            assert destination.shape == source.shape and destination.dtype == source.dtype
+            assert destination.device == source.device
+            if destination.device.type == "xpu":
+                destinations.append(destination)
+                sources.append(source)
+            else:
+                destination.copy_(source)
+        elif isinstance(destination, dict):
+            assert destination.keys() == source.keys()
+            for key in destination:
+                visit(destination[key], source[key])
+        elif dataclasses.is_dataclass(destination):
+            for field in dataclasses.fields(destination):
+                if field.name == "max_seq_len":
+                    assert getattr(source, field.name) <= destination.max_seq_len
+                    continue
+                visit(getattr(destination, field.name), getattr(source, field.name))
+        elif isinstance(destination, (tuple, list)):
+            assert len(destination) == len(source)
+            for a, b in zip(destination, source):
+                visit(a, b)
+        else:
+            assert destination == source, (destination, source)
+    visit(destination, source)
+    if destinations:
+        torch._foreach_copy_(destinations, sources)
 
 
 @contextmanager
@@ -183,7 +194,20 @@ class TargetGraphs:
             self.fallback("disabled", key)
             return eager(runner, batch, metadata, inputs)
         context = get_forward_context()
-        current = (inputs, metadata, context.slot_mapping, context.is_padding)
+        # The runner's forward context includes target AND draft metadata.
+        # Only bind consumers in this target model: draft softmax workspaces
+        # and mappings are neither inputs nor outputs of the target graph.
+        names = getattr(self, "target_context_names", None)
+        if names is None:
+            modules = set(runner.model.modules())
+            names = self.target_context_names = frozenset(
+                name for name, module in runner.vllm_config.compilation_config.static_forward_context.items()
+                if module in modules
+            )
+            assert names and all(name in names for name in metadata if name.startswith("language_model."))
+        target_metadata = {name: value for name, value in metadata.items() if name in names}
+        target_slots = {name: value for name, value in context.slot_mapping.items() if name in names}
+        current = (inputs, target_metadata, target_slots, context.is_padding)
         entry = self.entries.get(key)
         if entry is not None:
             try:
