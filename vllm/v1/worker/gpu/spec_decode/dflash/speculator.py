@@ -451,6 +451,23 @@ class DFlashSpeculator(DraftModelSpeculator):
                 self.sample_from_anchor,
             )
 
+        # An unfinished prompt chunk cannot produce accepted draft tokens.
+        # Preserve every context K/V write, but avoid queries whose positions
+        # will be overwritten by the next target-prefill chunk. The scheduler
+        # explicitly ignores draft IDs while request.is_prefill_chunk is true.
+        if (
+            not dummy_run and self.dp_size == 1
+            and self._speculator_name == "DFlash2"
+            and input_batch.has_prefill
+            and input_batch.is_prefilling_np.all()
+            and (input_batch.num_computed_prefill_tokens_np
+                 + input_batch.num_scheduled_tokens < input_batch.prefill_len_np).all()
+        ):
+            self._precompute_context_kv(0, num_target_tokens)
+            self.draft_tokens[:num_reqs].fill_(-1)
+            return self.draft_tokens[:num_reqs]
+
+
         batch_sync, num_batch_tokens = (
             self._build_uniform_batch_dp_sync(
                 dp_sync_state, num_reqs, self.num_query_per_req

@@ -22,6 +22,11 @@ def hc_graph_scope(width):
 
 def replay_hc(module, name, forward, args):
     """Return a fixed-address HC result, or use eager outside the C1 scope."""
+    from .b70_prefill_hc import prefill_hc
+
+    prefilled = prefill_hc(module, name, forward, args)
+    if prefilled is not None:
+        return prefilled
     if not getattr(_scope, "active", False) or torch.xpu.is_current_stream_capturing():
         return forward(*args)
     entries = getattr(module, "_c1_hc_graphs", None)

@@ -8,12 +8,12 @@ import torch
 from vllm.triton_utils import tl, triton
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _ordered_hc_gemm(
     x,
     weight,
     output,
-    M: tl.constexpr,
+    M,
     N: tl.constexpr,
     K: tl.constexpr,
     XS0: tl.constexpr,
@@ -61,7 +61,9 @@ def ordered_hc_gemm(x, weight, valid_columns):
     ):
         return parallel_hc_gemm(x, weight, valid_columns)
     output = torch.empty((rows, columns), device=x.device, dtype=x.dtype)
-    _ordered_hc_gemm[(triton.cdiv(rows, 16), triton.cdiv(columns, 32))](
+    # Preserve fixed K ordering; wide prefill tiles share more weight loads.
+    bm, bn = (32, 64) if rows >= 256 and inner == 10240 else (16, 32)
+    _ordered_hc_gemm[(triton.cdiv(rows, bm), triton.cdiv(columns, bn))](
         x,
         weight,
         output,
@@ -71,6 +73,7 @@ def ordered_hc_gemm(x, weight, valid_columns):
         *x.stride(),
         *weight.stride(),
         valid_columns,
+        BM=bm, BN=bn,
         num_warps=4,
         num_stages=2,
     )
