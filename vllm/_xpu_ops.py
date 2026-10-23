@@ -1083,6 +1083,36 @@ class xpu_ops:
             assert len(window_size) == 2
             real_window_size = (window_size[0], window_size[1])  # noqa: F841
 
+        from vllm.models.qwen4_exp.nvidia import b70_target_attention
+
+        splits = b70_target_attention.fixed_splits(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            causal,
+            real_window_size,
+            softcap,
+            alibi_slopes,
+            s_aux,
+            return_softmax_lse,
+            q_descale,
+        )
+        if splits is not None:
+            return b70_target_attention.forward(
+                q,
+                k,
+                v,
+                out,
+                seqused_k,
+                block_table,
+                max_seqlen_k,
+                softmax_scale,
+                splits,
+            )
         return flash_attn_varlen_func(
             out=out,
             q=q,

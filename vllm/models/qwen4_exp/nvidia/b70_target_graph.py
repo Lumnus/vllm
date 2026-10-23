@@ -162,7 +162,14 @@ class TargetGraphs:
         # The runner admits one uniform C1 verification. Partial blocks use eager.
         if batch.num_tokens != 8:
             return eager(runner, batch, metadata, inputs)
-        bound = max(512, 1 << (int(batch.seq_lens_cpu_upper_bound[0]) - 1).bit_length())
+        if os.getenv("VLLM_XPU_DFLASH_FIXED_SPLITS", "0") in ("32", "64"):
+            # The target split schedule no longer depends on this host bound.
+            # One graph follows live device lengths across context boundaries.
+            bound = runner.model_config.max_model_len
+        else:
+            bound = max(
+                512, 1 << (int(batch.seq_lens_cpu_upper_bound[0]) - 1).bit_length()
+            )
         if bound in self.disabled:
             self.fallbacks += 1
             return eager(runner, batch, metadata, inputs)
