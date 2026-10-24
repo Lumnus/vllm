@@ -1825,6 +1825,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # cross-attention cache with dynamic encoder outputs.
             skip_compiled = True
 
+        from vllm.v1.worker.gpu import b70_phase as _b70p
+
+        if not dummy_run:
+            _b70p.mark("exec")
         batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
@@ -1856,10 +1860,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.observability_config.cudagraph_metrics:
                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
             assert batch_req_state is not None
+            _b70p.mark("pin")
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
+            _b70p.mark("pattn")
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+            _b70p.mark("pstate")
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -2010,8 +2017,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "intermediate_tensors": None,
             # NOTE: Values returned by `prepare_inputs` will override the default
             # values above.
-            **self.model_state.prepare_inputs(input_batch, self.req_states),
+            **(
+                _b70p.mark("mstate") if not dummy_run else None,
+                self.model_state.prepare_inputs(input_batch, self.req_states),
+            )[1],
         }
+        if not dummy_run:
+            _b70p.mark("post-mstate")
         if not self.is_first_pp_rank:
             # Update for non-first PP ranks.
             model_inputs["input_ids"] = None
@@ -2041,6 +2053,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        if not dummy_run:
+            _b70p.mark("fwd")
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -2188,9 +2202,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.restore_for_sampling(hidden_states, aux_hidden_states)
             )
 
+        from vllm.v1.worker.gpu import b70_phase as _b70p
+
+        _b70p.mark("sample")
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        _b70p.mark("post")
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2289,6 +2307,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.prepare_watermarking(
                     self.sampler, input_batch.idx_mapping
                 )
+            _b70p.mark("draft")
             with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
@@ -2326,10 +2345,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.req_states.draft_tokens, input_batch
                 )
 
+        _b70p.mark("kvpost")
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
+        _b70p.mark("end")
 
         return async_output
 
