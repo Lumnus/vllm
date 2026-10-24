@@ -175,6 +175,10 @@ class XPUExperts(mk.FusedMoEExpertsModular):
                 gemm1_clamp_limit=self.gemm1_clamp_limit,
             )
         assert self.fused_moe_impl is not None
+        if self._b70_resident_decode_op(
+            output, hidden_states, topk_weights, topk_ids, activation, expert_map
+        ):
+            return
         if (self.moe_config.ep_size > 1
                 and getattr(self.fused_moe_impl, "_astra_groups", None) is None):
             # Avoid topk_ids = -1, remap them to an
@@ -188,6 +192,95 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             topk_ids=topk_ids,
             a1q_scale=a1q_scale,
         )
+
+    # B70-V32-0054: None = not decided yet, False = stock path, tuple = the op's weight arguments
+    _b70_decode_args = None
+
+    def _b70_resident_decode_op(
+        self, output, hidden_states, topk_weights, topk_ids, activation, expert_map
+    ) -> bool:
+        """B70-0054 on 0.32 (B70_MOE_DECODE_OP_RESIDENT=1 + B70_MOE_DECODE_OP=<lib>): decode batches of at most
+        B70_MOE_DECODE_OP_MAX_ROWS tokens of the all-resident EP int4 MoE through b70moe.moe_decode. Refuses (stock
+        path, one log line) under wu1ff's group ownership (weights re-laid out) or anything unexpected."""
+        args = self._b70_decode_args
+        if args is False:
+            return False
+        if args is None:
+            if torch.xpu.is_current_stream_capturing():
+                return False
+            args = self._b70_resident_setup(activation, expert_map)
+            self._b70_decode_args = args
+            if args is False:
+                return False
+        from vllm.model_executor.layers.fused_moe import b70_decode_op as _op
+
+        m = hidden_states.shape[0]
+        if (m == 0 or m > _op.decode_op_max_rows() or m * topk_ids.size(-1) > 256
+                or hidden_states.dtype != torch.bfloat16 or output.dtype != torch.bfloat16
+                or not output.is_contiguous()):
+            return False
+        ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
+        torch.ops.b70moe.moe_decode(output, hidden_states.contiguous(), topk_weights.contiguous(),
+                                    ids.contiguous(), *args)
+        return True
+
+    def _b70_resident_setup(self, activation, expert_map):
+        import os
+
+        from vllm.logger import init_logger
+        from vllm.model_executor.layers.fused_moe import b70_decode_op as _op
+
+        logger = init_logger(__name__)
+        if os.environ.get("B70_MOE_DECODE_OP_RESIDENT", "0") != "1":
+            return False
+        impl = self.fused_moe_impl
+        why = None
+        if getattr(impl, "_astra_groups", None) is not None:
+            why = "wu1ff group ownership re-laid out the expert weights"
+        elif _op.decode_op_max_rows() <= 0:
+            why = "B70_MOE_DECODE_OP not set or the library did not load"
+        elif not getattr(impl, "is_int4", False):
+            why = "not an int4 MoE"
+        elif activation.value != "silu" or self.gemm1_clamp_limit is not None:
+            why = f"activation {activation.value} / clamp {self.gemm1_clamp_limit}"
+        elif impl.w13_bias is not None or impl.w2_bias is not None:
+            why = "expert biases"
+        if why is None:
+            w = (impl.w13, impl.gemm1_wei_scales, impl.w2, impl.gemm2_wei_scales)
+            if any(t is None or not t.is_contiguous() or t.device.type != "xpu" for t in w):
+                why = "weights not contiguous on the device"
+            elif w[1].dtype != torch.bfloat16 or w[3].dtype != torch.bfloat16:
+                why = f"scales {w[1].dtype}"
+            elif w[0].element_size() != 1 or w[0].dim() != 3:
+                why = f"w13 {w[0].dtype} {tuple(w[0].shape)}"
+            elif (w[1].shape[-1] * 128 != w[0].shape[-1] * 2
+                    or w[3].shape[-1] * 128 != w[2].shape[-1] * 2):
+                why = "quant group size is not 128"
+        if why is None:
+            n_local = impl.num_experts
+            hot_map = impl.expert_map
+            if hot_map is None:
+                hot_map = torch.arange(n_local, dtype=torch.int32, device=impl.w13.device)
+            hot_map = hot_map.to(torch.int32).contiguous()
+            if expert_map is not None and (expert_map.numel() != hot_map.numel() or not torch.equal(
+                    expert_map.to(device=hot_map.device, dtype=torch.int32), hot_map)):
+                why = "vLLM's expert_map differs from the stock kernel's"
+            else:
+                local = hot_map[hot_map >= 0]
+                if local.numel() != n_local or not torch.equal(
+                        torch.sort(local).values.cpu(), torch.arange(n_local, dtype=torch.int32)):
+                    why = f"expert map names {local.numel()} local slots, kernel has {n_local}"
+        if why is not None:
+            if not getattr(XPUExperts, "_b70_resident_warned", False):
+                XPUExperts._b70_resident_warned = True
+                logger.warning("B70-0054 resident decode op: %s; stock path", why)
+            return False
+        cold_map = torch.full_like(hot_map, -1)
+        if not getattr(XPUExperts, "_b70_resident_logged", False):
+            XPUExperts._b70_resident_logged = True
+            logger.info("B70-0054 resident decode op: on: %d local of %d experts, batches of <= %d tokens",
+                        n_local, hot_map.numel(), _op.decode_op_max_rows())
+        return (hot_map, cold_map, *w, *w)
 
 
 class XPUExpertsFp8(XPUExperts):
