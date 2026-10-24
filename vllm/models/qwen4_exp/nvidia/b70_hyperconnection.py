@@ -23,6 +23,8 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -48,6 +50,10 @@ from .ops.hc import (
 )
 
 logger = init_logger(__name__)
+# B70-V32-07: rows up to which the DFlash2 fixed-order HC down projection is used; wider batches (8-stream
+# decode, prefill chunks) take the stock BF16 GEMM. The ordered Triton GEMM is 4.5x (64 rows) to 6.7x
+# (4096 rows) slower than F.linear on B70. Default: unbounded (wu1ff behaviour).
+_B70_HC_ORDERED_MAX_ROWS = int(os.environ.get("B70_HC_ORDERED_MAX_ROWS", str(1 << 30)))
 
 
 def _is_xpu() -> bool:
@@ -236,7 +242,7 @@ class GatedResidual(nn.Module):
 
     def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
         """Use ordered DFlash2 projection or the legacy target-only policy."""
-        if self._ordered_hc:
+        if self._ordered_hc and xn.shape[0] <= _B70_HC_ORDERED_MAX_ROWS:
             from .b70_hc_gemm import ordered_hc_gemm
 
             linear = (
