@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import Any
 
 from typing_extensions import override
@@ -21,6 +22,10 @@ from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+
+def envs_b70_private_pinned() -> bool:
+    return os.environ.get("B70_OFFLOAD_PRIVATE_PINNED", "0") == "1"
 
 
 def _all_workers_barrier() -> None:
@@ -161,6 +166,16 @@ class CPUOffloadingSpec(OffloadingSpec):
     def _uses_shared_region(self) -> bool:
         """Whether the worker CPU buffer is the shared mmap region (vs a private
         per-rank tensor); replicated-layout dedup is gated on this being True."""
+        # B70-V32-RC1: B70_OFFLOAD_PRIVATE_PINNED=1 keeps a private pinned (USM
+        # host) tensor per rank on XPU, as 0.30 did. The shared /dev/shm region
+        # is only host-registered (prepare_for_device_copy), which SYCL reports
+        # as usm::alloc::unknown, so every CPU->GPU load in swap_blocks_batch
+        # goes through a pinned staging buffer from torch's caching host
+        # allocator; those power-of-two blocks stay cached (measured 3.25 GiB
+        # per rank after one kvreplay). A USM host pool is copied directly
+        # (kernels PR3 path, snapshot_src=False) and needs no /dev/shm.
+        if current_platform.is_xpu() and envs_b70_private_pinned():
+            return False
         return (
             current_platform.is_cuda_alike() and not current_platform.is_rocm()
         ) or current_platform.is_xpu()
