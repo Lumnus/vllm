@@ -51,8 +51,17 @@ class Regions:
 
 _regions = None
 
+import os as _os
+
+# B70-V32-08: B70_PREFILL_HC_GRAPHS=0 turns off the 33-256-row prefill HC graph regions (one captured graph
+# per HC module plus their pool memory, sized before KV): KV memory over short-prefill speed.
+_B70_PREFILL_HC_GRAPHS = _os.environ.get("B70_PREFILL_HC_GRAPHS", "1") == "1"
+
+
 def prefill_hc(module, name, fn, args):
     global _regions
+    if not _B70_PREFILL_HC_GRAPHS:
+        return None
     rows = args[0].shape[0]
     if rows <= 32 or torch.xpu.is_current_stream_capturing():
         return None
