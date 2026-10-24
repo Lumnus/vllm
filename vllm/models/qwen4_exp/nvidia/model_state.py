@@ -143,7 +143,17 @@ class Qwen4ExpModelState(MambaHybridModelState):
                 num_tokens = input_batch.num_tokens
                 ctx = model_inputs["ngram_context"][:num_reqs]
                 flat = torch.cat([input_batch.input_ids[:num_tokens].long(), ctx.reshape(-1).long()])
-                flat = flat.to("cpu", non_blocking=False).numpy()
+                # A blocking D2H wakes up ~2-3 ms late on this stack; poll an event instead.
+                host = getattr(self, "_b70_ids_host", None)
+                if host is None or host.numel() < flat.numel():
+                    host = self._b70_ids_host = torch.empty(
+                        max(flat.numel(), 4096), dtype=torch.long, pin_memory=True)
+                    self._b70_ids_event = torch.xpu.Event()
+                host[: flat.numel()].copy_(flat, non_blocking=True)
+                self._b70_ids_event.record()
+                while not self._b70_ids_event.query():
+                    pass
+                flat = host[: flat.numel()].numpy()
                 _b70p.mark("ple-hash")
                 ids = module.compute_ngram_ids_host(
                     flat[:num_tokens],

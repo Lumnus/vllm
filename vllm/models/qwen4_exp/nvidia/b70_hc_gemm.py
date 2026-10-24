@@ -9,6 +9,10 @@ import torch
 from vllm.triton_utils import tl, triton
 
 _large_hc = None
+# B70-V32-04: rows up to which the split-K parallel HC GEMM is used (wu1ff: 32). Above it the
+# ordered GEMM runs one serial K=10240 loop over (rows/16 x cols/32) programs: 40 programs at
+# 64 rows, HC 15.7 ms of a 48 ms 8-stream forward. The split-K tile sum is batch-invariant.
+_PARALLEL_MAX_ROWS = int(os.getenv("B70_HC_PARALLEL_MAX_ROWS", "32"))
 
 
 @triton.jit(do_not_specialize=["M"])
@@ -79,7 +83,7 @@ def ordered_hc_gemm(x, weight, valid_columns):
             _large_hc = torch.ops.long_hc.forward
         return _large_hc(x, weight, valid_columns, 1)
     if (
-        (1 <= rows <= 8 or (9 <= rows <= 32 and inner == 10240))
+        (1 <= rows <= 8 or (9 <= rows <= _PARALLEL_MAX_ROWS and inner == 10240))
         and x.stride(1) == weight.stride(1) == 1
         and os.getenv("VLLM_XPU_C1_PARALLEL_HC", "1") == "1"
     ):
