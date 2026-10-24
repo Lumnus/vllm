@@ -15,6 +15,11 @@ from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
 from vllm.v1.worker.gpu.states import RequestState
 
 
+import os
+
+_B70_HOST_IDS = os.environ.get("B70_PLE_HOST_IDS", "0") == "1"
+
+
 class Qwen4ExpModelState(MambaHybridModelState):
     """Add rollback-safe PLE n-gram context to the model inputs."""
 
@@ -127,6 +132,21 @@ class Qwen4ExpModelState(MambaHybridModelState):
             if input_batch.input_ids.shape[0] != num_tokens_padded:
                 raise ValueError("Disk BF16 PLE input length differs from dispatch")
             if num_tokens_padded == 0:
+                continue
+            if _B70_HOST_IDS and hasattr(module, "compute_ngram_ids_host"):
+                # B70-V32-03: one small D2H of the tokens + context, ids hashed on the host: the
+                # step's only host sync no longer waits behind ~50 eager hash kernels.
+                num_reqs = input_batch.num_reqs
+                num_tokens = input_batch.num_tokens
+                ctx = model_inputs["ngram_context"][:num_reqs]
+                flat = torch.cat([input_batch.input_ids[:num_tokens].long(), ctx.reshape(-1).long()])
+                flat = flat.to("cpu", non_blocking=False).numpy()
+                ids = module.compute_ngram_ids_host(
+                    flat[:num_tokens],
+                    input_batch.query_start_loc_np[: num_reqs + 1],
+                    flat[num_tokens:].reshape(num_reqs, -1),
+                )
+                module.ngram_embedding.prepare(None, num_tokens, num_tokens_padded, host_ids=ids)
                 continue
             # Existing GPU IDs use the authoritative committed context above.
             # This producer runs before FULL replay as well as ordinary forward.

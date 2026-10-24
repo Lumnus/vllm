@@ -293,6 +293,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         valid = (source.unsqueeze(0) >= 0) & (position_in_segment >= shift)
         return torch.where(valid, shifted, tokens.new_full((), eos_token_id))
 
+    def compute_ngram_ids_host(self, input_ids, query_start_loc, ngram_context):
+        """B70-V32-03: compute_ngram_ids on the host (numpy), same arithmetic as the eager torch path.
+
+        input_ids [T], query_start_loc [R+1], ngram_context [R, n-1]: int64 numpy arrays of the actual
+        (unpadded) batch. Returns int64 [T, heads]. int64 products wrap exactly as torch's do."""
+        import numpy as np
+
+        consts = getattr(self, "_b70_host_consts", None)
+        if consts is None:
+            consts = self._b70_host_consts = (
+                [int(x) for x in self.layer_multipliers.cpu().tolist()],
+                self.ngram_heads_vocab_sizes.cpu().numpy().astype(np.int64),
+                self.ngram_heads_offsets.cpu().numpy().astype(np.int64),
+            )
+        return b70_host_ngram_ids(input_ids, query_start_loc, ngram_context, consts[0], consts[1],
+                                  consts[2], int(self.eos_token_id), int(self.heads_per_ngram),
+                                  int(self.ngram_size))
+
     def compute_ngram_ids(
         self,
         input_ids: torch.Tensor,
@@ -492,3 +510,45 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             self.ngram_embedding.load_host_table(self)
             loaded.add("ngram_embedding.weight")
         return loaded
+
+
+def b70_host_ngram_ids(input_ids, query_start_loc, ngram_context, multipliers, sizes, offsets, eos, heads_per_ngram,
+                       ngram_size):
+    """B70-V32-03: numpy twin of Qwen4ExpNGramEmbedding.compute_ngram_ids (eager path)."""
+    import numpy as np
+
+    input_ids = np.asarray(input_ids, dtype=np.int64).reshape(-1)
+    qsl = np.asarray(query_start_loc, dtype=np.int64)
+    num_reqs = qsl.size - 1
+    num_tokens = input_ids.shape[0]
+    positions = np.arange(num_tokens, dtype=np.int64)
+    packed = np.full((num_reqs, num_tokens), eos, dtype=np.int64)
+    request_indices = np.searchsorted(qsl, positions, side="right") - 1
+    request_indices = np.minimum(request_indices, num_reqs - 1)
+    columns = np.clip(positions - qsl[request_indices], 0, packed.shape[1] - 1)
+    packed[request_indices, columns] = input_ids
+    context = np.concatenate([np.asarray(ngram_context, dtype=np.int64)[:num_reqs], packed], axis=1)
+    batch, seq = context.shape
+    pos = np.arange(seq, dtype=np.int64)
+    eos_pos = np.where(context == eos, pos[None, :], -1)
+    prev_incl = np.maximum.accumulate(eos_pos, axis=1)
+    prev = np.concatenate([np.full((batch, 1), -1, dtype=np.int64), prev_incl[:, :-1]], axis=1)
+    in_segment = pos[None, :] - prev - 1
+    shifted = [context]
+    for shift in range(1, ngram_size):
+        source = pos - shift
+        gathered = context[:, np.maximum(source, 0)]
+        valid = (source[None, :] >= 0) & (in_segment >= shift)
+        shifted.append(np.where(valid, gathered, eos))
+    adjusted = columns + ngram_size - 1
+    blocks = []
+    with np.errstate(over="ignore"):
+        for ngram in range(2, ngram_size + 1):
+            start = (ngram - 2) * heads_per_ngram
+            end = start + heads_per_ngram
+            mixed = shifted[0] * np.int64(multipliers[0])
+            for index in range(1, ngram):
+                mixed = np.bitwise_xor(mixed, shifted[index] * np.int64(multipliers[index]))
+            ids = np.remainder(mixed[..., None], sizes[start:end]) + offsets[start:end]
+            blocks.append(ids[request_indices, adjusted])
+    return np.concatenate(blocks, axis=-1)

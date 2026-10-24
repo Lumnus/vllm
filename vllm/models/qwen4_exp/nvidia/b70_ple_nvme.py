@@ -241,7 +241,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         self._dirty = num_tokens
 
     def prepare(self, ngram_ids: torch.Tensor | None, num_tokens: int,
-                num_tokens_padded: int) -> None:
+                num_tokens_padded: int, host_ids: np.ndarray | None = None) -> None:
         self._check_capacity(num_tokens_padded)
         if not 0 <= num_tokens <= num_tokens_padded:
             raise ValueError("B70 PLE NVMe invalid actual/padded token counts")
@@ -255,7 +255,11 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
                     stream != self._owner_stream or thread != self._owner_thread):
                 self._owner_stream.synchronize()
             self._owner_stream, self._owner_thread = stream, thread
-            if ngram_ids is None:
+            if host_ids is not None:
+                if tuple(host_ids.shape) != (num_tokens, self._heads):
+                    raise ValueError("B70 PLE NVMe: host ids shape mismatch")
+                self._fill_stage(host_ids, num_tokens, num_tokens_padded)
+            elif ngram_ids is None:
                 self._fill_stage(None, 0, num_tokens_padded)
             else:
                 if tuple(ngram_ids.shape) != (num_tokens_padded, self._heads):
