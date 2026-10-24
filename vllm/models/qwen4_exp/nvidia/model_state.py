@@ -136,16 +136,21 @@ class Qwen4ExpModelState(MambaHybridModelState):
             if _B70_HOST_IDS and hasattr(module, "compute_ngram_ids_host"):
                 # B70-V32-03: one small D2H of the tokens + context, ids hashed on the host: the
                 # step's only host sync no longer waits behind ~50 eager hash kernels.
+                from vllm.v1.worker.gpu import b70_phase as _b70p
+
+                _b70p.mark("ple-d2h")
                 num_reqs = input_batch.num_reqs
                 num_tokens = input_batch.num_tokens
                 ctx = model_inputs["ngram_context"][:num_reqs]
                 flat = torch.cat([input_batch.input_ids[:num_tokens].long(), ctx.reshape(-1).long()])
                 flat = flat.to("cpu", non_blocking=False).numpy()
+                _b70p.mark("ple-hash")
                 ids = module.compute_ngram_ids_host(
                     flat[:num_tokens],
                     input_batch.query_start_loc_np[: num_reqs + 1],
                     flat[num_tokens:].reshape(num_reqs, -1),
                 )
+                _b70p.mark("ple-prep")
                 module.ngram_embedding.prepare(None, num_tokens, num_tokens_padded, host_ids=ids)
                 continue
             # Existing GPU IDs use the authoritative committed context above.
