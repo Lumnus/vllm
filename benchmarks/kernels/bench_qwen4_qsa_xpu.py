@@ -956,7 +956,7 @@ def main() -> None:
             p.expand()
         per = totals.setdefault((m, rows, ctx), {})
         for name, fn in ops.items():
-            if want and name not in want:
+            if want and name not in want and name.split("@")[0] not in want:
                 continue
             _drain_kernel_info()
             try:
