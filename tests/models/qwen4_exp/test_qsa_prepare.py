@@ -19,10 +19,27 @@ from vllm.models.qwen4_exp.nvidia.ops.qsa_prepare import qsa_prepare
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON
 
+# B70-QSA: the fused prepare is the Triton path QSA serves on Intel XPU too.
+_DEVICE = "xpu" if current_platform.is_xpu() else "cuda"
+
 requires_qsa_kernels = pytest.mark.skipif(
-    not current_platform.is_cuda() or not HAS_TRITON,
-    reason="QSA kernels require CUDA and Triton",
+    not (current_platform.is_cuda() or current_platform.is_xpu()) or not HAS_TRITON,
+    reason="QSA kernels require CUDA or XPU and Triton",
 )
+
+
+def _gemma_rmsnorm_reference(
+    x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """Gemma RMSNorm: flashinfer on CUDA, the same math in torch elsewhere."""
+    if current_platform.is_cuda():
+        from flashinfer.norm import gemma_rmsnorm
+
+        return gemma_rmsnorm(x, weight, eps)
+    xf = x.float()
+    xf = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (xf * (1.0 + weight.float())).to(x.dtype)
+
 
 HQ, D = 4, 128
 CR = 4
@@ -69,18 +86,18 @@ def _make_main_inputs(num_tokens: int, fp8_cache: bool) -> dict:
         MAIN_PAGE,
         2 * MAIN_D,
         dtype=torch.uint8 if fp8_cache else torch.bfloat16,
-        device="cuda",
+        device=_DEVICE,
     ).transpose(1, 2)
-    slots = torch.randperm(num_blocks * MAIN_PAGE, device="cuda")[:num_tokens]
+    slots = torch.randperm(num_blocks * MAIN_PAGE, device=_DEVICE)[:num_tokens]
     slots[-1] = -1
-    norm_weights = torch.randn(2, MAIN_D, dtype=torch.bfloat16, device="cuda") * 0.2
+    norm_weights = torch.randn(2, MAIN_D, dtype=torch.bfloat16, device=_DEVICE) * 0.2
     qkv_width = 2 * (MAIN_HQ + MAIN_HK) * MAIN_D
     return dict(
         main_qkv=torch.randn(
             num_tokens,
             qkv_width + (HQ + 1) * D,
             dtype=torch.bfloat16,
-            device="cuda",
+            device=_DEVICE,
         )[:, :qkv_width],
         main_q_norm_weight=norm_weights[0],
         main_k_norm_weight=norm_weights[1],
@@ -128,8 +145,8 @@ def _check_main_outputs(main: dict, q_out, gate_out, rope, positions) -> None:
         value_cache,
         main["main_slot_mapping"],
         "fp8" if fp8_cache else "auto",
-        torch.tensor(main["main_k_scale"], device="cuda"),
-        torch.tensor(main["main_v_scale"], device="cuda"),
+        torch.tensor(main["main_k_scale"], device=_DEVICE),
+        torch.tensor(main["main_v_scale"], device=_DEVICE),
     )
     torch.testing.assert_close(q_out.flatten(1), q, rtol=RTOL, atol=ATOL)
     assert torch.equal(gate_out.flatten(1), gate)
@@ -174,11 +191,10 @@ def test_qsa_fused_prepare_matches_unfused(
     query_lens,
     history_lens,
 ) -> None:
-    from flashinfer.norm import gemma_rmsnorm
-
     from vllm.model_executor.layers.rotary_embedding import get_rope
 
-    device = "cuda"
+    gemma_rmsnorm = _gemma_rmsnorm_reference
+    device = _DEVICE
     rope_params = {
         "partial_rotary_factor": 0.25,
         "rope_theta": 10000000,
