@@ -16,6 +16,8 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from . import qsa_xpu_tuning as xpu_tune
+
 
 @lru_cache(maxsize=1)
 def _is_sm120() -> bool:
@@ -575,20 +577,36 @@ def _select_xpu_config(
     """
     del is_fp8
     if base_programs > 2048:
-        return (32, 1, 1) if use_prefill_config else (64, 1, 2)
-    if base_programs <= 24:
-        return 32, 64, 4
-    if base_programs <= 32:
-        return 32, 16, 1
-    if base_programs <= 64:
-        return 32, 8, 1
-    if base_programs <= 128:
-        return 32, 4, 1
-    if base_programs <= 256:
-        return 32, 8, 1
-    if base_programs <= 512:
-        return 64, 4, 2
-    return 64, 1, 2
+        config = (32, 1, 1) if use_prefill_config else (64, 1, 2)
+    elif base_programs <= 24:
+        config = 32, 64, 4
+    elif base_programs <= 32:
+        config = 32, 16, 1
+    elif base_programs <= 64:
+        config = 32, 8, 1
+    elif base_programs <= 128:
+        config = 32, 4, 1
+    elif base_programs <= 256:
+        config = 32, 8, 1
+    elif base_programs <= 512:
+        config = 64, 4, 2
+    else:
+        config = 64, 1, 2
+    # B70-QSA-T: B70_QSA_TUNE overrides one region at a time (see
+    # qsa_xpu_tuning); the warmup enumerates through this function too.
+    key = _sparse_gqa_tune_key(base_programs, use_prefill_config)
+    return (
+        xpu_tune.get(key, "block_n", config[0]),
+        xpu_tune.get(key, "splits", config[1]),
+        xpu_tune.get(key, "num_warps", config[2]),
+    )
+
+
+def _sparse_gqa_tune_key(base_programs: int, use_prefill_config: bool) -> str:
+    """B70-QSA-T: tuning region of a sparse GQA launch."""
+    if base_programs > 2048 and use_prefill_config:
+        return "sparse_gqa_prefill"
+    return "sparse_gqa_decode"
 
 
 def _qsa_block_m(group_size: int) -> int:
@@ -817,7 +835,7 @@ def qsa_sparse_paged_attention(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_warps=partial_warps,
-        num_stages=2,
+        **_sparse_gqa_stage_kwargs(q.shape[0] * k_cache.shape[2], use_prefill_config),
     )
     if num_splits == 1:
         return out
@@ -836,10 +854,31 @@ def qsa_sparse_paged_attention(
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
-        num_warps=2,
-        num_stages=1,
+        **_merge_kwargs(),
     )
     return out
+
+
+def _sparse_gqa_stage_kwargs(base_programs: int, use_prefill_config: bool) -> dict:
+    """num_stages (+ XPU grf_mode) of a sparse GQA launch; warmup reads it too."""
+    if not current_platform.is_xpu():
+        return {"num_stages": 2}
+    key = _sparse_gqa_tune_key(base_programs, use_prefill_config)
+    return {
+        "num_stages": xpu_tune.get(key, "num_stages", 2),
+        **xpu_tune.launch_extra(key),
+    }
+
+
+def _merge_kwargs() -> dict:
+    """num_warps/num_stages (+ XPU grf_mode) of the split-K merge."""
+    if not current_platform.is_xpu():
+        return {"num_warps": 2, "num_stages": 1}
+    return {
+        "num_warps": xpu_tune.get("merge", "num_warps", 2),
+        "num_stages": 1,
+        **xpu_tune.launch_extra("merge"),
+    }
 
 
 def warmup_qsa_sparse_paged_attention(
@@ -866,9 +905,20 @@ def warmup_qsa_sparse_paged_attention(
     block_m = _qsa_block_m(group_size)
 
     # Every config the dispatch can pick for this group size.
+    # B70-QSA-T: num_stages/grf_mode depend on the tuning region, so a
+    # profile carries the region's stage kwargs as a sorted tuple.
     profiles = {
-        _select_config(
-            num_rows, num_kv_heads, use_prefill_config, selection_width, is_fp8
+        (
+            *_select_config(
+                num_rows, num_kv_heads, use_prefill_config, selection_width, is_fp8
+            ),
+            tuple(
+                sorted(
+                    _sparse_gqa_stage_kwargs(
+                        num_rows * num_kv_heads, use_prefill_config
+                    ).items()
+                )
+            ),
         )
         for num_rows in range(1, 8193)
         for use_prefill_config in (False, True)
@@ -912,7 +962,7 @@ def warmup_qsa_sparse_paged_attention(
     num_cache_blocks = triton_scalar_specialization_rep(kv_cache.shape[0])
 
     warmed = []
-    for block_n, warps, num_tiles, num_splits in sorted(profiles):
+    for block_n, warps, num_tiles, num_splits, stage_items in sorted(profiles):
         if num_splits == 1:
             partial_output_ptr = output_ptr
             partial_lse_ptr = output_ptr
@@ -965,7 +1015,7 @@ def warmup_qsa_sparse_paged_attention(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             num_warps=warps,
-            num_stages=2,
+            **dict(stage_items),
             grid=(num_rows, num_kv_heads, num_splits),
         )
         if num_splits > 1:
@@ -983,8 +1033,7 @@ def warmup_qsa_sparse_paged_attention(
                 NUM_QUERY_HEADS=num_query_heads,
                 NUM_SPLITS=num_splits,
                 BLOCK_SPLITS=triton.next_power_of_2(num_splits),
-                num_warps=2,
-                num_stages=1,
+                **_merge_kwargs(),
                 grid=(num_rows, num_query_heads),
             )
         warmed.append((block_n, num_splits, warps))

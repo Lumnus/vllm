@@ -14,6 +14,8 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+from . import qsa_xpu_tuning as xpu_tune
+
 logger = init_logger(__name__)
 
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
@@ -28,10 +30,23 @@ def _min_dot_n() -> int:
     N >= 16 and K >= 16"; measured on B70, G1 2026-10-25), and a plain decode
     has N = 4. So XPU pads N to 16 by default; padded rows are masked.
     B70_QSA_MIN_DOT_N (XPU only) overrides, e.g. 32 for the Cell C sweep.
+    B70-QSA-T: values below 16 are honoured only with B70_QSA_ALLOW_SMALL_DOT=1,
+    the arm for a Triton that accepts N < 16 (Intel backend main, whose
+    min_dot_size is (1, 1, 1)); on 3.8.0 that arm fails to compile by design.
     """
     if current_platform.is_xpu():
-        return max(16, int(os.environ.get("B70_QSA_MIN_DOT_N", "16")))
+        value = int(os.environ.get("B70_QSA_MIN_DOT_N", "16"))
+        if os.environ.get("B70_QSA_ALLOW_SMALL_DOT", "0") == "1":
+            return max(1, value)
+        return max(16, value)
     return 1
+
+
+def _decode_block_n() -> int:
+    """Key tile of the decode scorer (B70-QSA-T: overridable on XPU)."""
+    if current_platform.is_xpu():
+        return xpu_tune.get("decode_score", "block_n", _DECODE_BLOCK_N)
+    return _DECODE_BLOCK_N
 
 
 def _decode_launch_config(dtype: torch.dtype) -> tuple[int, int]:
@@ -41,7 +56,9 @@ def _decode_launch_config(dtype: torch.dtype) -> tuple[int, int]:
     UNTUNED copy of the GB300 one (Cell C replaces it with BMG numbers).
     """
     if current_platform.is_xpu():
-        return 2, 1 if dtype == torch.float8_e4m3fn else 2
+        stages = xpu_tune.get("decode_score", "stages", 2)
+        warps = 1 if dtype == torch.float8_e4m3fn else 2
+        return stages, xpu_tune.get("decode_score", "num_warps", warps)
     # tuned on GB300
     return 2, 1 if dtype == torch.float8_e4m3fn else 2
 
@@ -54,9 +71,13 @@ def _prefill_launch_config(dtype: torch.dtype) -> tuple[int, int, int, int, int]
     so N = TILE_R * padded heads (256 here) is DPAS-eligible on XPU.
     """
     if current_platform.is_xpu():
-        if dtype == torch.float8_e4m3fn:
-            return 32, 64, 16, 2, 8
-        return 64, 64, 16, 2, 4
+        base = (
+            (32, 64, 16, 2, 8) if dtype == torch.float8_e4m3fn else (64, 64, 16, 2, 4)
+        )
+        names = ("tile_r", "block_n", "k_tiles", "stages", "num_warps")
+        return tuple(  # type: ignore[return-value]
+            xpu_tune.get("prefill_score", n, v) for n, v in zip(names, base)
+        )
     # tuned on GB300
     if dtype == torch.float8_e4m3fn:
         return 32, 64, 16, 2, 8
@@ -332,7 +353,11 @@ def _expand_qsa_indices_kernel(
 
 
 def _decode_tiles_per_program(num_requests: int, columns: int) -> int:
-    programs = num_requests * triton.cdiv(columns, _DECODE_BLOCK_N)
+    if current_platform.is_xpu():
+        forced = xpu_tune.get("decode_score", "tiles_per_prog", 0)
+        if forced:
+            return forced
+    programs = num_requests * triton.cdiv(columns, _decode_block_n())
     if programs < 16384:
         return 1
     if programs < 32768:
@@ -420,15 +445,16 @@ def warmup_qsa_mqa_paged_decode(
             NUM_HEADS=num_heads,
             HEAD_DIM=head_dim,
             DECODE_QUERY_LEN=decode_query_len,
-            BLOCK_N=_DECODE_BLOCK_N,
+            BLOCK_N=_decode_block_n(),
             TILES_PER_PROG=tiles_per_program,
             STAGES=stages,
             MIN_DOT_N=_min_dot_n(),
             num_warps=num_warps,
             grid=(
                 num_requests,
-                triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+                triton.cdiv(columns, _decode_block_n() * tiles_per_program),
             ),
+            **xpu_tune.launch_extra("decode_score"),
         )
     return profiles
 
@@ -485,6 +511,7 @@ def _prefill_logits(
         K_TILES=K_TILES,
         STAGES=STAGES,
         num_warps=num_warps,
+        **xpu_tune.launch_extra("prefill_score"),
     )
     return logits
 
@@ -507,7 +534,7 @@ def expand_qsa_block_indices(
     # count (never a token index); the index region below only writes
     # columns [0, output_width).
     assert out.shape == (block_indices.shape[0], output_width + 1)
-    column_block = 256
+    column_block = xpu_tune.get("expand", "column_block", 256)
     grid = (block_indices.shape[0], triton.cdiv(output_width, column_block))
     _expand_qsa_indices_kernel[grid](
         block_indices,
@@ -519,7 +546,8 @@ def expand_qsa_block_indices(
         BLOCK_TOPK=block_topk,
         COMPRESS_RATIO=compress_ratio,
         COLUMN_BLOCK=column_block,
-        num_warps=4,
+        num_warps=xpu_tune.get("expand", "num_warps", 4),
+        **xpu_tune.launch_extra("expand"),
     )
 
 
@@ -698,7 +726,7 @@ def qsa_select_paged_decode(
     stages, num_warps = _decode_launch_config(k_cache.dtype)
     grid = (
         num_requests,
-        triton.cdiv(columns, _DECODE_BLOCK_N * tiles_per_program),
+        triton.cdiv(columns, _decode_block_n() * tiles_per_program),
     )
     _qsa_mqa_paged_uniform_kernel[grid](
         q,
@@ -715,11 +743,12 @@ def qsa_select_paged_decode(
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
         DECODE_QUERY_LEN=decode_query_len,
-        BLOCK_N=_DECODE_BLOCK_N,
+        BLOCK_N=_decode_block_n(),
         TILES_PER_PROG=tiles_per_program,
         STAGES=stages,
         MIN_DOT_N=_min_dot_n(),
         num_warps=num_warps,
+        **xpu_tune.launch_extra("decode_score"),
     )
     _topk(
         logits,
