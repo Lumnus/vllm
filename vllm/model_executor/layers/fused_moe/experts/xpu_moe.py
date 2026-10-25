@@ -423,11 +423,10 @@ class XPUExpertsWNA16(XPUExperts):
             activation.value, {"gemm1_clamp_limit": self.gemm1_clamp_limit},
         )
         if self.moe_config.ep_size > 1:
-            # 0.32: the stock path remaps topk_ids == -1 to an expert this rank does not own;
-            # it is -1 in both the hot and the cold map, so both calls skip it.
-            sentinel = topk_ids.new_tensor(
-                self.b70_hotcold.num_global - 1 if self.moe_config.ep_rank == 0 else 0)
-            topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
+            # 0.32: the stock remap of topk_ids == -1 (b70_hotcold.remap_unrouted).
+            from vllm.model_executor.layers.fused_moe.b70_hotcold import remap_unrouted
+
+            topk_ids = remap_unrouted(topk_ids, self.b70_hotcold.num_global, self.moe_config.ep_rank)
         if not (activation.value == "silu" and self.gemm1_clamp_limit is None
                 and self.b70_hotcold.apply_decode_op(output, hidden_states, topk_weights, topk_ids)):
             hot.apply(output=output, hidden_states=hidden_states,
