@@ -15,7 +15,7 @@ icpx --version | head -1
 export LD_LIBRARY_PATH=$VENV/lib:${LD_LIBRARY_PATH:-}
 T=$($VENV/bin/python -I -c 'import torch, os; print(os.path.dirname(torch.__file__))')
 icpx -fsycl -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen '-device bmg' \
-  -O2 -std=c++17 -shared -fPIC -D_GLIBCXX_USE_CXX11_ABI=1 \
+  -O2 -std=c++20 -shared -fPIC -D_GLIBCXX_USE_CXX11_ABI=1 \
   -I$T/include -I$T/include/torch/csrc/api/include \
   -x c++ $S/b70_step_trace.sycl -o $OUT/libb70_step_trace.so \
   -L$T/lib -lc10 -lc10_xpu -ltorch -ltorch_cpu -ltorch_xpu -Wl,-rpath,$T/lib -Wl,-rpath,$VENV/lib
