@@ -14,6 +14,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
+from vllm.platforms import current_platform
 
 from ..common.qsa_cache import (
     QSACompressedKeyCache,
@@ -53,12 +54,31 @@ def apply_qsa_rope(
         )
         return tensor.reshape(shape)
 
-    rotated = rotary_emb.apply_rotary_emb.forward_cuda(
+    # B70-QSA: forward_cuda imports vllm_flash_attn (CUDA-only); other
+    # platforms take the exact torch reference (unfused path only).
+    apply = (
+        rotary_emb.apply_rotary_emb.forward_cuda
+        if current_platform.is_cuda()
+        else rotary_emb.apply_rotary_emb.forward_native
+    )
+    rotated = apply(
         tensor[..., :rotary_dim],
         cos,
         sin,
     )
     return torch.cat((rotated, tensor[..., rotary_dim:]), dim=-1)
+
+
+def _qsa_gemma_rmsnorm(
+    norm: GemmaRMSNorm, x: torch.Tensor, weight: torch.Tensor, eps: float
+) -> torch.Tensor:
+    """Gemma RMSNorm: flashinfer on CUDA, the module's own dispatch elsewhere."""
+    if current_platform.is_cuda():
+        from flashinfer.norm import gemma_rmsnorm
+
+        return gemma_rmsnorm(x, weight, eps)
+    # B70-QSA: XPU/ROCm-less path, same GemmaRMSNorm math as the dense model.
+    return norm(x)
 
 
 def _supports_fused_pre_indexer(
@@ -225,7 +245,9 @@ class QSAIndexer(nn.Module):
         )
         if raw_split != compressed_split:
             raise RuntimeError("QSA side-cache metadata batch splits disagree")
-        if not raw.logical_positions.is_cuda and (
+        # B70-QSA: host-only consistency check. `not is_cuda` also matched
+        # XPU tensors, where torch.equal syncs and breaks graph capture.
+        if raw.logical_positions.device.type == "cpu" and (
             not torch.equal(raw.logical_positions, compressed.logical_positions)
         ):
             raise RuntimeError("QSA side-cache metadata positions disagree")
@@ -342,10 +364,9 @@ class QSAIndexer(nn.Module):
             )
         else:
             # Unfused reference path
-            from flashinfer.norm import gemma_rmsnorm
-
             q = projected_q.reshape(-1, self.index_n_heads, self.index_head_dim)
-            q = gemma_rmsnorm(
+            q = _qsa_gemma_rmsnorm(
+                self.q_layernorm,
                 q.reshape(-1, self.index_head_dim),
                 self.q_layernorm.weight,
                 self.q_layernorm.variance_epsilon,
@@ -375,7 +396,8 @@ class QSAIndexer(nn.Module):
                 self.compress_ratio,
                 rope_position_cache,
             )
-            compressed_keys = gemma_rmsnorm(
+            compressed_keys = _qsa_gemma_rmsnorm(
+                self.k_layernorm,
                 pooled.reshape(-1, self.index_head_dim),
                 self.k_layernorm.weight,
                 self.k_layernorm.variance_epsilon,

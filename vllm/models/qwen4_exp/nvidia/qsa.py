@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable
 from typing import ClassVar, cast
 
@@ -16,6 +17,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheConfig, CacheDType
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
     set_default_quant_scales,
 )
@@ -62,6 +64,8 @@ from vllm.v1.kv_cache_interface import (
 from ..common.qsa_cache import QSAForwardMetadata
 from . import model
 from .indexer_qsa import QSAIndexer
+
+logger = init_logger(__name__)
 
 
 class Qwen4ExpQSAQKVIndexerLinear(MergedColumnParallelLinear):
@@ -450,10 +454,12 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             torch.float16,
             torch.bfloat16,
         )
+        # B70-QSA: XPU runs the same Triton fused_qk_rmsnorm_rope_gate that
+        # Qwen3NextAttention already enables there (qwen3_next.py).
         self.use_fused_qk_norm_rope_gate = (
             self.attn_output_gate
             and getattr(self.rotary_emb, "is_neox_style", False)
-            and current_platform.is_cuda()
+            and (current_platform.is_cuda() or current_platform.is_xpu())
             and supports_dtype
             and (text_only or supports_mrope)
         )
@@ -504,6 +510,17 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 self.kv_cache_torch_dtype != torch.uint8
                 or current_platform.has_device_capability(89)
             )
+            # B70-QSA: B70_QSA_FUSED_PREPARE=0 forces the unfused kernels
+            # (A/B and fallback if the fused launch misbehaves on a backend).
+            and os.environ.get("B70_QSA_FUSED_PREPARE", "1") != "0"
+        )
+        logger.info_once(
+            "B70-QSA: Qwen4Exp QSA attention on %s: fused_qk_norm_rope_gate=%s "
+            "fused_qsa_prepare=%s kv_cache_dtype=%s",
+            current_platform.device_name,
+            self.use_fused_qk_norm_rope_gate,
+            self.use_fused_qsa_prepare,
+            self.kv_cache_dtype,
         )
         self.fuse_indexer_projection = vllm_config.lora_config is None
         if self.fuse_indexer_projection:
