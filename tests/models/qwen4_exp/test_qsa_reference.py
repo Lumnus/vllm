@@ -556,6 +556,16 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
     assert metadata.k_work_metadata.tolist() == [[0, 0], [2, 0], [2, 1], [-1, -1]]
 
 
+
+class _GemmaNormStub(SimpleNamespace):
+    """weight + variance_epsilon like GemmaRMSNorm, and callable: off CUDA the
+    indexer calls the norm module itself (no flashinfer), so the stub must too."""
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        xf = x.float()
+        xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
+        return (xf * (1.0 + self.weight.float())).to(x.dtype)
+
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")
 def test_qsa_unfused_cache_update_ignores_padded_qk() -> None:
@@ -584,7 +594,7 @@ def test_qsa_unfused_cache_update_ignores_padded_qk() -> None:
         )
     raw_cache = torch.zeros((1, 4, 1, 64), dtype=torch.bfloat16, device=device)
     compressed_cache = torch.zeros((1, 2, 1, 64), dtype=torch.bfloat16, device=device)
-    norm = SimpleNamespace(
+    norm = _GemmaNormStub(
         weight=torch.zeros(64, dtype=torch.bfloat16, device=device),
         variance_epsilon=1e-6,
     )
