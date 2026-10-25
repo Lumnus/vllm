@@ -338,6 +338,26 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         return output
 
 
+def _qsa_eager_break(fn):
+    """B70-QSA-T04: ``@eager_break_during_capture`` on ``_run_qsa``, unless
+    B70_QSA_EAGER_BREAK=0.
+
+    vLLM auto-enables breakable CUDA graphs for Qwen4Exp (vllm.py
+    DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES; the engine journal shows "Auto-
+    enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1"). The decorator then ends the graph
+    segment at every QSA layer and replays the whole QSA body eagerly from
+    Python on every step: 12 layers x (metadata reads, asserts, ~7-20 kernel
+    launches incl. top-k). The QSA metadata builder declares UNIFORM_BATCH, so
+    a capture of the body is supported in principle; B70_QSA_EAGER_BREAK=0 is
+    the measurement arm that captures it into the decode segments instead.
+    Decided at class definition (import time), like the decorator itself.
+    """
+    if os.environ.get("B70_QSA_EAGER_BREAK", "1") == "0":
+        logger.info_once("B70-QSA: _run_qsa is captured into graph segments")
+        return fn
+    return eager_break_during_capture(fn)
+
+
 class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     """Merged Qwen full-attention owner with a QSA index side branch."""
 
@@ -576,7 +596,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
         )
 
-    @eager_break_during_capture
+    @_qsa_eager_break
     def _run_qsa(
         self,
         projected_qk: torch.Tensor,
