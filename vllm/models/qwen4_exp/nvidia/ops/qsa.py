@@ -16,6 +16,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
 
+from . import qsa_attn2 as attn2
 from . import qsa_xpu_tuning as xpu_tune
 
 
@@ -772,6 +773,22 @@ def qsa_sparse_paged_attention(
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = _qsa_block_m(group_size)
+    if attn2.attn_impl() == "attn2":
+        # B70-QSA-K: head_dim-chunked, all-heads-per-program kernel (qsa_attn2).
+        return attn2.qsa_sparse_paged_attention_attn2(
+            q,
+            k_cache,
+            v_cache,
+            logical_indices,
+            block_table,
+            token_to_req,
+            use_prefill_config,
+            out,
+            output_gate_view,
+            softmax_scale,
+            output_scale,
+            block_m,
+        )
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
     block_n, partial_warps, num_tiles, num_splits = _select_config(
         q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
@@ -961,6 +978,30 @@ def warmup_qsa_sparse_paged_attention(
     row_stride = num_query_heads * head_dim
     num_cache_blocks = triton_scalar_specialization_rep(kv_cache.shape[0])
 
+    if attn2.attn_impl() == "attn2":
+        return _warmup_attn2(
+            q_ptr,
+            k_cache_ptr,
+            v_cache_ptr,
+            indices_ptr,
+            block_table_ptr,
+            token_to_req_ptr,
+            output_ptr,
+            output_gate_ptr,
+            key_cache,
+            value_cache,
+            block_table,
+            num_rows=num_rows,
+            num_requests=num_requests,
+            num_cache_blocks=num_cache_blocks,
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            group_size=group_size,
+            block_m=block_m,
+            head_dim=head_dim,
+            selection_width=selection_width,
+        )
+
     warmed = []
     for block_n, warps, num_tiles, num_splits, stage_items in sorted(profiles):
         if num_splits == 1:
@@ -1037,6 +1078,99 @@ def warmup_qsa_sparse_paged_attention(
                 grid=(num_rows, num_query_heads),
             )
         warmed.append((block_n, num_splits, warps))
+    return tuple(warmed)
+
+
+def _warmup_attn2(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    indices_ptr,
+    block_table_ptr,
+    token_to_req_ptr,
+    output_ptr,
+    output_gate_ptr,
+    key_cache,
+    value_cache,
+    block_table,
+    *,
+    num_rows,
+    num_requests,
+    num_cache_blocks,
+    num_query_heads,
+    num_kv_heads,
+    group_size,
+    block_m,
+    head_dim,
+    selection_width,
+) -> tuple[tuple[int, int, int], ...]:
+    """B70-QSA-K: compile every attn2 tile/merge specialization dispatch can pick."""
+    head_stride = head_dim
+    row_stride = num_query_heads * head_dim
+    partial_output_ptr = TritonWarmupTensor(torch.float32)
+    partial_lse_ptr = TritonWarmupTensor(torch.float32)
+    warmed = []
+    profiles = attn2.attn2_profiles(num_kv_heads, selection_width)
+    for block_n, num_dchunk, tpp, warps, stages, extra in sorted(profiles):
+        attn2._qsa_attn2_tile_kernel.warmup(
+            q_ptr,
+            k_cache_ptr,
+            v_cache_ptr,
+            indices_ptr,
+            block_table_ptr,
+            token_to_req_ptr,
+            partial_output_ptr,
+            partial_lse_ptr,
+            1.0,
+            1.0,
+            row_stride,
+            head_stride,
+            key_cache.stride(0),
+            key_cache.stride(1),
+            key_cache.stride(2),
+            value_cache.stride(0),
+            value_cache.stride(1),
+            value_cache.stride(2),
+            selection_width + 1,
+            block_table.stride(0),
+            num_rows,
+            num_cache_blocks,
+            num_requests,
+            TOPK=selection_width,
+            PAGE_SIZE=key_cache.shape[1],
+            PAGE_TABLE_WIDTH=block_table.shape[1],
+            GROUP_SIZE=group_size,
+            HEAD_DIM=head_dim,
+            NUM_QUERY_HEADS=num_query_heads,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            NUM_DCHUNK=num_dchunk,
+            TILES_PER_PROG=tpp,
+            num_warps=warps,
+            num_stages=stages,
+            **dict(extra),
+            grid=(num_rows, num_kv_heads, 1),
+        )
+        attn2._qsa_attn2_merge_kernel.warmup(
+            partial_output_ptr,
+            partial_lse_ptr,
+            indices_ptr,
+            output_ptr,
+            output_gate_ptr,
+            selection_width + 1,
+            row_stride,
+            head_stride,
+            row_stride,
+            head_stride,
+            num_rows,
+            TOPK=selection_width,
+            BLOCK_N=block_n,
+            HEAD_DIM=head_dim,
+            NUM_QUERY_HEADS=num_query_heads,
+            **attn2.merge_kwargs(),
+            grid=(num_rows, num_query_heads),
+        )
+        warmed.append((block_n, tpp, warps))
     return tuple(warmed)
 
 
