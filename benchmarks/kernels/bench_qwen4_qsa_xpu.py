@@ -14,7 +14,11 @@ BF16), through the real vLLM entry points, with a torch reference check:
   prefill_score  _qsa_mqa_paged_prefill_kernel (one 4096-row chunk)
   select_prefill scorer + top-k as qsa_select_paged_prefill runs them
   expand         _expand_qsa_indices_kernel
-  attn           _qsa_sparse_paged_gqa_splitk_kernel (+ _qsa_merge_splitk_kernel)
+  attn           sparse GQA as the engine dispatches it (B70_QSA_ATTN_IMPL; default splitk =
+                 _qsa_sparse_paged_gqa_splitk_kernel + _qsa_merge_splitk_kernel)
+  attn@<impl>    with --attn-impls splitk,attn2: each implementation side by side
+                 (attn2 = qsa_attn2._qsa_attn2_tile_kernel + _qsa_attn2_merge_kernel), each
+                 checked against the torch reference and against splitk
 
 Decode rows are requests x DECODE_QUERY_LEN (8 = one DFlash K=7 verify step), so
 rows 8/32/64 = 1/4/8 requests; prefill is one request's 4096-row chunk at the
@@ -32,6 +36,8 @@ Usage (one card; --card picks it with ZE_AFFINITY_MASK semantics):
   python benchmarks/kernels/bench_qwen4_qsa_xpu.py --sweep sparse_gqa_prefill --ctx 32768
   python benchmarks/kernels/bench_qwen4_qsa_xpu.py --sweep decode_score --rows 8 --ctx 4096,131072
   python benchmarks/kernels/bench_qwen4_qsa_xpu.py --budget   # per-step totals vs the W1 dense gap
+  python benchmarks/kernels/bench_qwen4_qsa_xpu.py --ops attn --attn-impls splitk,attn2 --graph
+  python benchmarks/kernels/bench_qwen4_qsa_xpu.py --sweep sparse_attn2_decode --rows 8,64 --graph
 
 Overrides use the same mechanism as the engine (B70_QSA_TUNE, see
 vllm/models/qwen4_exp/nvidia/ops/qsa_xpu_tuning.py), so a winning sweep row is
@@ -60,6 +66,7 @@ import torch  # noqa: E402
 
 # Importing the XPU platform registers torch.ops._C (vllm-xpu-kernels).
 from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops  # noqa: E402
+from vllm.models.qwen4_exp.nvidia.ops import qsa_attn2 as attn2_ops  # noqa: E402
 from vllm.models.qwen4_exp.nvidia.ops import qsa_indexer as idx_ops  # noqa: E402
 from vllm.models.qwen4_exp.nvidia.ops import qsa_xpu_tuning as xpu_tune  # noqa: E402
 from vllm.platforms import current_platform  # noqa: E402
@@ -175,6 +182,8 @@ for _fn in (
     idx_ops._expand_qsa_indices_kernel,
     qsa_ops._qsa_sparse_paged_gqa_splitk_kernel,
     qsa_ops._qsa_merge_splitk_kernel,
+    attn2_ops._qsa_attn2_tile_kernel,
+    attn2_ops._qsa_attn2_merge_kernel,
 ):
     _hook_jit(_fn)
 
@@ -385,6 +394,22 @@ class Problem:
             TOKEN_TOPK,
             self.logical,
         )
+
+    def attn_impl(self, impl: str) -> Callable[[], None]:
+        """Run attn with B70_QSA_ATTN_IMPL forced to `impl` (read at call/capture)."""
+
+        def run() -> None:
+            saved = os.environ.get(attn2_ops.ATTN_IMPL_ENV)
+            os.environ[attn2_ops.ATTN_IMPL_ENV] = impl
+            try:
+                self.attn()
+            finally:
+                if saved is None:
+                    os.environ.pop(attn2_ops.ATTN_IMPL_ENV, None)
+                else:
+                    os.environ[attn2_ops.ATTN_IMPL_ENV] = saved
+
+        return run
 
     def attn(self) -> None:
         qsa_ops.qsa_sparse_paged_attention(
@@ -664,6 +689,22 @@ GRIDS: dict[str, dict[str, list]] = {
         "num_stages": [1, 2, 3],
         "grf_mode": ["default", "256"],
     },
+    # B70-QSA-K attn2: the spill-free region from the AOT compile (num_warps
+    # stays 1: Intel lays a chained dot's warps on M = 8 heads, so more warps
+    # replicate). See artifacts/K-sparse-attn-kernel.md; refine with --grid-json.
+    "sparse_attn2_decode": {
+        "block_n": [16, 32, 64],
+        "num_dchunk": [4, 8],
+        "tiles_per_prog": [1, 2],
+        "grf_mode": ["default", "256"],
+    },
+    "sparse_attn2_prefill": {
+        "block_n": [16, 32, 64],
+        "num_dchunk": [4, 8],
+        "tiles_per_prog": [1, 4],
+        "row_chunk": [128, 512],
+        "grf_mode": ["default", "256"],
+    },
     "merge": {"num_warps": [1, 2, 4, 8]},
     "expand": {"column_block": [128, 256, 512, 1024], "num_warps": [1, 2, 4, 8]},
 }
@@ -672,12 +713,16 @@ ENV_GRIDS: dict[str, dict[str, list[str]]] = {
     "decode_score": {"B70_QSA_MIN_DOT_N": ["16", "32"]},
     "sparse_gqa_decode": {"B70_QSA_MIN_BLOCK_M": ["1", "16"]},
     "sparse_gqa_prefill": {"B70_QSA_MIN_BLOCK_M": ["1", "16"]},
+    "sparse_attn2_decode": {attn2_ops.ATTN_IMPL_ENV: ["attn2"]},
+    "sparse_attn2_prefill": {attn2_ops.ATTN_IMPL_ENV: ["attn2"]},
 }
 SWEEP_OP = {
     "decode_score": ("decode", "decode_score"),
     "prefill_score": ("prefill", "prefill_score"),
     "sparse_gqa_decode": ("decode", "attn"),
     "sparse_gqa_prefill": ("prefill", "attn"),
+    "sparse_attn2_decode": ("decode", "attn"),
+    "sparse_attn2_prefill": ("prefill", "attn"),
     "merge": ("decode", "attn"),
     "expand": ("decode", "expand"),
 }
@@ -742,6 +787,11 @@ def main() -> None:
     ap.add_argument(
         "--budget", action="store_true", help="per-step totals vs the W1 dense gap"
     )
+    ap.add_argument(
+        "--attn-impls",
+        default="",
+        help="comma list (splitk,attn2): add attn@<impl> ops side by side",
+    )
     ap.add_argument("--no-check", action="store_true")
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--out", default="")
@@ -763,6 +813,8 @@ def main() -> None:
         "block": a.block,
         "max_model_len": a.max_model_len,
         "graph": a.graph,
+        "attn_impl_env": os.environ.get(attn2_ops.ATTN_IMPL_ENV, "splitk"),
+        "attn_impls": a.attn_impls,
     }
     print(json.dumps({"meta": meta}), flush=True)
 
@@ -795,7 +847,7 @@ def main() -> None:
             p.expand()
             ref = None
             if op == "attn":
-                p.attn()
+                p.attn_impl("splitk")()
                 ref = p.out.clone()
             for cfg, env in configs:
                 saved = {k: os.environ.get(k) for k in env}
@@ -828,6 +880,8 @@ def main() -> None:
                     if op in ("decode_score", "prefill_score") and not a.no_check:
                         p.select()
                         row.update(check_selection(p))
+                    if op == "attn" and not a.no_check:
+                        row.update(check_attention(p))
                     emit(row)
                 except (
                     Exception
@@ -872,6 +926,9 @@ def main() -> None:
             )
             continue
         ops = build_ops(p)
+        impls = [x for x in a.attn_impls.split(",") if x]
+        for impl in impls:
+            ops[f"attn@{impl}"] = p.attn_impl(impl)
         checks: dict[str, Any] = {}
         if not a.no_check:
             p.select()
@@ -879,6 +936,17 @@ def main() -> None:
             p.expand()
             p.attn()
             checks.update(check_attention(p))
+            ref_out = None
+            for impl in impls:
+                p.attn_impl(impl)()
+                c = check_attention(p)
+                if impl == "splitk":
+                    ref_out = p.out.clone()
+                elif ref_out is not None:
+                    c["max_abs_vs_splitk"] = (
+                        (p.out.float() - ref_out.float()).abs().max().item()
+                    )
+                checks[f"attn@{impl}"] = c
         else:
             p.select()
             p.expand()
@@ -909,12 +977,17 @@ def main() -> None:
                     "op": name,
                     **t,
                     "kernels": _drain_kernel_info(),
-                    **sycl_bar(name, rows, ctx),
+                    **sycl_bar(name.split("@")[0], rows, ctx),
                     **(
-                        checks
+                        {
+                            k: v
+                            for k, v in checks.items()
+                            if not k.startswith("attn@")
+                        }
                         if name in ("select_decode", "select_prefill", "attn")
                         else {}
                     ),
+                    **(checks.get(name, {}) if name.startswith("attn@") else {}),
                     "decode_logits_width": p.columns
                     if m == "decode"
                     else p.logits_width,
