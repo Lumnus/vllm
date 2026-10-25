@@ -14,6 +14,8 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
+from ...common import qsa_debug as _qsa_debug
+
 logger = init_logger(__name__)
 
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
@@ -529,10 +531,15 @@ def _qsa_topk_mode() -> str:
     ``native``: vllm-xpu-kernels ``torch.ops._C.top_k_per_row_decode`` (SYCL,
     registered for kXPU). ``torch``: exact, deterministic torch path below.
     ``auto`` (default): native when the op is registered, else torch.
+    ``native_det`` (B70-QSA-Q): native, then made identical to ``torch``:
+    rows whose boundary is an exact tie are redone on the torch path and every
+    row is put in the torch order. Under graph capture it is the torch path.
     """
     mode = os.environ.get("B70_QSA_TOPK", "auto")
-    if mode not in ("auto", "native", "torch"):
-        raise ValueError(f"B70_QSA_TOPK must be auto|native|torch, got {mode!r}")
+    if mode not in ("auto", "native", "torch", "native_det"):
+        raise ValueError(
+            f"B70_QSA_TOPK must be auto|native|torch|native_det, got {mode!r}"
+        )
     if mode == "auto":
         has_native = hasattr(torch.ops._C, "top_k_per_row_decode")
         mode = "native" if has_native else "torch"
@@ -606,6 +613,71 @@ def _qsa_topk_torch_rows(
         block_indices[:, k:].fill_(-1)
 
 
+def _qsa_topk_native(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    block_topk: int,
+    block_indices: torch.Tensor,
+) -> None:
+    assert block_indices.is_contiguous()
+    seq_lens = visible_blocks[: logits.shape[0]].to(torch.int32).contiguous()
+    # next_n=1: row i scores columns [0, seq_lens[i]); rows with fewer than
+    # topK columns get 0..len-1 then -1, as cooperative/persistent_topk do.
+    torch.ops._C.top_k_per_row_decode(
+        logits,
+        1,
+        seq_lens,
+        block_indices,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        block_topk,
+    )
+
+
+def _qsa_topk_make_deterministic(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    block_topk: int,
+    block_indices: torch.Tensor,
+) -> None:
+    """B70-QSA-Q: turn a native selection into exactly _qsa_topk_torch's.
+
+    Rows without a boundary tie have one correct set; it only needs the torch
+    order (descending score, lower column first). Rows with a tie at the k-th
+    score are recomputed on the torch path. Eager only: the tie rows are
+    gathered with a host sync.
+    """
+    rows, width = logits.shape
+    if rows == 0:
+        return
+    k = min(block_topk, width)
+    tied = _qsa_debug.boundary_tie_rows(logits, visible_blocks, block_indices, k)
+    selected = block_indices[:rows, :k].long()
+    valid = selected >= 0
+    columns = selected.clamp_min(0)
+    bits = logits.gather(1, columns).contiguous().view(torch.int32).to(torch.int64)
+    bits = torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+    key = (bits << 32) | (0xFFFFFFFF - columns)
+    key = torch.where(valid, key, torch.iinfo(torch.int64).min)
+    order = torch.argsort(key, dim=1, descending=True)
+    block_indices[:rows, :k].copy_(selected.gather(1, order).to(torch.int32))
+    tied_rows = tied.nonzero().flatten()
+    if tied_rows.numel():
+        redo = torch.empty(
+            (tied_rows.numel(), block_indices.shape[1]),
+            dtype=block_indices.dtype,
+            device=block_indices.device,
+        )
+        _qsa_topk_torch(
+            logits.index_select(0, tied_rows),
+            visible_blocks[:rows].index_select(0, tied_rows),
+            block_topk,
+            redo,
+        )
+        block_indices.index_copy_(0, tied_rows, redo)
+
+
 def _topk(
     logits: torch.Tensor,
     visible_blocks: torch.Tensor,
@@ -620,23 +692,18 @@ def _topk(
         # B70-QSA: cooperative/persistent_topk are CUDA-only csrc ops.
         mode = _qsa_topk_mode()
         logger.info_once("B70-QSA: QSA block top-k backend = %s", mode)
-        if mode == "torch":
+        if mode == "torch" or (mode == "native_det" and _qsa_debug.is_capturing()):
             _qsa_topk_torch(logits, visible_blocks, block_topk, block_indices)
             return
-        assert block_indices.is_contiguous()
-        seq_lens = visible_blocks[: logits.shape[0]].to(torch.int32).contiguous()
-        # next_n=1: row i scores columns [0, seq_lens[i]); rows with fewer than
-        # topK columns get 0..len-1 then -1, as cooperative/persistent_topk do.
-        torch.ops._C.top_k_per_row_decode(
-            logits,
-            1,
-            seq_lens,
-            block_indices,
-            logits.shape[0],
-            logits.stride(0),
-            logits.stride(1),
-            block_topk,
-        )
+        _qsa_topk_native(logits, visible_blocks, block_topk, block_indices)
+        if _qsa_debug.TIES:
+            _qsa_debug.count_boundary_ties(
+                logits, visible_blocks, block_indices, block_topk
+            )
+        if mode == "native_det":
+            _qsa_topk_make_deterministic(
+                logits, visible_blocks, block_topk, block_indices
+            )
         return
     use_cooperative_topk = (
         logits.shape[0] <= 64
