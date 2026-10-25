@@ -32,6 +32,7 @@ mml32k()   { appendcmd "--max-model-len 32768"; }
 eager()    { appendcmd "--enforce-eager"; }
 tune()     { tree; echo "B70_QSA_TUNE=@$C/tune.json"; }
 noprep()   { echo 'B70_QSA_FUSED_PREPARE=0'; cat; }
+nobreak()  { tree; echo "B70_QSA_EAGER_BREAK=0"; }
 logits256(){ cat; echo 'VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=256'; }
 c1off()    { cat; echo 'VLLM_XPU_C1_TARGET_GRAPH=0'; }
 armmain()  { tree | sed "s#^VENV=.*#VENV=$ARMMAIN#"; echo 'B70_QSA_ALLOW_SMALL_DOT=1'; }
@@ -48,6 +49,7 @@ eager)     mk eager   '--enforce-eager (graph contribution)' eager same ;;
 tune)      mk tune    "B70_QSA_TUNE=@$C/tune.json (sweep winners) + PYTHONPATH=$TREE" same tune ;;
 noprep)    mk noprep  'B70_QSA_FUSED_PREPARE=0' same noprep ;;
 logits256) mk logits256 'VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=256 (KV capacity / prefill chunking)' same logits256 ;;
+nobreak)   mk nobreak 'B70_QSA_EAGER_BREAK=0 + tree (QSA body captured in the breakable FULL segments)' same nobreak ;;
 c1off)     mk c1off   'VLLM_XPU_C1_TARGET_GRAPH=0 (C1 target graph off: is QSA eager in the verify?)' same c1off ;;
 armmain)   mk armmain "VENV=$ARMMAIN (Intel triton main 3.9.0+gitf552c356) + tree" same armmain ;;
 armmain-n4) mk armmain-n4 'armmain + B70_QSA_MIN_DOT_N=4 (no decode-scorer padding)' same armmain_n4 ;;
@@ -55,5 +57,5 @@ armmain-n4) mk armmain-n4 'armmain + B70_QSA_MIN_DOT_N=4 (no decode-scorer paddi
 esac
 }
 if [ "${1:-all}" = all ]; then
-  for s in native tune0 trace prof mml32k eager tune noprep logits256 c1off armmain armmain-n4; do run $s; done
+  for s in native tune0 trace prof mml32k eager tune noprep nobreak logits256 c1off armmain armmain-n4; do run $s; done
 else for s in "$@"; do run "$s"; done; fi
