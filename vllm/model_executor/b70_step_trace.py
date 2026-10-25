@@ -182,6 +182,7 @@ def install(model: torch.nn.Module, draft: torch.nn.Module | None, device: torch
         return out
     GroupCoordinator.all_reduce = all_reduce
     n_wrapped = _wrap_methods(tr, os.environ.get("B70_STEP_TRACE_WRAP", ""))
+    n_wrapped += _wrap_functions(tr, os.environ.get("B70_STEP_TRACE_FUNCS", ""))
     n_wrapped += _wrap_methods(tr, os.environ.get("B70_STEP_TRACE_OPS", ""), ops=True)
     _state = tr
     logger.info("B70 step trace: %d target modules and %d draft modules hooked (depth %d), %d methods wrapped",
@@ -243,6 +244,66 @@ def _wrap_methods(tr: "_Trace", spec: str, ops: bool = False) -> int:
                 if tr.stack and tr.stack[-1] == lab:
                     tr.stack.pop()
         setattr(cls, meth, wrapped)
+        n += 1
+    return n
+
+
+# B70-QSA-T: B70_STEP_TRACE_FUNCS=qsa expands to the QSA op entry points. Each
+# QSA layer then shows prepare / select (decode or prefill) / top-k / prefill
+# scoring / expand / sparse attention as nested marks under its self_attn
+# (decode scorer time = select_decode minus its _topk child). The marks are
+# kernels, so they are captured into the decode graphs like the module marks.
+_FUNC_PRESETS = {
+    "qsa": (
+        "vllm.models.qwen4_exp.nvidia.ops.qsa_prepare:qsa_prepare",
+        "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer:qsa_select_paged_decode",
+        "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer:qsa_select_paged_prefill",
+        "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer:_prefill_logits",
+        "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer:_topk",
+        "vllm.models.qwen4_exp.nvidia.ops.qsa_indexer:expand_qsa_block_indices",
+        "vllm.models.qwen4_exp.nvidia.ops.qsa:qsa_sparse_paged_attention",
+        "vllm.models.qwen4_exp.nvidia.ops.qsa:qsa_store_cache_rows",
+        "vllm.models.qwen4_exp.nvidia.ops.qsa:qsa_compress_groups_with_ratio",
+    ),
+}
+
+
+def _wrap_functions(tr: "_Trace", spec: str) -> int:
+    """B70_STEP_TRACE_FUNCS=module:function,... (or a preset name, e.g. qsa): marks around
+    module-level functions. Every module that imported the function by name gets the wrapped
+    one too, so `from x import f` call sites are covered as well as `x.f` ones."""
+    import importlib
+    import sys
+
+    items: list[str] = []
+    for item in filter(None, (s.strip() for s in spec.split(","))):
+        items.extend(_FUNC_PRESETS.get(item, (item,)))
+    n = 0
+    for item in items:
+        modname, fname = item.split(":")
+        mod = importlib.import_module(modname)
+        orig = getattr(mod, fname)
+
+        def wrapped(*a, _orig=orig, _name=fname, **k):
+            if tr.cur < 0 or not tr.stack:
+                return _orig(*a, **k)
+            lab = f"{tr.stack[-1]}>{_name}"
+            tr.stack.append(lab)
+            tr.mark(tr.cur, lab + ":s")
+            try:
+                return _orig(*a, **k)
+            finally:
+                tr.mark(tr.cur, lab + ":e")
+                if tr.stack and tr.stack[-1] == lab:
+                    tr.stack.pop()
+
+        for other in list(sys.modules.values()):
+            d = getattr(other, "__dict__", None)
+            if d is None:
+                continue
+            for key, value in list(d.items()):
+                if value is orig:
+                    d[key] = wrapped
         n += 1
     return n
 
