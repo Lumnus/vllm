@@ -21,7 +21,8 @@ Load path (no full-size host or device copy of a layer ever exists):
     pinned memory and dropped (the host only copies: an all-core CPU repack on
     both ranks at once was the heaviest burst of the whole boot).
 
-Switches: B70_MOE_HOTCOLD=1, B70_MOE_HOT_EXPERTS=<per layer per rank>,
+Switches: B70_MOE_HOTCOLD=1, B70_MOE_HOT_EXPERTS=<per layer per rank> (or, 0.32 port,
+B70_MOE_COLD_EXPERTS=<cold per layer per rank>, which wins),
 B70_MOE_HOTCOLD_RANKINGS=<json: layer -> global expert ids, hottest first>.
 Off (default): nothing here runs.
 """
@@ -829,6 +830,40 @@ class HotColdPlan:
         return self._impls
 
 
+def hot_count_for(num_local: int) -> int:
+    """B70-V32-HC1: how many of a rank's ``num_local`` experts per layer stay in VRAM.
+
+    B70_MOE_COLD_EXPERTS=N (cold per layer per rank) wins over B70_MOE_HOT_EXPERTS (hot per layer per rank),
+    so one number means the same VRAM saving whatever the EP size: N = 16 is 16 of 128 at TP4 and 16 of
+    256 at TP2. Neither set: everything hot (no plan). Clamped to [1, num_local]."""
+    cold = os.environ.get("B70_MOE_COLD_EXPERTS", "").strip()
+    if cold:
+        hot = num_local - int(cold)
+        if os.environ.get("B70_MOE_HOT_EXPERTS", "").strip():
+            _warn_once("B70 hot/cold: B70_MOE_COLD_EXPERTS=%s wins over B70_MOE_HOT_EXPERTS=%s",
+                       cold, os.environ["B70_MOE_HOT_EXPERTS"])
+    else:
+        hot = int(os.environ.get("B70_MOE_HOT_EXPERTS", str(num_local)))
+    return max(1, min(hot, num_local))
+
+
+_WARNED: set = set()
+
+
+def _warn_once(msg: str, *args) -> None:
+    if msg not in _WARNED:
+        _WARNED.add(msg)
+        logger.warning(msg, *args)
+
+
+def remap_unrouted(topk_ids: torch.Tensor, num_global: int, ep_rank: int) -> torch.Tensor:
+    """B70-V32-HC1: 0.32's stock XPU path sends topk_ids == -1 to an expert this rank does not own (the last
+    expert on rank 0, expert 0 elsewhere: linear EP placement). That expert is -1 in both the hot and the
+    cold map, so both kernel calls skip the row, as the stock call does."""
+    sentinel = num_global - 1 if ep_rank == 0 else 0
+    return torch.where(topk_ids < 0, topk_ids.new_full((), sentinel), topk_ids)
+
+
 def maybe_plan(layer_name: str, moe_config, expert_map_manager,
                quant_config) -> HotColdPlan | None:
     """A plan for this RoutedExperts layer, or None (switch off / not applicable)."""
@@ -847,8 +882,7 @@ def maybe_plan(layer_name: str, moe_config, expert_map_manager,
     pairs = sorted((loc, g) for g, loc in local_of.items() if loc >= 0)
     local_ids = [loc for loc, _ in pairs]
     global_ids = [g for _, g in pairs]
-    hot_count = int(os.environ.get("B70_MOE_HOT_EXPERTS", str(len(local_ids))))
-    hot_count = max(1, min(hot_count, len(local_ids)))
+    hot_count = hot_count_for(len(local_ids))
     if hot_count >= len(local_ids):
         return None
     ranked = [g for g in _rankings().get(layer_idx, []) if local_of.get(g, -1) >= 0]
