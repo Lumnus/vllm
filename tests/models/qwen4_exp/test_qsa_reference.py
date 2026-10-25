@@ -282,6 +282,22 @@ def test_qsa_topk_torch_contract_and_ties(width: int) -> None:
         assert chosen.tolist() == order[:k]
 
 
+def test_qsa_topk_torch_row_chunks_match_one_pass(monkeypatch) -> None:
+    """B70-QSA-09: chunking rows (memory cap) gives the same indices."""
+    torch.manual_seed(1)
+    rows, width, block_topk = 37, 700, 512
+    logits = torch.randn(rows, width)
+    logits[logits < 0.2] = 0.0
+    visible = torch.randint(0, width + 1, (rows,), dtype=torch.int32)
+    whole = torch.empty(rows, block_topk, dtype=torch.int32)
+    chunked = torch.empty(rows, block_topk, dtype=torch.int32)
+    monkeypatch.setenv("B70_QSA_TOPK_TORCH_CHUNK_MB", "4096")
+    qsa_indexer_ops._qsa_topk_torch(logits, visible, block_topk, whole)
+    monkeypatch.setenv("B70_QSA_TOPK_TORCH_CHUNK_MB", "0")  # one row per chunk
+    qsa_indexer_ops._qsa_topk_torch(logits, visible, block_topk, chunked)
+    assert torch.equal(whole, chunked)
+
+
 @requires_qsa_kernels
 def test_qsa_side_metadata_marks_cudagraph_padding_inert() -> None:
     device = torch.device(_DEVICE)
@@ -556,7 +572,6 @@ def test_qsa_compressed_metadata_keeps_dummy_slots_inert() -> None:
     assert metadata.k_work_metadata.tolist() == [[0, 0], [2, 0], [2, 1], [-1, -1]]
 
 
-
 class _GemmaNormStub(SimpleNamespace):
     """weight + variance_epsilon like GemmaRMSNorm, and callable: off CUDA the
     indexer calls the norm module itself (no flashinfer), so the stub must too."""
@@ -565,6 +580,7 @@ class _GemmaNormStub(SimpleNamespace):
         xf = x.float()
         xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.variance_epsilon)
         return (xf * (1.0 + self.weight.float())).to(x.dtype)
+
 
 @requires_qsa_kernels
 @pytest.mark.usefixtures("default_vllm_config")

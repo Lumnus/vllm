@@ -556,6 +556,39 @@ def _qsa_topk_torch(
     rows, width = logits.shape
     if rows == 0:
         return
+    # B70-QSA-09: the int64 key costs ~5 transient int64 copies of the logits
+    # (bits, flip, key, mask select, topk input) -- ~10x the fp32 logits. A
+    # 4096-row prefill chunk at long context OOMed rank 0 (192 MiB alloc, 179 MiB
+    # free; W1 2026-10-25). Rows are independent, so process them in chunks
+    # sized to B70_QSA_TOPK_TORCH_CHUNK_MB (default 64) of key memory.
+    budget = int(os.environ.get("B70_QSA_TOPK_TORCH_CHUNK_MB", "64")) << 20
+    step = max(1, budget // max(1, width * 8 * 5))
+    if step < rows:
+        logger.info_once(
+            "B70-QSA: torch top-k processes rows in chunks of %d (width %d)",
+            step,
+            width,
+        )
+        for start in range(0, rows, step):
+            end = min(rows, start + step)
+            _qsa_topk_torch_rows(
+                logits[start:end],
+                visible_blocks[start:end],
+                block_topk,
+                block_indices[start:end],
+            )
+        return
+    _qsa_topk_torch_rows(logits, visible_blocks, block_topk, block_indices)
+
+
+def _qsa_topk_torch_rows(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    block_topk: int,
+    block_indices: torch.Tensor,
+) -> None:
+    """One chunk of _qsa_topk_torch (same contract)."""
+    rows, width = logits.shape
     k = min(block_topk, width)
     bits = logits.contiguous().view(torch.int32).to(torch.int64)
     # IEEE-754 total order on the int view: flip the magnitude bits of negatives.
