@@ -15,6 +15,8 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
+_GRAPH_CHECK = os.environ.get("B70_QSA_GRAPH_CHECK", "").strip() in ("1", "true", "on")
+
 
 def state_routes(runner, metadata):
     context = runner.vllm_config.compilation_config.static_forward_context
@@ -33,6 +35,38 @@ def state_routes(runner, metadata):
     return [
         (name, tensor, torch.cat(indices).unique())
         for name, tensor, indices in grouped.values()
+    ]
+
+
+def qsa_side_rows(runner, metadata):
+    """B70-QSA-Q: the QSA side-cache rows this step writes (B70_QSA_GRAPH_CHECK).
+
+    The side caches are not state routes: their writes are expected to be
+    idempotent for a repeated 8-row verify step. This lets the capture prove
+    it on the live batch instead of assuming it.
+    """
+    from vllm.models.qwen4_exp.common.qsa_cache import QSAForwardMetadata
+
+    context = runner.vllm_config.compilation_config.static_forward_context
+    found = []
+    for name, meta in metadata.items():
+        if not isinstance(meta, QSAForwardMetadata):
+            continue
+        cache = getattr(context.get(name), "kv_cache", None)
+        if not isinstance(cache, torch.Tensor) or cache.ndim != 4 or not cache.numel():
+            continue
+        slots = meta.slot_mapping[: meta.num_actual_tokens].long()
+        page = cache.shape[1]
+        safe = slots.clamp_min(0)
+        found.append((name, cache, safe // page, safe % page, slots >= 0))
+    return found
+
+
+def qsa_side_snapshot(side):
+    return [
+        (torch.where(valid.view(-1, 1, 1), cache[blocks, offsets], 0).clone(),
+         cache[0].clone())
+        for _, cache, blocks, offsets, valid in side
     ]
 
 
@@ -225,9 +259,12 @@ class TargetGraphs:
         # Capture must never advance the accepted-prefix state. Several layers
         # share cache arenas: union every layer's indices before saving them.
         routes = state_routes(runner, metadata)
+        side = qsa_side_rows(runner, target_metadata) if _GRAPH_CHECK else []
+        side_initial = qsa_side_snapshot(side)
         initial = save(routes)
         expected = clone_output(eager(runner, batch, metadata, inputs))
         expected_state = save(routes)
+        side_expected = qsa_side_snapshot(side)
         restore(routes, initial)
         static = stage(current, {}, bound)
         model_inputs, model_metadata, slots, padding = static
@@ -251,6 +288,20 @@ class TargetGraphs:
                 torch.equal(value, tensor[indices])
                 for (_, tensor, indices), value in zip(routes, expected_state)
             )
+            if side:
+                side_replayed = qsa_side_snapshot(side)
+                bad = [
+                    side[i][0]
+                    for i, ((rows, null), (rows2, null2), (_, null0)) in enumerate(
+                        zip(side_expected, side_replayed, side_initial)
+                    )
+                    if not (torch.equal(rows, rows2) and torch.equal(null2, null0))
+                ]
+                logger.info(
+                    "B70-QSA-GRAPH-CHECK: %d QSA side caches, %d differ after "
+                    "replay: %s", len(side), len(bad), bad[:4]
+                )
+                passed = passed and not bad
             verdict = torch.tensor(int(passed), dtype=torch.int32)
             dist.all_reduce(
                 verdict, op=dist.ReduceOp.MIN, group=get_tp_group().cpu_group
