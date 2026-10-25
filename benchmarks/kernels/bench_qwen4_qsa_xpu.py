@@ -442,7 +442,7 @@ def ref_logits(p: Problem, rows: list[int]) -> torch.Tensor:
     return out
 
 
-def _check_rows(p: "Problem", sample: int, extra: set[int]) -> list[int]:
+def _check_rows(p: Problem, sample: int, extra: set[int]) -> list[int]:
     """Rows to check. B70_BENCH_CHECK_ROWS=all checks every row against the torch
     reference (slow; for correctness runs); an integer N samples N rows."""
     want = os.environ.get("B70_BENCH_CHECK_ROWS", "")
