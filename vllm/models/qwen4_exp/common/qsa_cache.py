@@ -849,6 +849,14 @@ class QSAKeyStateCache(_QSAStateCache):
         # overwrite a committed key the next step needs to close the group.
         span = self.compress_ratio + vllm_config.num_speculative_tokens
         capacity = self.compress_ratio * cdiv(span, self.compress_ratio)
+        # B70-QSA: a wider ring is equally correct (it only adds slack), so
+        # when the minimal whole-group capacity does not divide the attention
+        # block, take the next whole-group size that does. Flash-Next with
+        # DFlash2 K=7 needs 12, and the hybrid block on BMG is 832 = 13 x 64;
+        # 16 divides it.
+        block_size = self.cache_config.block_size
+        while block_size % capacity and capacity < block_size:
+            capacity += self.compress_ratio
         assert self.cache_config.block_size % capacity == 0, (
             f"QSA ring capacity {capacity} must divide the attention block "
             f"size {self.cache_config.block_size}"
