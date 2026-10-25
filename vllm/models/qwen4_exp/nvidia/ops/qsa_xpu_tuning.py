@@ -119,7 +119,7 @@ def _load() -> dict[str, dict[str, Any]]:
             logger.warning_once("B70-QSA: B70_QSA_TUNE ignored off XPU")
             parsed = {}
         if parsed:
-            logger.info_once("B70-QSA: XPU launch overrides active: %s", parsed)
+            logger.info_once("B70-QSA: XPU launch overrides active: %s", json.dumps(parsed, sort_keys=True))
         _overrides = parsed
     return _overrides
 
