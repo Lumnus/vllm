@@ -19,7 +19,10 @@ Kernel keys and the fields each one reads:
                         (every base_programs region except the prefill one)
 ``sparse_gqa_prefill``  same fields; base_programs > 2048 with
                         use_prefill_config (the 4096-row prefill chunk)
-``merge``          num_warps, grf_mode
+``sparse_attn2_decode`` / ``sparse_attn2_prefill`` (B70_QSA_ATTN_IMPL=attn2)
+                   block_n, num_dchunk (head_dim chunks), tiles_per_prog,
+                   row_chunk, num_warps, num_stages, grf_mode
+``merge``          num_warps, grf_mode (also the attn2 merge)
 ``expand``         column_block, num_warps, grf_mode
 
 The launch site and the JIT warmup read the same values, so warmup can never
@@ -54,6 +57,24 @@ _KNOWN = {
     },
     "sparse_gqa_decode": {"block_n", "splits", "num_warps", "num_stages", "grf_mode"},
     "sparse_gqa_prefill": {"block_n", "splits", "num_warps", "num_stages", "grf_mode"},
+    "sparse_attn2_decode": {
+        "block_n",
+        "num_dchunk",
+        "tiles_per_prog",
+        "row_chunk",
+        "num_warps",
+        "num_stages",
+        "grf_mode",
+    },
+    "sparse_attn2_prefill": {
+        "block_n",
+        "num_dchunk",
+        "tiles_per_prog",
+        "row_chunk",
+        "num_warps",
+        "num_stages",
+        "grf_mode",
+    },
     "merge": {"num_warps", "grf_mode"},
     "expand": {"column_block", "num_warps", "grf_mode"},
 }
