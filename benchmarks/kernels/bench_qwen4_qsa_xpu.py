@@ -428,6 +428,10 @@ def check_selection(p: Problem, sample: int = 6) -> dict:
     for r, s in zip(rows, ref_logits(p, rows)):
         vis = s.numel()
         k = min(BLOCK_TOPK, vis)
+        if k == 0:  # empty history (first prefill rows): nothing to select, no index may be written
+            if (p.block_indices[r, :BLOCK_TOPK] >= 0).any():
+                bad += 1
+            continue
         got = p.block_indices[r, :k].long()
         if (got < 0).any() or (got >= vis).any() or got.unique().numel() != k:
             bad += 1
