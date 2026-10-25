@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 from vllm.platforms import current_platform
 
+from ..common import qsa_debug as _qsa_debug
 from ..common.qsa_cache import (
     QSACompressedKeyCache,
     QSAForwardMetadata,
@@ -494,6 +495,14 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             out,
         )
+        if _qsa_debug.DUMP_DIR:
+            # B70-QSA-Q: qualification hook, off by default (B70_QSA_DEBUG_DUMP).
+            _qsa_debug.dump_prefill_state(
+                self.compressed_key_cache.prefix,
+                compressed_metadata,
+                compressed_key_cache,
+                block_indices,
+            )
         return out, main_outputs
 
 

@@ -44,6 +44,8 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
 )
 
+from . import qsa_debug as _qsa_debug
+
 
 def canonical_qsa_rope_positions(positions: torch.Tensor) -> torch.Tensor:
     """Return exact per-token positions as ``[tokens, 1, 3]`` int64 rows."""
@@ -702,6 +704,13 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
                 request_capacity=request_capacity,
             )
         )
+        if _qsa_debug.RING_MODE and self.is_circular_buffer:
+            # B70-QSA-Q: qualification hook, off by default (B70_QSA_DEBUG_RING).
+            _qsa_debug.observe_ring_metadata(
+                common_attn_metadata,
+                self.kv_cache_spec.block_size,
+                self._ring_compress_ratio(),
+            )
         return QSAForwardMetadata(
             block_table=common_attn_metadata.block_table_tensor,
             slot_mapping=slot_mapping,
@@ -722,6 +731,20 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
         )
+
+    def _ring_compress_ratio(self) -> int:
+        # The ring spec does not carry the ratio; its owning layers do.
+        ratio = getattr(self, "_debug_ring_ratio", None)
+        if ratio is None:
+            ratio = 4
+            context = self.vllm_config.compilation_config.static_forward_context
+            for name in self.layer_names:
+                layer = context.get(name)
+                if layer is not None and hasattr(layer, "compress_ratio"):
+                    ratio = int(layer.compress_ratio)
+                    break
+            self._debug_ring_ratio = ratio
+        return ratio
 
 
 class QSAStateBackend(AttentionBackend):
