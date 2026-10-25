@@ -442,12 +442,19 @@ def ref_logits(p: Problem, rows: list[int]) -> torch.Tensor:
     return out
 
 
+def _check_rows(p: "Problem", sample: int, extra: set[int]) -> list[int]:
+    """Rows to check. B70_BENCH_CHECK_ROWS=all checks every row against the torch
+    reference (slow; for correctness runs); an integer N samples N rows."""
+    want = os.environ.get("B70_BENCH_CHECK_ROWS", "")
+    if want == "all":
+        return list(range(p.rows))
+    n = int(want) if want else sample
+    return sorted(extra | {int(x) for x in torch.linspace(0, p.rows - 1, n).tolist()})
+
+
 def check_selection(p: Problem, sample: int = 6) -> dict:
     """Selected-set check that tolerates exact score ties (compares score multisets)."""
-    rows = sorted(
-        {0, p.rows - 1, p.rows // 2}
-        | {int(x) for x in torch.linspace(0, p.rows - 1, sample).tolist()}
-    )
+    rows = _check_rows(p, sample, {0, p.rows - 1, p.rows // 2})
     worst = 0.0
     bad = 0
     for r, s in zip(rows, ref_logits(p, rows)):
@@ -471,10 +478,7 @@ def check_selection(p: Problem, sample: int = 6) -> dict:
 
 
 def check_attention(p: Problem, sample: int = 4) -> dict:
-    rows = sorted(
-        {0, p.rows - 1}
-        | {int(x) for x in torch.linspace(0, p.rows - 1, sample).tolist()}
-    )
+    rows = _check_rows(p, sample, {0, p.rows - 1})
     worst = 0.0
     for r in rows:
         lg = p.logical[r, :SEL_WIDTH]
