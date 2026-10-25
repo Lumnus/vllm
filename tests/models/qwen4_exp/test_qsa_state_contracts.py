@@ -48,6 +48,26 @@ def should_do_global_cleanup_after_test() -> bool:
     return _ON_GPU
 
 
+_PROD_BUILDER = qsa_cache.build_qsa_metadata
+
+
+def _builder_by_device(*args, **kwargs):
+    """CPU tensors take the torch builder; device tensors keep the production one."""
+    for x in (*args, *kwargs.values()):
+        if isinstance(x, torch.Tensor):
+            if x.device.type == "cpu":
+                return qsa_cache._build_qsa_metadata_torch(*args, **kwargs)
+            break
+    return _PROD_BUILDER(*args, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _cpu_tensors_use_the_torch_builder(monkeypatch):
+    # On a GPU host HAS_TRITON is true, so the module-level builder is the
+    # Triton one, and the ref backend's CPU tensors would reach a Triton launch.
+    monkeypatch.setattr(qsa_cache, "build_qsa_metadata", _builder_by_device)
+
+
 CR = 4  # compression ratio
 K = 7  # DFlash2 draft length on the serving def
 D = 32  # raw-key width for state tests (production: 128; width is irrelevant)
