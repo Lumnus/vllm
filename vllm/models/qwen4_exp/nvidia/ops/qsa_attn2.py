@@ -301,28 +301,31 @@ def _qsa_attn2_merge_kernel(
 # --------------------------------------------------------------------------------------
 # dispatch
 # --------------------------------------------------------------------------------------
-# Defaults are the configs that compile with zero spill for BMG-G31 (Triton
-# 3.8.0+xpu, IGC 2.41.5; benchmarks/kernels/b70_qsa_tune/aot_attn_regs.py):
-# decode BLOCK_N 32 x 4 chunks (256 GRF), prefill BLOCK_N 64 x 8 chunks (256 GRF).
-# Untimed: the GPU block picks the winners with --sweep sparse_attn2_*.
+# Defaults: the fastest configs measured on a B70 (Triton 3.8.0+xpu, IGC 2.41.5,
+# compute-runtime 26.35; run 2026-W43/2026-10-25-qsa-triton-xpu, B2a): BLOCK_N 32 x
+# 8 head_dim chunks at 256 GRF, zero spill, for both regions. Decode 8 rows
+# 54-56 us (rows 32: 84-202, rows 64: 191-372, 4K-131K); prefill 4,096 rows
+# 9.3 ms at 32K, 12.6 ms at 131K. At 128 GRF the same tile spills 192 B and
+# runs ~17 % slower, so grf_mode "256" is part of the default.
 _DEFAULTS = {
     "sparse_attn2_decode": {
         "block_n": 32,
-        "num_dchunk": 4,
+        "num_dchunk": 8,
         "tiles_per_prog": 1,
         "row_chunk": 4096,
         "num_warps": 1,
         "num_stages": 1,
     },
     "sparse_attn2_prefill": {
-        "block_n": 64,
+        "block_n": 32,
         "num_dchunk": 8,
         "tiles_per_prog": 1,
-        "row_chunk": 256,
+        "row_chunk": 512,
         "num_warps": 1,
         "num_stages": 1,
     },
 }
+_DEFAULT_GRF = "256"
 # Rows at/above which a use_prefill_config call takes the prefill region.
 _PREFILL_ROWS = 2048
 
@@ -347,6 +350,18 @@ def select_attn2_config(
     num_dchunk = get("num_dchunk")
     tiles_per_prog = get("tiles_per_prog")
     num_tiles = triton.cdiv(selection_width, block_n)
+    num_warps = get("num_warps")
+    if num_warps > 1 and block_n >= 32:
+        # IGC 2.41.5 dies with SIGFPE ("Internal Compiler Error: Floating point
+        # exception") compiling these, which kills the process (measured: every
+        # BLOCK_N 32/64 config with num_warps 2, Triton 3.8.0 and Intel main).
+        raise ValueError(
+            f"B70_QSA attn2: num_warps {num_warps} with block_n {block_n} crashes "
+            "IGC 2.41.5; use num_warps 1 (or block_n 16)"
+        )
+    extra = xpu_tune.launch_extra(region)
+    if xpu_tune.get(region, "grf_mode", None) is None:
+        extra = {"grf_mode": _DEFAULT_GRF}
     return {
         "region": region,
         "block_n": block_n,
@@ -354,9 +369,9 @@ def select_attn2_config(
         "tiles_per_prog": min(tiles_per_prog, num_tiles),
         "num_tiles": num_tiles,
         "row_chunk": max(1, min(get("row_chunk"), num_rows)),
-        "num_warps": get("num_warps"),
+        "num_warps": num_warps,
         "num_stages": get("num_stages"),
-        "extra": xpu_tune.launch_extra(region),
+        "extra": extra,
     }
 
 
