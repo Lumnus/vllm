@@ -6,6 +6,7 @@ import copy
 import hashlib
 import math
 import os
+import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
@@ -1857,6 +1858,30 @@ def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -
     return best_d
 
 
+def _b70_layer_index(name: str) -> tuple[int, str]:
+    m = re.search(r"layers\.(\d+)\.", name)
+    return (int(m.group(1)) if m else 1 << 30, name)
+
+
+def _b70_pack_repeats_floor(floor: int) -> int:
+    """B70-K2: lower the repeat floor that keeps a balanced mixed-page bucket
+    (QSA: 12 full-attention + 12 compressed-key layers) in one group. With one
+    group every per-request state group (GDN, PLE, QSA ring, draft SWA) pays a
+    whole ~10.9 MB block; splitting the bucket shrinks the block (~0.9 MB at
+    n=1). B70_KV_SPLIT_GROUPS=1 means n=1; B70_KV_PACK_REPEATS=<n> sets n
+    explicitly and wins. Both unset (default) = upstream behaviour."""
+    raw = os.environ.get("B70_KV_PACK_REPEATS")
+    if not raw and os.environ.get("B70_KV_SPLIT_GROUPS", "0") not in ("", "0"):
+        raw = "1"
+    if not raw:
+        return floor
+    value = max(1, min(int(raw), floor))
+    logger.info_once(
+        "B70-K2: packed KV repeat floor %d -> %d (B70_KV_PACK_REPEATS)", floor, value
+    )
+    return value
+
+
 def _get_packed_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -1918,7 +1943,7 @@ def _get_packed_kv_cache_groups(
                 for spec, _, balanced in bucketed
                 if balanced
             ],
-            lower_bound=min_repeats_per_group,
+            lower_bound=_b70_pack_repeats_floor(min_repeats_per_group),
         )
         if min_repeats_per_group
         else None
@@ -1972,7 +1997,11 @@ def _get_packed_kv_cache_groups(
             groups.append(KVCacheGroupSpec(list(spec.kv_cache_specs), spec))
             continue
 
-        pattern_repeats = list(zip(*page_size_layers.values()))
+        # B70-K2: pair the layers of one repeat by layer index, not by dict
+        # order, so a split group always holds full_i with its own side caches.
+        pattern_repeats = list(
+            zip(*(sorted(v, key=_b70_layer_index) for v in page_size_layers.values()))
+        )
         for i in range(num_groups):
             group_layer_names = [
                 name for repeat in pattern_repeats[i::num_groups] for name in repeat
