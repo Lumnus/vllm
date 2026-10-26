@@ -1868,10 +1868,10 @@ def _b70_pack_repeats_floor(floor: int) -> int:
     (QSA: 12 full-attention + 12 compressed-key layers) in one group. With one
     group every per-request state group (GDN, PLE, QSA ring, draft SWA) pays a
     whole ~10.9 MB block; splitting the bucket shrinks the block (~0.9 MB at
-    n=1). B70_KV_SPLIT_GROUPS=1 means n=1; B70_KV_PACK_REPEATS=<n> sets n
-    explicitly and wins. Both unset (default) = upstream behaviour."""
+    n=1). Default ON (n=1); B70_KV_SPLIT_GROUPS=0 restores the upstream floor.
+    B70_KV_PACK_REPEATS=<n> sets n explicitly and wins."""
     raw = os.environ.get("B70_KV_PACK_REPEATS")
-    if not raw and os.environ.get("B70_KV_SPLIT_GROUPS", "0") not in ("", "0"):
+    if not raw and os.environ.get("B70_KV_SPLIT_GROUPS", "1") not in ("0",):
         raw = "1"
     if not raw:
         return floor

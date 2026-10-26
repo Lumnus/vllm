@@ -61,10 +61,10 @@ def _stub(monkeypatch):
     monkeypatch.delenv("B70_KV_SPLIT_GROUPS", raising=False)
 
 
-# env -> (groups, bytes per block); unset = upstream packing
+# env -> (groups, bytes per block); unset = split (default on)
 CASES = [
-    ({}, 7, 10_862_592),
-    ({"B70_KV_SPLIT_GROUPS": "0"}, 7, 10_862_592),
+    ({}, 66, 905_216),  # default ON
+    ({"B70_KV_SPLIT_GROUPS": "0"}, 7, 10_862_592),  # opt-out = upstream packing
     ({"B70_KV_SPLIT_GROUPS": "1"}, 66, 905_216),
     ({"B70_KV_PACK_REPEATS": "1"}, 66, 905_216),
     ({"B70_KV_PACK_REPEATS": "3"}, 23, 2_715_648),
