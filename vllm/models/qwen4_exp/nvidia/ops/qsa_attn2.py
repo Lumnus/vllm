@@ -49,9 +49,12 @@ import os
 
 import torch
 
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
 from . import qsa_xpu_tuning as xpu_tune
+
+logger = init_logger(__name__)
 
 ATTN_IMPL_ENV = "B70_QSA_ATTN_IMPL"
 _IMPLS = ("splitk", "attn2")
@@ -62,6 +65,7 @@ def attn_impl() -> str:
     impl = os.environ.get(ATTN_IMPL_ENV, "splitk").strip() or "splitk"
     if impl not in _IMPLS:
         raise ValueError(f"{ATTN_IMPL_ENV}={impl!r}; expected one of {_IMPLS}")
+    logger.info_once("B70-QSA: sparse attention implementation = %s", impl)
     return impl
 
 
