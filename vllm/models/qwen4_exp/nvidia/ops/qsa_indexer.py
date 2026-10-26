@@ -606,9 +606,11 @@ def _qsa_topk_mode() -> str:
     ``auto`` (default): native when the op is registered, else torch.
     ``native_det`` (B70-QSA-Q): native, then made identical to ``torch``.
     B70-QSA-D01: by default the repair is ``_qsa_topk_select`` anchored on the
-    native k-th score (device ops only, no host sync, no full-width sort);
-    under graph capture it is ``_qsa_topk_select`` with a radix-select
-    threshold. ``B70_QSA_TOPK_DET_IMPL=legacy`` restores the Q repair (tie rows
+    native k-th score (device ops only, no host sync, no full-width sort),
+    eager and under graph capture alike (B70-QSA-D06;
+    ``B70_QSA_TOPK_CAPTURE=radix`` uses the radix threshold under capture
+    instead of the native op). ``B70_QSA_TOPK_DET_IMPL=legacy`` restores the
+    Q repair (tie rows
     redone on the torch path after a host sync; torch path under capture).
     ``radix`` (B70-QSA-D01): ``_qsa_topk_select`` with the radix-select
     threshold, no native op; identical output to ``torch``.
@@ -709,11 +711,19 @@ def _ordered_bits(logits: torch.Tensor) -> torch.Tensor:
     return torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
 
 
-def _radix_passes(rows: int) -> tuple[tuple[int, int], ...]:
-    """(shift, bits) per pass, MSB first; two 16-bit passes while the per-row
-    histograms stay under 32 MiB, else four 8-bit passes."""
-    if rows * (1 << 16) * 4 <= 32 << 20:
+def _radix_passes(rows: int, width: int) -> tuple[tuple[int, int], ...]:
+    """(shift, bits) per pass, MSB first, covering all 32 bits.
+
+    Each pass costs one full-width sweep plus a scan over rows x bins: four
+    8-bit passes (256 bins) for narrow rows, three 11/11/10-bit passes (2,048
+    bins, the persistent_topk decode bin count) for wide ones.
+    B70_QSA_TOPK_RADIX=8|11|16 forces a schedule (16 = two 16-bit passes).
+    """
+    forced = os.environ.get("B70_QSA_TOPK_RADIX", "")
+    if forced == "16":
         return ((16, 16), (0, 16))
+    if forced == "11" or (forced != "8" and width > 4096):
+        return ((21, 11), (10, 11), (0, 10))
     return ((24, 8), (16, 8), (8, 8), (0, 8))
 
 
@@ -734,7 +744,7 @@ def _radix_threshold(
     remaining = want.clone()
     threshold = torch.zeros(rows, dtype=torch.int64, device=dev)
     row_base = torch.arange(rows, dtype=torch.int64, device=dev).unsqueeze(1)
-    for i, (shift, bits) in enumerate(_radix_passes(rows)):
+    for i, (shift, bits) in enumerate(_radix_passes(rows, ordered.shape[1])):
         bins = 1 << bits
         if i == 0:
             # arithmetic shift keeps the sign: [-bins/2, bins/2) -> [0, bins)
@@ -787,6 +797,11 @@ def _qsa_topk_select(
     """
     rows, width = logits.shape
     if rows == 0:
+        return
+    if native_indices is not None and _select_impl() == "triton":
+        _qsa_topk_select_triton(
+            logits, visible_blocks, block_topk, block_indices, native_indices
+        )
         return
     budget = int(os.environ.get("B70_QSA_TOPK_SELECT_CHUNK_MB", "256")) << 20
     step = max(1, budget // max(1, width * 40))
@@ -864,6 +879,166 @@ def _qsa_topk_select_rows(
     key = torch.sort(key, dim=1, descending=True).values
     top = torch.where(key == floor, -1, 0xFFFFFFFF - (key & 0xFFFFFFFF))
     block_indices[:, :k].copy_(top.to(torch.int32))
+    if k < block_topk:
+        block_indices[:, k:].fill_(-1)
+
+
+def _select_impl() -> str:
+    """B70-QSA-D06: native-anchored select as ``torch`` ops (default, ~50
+    launches) or two fused Triton launches (``triton``),
+    B70_QSA_TOPK_SELECT_IMPL."""
+    impl = os.environ.get("B70_QSA_TOPK_SELECT_IMPL", "torch")
+    if impl not in ("torch", "triton"):
+        raise ValueError(f"B70_QSA_TOPK_SELECT_IMPL must be torch|triton, got {impl!r}")
+    return impl
+
+
+@triton.jit
+def _qsa_select_keep_kernel(
+    logits_ptr,
+    visible_ptr,
+    native_ptr,
+    keep_ptr,
+    stride_logits_row,
+    stride_native_row,
+    stride_keep_row,
+    width,
+    K: tl.constexpr,
+    K_PAD: tl.constexpr,
+    TILE: tl.constexpr,
+) -> None:
+    """One row per program: the kept columns of _qsa_topk_select_rows
+    (native-anchored), compacted in ascending column order, then -1."""
+    row = tl.program_id(0).to(tl.int64)
+    vis = tl.minimum(tl.maximum(tl.load(visible_ptr + row), 0), width)
+    want = tl.minimum(vis, K)
+    slots = tl.arange(0, K_PAD)
+    idx = tl.load(
+        native_ptr + row * stride_native_row + slots, mask=slots < K, other=-1
+    )
+    valid = (idx >= 0) & (idx < vis)
+    picked = tl.load(
+        logits_ptr + row * stride_logits_row + idx, mask=valid, other=float("inf")
+    )
+    kth = tl.min(picked, axis=0)
+    kth_bits = kth.to(tl.int32, bitcast=True)
+    t0 = tl.where(kth_bits < 0, kth_bits ^ 0x7FFFFFFF, kth_bits)
+    n_tiles = tl.cdiv(vis, TILE)
+    count_gt = 0
+    count_ge_zero = 0
+    count_gt_zero = 0
+    for tile in range(0, n_tiles):
+        cols = tile * TILE + tl.arange(0, TILE)
+        live = cols < vis
+        bits = tl.load(
+            logits_ptr + row * stride_logits_row + cols, mask=live, other=0.0
+        ).to(tl.int32, bitcast=True)
+        ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+        count_gt += tl.sum((live & (ordered > t0)).to(tl.int32), axis=0)
+        count_ge_zero += tl.sum((live & (ordered >= 0)).to(tl.int32), axis=0)
+        count_gt_zero += tl.sum((live & (ordered > 0)).to(tl.int32), axis=0)
+    # native compares floats (-0.0 == +0.0); the key orders -0.0 < +0.0
+    pos_zero = count_ge_zero >= want
+    is_zero = kth == 0.0
+    threshold = tl.where(is_zero, tl.where(pos_zero, 0, -1), t0)
+    above = tl.where(
+        is_zero, tl.where(pos_zero, count_gt_zero, count_ge_zero), count_gt
+    )
+    remaining = want - above
+    kept = 0
+    equals = 0
+    for tile in range(0, n_tiles):
+        cols = tile * TILE + tl.arange(0, TILE)
+        live = cols < vis
+        bits = tl.load(
+            logits_ptr + row * stride_logits_row + cols, mask=live, other=0.0
+        ).to(tl.int32, bitcast=True)
+        ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits)
+        is_above = live & (ordered > threshold)
+        is_equal = live & (ordered == threshold)
+        equal_rank = equals + tl.cumsum(is_equal.to(tl.int32), axis=0)
+        keep = is_above | (is_equal & (equal_rank <= remaining))
+        slot = kept + tl.cumsum(keep.to(tl.int32), axis=0) - 1
+        tl.store(keep_ptr + row * stride_keep_row + slot, cols, mask=keep)
+        kept += tl.sum(keep.to(tl.int32), axis=0)
+        equals += tl.sum(is_equal.to(tl.int32), axis=0)
+    tl.store(
+        keep_ptr + row * stride_keep_row + slots,
+        tl.full((K_PAD,), -1, tl.int32),
+        mask=(slots >= kept) & (slots < K),
+    )
+
+
+@triton.jit
+def _qsa_select_order_kernel(
+    logits_ptr,
+    keep_ptr,
+    out_ptr,
+    stride_logits_row,
+    stride_keep_row,
+    stride_out_row,
+    K: tl.constexpr,
+    K_PAD: tl.constexpr,
+) -> None:
+    """One row per program: sort the kept columns by the torch key
+    (descending score, lower column first), -1 last."""
+    row = tl.program_id(0).to(tl.int64)
+    slots = tl.arange(0, K_PAD)
+    col = tl.load(keep_ptr + row * stride_keep_row + slots, mask=slots < K, other=-1)
+    valid = col >= 0
+    bits = tl.load(
+        logits_ptr + row * stride_logits_row + col, mask=valid, other=0.0
+    ).to(tl.int32, bitcast=True)
+    ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(tl.int64)
+    low = 0xFFFFFFFF - col.to(tl.int64)
+    key = (ordered << 32) | low
+    floor = tl.full((K_PAD,), -0x7FFFFFFFFFFFFFFF - 1, tl.int64)
+    key = tl.where(valid, key, floor)
+    key = tl.sort(key, descending=True)
+    top = 0xFFFFFFFF - (key & 0xFFFFFFFF)
+    top = tl.where(key == floor, -1, top)
+    tl.store(out_ptr + row * stride_out_row + slots, top.to(tl.int32), mask=slots < K)
+
+
+def _qsa_topk_select_triton(
+    logits: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    block_topk: int,
+    block_indices: torch.Tensor,
+    native_indices: torch.Tensor,
+) -> None:
+    """B70-QSA-D06: _qsa_topk_select (native-anchored) in two launches."""
+    rows, width = logits.shape
+    k = min(block_topk, width)
+    k_pad = 1 << max(0, k - 1).bit_length()
+    keep = torch.empty((rows, k), dtype=torch.int32, device=logits.device)
+    logits = logits.contiguous()
+    visible = visible_blocks[:rows].to(torch.int32).contiguous()
+    _qsa_select_keep_kernel[(rows,)](
+        logits,
+        visible,
+        native_indices,
+        keep,
+        logits.stride(0),
+        native_indices.stride(0),
+        keep.stride(0),
+        width,
+        K=k,
+        K_PAD=k_pad,
+        TILE=1024,
+        num_warps=4,
+    )
+    _qsa_select_order_kernel[(rows,)](
+        logits,
+        keep,
+        block_indices,
+        logits.stride(0),
+        keep.stride(0),
+        block_indices.stride(0),
+        K=k,
+        K_PAD=k_pad,
+        num_warps=4,
+    )
     if k < block_topk:
         block_indices[:, k:].fill_(-1)
 
@@ -952,10 +1127,13 @@ def _topk(
             mode,
             f" (repair = {det_impl})" if det_impl else "",
         )
-        if mode == "radix" or (det_impl == "select" and _qsa_debug.is_capturing()):
+        capture_radix = os.environ.get("B70_QSA_TOPK_CAPTURE", "native") == "radix"
+        if mode == "radix" or (
+            det_impl == "select" and capture_radix and _qsa_debug.is_capturing()
+        ):
             _qsa_topk_select(logits, visible_blocks, block_topk, block_indices)
             return
-        if mode == "torch" or (mode == "native_det" and _qsa_debug.is_capturing()):
+        if mode == "torch" or (det_impl == "legacy" and _qsa_debug.is_capturing()):
             _qsa_topk_torch(logits, visible_blocks, block_topk, block_indices)
             return
         _qsa_topk_native(logits, visible_blocks, block_topk, block_indices)
