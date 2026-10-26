@@ -469,6 +469,7 @@ class QSAIndexer(nn.Module):
                 self.compress_ratio,
                 decode_query_len,
                 block_indices[decode_slice],
+                max_seq_len=compressed_metadata.max_seq_len,
             )
 
         # Prefill requests follow the leading decode rows in the reordered batch.
