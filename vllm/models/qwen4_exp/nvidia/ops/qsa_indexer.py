@@ -22,6 +22,26 @@ logger = init_logger(__name__)
 _TOPK_WORKSPACE_BYTES = 1024 * 1024
 _DECODE_BLOCK_N = 64
 
+# B70-QSA-D03: scorer launch defaults on XPU from the Cell C s1 sweep
+# (runs/2026-W43/2026-10-25-qsa-triton-xpu, C2 section 1 and its candidate
+# tune.json; Triton 3.8.0+xpu, B70, bf16 indexer). decode_score is C2's
+# lowest-max-regret row (worst 1.15x of the per-shape best over 8/64 rows x
+# 4K/131K; base was 1.5-3.5x slower). prefill_score is the 131K winner
+# (11x vs base). They apply to the bf16 indexer only (fp8 was never swept).
+# B70_QSA_TUNE still overrides any field; B70_QSA_SCORE_DEFAULTS=legacy
+# restores the GB300 copies.
+_C2_DECODE_SCORE = {"num_warps": 4, "stages": 3, "block_n": 32, "tiles_per_prog": 1}
+_C2_PREFILL_SCORE = (32, 128, 16, 1, 16)  # tile_r, block_n, k_tiles, stages, warps
+
+
+def _c2_score_defaults(dtype: torch.dtype | None) -> bool:
+    """True when the C2 scorer defaults replace the GB300 copies."""
+    return (
+        current_platform.is_xpu()
+        and dtype != torch.float8_e4m3fn
+        and os.environ.get("B70_QSA_SCORE_DEFAULTS", "c2") != "legacy"
+    )
+
 
 def _min_dot_n() -> int:
     """B70-QSA: floor for the decode scorer's tl.dot N (query rows x heads).
@@ -43,10 +63,18 @@ def _min_dot_n() -> int:
     return 1
 
 
-def _decode_block_n() -> int:
-    """Key tile of the decode scorer (B70-QSA-T: overridable on XPU)."""
+def _decode_block_n(dtype: torch.dtype | None = None) -> int:
+    """Key tile of the decode scorer (B70-QSA-T: overridable on XPU).
+
+    ``dtype`` None means the bf16 indexer (the benchmark's and the engine's).
+    """
     if current_platform.is_xpu():
-        return xpu_tune.get("decode_score", "block_n", _DECODE_BLOCK_N)
+        default = (
+            _C2_DECODE_SCORE["block_n"]
+            if _c2_score_defaults(dtype)
+            else _DECODE_BLOCK_N
+        )
+        return xpu_tune.get("decode_score", "block_n", default)
     return _DECODE_BLOCK_N
 
 
@@ -57,8 +85,13 @@ def _decode_launch_config(dtype: torch.dtype) -> tuple[int, int]:
     UNTUNED copy of the GB300 one (Cell C replaces it with BMG numbers).
     """
     if current_platform.is_xpu():
-        stages = xpu_tune.get("decode_score", "stages", 2)
-        warps = 1 if dtype == torch.float8_e4m3fn else 2
+        if _c2_score_defaults(dtype):
+            stages = _C2_DECODE_SCORE["stages"]
+            warps = _C2_DECODE_SCORE["num_warps"]
+        else:
+            stages = 2
+            warps = 1 if dtype == torch.float8_e4m3fn else 2
+        stages = xpu_tune.get("decode_score", "stages", stages)
         return stages, xpu_tune.get("decode_score", "num_warps", warps)
     # tuned on GB300
     return 2, 1 if dtype == torch.float8_e4m3fn else 2
@@ -72,9 +105,14 @@ def _prefill_launch_config(dtype: torch.dtype) -> tuple[int, int, int, int, int]
     so N = TILE_R * padded heads (256 here) is DPAS-eligible on XPU.
     """
     if current_platform.is_xpu():
-        base = (
-            (32, 64, 16, 2, 8) if dtype == torch.float8_e4m3fn else (64, 64, 16, 2, 4)
-        )
+        if _c2_score_defaults(dtype):
+            base = _C2_PREFILL_SCORE
+        else:
+            base = (
+                (32, 64, 16, 2, 8)
+                if dtype == torch.float8_e4m3fn
+                else (64, 64, 16, 2, 4)
+            )
         names = ("tile_r", "block_n", "k_tiles", "stages", "num_warps")
         return tuple(  # type: ignore[return-value]
             xpu_tune.get("prefill_score", n, v) for n, v in zip(names, base)
@@ -353,12 +391,15 @@ def _expand_qsa_indices_kernel(
         )
 
 
-def _decode_tiles_per_program(num_requests: int, columns: int) -> int:
+def _decode_tiles_per_program(
+    num_requests: int, columns: int, dtype: torch.dtype | None = None
+) -> int:
     if current_platform.is_xpu():
-        forced = xpu_tune.get("decode_score", "tiles_per_prog", 0)
+        default = _C2_DECODE_SCORE["tiles_per_prog"] if _c2_score_defaults(dtype) else 0
+        forced = xpu_tune.get("decode_score", "tiles_per_prog", default)
         if forced:
             return forced
-    programs = num_requests * triton.cdiv(columns, _decode_block_n())
+    programs = num_requests * triton.cdiv(columns, _decode_block_n(dtype))
     if programs < 16384:
         return 1
     if programs < 32768:
@@ -373,13 +414,14 @@ def _qsa_decode_warmup_profiles(
     max_num_reqs: int,
     max_num_batched_tokens: int,
     columns: int,
+    dtype: torch.dtype | None = None,
 ) -> tuple[tuple[int, int], ...]:
     profiles: list[tuple[int, int]] = []
     for dql in range(1, max_dql + 1):
         max_reqs = min(max_num_reqs, max_num_batched_tokens // dql)
         requests_by_grouping: dict[int, int] = {}
         for num_requests in range(1, max_reqs + 1):
-            tiles_per_program = _decode_tiles_per_program(num_requests, columns)
+            tiles_per_program = _decode_tiles_per_program(num_requests, columns, dtype)
             requests_by_grouping.setdefault(tiles_per_program, num_requests)
         profiles.extend(
             (dql, num_requests) for num_requests in requests_by_grouping.values()
@@ -406,6 +448,7 @@ def warmup_qsa_mqa_paged_decode(
         max_num_reqs,
         max_num_batched_tokens,
         columns,
+        k_cache.dtype,
     )
     if not profiles:
         return ()
@@ -427,7 +470,9 @@ def warmup_qsa_mqa_paged_decode(
             torch.float32,
             shape=(num_rows, columns),
         )
-        tiles_per_program = _decode_tiles_per_program(num_requests, columns)
+        tiles_per_program = _decode_tiles_per_program(
+            num_requests, columns, k_cache.dtype
+        )
         stages, num_warps = _decode_launch_config(k_cache.dtype)
         _qsa_mqa_paged_uniform_kernel.warmup(
             q_ptr,
@@ -446,14 +491,16 @@ def warmup_qsa_mqa_paged_decode(
             NUM_HEADS=num_heads,
             HEAD_DIM=head_dim,
             DECODE_QUERY_LEN=decode_query_len,
-            BLOCK_N=_decode_block_n(),
+            BLOCK_N=_decode_block_n(k_cache.dtype),
             TILES_PER_PROG=tiles_per_program,
             STAGES=stages,
             MIN_DOT_N=_min_dot_n(),
             num_warps=num_warps,
             grid=(
                 num_requests,
-                triton.cdiv(columns, _decode_block_n() * tiles_per_program),
+                triton.cdiv(
+                    columns, _decode_block_n(k_cache.dtype) * tiles_per_program
+                ),
             ),
             **xpu_tune.launch_extra("decode_score"),
         )
@@ -1115,11 +1162,11 @@ def _select_decode_rows(
 
     columns = page_table.shape[1] * k_cache.shape[1]
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
-    tiles_per_program = _decode_tiles_per_program(num_requests, columns)
+    tiles_per_program = _decode_tiles_per_program(num_requests, columns, k_cache.dtype)
     stages, num_warps = _decode_launch_config(k_cache.dtype)
     grid = (
         num_requests,
-        triton.cdiv(columns, _decode_block_n() * tiles_per_program),
+        triton.cdiv(columns, _decode_block_n(k_cache.dtype) * tiles_per_program),
     )
     _qsa_mqa_paged_uniform_kernel[grid](
         q,
@@ -1136,7 +1183,7 @@ def _select_decode_rows(
         NUM_HEADS=q.shape[1],
         HEAD_DIM=q.shape[2],
         DECODE_QUERY_LEN=decode_query_len,
-        BLOCK_N=_decode_block_n(),
+        BLOCK_N=_decode_block_n(k_cache.dtype),
         TILES_PER_PROG=tiles_per_program,
         STAGES=stages,
         MIN_DOT_N=_min_dot_n(),
