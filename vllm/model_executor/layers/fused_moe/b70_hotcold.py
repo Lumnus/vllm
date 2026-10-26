@@ -148,6 +148,19 @@ def cold_prefetch_min_tokens() -> int:
     return max(64, int(os.environ.get("B70_MOE_COLD_PREFETCH_MIN_TOKENS", "512")))
 
 
+def _capturing() -> bool:
+    """True while the current XPU stream is recording a graph (CUDA/XPU graph capture)."""
+    return bool(torch.xpu.is_current_stream_capturing())
+
+
+def _refuse_under_capture(what: str) -> None:
+    """B70-V32-HC3: the prefetcher orders an eager side copy stream against the current stream
+    with events. Recorded into a graph, those events never complete on the eager timeline, so the
+    copy stream and the next eager forward wait forever. Fail loudly instead."""
+    if _capturing():
+        raise RuntimeError(f"B70 hot/cold: cold prefetch {what} called during graph capture")
+
+
 class _ColdPrefetcher:
     """Two VRAM slots, each holding one layer's cold experts (kernel layout).
 
@@ -177,6 +190,7 @@ class _ColdPrefetcher:
                     cold_prefetch_min_tokens(), gib)
 
     def _load(self, slot: int, plan: "HotColdPlan") -> None:
+        _refuse_under_capture("_load")
         compute = torch.xpu.current_stream()
         with torch.xpu.stream(self.stream):
             if self.free[slot] is not None:
@@ -190,6 +204,7 @@ class _ColdPrefetcher:
         del compute
 
     def acquire(self, plan: "HotColdPlan", device) -> dict[str, torch.Tensor]:
+        _refuse_under_capture("acquire")
         self._ensure(plan, device)
         if plan.layer_idx in self.owner:
             slot = self.owner.index(plan.layer_idx)
@@ -201,6 +216,7 @@ class _ColdPrefetcher:
         return self.bufs[slot]
 
     def release_and_prefetch(self, plan: "HotColdPlan") -> None:
+        _refuse_under_capture("release_and_prefetch")
         slot = self.last
         event = torch.xpu.Event()
         event.record(torch.xpu.current_stream())
@@ -763,9 +779,16 @@ class HotColdPlan:
     # -- forward ---------------------------------------------------------------
 
     def apply_cold(self, cold, output, hidden_states, topk_weights, topk_ids) -> None:
-        """The cold experts' share: UVA reads (decode, graphs) or a VRAM slot (large batches)."""
+        """The cold experts' share: UVA reads (decode, graphs) or a VRAM slot (large eager batches).
+
+        Graph capture always takes the UVA path, whatever the batch size (B70-V32-HC3): the
+        prefetcher's side stream and events cannot live inside a graph. Same kernel, same bytes,
+        same math; a captured 512/1024-token graph reads its cold experts over PCIe."""
         min_tokens = cold_prefetch_min_tokens()
-        if not min_tokens or hidden_states.shape[0] < min_tokens:
+        if not min_tokens or hidden_states.shape[0] < min_tokens or _capturing():
+            if min_tokens and hidden_states.shape[0] >= min_tokens:
+                logger.info_once("B70 hot/cold: graph capture at %d tokens reads cold experts over "
+                                 "UVA (prefetch is eager-only)", hidden_states.shape[0])
             cold.apply(output=output, hidden_states=hidden_states,
                        topk_weights=topk_weights, topk_ids=topk_ids)
             return
