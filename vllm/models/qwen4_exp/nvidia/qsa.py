@@ -352,6 +352,9 @@ def _qsa_eager_break(fn):
     the measurement arm that captures it into the decode segments instead.
     Decided at class definition (import time), like the decorator itself.
     """
+    from .qsa_optimer import wrap_run_qsa
+
+    fn = wrap_run_qsa(fn)  # B70-QSA-P: no-op unless B70_QSA_OPTIMER=1
     if os.environ.get("B70_QSA_EAGER_BREAK", "1") == "0":
         logger.info_once("B70-QSA: _run_qsa is captured into graph segments")
         return fn
