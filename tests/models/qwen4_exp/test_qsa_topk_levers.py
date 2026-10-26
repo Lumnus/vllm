@@ -9,6 +9,7 @@ D03: the C2 scorer launch defaults and their overrides.
 """
 
 import itertools
+import os
 import zlib
 
 import pytest
@@ -123,12 +124,11 @@ def test_select_full_page_table_width():
     assert torch.equal(_select(logits, visible, k, native), want)
 
 
-@pytest.mark.parametrize("kind", ["few_values", "relu", "randn"])
-def test_select_eight_bit_passes_match(monkeypatch, kind):
-    """Force the 4 x 8-bit radix schedule (used for large row counts)."""
-    monkeypatch.setattr(
-        qi, "_radix_passes", lambda rows: ((24, 8), (16, 8), (8, 8), (0, 8))
-    )
+@pytest.mark.parametrize("radix", ["8", "11", "16"])
+@pytest.mark.parametrize("kind", ["few_values", "relu", "randn", "signed_zero", "inf"])
+def test_select_every_radix_schedule_matches(monkeypatch, kind, radix):
+    """Every pass schedule (B70_QSA_TOPK_RADIX) gives the torch output."""
+    monkeypatch.setenv("B70_QSA_TOPK_RADIX", radix)
     gen = torch.Generator().manual_seed(8)
     logits = _tie_heavy(12, 2000, gen, kind)
     visible = _visible_set(12, 2000, 512, gen)
@@ -176,22 +176,34 @@ def test_topk_dispatch_is_torch_exact(monkeypatch, mode, impl):
     assert torch.equal(got, _torch_ref(logits, visible, 512))
 
 
-def test_native_det_select_under_capture_never_calls_native(monkeypatch):
+@pytest.mark.parametrize("capture", ["native", "radix"])
+def test_native_det_select_under_capture(monkeypatch, capture):
+    """Under capture: native + select (default) or radix (no native op);
+    the torch full-width path is never used."""
     from vllm.models.qwen4_exp.common import qsa_debug
 
     gen = torch.Generator().manual_seed(6)
     logits = _tie_heavy(4, 900, gen, "zeros")
     visible = torch.tensor([900, 10, 600, 513], dtype=torch.int32)
+    calls = []
 
-    def boom(*a, **k):
-        raise AssertionError("native op called under capture")
+    def native(logits, visible_blocks, block_topk, out):
+        calls.append("native")
+        out.copy_(_adversarial_native(logits, visible_blocks, block_topk, gen))
+
+    def no_torch(*a, **k):
+        raise AssertionError("torch top-k under capture")
 
     monkeypatch.setenv("B70_QSA_TOPK", "native_det")
-    monkeypatch.setattr(qi, "_qsa_topk_native", boom)
+    monkeypatch.setenv("B70_QSA_TOPK_CAPTURE", capture)
+    monkeypatch.setattr(qi, "_qsa_topk_native", native)
+    monkeypatch.setattr(qi, "_qsa_topk_torch", no_torch)
     monkeypatch.setattr(qsa_debug, "is_capturing", lambda: True)
     got = torch.empty(4, 512, dtype=torch.int32)
     qi._topk(logits, visible, 2048, 4, got, torch.empty(0, dtype=torch.uint8))
+    monkeypatch.undo()
     assert torch.equal(got, _torch_ref(logits, visible, 512))
+    assert calls == (["native"] if capture == "native" else [])
 
 
 def test_bad_det_impl_is_rejected(monkeypatch):
@@ -466,3 +478,82 @@ def test_select_check_flags_a_wrong_native_set(monkeypatch):
     assert torch.equal(
         _select(logits, visible, 8, right), _torch_ref(logits, visible, 8)
     )
+
+
+# --------------------------------------------------------------------------
+# D06: fused Triton select (CPU needs TRITON_INTERPRET=1 at import)
+# --------------------------------------------------------------------------
+
+_TRITON_DEV = None
+if hasattr(torch, "xpu") and torch.xpu.is_available():
+    _TRITON_DEV = "xpu"
+elif os.environ.get("TRITON_INTERPRET") == "1":
+    _TRITON_DEV = "cpu"
+requires_triton = pytest.mark.skipif(
+    _TRITON_DEV is None, reason="needs an XPU or TRITON_INTERPRET=1"
+)
+
+
+def _interpretable(kernel):
+    """On a GPU-less host vllm.triton_utils hands out placeholder ``triton`` /
+    ``tl`` (no active driver), so the kernels are plain functions. Rebind them
+    to the real modules and jit them for the Triton interpreter."""
+    if _TRITON_DEV != "cpu" or hasattr(kernel, "__getitem__"):
+        return kernel
+    import types
+
+    import triton as real_triton
+    import triton.language as real_tl
+
+    fn = types.FunctionType(
+        kernel.__code__,
+        {**kernel.__globals__, "tl": real_tl, "triton": real_triton},
+        kernel.__name__,
+        kernel.__defaults__,
+        kernel.__closure__,
+    )
+    fn.__annotations__ = {
+        name: real_tl.constexpr if "constexpr" in repr(ann) else ann
+        for name, ann in kernel.__annotations__.items()
+    }
+    return real_triton.jit(fn)
+
+
+@pytest.fixture
+def triton_select(monkeypatch):
+    monkeypatch.setenv("B70_QSA_TOPK_SELECT_IMPL", "triton")
+    for name in ("_qsa_select_keep_kernel", "_qsa_select_order_kernel"):
+        monkeypatch.setattr(qi, name, _interpretable(getattr(qi, name)))
+
+
+@requires_triton
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("width,k", [(7, 4), (64, 16), (700, 512), (3000, 512)])
+def test_triton_select_matches_torch(triton_select, kind, width, k):
+    gen = torch.Generator().manual_seed(zlib.crc32(f"t{kind}{width}{k}".encode()))
+    logits = _tie_heavy(9, width, gen, kind)
+    visible = _visible_set(9, width, k, gen)
+    want = _torch_ref(logits, visible, k)
+    for high in (True, False):
+        native = _adversarial_native(logits, visible, k, gen, high_col=high)
+        got = torch.empty(9, k, dtype=torch.int32, device=_TRITON_DEV)
+        qi._qsa_topk_select(
+            logits.to(_TRITON_DEV),
+            visible.to(_TRITON_DEV),
+            k,
+            got,
+            native_indices=native.to(_TRITON_DEV),
+        )
+        assert torch.equal(got.cpu(), want)
+
+
+@requires_triton
+def test_triton_select_in_place(triton_select):
+    gen = torch.Generator().manual_seed(12)
+    logits = _tie_heavy(5, 1024, gen, "zeros")
+    visible = torch.tensor([700, 512, 300, 1000, 513], dtype=torch.int32)
+    buf = _adversarial_native(logits, visible, 512, gen).to(_TRITON_DEV)
+    qi._qsa_topk_select(
+        logits.to(_TRITON_DEV), visible.to(_TRITON_DEV), 512, buf, native_indices=buf
+    )
+    assert torch.equal(buf.cpu(), _torch_ref(logits, visible, 512))
