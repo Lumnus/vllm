@@ -75,6 +75,10 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
         adaptive_verification=manager,
         rejection_sampler=rejection_sampler,
     )
+    budget_warmups = []
+    manager.warmup_budget_kernel = lambda: budget_warmups.append(
+        runner.adaptive_verification
+    )
 
     def run_steps(model_runner, execute, sample):
         assert model_runner.adaptive_verification is None
@@ -91,3 +95,5 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
     assert runner.adaptive_verification is manager
     assert manager.cost_tables is None
     assert rejection_sampler.enable_adaptive_verification
+    # The budget kernel is warmed once, after the manager is restored.
+    assert budget_warmups == ([] if fail_warmup else [manager])
