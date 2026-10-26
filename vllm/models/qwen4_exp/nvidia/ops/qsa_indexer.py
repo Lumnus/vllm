@@ -951,6 +951,56 @@ def _topk(
     )
 
 
+def _topk_per_step() -> bool:
+    """B70-QSA-D02: B70_QSA_TOPK_PER_STEP=1 (default 0). See
+    _select_decode_per_step."""
+    return os.environ.get("B70_QSA_TOPK_PER_STEP", "0") == "1"
+
+
+def _topk_skip_fit() -> bool:
+    """B70-QSA-D02: B70_QSA_TOPK_SKIP_FIT=1 (default 0). See
+    _select_all_visible."""
+    return os.environ.get("B70_QSA_TOPK_SKIP_FIT", "0") == "1"
+
+
+def _select_all_visible(
+    visible_blocks: torch.Tensor, block_indices: torch.Tensor
+) -> None:
+    """Every visible block, ascending: blocks 0..visible-1, then -1.
+
+    The same SET every selector returns when visible <= block_topk (it keeps
+    all visible blocks); the order is ascending column instead of descending
+    score, so attention sums in another order (set-exact, not bit-exact).
+    """
+    width = block_indices.shape[1]
+    columns = torch.arange(width, device=block_indices.device, dtype=torch.int32)
+    visible = visible_blocks[: block_indices.shape[0]].to(torch.int32)
+    block_indices.copy_(
+        torch.where(columns.unsqueeze(0) < visible.unsqueeze(1), columns, -1)
+    )
+
+
+def _broadcast_anchor_selection(
+    anchor_indices: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    decode_query_len: int,
+    block_indices: torch.Tensor,
+) -> None:
+    """Give each verify row its request's anchor selection, causally clipped.
+
+    Row r keeps the anchor's blocks < visible_blocks[r] in the anchor's order
+    and moves the dropped entries to the end as -1. Dropped blocks lie in
+    [visible_r, visible_anchor): the row's own open group (covered by the
+    expand tail) or later, never a block the row may attend.
+    """
+    rows = block_indices.shape[0]
+    spread = anchor_indices.repeat_interleave(decode_query_len, dim=0)
+    visible = visible_blocks[:rows].to(spread.dtype).unsqueeze(1)
+    ok = (spread >= 0) & (spread < visible)
+    order = torch.sort((~ok).to(torch.int32), dim=1, stable=True).indices
+    block_indices.copy_(torch.where(ok, spread, -1).gather(1, order))
+
+
 def qsa_select_paged_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -960,6 +1010,7 @@ def qsa_select_paged_decode(
     compress_ratio: int,
     decode_query_len: int,
     block_indices: torch.Tensor,
+    max_seq_len: int | None = None,
 ) -> None:
     """Score and select compressed blocks for a request-major decode batch.
 
@@ -974,6 +1025,25 @@ def qsa_select_paged_decode(
         compress_ratio: Number of logical tokens represented by a cache row.
         decode_query_len: Number of query tokens per request.
         block_indices: Compressed-index output buffer.
+        max_seq_len: Host bound on every request's length this step, or None.
+            Only read by B70_QSA_TOPK_SKIP_FIT, and never under graph capture.
+
+    B70-QSA-D02, both off by default:
+
+    ``B70_QSA_TOPK_SKIP_FIT=1`` (exact set): when ``max_seq_len //
+    compress_ratio <= token_topk // compress_ratio`` no row can see more
+    blocks than it keeps, so every selector keeps all visible blocks. Scoring
+    and top-k are skipped; rows get 0..visible-1 (ascending, not score order).
+
+    ``B70_QSA_TOPK_PER_STEP=1`` (approximate): with decode_query_len > 1 (a
+    spec-verify step) only the last row of each request (its anchor, the row
+    that sees the most blocks) is scored and top-k'd; every row of the
+    request takes the anchor's selection clipped to its own visible blocks.
+    Causal by construction. Set-exact while the anchor's visible blocks fit in
+    block_topk. Beyond that, rows 0..K-1 use the anchor's indexer query
+    instead of their own: a model-behaviour change to be measured (KL vs the
+    per-row selection), not an exact transform. Upstream vLLM DSA and
+    Qwen4Exp select per verify row.
 
     """
     assert token_topk % compress_ratio == 0
@@ -983,6 +1053,65 @@ def qsa_select_paged_decode(
     num_requests = q.shape[0] // decode_query_len
     assert page_table.shape[0] == num_requests
     assert visible_blocks.shape == (q.shape[0],)
+
+    block_topk = token_topk // compress_ratio
+    if (
+        max_seq_len is not None
+        and _topk_skip_fit()
+        and max_seq_len // compress_ratio <= block_topk
+        and not _qsa_debug.is_capturing()
+    ):
+        _select_all_visible(visible_blocks, block_indices)
+        return
+    if decode_query_len > 1 and _topk_per_step():
+        logger.info_once(
+            "B70-QSA: top-k once per verify step (B70_QSA_TOPK_PER_STEP=1, "
+            "anchor = last row of each request; approximate past the budget)"
+        )
+        last = decode_query_len - 1
+        anchor_q = q.reshape(num_requests, decode_query_len, *q.shape[1:])[:, last]
+        anchor_visible = visible_blocks.reshape(num_requests, decode_query_len)[:, last]
+        anchor_indices = torch.empty(
+            (num_requests, block_topk), dtype=block_indices.dtype, device=q.device
+        )
+        _select_decode_rows(
+            anchor_q.contiguous(),
+            k_cache,
+            page_table,
+            anchor_visible.contiguous(),
+            token_topk,
+            compress_ratio,
+            1,
+            anchor_indices,
+        )
+        _broadcast_anchor_selection(
+            anchor_indices, visible_blocks, decode_query_len, block_indices
+        )
+        return
+    _select_decode_rows(
+        q,
+        k_cache,
+        page_table,
+        visible_blocks,
+        token_topk,
+        compress_ratio,
+        decode_query_len,
+        block_indices,
+    )
+
+
+def _select_decode_rows(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    visible_blocks: torch.Tensor,
+    token_topk: int,
+    compress_ratio: int,
+    decode_query_len: int,
+    block_indices: torch.Tensor,
+) -> None:
+    """Score every row and top-k (the original qsa_select_paged_decode body)."""
+    num_requests = q.shape[0] // decode_query_len
 
     columns = page_table.shape[1] * k_cache.shape[1]
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
