@@ -37,6 +37,9 @@ BUCKETS = [
     ("qsa_sparse_attn", r"_qsa_sparse_paged_gqa"),
     ("qsa_merge", r"_qsa_merge_splitk"),
     ("qsa_store_compress", r"_store_qsa_rows|_compress_qsa_groups"),
+    ("qsa_attn2", r"_qsa_attn2_tile"),
+    ("qsa_attn2_merge", r"_qsa_attn2_merge"),
+    ("qsa_select", r"_qsa_select_(keep|order)"),
     ("torch_sort_topk", r"(?i)sort|topk|radix|segmented|bitonic"),
     (
         "elementwise_fill_copy",
