@@ -65,6 +65,18 @@ FlashInfer ReplaySSM has these limits:
 
 Prefix reuse still requires a shared prefix with a saved Mamba checkpoint. The matching rules for hybrid Mamba models above also apply.
 
+### Evicting superseded Mamba states first
+
+In a multi-turn conversation, each turn caches the Mamba state at the end of its prompt. Once the next turn resumes from that state and caches a deeper one, the old state can only serve a request that stops exactly there, yet LRU keeps it as long as any other cached block. `--prefix-cache-eviction-policy mamba_aware_lru` evicts such superseded states before every other cached block, which leaves more of the cache to live conversations. The default, `lru`, keeps plain LRU order.
+
+```bash
+vllm serve <hybrid-model> \
+    --enable-prefix-caching \
+    --prefix-cache-eviction-policy mamba_aware_lru
+```
+
+States that other prompts resume from, such as the shared-prefix junction, keep their LRU order. The policy pays off when multi-turn traffic, such as agentic coding sessions, fills the GPU prefix cache.
+
 ## Example workloads
 
 We describe two example workloads, where APC can provide huge performance benefit:
