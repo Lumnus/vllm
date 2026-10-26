@@ -630,6 +630,36 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    def _b70_reserve_c1_capture(self) -> None:
+        """B70-C1-R1: count the C1 target-graph capture's device footprint (built after the
+        KV cache, at warm-up and on first use of a shape) in the profiled transient peak:
+        hold it once here, so the peak is max(activations, capture) and the KV sizing leaves
+        room for it. Qwen4Exp + DFlash2 on XPU only; 0 bytes elsewhere."""
+        hf = getattr(self.model_config, "hf_text_config", None)
+        if getattr(hf, "model_type", None) != "qwen4_exp_text":
+            return
+        from vllm.models.qwen4_exp.nvidia.b70_target_graph import capture_reserve_bytes
+
+        need = capture_reserve_bytes(self.model_runner)
+        if not need:
+            return
+        # Only touch the device when the profiled transient peak does not already
+        # cover the footprint: a large allocate/free is not side-effect free here
+        # (an unconditional allocation is not needed).
+        headroom = torch.accelerator.max_memory_allocated(
+            self.device
+        ) - torch.accelerator.memory_allocated(self.device)
+        if need > headroom:
+            held = torch.empty(need, dtype=torch.uint8, device=self.device)
+            del held
+        logger.info_once(
+            "B70-C1-R1: target-graph capture footprint %.2f GiB/rank in the memory "
+            "profile (profiled transient %.2f GiB%s; snapshots in host RAM)",
+            need / 2**30,
+            headroom / 2**30,
+            ", raised" if need > headroom else ", already covers it",
+        )
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -691,6 +721,7 @@ class Worker(WorkerBase):
             set_current_vllm_config(self.vllm_config),
         ):
             self.model_runner.profile_run(randomize_inputs=self.randomize_dummy_inputs)
+            self._b70_reserve_c1_capture()
 
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to

@@ -70,13 +70,64 @@ def qsa_side_snapshot(side):
     ]
 
 
+# B70-C1-R1: the capture snapshots (``initial`` and ``expected_state``) live in host
+# RAM, moved through the device in chunks of at most this many bytes. On the device
+# they were 2 x (requests x (1 + K) state blocks x every GDN layer): ~0.45 GiB per
+# request per rank at TP2, plus one transient gather copy, none of it seen by the
+# memory profiler; TP2 warm-up (3 requests) OOMed at the second gather. Bytes are copied exactly, so every check below is unchanged.
+SNAPSHOT_CHUNK_BYTES = 256 << 20
+
+
+def _rows_per_chunk(tensor):
+    row = tensor[0].numel() * tensor.element_size() if tensor.shape[0] else 1
+    return max(1, SNAPSHOT_CHUNK_BYTES // max(row, 1))
+
+
 def save(routes):
-    return [tensor[indices].clone() for _, tensor, indices in routes]
+    values = []
+    for _, tensor, indices in routes:
+        host = torch.empty((indices.numel(), *tensor.shape[1:]), dtype=tensor.dtype)
+        step = _rows_per_chunk(tensor)
+        for i in range(0, indices.numel(), step):
+            host[i:i + step].copy_(tensor[indices[i:i + step]])
+        values.append(host)
+    return values
 
 
 def restore(routes, values):
     for (_, tensor, indices), value in zip(routes, values):
-        tensor[indices] = value
+        step = _rows_per_chunk(tensor)
+        for i in range(0, indices.numel(), step):
+            tensor[indices[i:i + step]] = value[i:i + step].to(tensor.device)
+
+
+def state_equal(routes, values):
+    """Exact comparison of the live state rows with a host snapshot, chunk by chunk."""
+    for (_, tensor, indices), value in zip(routes, values):
+        step = _rows_per_chunk(tensor)
+        for i in range(0, indices.numel(), step):
+            if not torch.equal(value[i:i + step].to(tensor.device), tensor[indices[i:i + step]]):
+                return False
+    return True
+
+
+def capture_reserve_bytes(runner) -> int:
+    """Device bytes a target-graph capture needs beyond the step itself (B70-C1-R1):
+    one gathered chunk plus one chunk staged back, while the snapshots are in host RAM.
+    0 when the C1 target-graph path cannot run on this engine."""
+    spec = getattr(runner, "speculative_config", None)
+    try:
+        enabled = (
+            spec is not None
+            and spec.method == "dflash"
+            and spec.draft_model_config.architectures == ["DFlash2DraftModel"]
+            and runner.device.type == "xpu"
+            and runner.model_config.hf_text_config.model_type == "qwen4_exp_text"
+            and os.getenv("VLLM_XPU_C1_TARGET_GRAPH", "1") == "1"
+        )
+    except AttributeError:
+        return 0
+    return 2 * SNAPSHOT_CHUNK_BYTES if enabled else 0
 
 
 def clone_output(value):
@@ -284,10 +335,7 @@ class TargetGraphs:
             graph.replay()
             torch.xpu.synchronize()
             # Check every state exactly without another full observed-state copy.
-            passed = compare(expected, output) and all(
-                torch.equal(value, tensor[indices])
-                for (_, tensor, indices), value in zip(routes, expected_state)
-            )
+            passed = compare(expected, output) and state_equal(routes, expected_state)
             if side:
                 side_replayed = qsa_side_snapshot(side)
                 bad = [
