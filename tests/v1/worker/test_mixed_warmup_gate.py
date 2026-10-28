@@ -73,6 +73,7 @@ def test_kernel_warmup_restores_uncalibrated_adaptive_manager(monkeypatch, fail_
     rejection_sampler = SimpleNamespace(enable_adaptive_verification=True)
     runner = SimpleNamespace(
         adaptive_verification=manager,
+        speculator=None,
         rejection_sampler=rejection_sampler,
     )
     budget_warmups = []
