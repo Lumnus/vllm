@@ -197,6 +197,21 @@ class DFlash2Speculator(DFlashSpeculator):
             self.max_num_reqs, self.num_speculative_steps, self.top_k, device
         )
 
+    def load_draft_model(self, target_model, target_attn_layer_names):
+        model = super().load_draft_model(target_model, target_attn_layer_names)
+        if type(self) is not DFlash2Speculator:  # LiLiCorr and other subclasses
+            return model
+        # B70-Q27-0006: B70_DFLASH_DRAFT_VOCAB=<ids file> -> a shortlist draft head
+        # (Qwen3_5 targets only). Kept out of the module tree: not a submodule.
+        from vllm.v1.worker.gpu.spec_decode.dflash2.draft_vocab import (
+            maybe_build_draft_vocab_head,
+        )
+
+        head = maybe_build_draft_vocab_head(model, target_model, self.top_k)
+        if head is not None:
+            model.__dict__["_b70_draft_vocab_head"] = head
+        return model
+
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         # fp32 so the walk and the rejection that checks it read the same
         # distribution; -inf because the cache kernel writes only the K

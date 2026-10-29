@@ -408,6 +408,14 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # B70-Q27-0006: B70_DFLASH_DRAFT_VOCAB -> the shortlist head (draft_vocab.py).
+        head = self.__dict__.get("_b70_draft_vocab_head")
+        if head is not None:
+            return head.get_top_k_tokens(
+                self.candidate_logits_processor,
+                hidden_states,
+                self.model.candidate_selector.top_k,
+            )
         return self.candidate_logits_processor.get_top_k_tokens(
             self.lm_head, hidden_states, self.model.candidate_selector.top_k
         )
