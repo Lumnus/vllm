@@ -234,6 +234,22 @@ def swap_enabled() -> bool:
     return os.environ.get("B70_MOE_HOTCOLD_SWAP", "0") == "1"
 
 
+def async_swap_enabled() -> bool:
+    """B70-Q27-0003: B70_MOE_HOTCOLD_ASYNC_SWAP=1 (with B70_MOE_HOTCOLD_SWAP=1) moves experts without a host
+    synchronize on the forward path (_Swapper._maybe_swap_async). Unset: the synchronous swap, unchanged."""
+    return swap_enabled() and os.environ.get("B70_MOE_HOTCOLD_ASYNC_SWAP", "0") == "1"
+
+
+def spare_rows() -> int:
+    """B70-Q27-0003: free cold rows per layer for the asynchronous swap (0 when it is off). A hot expert is first
+    copied into a free cold row while it is still served hot, so every expert stays routable at every step.
+    B70_MOE_HOTCOLD_ASYNC_SPARE, default the swap budget; it also caps the swaps per layer and cycle."""
+    if not async_swap_enabled():
+        return 0
+    default = os.environ.get("B70_MOE_HOTCOLD_SWAP_BUDGET", "8")
+    return max(1, int(os.environ.get("B70_MOE_HOTCOLD_ASYNC_SPARE", default)))
+
+
 def route_count_enabled() -> bool:
     """B70_MOE_ROUTE_COUNT: 1 = count eager batches and decode graphs; prefill = eager batches only
     (nothing is added to the decode graphs). B70_MOE_HOTCOLD_SWAP=1 implies prefill counting."""
@@ -399,13 +415,19 @@ def maybe_dump_routes() -> None:
             json.dump(out, handle)
 
 
-def _pin(t: torch.Tensor) -> torch.Tensor:
-    pinned = _ARENA.empty(t.shape, t.dtype)
-    pinned.copy_(t)
+def _pin(t: torch.Tensor, extra: int = 0) -> torch.Tensor:
+    """Pinned copy of ``t``; ``extra`` zeroed rows appended (B70-Q27-0003 spare cold rows)."""
+    if not extra:
+        pinned = _ARENA.empty(t.shape, t.dtype)
+        pinned.copy_(t)
+        return pinned
+    pinned = _ARENA.empty((t.shape[0] + extra, *t.shape[1:]), t.dtype)
+    pinned[: t.shape[0]].copy_(t)
+    pinned[t.shape[0]:].zero_()
     return pinned
 
 
-def _repack_int4_pinned(qweight: torch.Tensor, device: torch.device) -> torch.Tensor:
+def _repack_int4_pinned(qweight: torch.Tensor, device: torch.device, extra: int = 0) -> torch.Tensor:
     """GPTQ int32 [E, in/8, out] (CPU) -> signed-int4 bytes [E, out, in/2] in pinned memory.
 
     The transforms of int_wna16._process_weights_xpu (transpose, int32 -> uint8 view)
@@ -415,12 +437,14 @@ def _repack_int4_pinned(qweight: torch.Tensor, device: torch.device) -> torch.Te
     from vllm_xpu_kernels.fused_moe_interface import implement_zp
 
     e, k8, n = qweight.shape
-    out = _ARENA.empty((e, n, k8 * 4), torch.uint8)
+    out = _ARENA.empty((e + extra, n, k8 * 4), torch.uint8)
     step = 16
     for i in range(0, e, step):
         chunk = qweight[i : i + step].to(device)
         packed = chunk.transpose(1, 2).contiguous().view(torch.uint8)
         out[i : i + step].copy_(implement_zp(packed))
+    if extra:
+        out[e:].zero_()
     return out
 
 
@@ -455,9 +479,11 @@ class _Swapper:
     # <prefix>-rank<R>.json every B70_MOE_HOTCOLD_STATE_S seconds; the next boot places the hot set by it
     # (maybe_plan) and seeds the short-term score with it, so a restart starts from this host's traffic.
 
-    def _combined(self, plan, np):
-        """This period's score mass per global expert."""
-        counts = plan.route_counts[:, :-1].cpu().numpy()
+    def _combined(self, plan, np, counts=None):
+        """This period's score mass per global expert. ``counts``: a host snapshot of the route counters
+        (async swap); None reads them from the device (a host sync, the synchronous swap)."""
+        if counts is None:
+            counts = plan.route_counts[:, :-1].cpu().numpy()
         delta, plan.last_counts = counts - plan.last_counts, counts.copy()
         if self.source != "decode":
             return delta[0].astype(np.float64)
@@ -508,12 +534,13 @@ class _Swapper:
                     return False
             hot_map, cold_map = plan.hot_map.cpu().numpy(), plan.cold_map.cpu().numpy()
             plan.hot_owner = np.full(plan.num_hot, -1, np.int64)
-            plan.cold_owner = np.full(plan.num_cold, -1, np.int64)
+            plan.cold_owner = np.full(plan.cold_rows, -1, np.int64)  # spare rows (async swap) stay -1
             for g in np.nonzero(hot_map >= 0)[0]:
                 plan.hot_owner[hot_map[g]] = g
             for g in np.nonzero(cold_map >= 0)[0]:
                 plan.cold_owner[cold_map[g]] = g
-            plan.local_globals = np.sort(np.concatenate([plan.hot_owner, plan.cold_owner]))
+            owners = np.concatenate([plan.hot_owner, plan.cold_owner])
+            plan.local_globals = np.sort(owners[owners >= 0])
             plan.last_counts = plan.route_counts[:, :-1].cpu().numpy().copy()
             plan.ema = np.zeros(plan.num_global)
             plan.lt = np.zeros(plan.num_global)
@@ -521,7 +548,8 @@ class _Swapper:
             plan.prior = np.zeros(plan.num_global)
             for i, g in enumerate(ranked):
                 plan.prior[g] = 1 - i / max(len(ranked), 1)
-            plan.tmp = {k: torch.empty_like(plan.hot_tensors[k][0]) for k in self.KEYS}
+            if not plan.spare:  # the in-place exchange's VRAM temporaries; the async swap needs none
+                plan.tmp = {k: torch.empty_like(plan.hot_tensors[k][0]) for k in self.KEYS}
         self.plans = plans
         self.period = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_S", "5"))
         self.decay = float(os.environ.get("B70_MOE_HOTCOLD_SWAP_DECAY", "0.95"))
@@ -555,6 +583,13 @@ class _Swapper:
                     "source %s (prefill weight %.2f), state %s (%d layers seeded, %d earlier periods)",
                     self.period, self.decay, self.budget, self.prior_weight, self.source, self.prefill_w,
                     self.state_path or "off", seeded, self.prev_periods)
+        self.async_mode = False
+        if async_swap_enabled():
+            if all(p.spare > 0 for p in plans):
+                self._setup_async(np)
+            else:
+                logger.warning("B70 hot/cold: B70_MOE_HOTCOLD_ASYNC_SWAP=1 but the cold tensors have no spare rows "
+                               "(set before load?); synchronous swap")
         return True
 
     def _swap(self, plan, a: int, b: int) -> None:
@@ -588,13 +623,36 @@ class _Swapper:
             self.ready = True
             self.t = now
             return
+        if self.async_mode:
+            self._maybe_swap_async(now, np)
+            return
         if now - self.t < self.period:
             return
         self.t = now
         t0 = time.perf_counter()
+        moves = self._moves(np, now)
+        if not moves:
+            return
+        if _PREFETCH.stream is not None:
+            torch.xpu.current_stream().wait_stream(_PREFETCH.stream)
+            _PREFETCH.owner = [None, None]  # staged copies may hold swapped-out experts
+        n = 0
+        for plan, pairs in moves:
+            plan.hot_map_np = plan.hot_map.cpu().numpy()
+            plan.cold_map_np = plan.cold_map.cpu().numpy()
+            for a, b in pairs:
+                self._swap(plan, a, b)
+                n += 1
+        torch.xpu.current_stream().synchronize()
+        self.total += n
+        logger.info("B70 hot/cold swap rank %d: %d experts in %d layers in %.1f ms (%d since start)",
+                    _rank(), n, len(moves), (time.perf_counter() - t0) * 1e3, self.total)
+
+    def _moves(self, np, now: float, snapshot=None) -> list:
+        """Fold this period's routes into the scores; [(plan, [(hot global a, cold global b), ...]), ...]."""
         active = False
-        for plan in self.plans:
-            delta = self._combined(plan, np)
+        for k, plan in enumerate(self.plans):
+            delta = self._combined(plan, np, None if snapshot is None else snapshot[k, :, :-1])
             if delta.sum() <= 0 and self.source == "decode":
                 continue  # no traffic on this layer: keep the scores (idle time does not decay them)
             active = active or delta.sum() > 0
@@ -612,32 +670,163 @@ class _Swapper:
         for plan in self.plans:
             score = plan.ema / top + self.prior_weight * plan.prior
             hot_g, cold_g = plan.hot_owner, plan.cold_owner
+            cold_g = cold_g[cold_g >= 0]  # without the async swap's spare rows
             cold_best = cold_g[np.argsort(-score[cold_g])][: self.budget]
             hot_worst = hot_g[np.argsort(score[hot_g])][: self.budget]
             pairs = [(int(a), int(b)) for a, b in zip(hot_worst, cold_best) if score[b] > 1.1 * score[a]]
             if pairs:
                 moves.append((plan, pairs))
-        if not moves:
-            return
-        if _PREFETCH.stream is not None:
-            torch.xpu.current_stream().wait_stream(_PREFETCH.stream)
-            _PREFETCH.owner = [None, None]  # staged copies may hold swapped-out experts
-        n = 0
-        for plan, pairs in moves:
-            plan.hot_map_np = plan.hot_map.cpu().numpy()
-            plan.cold_map_np = plan.cold_map.cpu().numpy()
-            for a, b in pairs:
-                self._swap(plan, a, b)
+        return moves
+
+    # -- B70-Q27-0003: the asynchronous swap (B70_MOE_HOTCOLD_ASYNC_SWAP=1) ------------------------------------
+    #
+    # The synchronous swap above exchanges hot slot i and cold row j in place on the forward stream and then
+    # synchronizes the host: every forward behind it waits for ~3 PCIe/VRAM copies per expert plus the host round
+    # trip (160-940 ms per tick after a domain shift). Here one swap (hot a in slot i, cold b in row j) is
+    # a cycle of phases, one per runner step at most, none of which waits on the host:
+    #   snap   forward stream: the route counters -> a pinned snapshot, event (no .cpu() sync)
+    #   copy1  side stream, after the last cycle's flip2: a's bytes, hot slot i -> a spare cold row s (D2H)
+    #   flip1  forward stream, once copy1's event has completed (polled with query()): maps a -> cold row s
+    #          (hot slot i is now unreferenced; forwards before this flip may still read it)
+    #   copy2  side stream, after flip1's event (so after every forward that could read slot i): b's bytes,
+    #          cold row j -> hot slot i (H2D)
+    #   flip2  forward stream, once copy2 has completed: maps b -> hot slot i; row j becomes spare after flip2's event
+    # Invariant: a forward reads only rows its maps (as of its place on the forward stream) reference, and a row is
+    # written only while no map references it and after every forward that referenced it, so every expert stays
+    # routable with complete bytes at every step. The maps are written in place from pinned staging (same storage, so
+    # the captured graphs read them), and the weights in place too; nothing is recaptured. Host cost per step: a few
+    # event queries and ~2 small H2D map copies per moved layer.
+
+    def _setup_async(self, np) -> None:
+        self.stream = torch.xpu.Stream(self.plans[0].hot_map.device)
+        self.phase = "idle"
+        self.ev = None  # the event the next phase waits for (polled)
+        self.ev_flip = None  # forward stream, after flip1
+        self.ev_spare = None  # forward stream, after the last flip2: the rows it released are free after it
+        self.cycle = None
+        self.snap = torch.empty((len(self.plans), *self.plans[0].route_counts.shape), dtype=torch.int64,
+                                pin_memory=True)
+        spare_bytes = 0
+        for plan in self.plans:
+            plan.hot_map_np = plan.hot_map.cpu().numpy().copy()
+            plan.cold_map_np = plan.cold_map.cpu().numpy().copy()
+            plan.spare_free = [r for r in range(plan.cold_rows) if plan.cold_owner[r] < 0]
+            plan.map_stage = torch.empty((2, plan.num_global), dtype=plan.hot_map.dtype, pin_memory=True)
+            plan.pending = []
+            spare_bytes += sum(t[0].numel() * t.element_size() for t in plan.cold.values()) * plan.spare
+        self.async_mode = True
+        logger.info("B70 hot/cold async swap on (B70-Q27-0003): side-stream copies, routing flips on the forward "
+                    "stream after their events, no host synchronize; %d spare cold rows per layer (%.2f GiB pinned), "
+                    "at most that many swaps per layer and cycle", self.plans[0].spare, spare_bytes / 2**30)
+
+    def _push_maps(self, plan) -> None:
+        """The host mirrors -> the device maps, in place, on the current (forward) stream."""
+        plan.map_stage[0].copy_(torch.from_numpy(plan.hot_map_np))
+        plan.map_stage[1].copy_(torch.from_numpy(plan.cold_map_np))
+        plan.hot_map.copy_(plan.map_stage[0], non_blocking=True)
+        plan.cold_map.copy_(plan.map_stage[1], non_blocking=True)
+
+    def _copy1(self, moves) -> int:
+        side, n = self.stream, 0
+        if self.ev_spare is not None:
+            side.wait_event(self.ev_spare)
+        with torch.xpu.stream(side):
+            for plan, pairs in moves:
+                plan.pending = []
+                for a, b in pairs[: len(plan.spare_free)]:
+                    i, j, s = int(plan.hot_map_np[a]), int(plan.cold_map_np[b]), plan.spare_free.pop(0)
+                    for key in self.KEYS:
+                        h, c = plan.hot_tensors[key], plan.cold[key]
+                        c[s].view(h.dtype).copy_(h[i], non_blocking=True)
+                    plan.pending.append((a, b, i, j, s))
+                    n += 1
+            self.ev = torch.xpu.Event()
+            self.ev.record(side)
+        return n
+
+    def _flip1_copy2(self, fwd) -> None:
+        fwd.wait_event(self.ev)  # already complete (polled): ordering only
+        for plan in self.plans:
+            if plan.pending:
+                for a, _b, _i, _j, s in plan.pending:
+                    plan.hot_map_np[a] = -1
+                    plan.cold_map_np[a] = s
+                self._push_maps(plan)
+        _PREFETCH.owner = [None, None]  # a staged layer may predate the new cold rows
+        self.ev_flip = torch.xpu.Event()
+        self.ev_flip.record(fwd)
+        side = self.stream
+        side.wait_event(self.ev_flip)
+        with torch.xpu.stream(side):
+            for plan in self.plans:
+                for _a, _b, i, j, _s in plan.pending:
+                    for key in self.KEYS:
+                        h, c = plan.hot_tensors[key], plan.cold[key]
+                        h[i].copy_(c[j].view(h.dtype), non_blocking=True)
+            self.ev = torch.xpu.Event()
+            self.ev.record(side)
+
+    def _flip2(self, fwd) -> tuple[int, int]:
+        fwd.wait_event(self.ev)
+        n = layers = 0
+        for plan in self.plans:
+            if not plan.pending:
+                continue
+            layers += 1
+            for a, b, i, j, s in plan.pending:
+                plan.hot_map_np[b] = i
+                plan.cold_map_np[b] = -1
+                plan.hot_owner[i], plan.cold_owner[s], plan.cold_owner[j] = b, a, -1
+                plan.spare_free.append(j)
                 n += 1
-        torch.xpu.current_stream().synchronize()
-        self.total += n
-        try:
-            from vllm.distributed import get_tensor_model_parallel_rank
-            rank = get_tensor_model_parallel_rank()
-        except Exception:
-            rank = 0
-        logger.info("B70 hot/cold swap rank %d: %d experts in %d layers in %.1f ms (%d since start)",
-                    rank, n, len(moves), (time.perf_counter() - t0) * 1e3, self.total)
+            self._push_maps(plan)
+            plan.pending = []
+        _PREFETCH.owner = [None, None]
+        self.ev_spare = torch.xpu.Event()
+        self.ev_spare.record(fwd)
+        return n, layers
+
+    def _maybe_swap_async(self, now: float, np) -> None:
+        import time
+
+        if _capturing():
+            return
+        t0 = time.perf_counter()
+        fwd = torch.xpu.current_stream()
+        if self.phase == "idle":
+            if now - self.t < self.period:
+                return
+            self.t = now
+            for k, plan in enumerate(self.plans):
+                self.snap[k].copy_(plan.route_counts, non_blocking=True)
+            self.ev = torch.xpu.Event()
+            self.ev.record(fwd)
+            self.phase = "snap"
+            self.cycle = {"t0": t0, "host": 0.0, "steps": 0, "n": 0}
+        elif not self.ev.query():
+            pass  # copies still running: the forward goes on with the current placement
+        elif self.phase == "snap":
+            moves = self._moves(np, now, self.snap.numpy())
+            if moves and self._copy1(moves):
+                self.phase = "copy1"
+            else:
+                self.phase = "idle"
+        elif self.phase == "copy1":
+            self._flip1_copy2(fwd)
+            self.phase = "copy2"
+        elif self.phase == "copy2":
+            n, layers = self._flip2(fwd)
+            self.total += n
+            self.phase = "idle"
+            c = self.cycle
+            c["host"] += time.perf_counter() - t0
+            logger.info("B70 hot/cold swap rank %d: %d experts in %d layers async: %.1f ms wall over %d steps, "
+                        "host %.2f ms (%d since start)", _rank(), n, layers, (time.perf_counter() - c["t0"]) * 1e3,
+                        c["steps"] + 1, c["host"] * 1e3, self.total)
+            return
+        if self.cycle is not None:
+            self.cycle["host"] += time.perf_counter() - t0
+            self.cycle["steps"] += 1
 
 
 _SWAPPER = _Swapper()
@@ -673,6 +862,7 @@ class HotColdPlan:
         self.cold_map: torch.Tensor | None = None
         self._impls = None
         self._decode_args = None
+        self.spare = 0  # B70-Q27-0003: free cold rows after the cold experts (async swap only)
 
     @property
     def num_hot(self) -> int:
@@ -681,6 +871,11 @@ class HotColdPlan:
     @property
     def num_cold(self) -> int:
         return len(self.cold_local)
+
+    @property
+    def cold_rows(self) -> int:
+        """Rows of the cold tensors: the cold experts plus the async swap's spare rows."""
+        return self.num_cold + self.spare
 
     # -- load ---------------------------------------------------------------
 
@@ -724,13 +919,16 @@ class HotColdPlan:
             if getattr(layer, bias, None) is not None:
                 raise NotImplementedError(f"B70 hot/cold: {bias} is not supported")
         twins, self.twins, self._param_names = self.twins, {}, {}
+        self.spare = spare_rows()
+        if self.spare and self.num_cold + self.spare == 128:
+            self.spare += 1  # 128 local experts would route the cold impl into the astra direct path
         # Same transforms as int_wna16._process_weights_xpu, then implement_zp.
         for key in ("w13", "w2"):
             self.cold[key] = _repack_int4_pinned(
-                twins.pop(f"{key}_qweight").data, layer.w13_qweight.device
+                twins.pop(f"{key}_qweight").data, layer.w13_qweight.device, self.spare
             )
             scales = twins.pop(f"{key}_scales").data.transpose(1, 2).contiguous()
-            self.cold[f"{key}_scales"] = _pin(scales.to(getattr(layer, f"{key}_scales").dtype))
+            self.cold[f"{key}_scales"] = _pin(scales.to(getattr(layer, f"{key}_scales").dtype), self.spare)
             del scales
         del twins  # qzeros: symmetric int4 has none on XPU
         for key, tensor in self.cold.items():
@@ -845,7 +1043,7 @@ class HotColdPlan:
             cold = XpuFusedMoe(w13=cw13, w13_scales=self.cold_views["w13_scales"],
                                w13_bias=None, w2=cw2,
                                w2_scales=self.cold_views["w2_scales"], w2_bias=None,
-                               num_experts=self.num_cold, expert_map=self.cold_map,
+                               num_experts=self.cold_rows, expert_map=self.cold_map,
                                **common)
             # sizes come from the uint8 view at init; the kernel reads int4 as int8
             cold.w13, cold.w2 = cw13.view(torch.int8), cw2.view(torch.int8)
