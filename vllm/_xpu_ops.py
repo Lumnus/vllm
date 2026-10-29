@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -101,6 +102,51 @@ if hasattr(torch.ops._xpu_C, "int4_gemm_w4a8"):
         M = input_2d.size(0)
         N = q_weight.size(1)
         return torch.empty((M, N), dtype=torch.float16, device=input.device)
+
+
+if hasattr(torch.ops._xpu_C, "int8_scaled_mm"):
+
+    @register_fake("_xpu_C::int8_scaled_mm")
+    def _int8_scaled_mm_fake(
+        a: torch.Tensor,
+        a_scale: torch.Tensor,
+        b: torch.Tensor,
+        b_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return torch.empty((a.size(0), b.size(1)), dtype=out_dtype, device=a.device)
+
+
+# B70: the vllm-xpu-kernels native per-token int8 quant op (wheel
+# 0.1.16.2+...int8n and later). Decided once at import, outside any traced code;
+# ``B70_XPU_INT8_QUANT_NATIVE=0`` forces the torch.compile reference.
+_B70_NATIVE_INT8_QUANT = os.environ.get(
+    "B70_XPU_INT8_QUANT_NATIVE", "1"
+) != "0" and hasattr(torch.ops._C, "dynamic_per_token_scaled_int8_quant")
+if _B70_NATIVE_INT8_QUANT:
+    logger.info("B70 int8 act-quant: native op")
+
+
+def b70_native_int8_quant_available() -> bool:
+    return _B70_NATIVE_INT8_QUANT
+
+
+def b70_dynamic_per_token_int8_quant_native(
+    input: torch.Tensor, scale_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Native symmetric per-token int8 quant; bit-identical to the reference.
+
+    Returns ``(q [..., K] int8, scale [..., 1] scale_dtype)``; the scale value
+    is the reference's (rounded to ``input.dtype``) in either dtype.
+    """
+    x = input if input.stride(-1) == 1 else input.contiguous()
+    if x.dim() != 2 and not x.is_contiguous():
+        x = x.contiguous()
+    q = torch.empty(x.shape, dtype=torch.int8, device=x.device)
+    s = torch.empty(x.shape[:-1] + (1,), dtype=scale_dtype, device=x.device)
+    torch.ops._C.dynamic_per_token_scaled_int8_quant(q, x, s)
+    return q, s
 
 
 if hasattr(torch.ops._xpu_C, "int4_gemm_w4a16"):
@@ -989,6 +1035,16 @@ _OPS_REGISTERED = False
 
 
 class xpu_ops:
+    @staticmethod
+    def dynamic_per_token_int8_quant(
+        input: torch.Tensor, use_sym_quant: bool, bits: int
+    ):
+        """B70: native op when present (symmetric 8-bit), else the reference."""
+        if use_sym_quant and bits == 8 and b70_native_int8_quant_available():
+            q, s = b70_dynamic_per_token_int8_quant_native(input, input.dtype)
+            return q, s, torch.zeros(s.shape, dtype=torch.int32, device=s.device)
+        return xpu_ops.dynamic_per_token_int8_quant_ref(input, use_sym_quant, bits)
+
     @staticmethod
     @torch.compile
     def dynamic_per_token_int8_quant_ref(

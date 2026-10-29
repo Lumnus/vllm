@@ -95,7 +95,7 @@ class INCXPUW4A8LinearMethod(INCXPULinearMethod):
         from vllm._xpu_ops import xpu_ops as ops
 
         out_shape = x.shape[:-1] + (layer.qweight.shape[1],)
-        quant_x, x_scale, x_zero = ops.dynamic_per_token_int8_quant_ref(
+        quant_x, x_scale, x_zero = ops.dynamic_per_token_int8_quant(
             reshaped_x, True, 8
         )
         out = torch.ops._xpu_C.int4_gemm_w4a8(
