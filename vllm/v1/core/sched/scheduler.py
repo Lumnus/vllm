@@ -385,7 +385,13 @@ class Scheduler(SchedulerInterface):
         )
         # B70 0014c: prefill chunks also stop at the backstep boundaries so
         # their Mamba states are materialized (they are block aligned).
-        from vllm.v1.core.kv_cache_coordinator import b70_gdn_backstep
+        from vllm.v1.core.kv_cache_coordinator import (
+            b70_disable_gdn_backstep_for_align,
+            b70_gdn_backstep,
+        )
+
+        if self.need_mamba_block_aligned_split and b70_gdn_backstep():
+            b70_disable_gdn_backstep_for_align()
         self.b70_gdn_backstep = b70_gdn_backstep()
         # TODO: Support models with multiple Mamba specs that require different
         # prefill checkpoint alignments instead of selecting the first one.

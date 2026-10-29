@@ -62,9 +62,39 @@ def _validate_prefix_cache_retention_interval(
         )
 
 
+# B70-XC: 0014c is forced off under Mamba "align" mode, where
+# warm-vs-cold greedy output diverges with it on (a prefix-cache test). Set by the
+# scheduler at construction; B70_GDN_BACKSTEP_ALIGN_GUARD=0 opts out.
+_B70_BACKSTEP_ALIGN_DISABLED = False
+
+
+def b70_disable_gdn_backstep_for_align() -> bool:
+    """Disable 0014c under align mode unless the guard is opted out."""
+    import os
+
+    global _B70_BACKSTEP_ALIGN_DISABLED
+    guard = os.environ.get("B70_GDN_BACKSTEP_ALIGN_GUARD", "1").strip().lower()
+    if guard in ("0", "false", "no", "off"):
+        return False
+    if not _B70_BACKSTEP_ALIGN_DISABLED:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).warning(
+            "B70-XC backstep guard: B70_OFFLOAD_GDN_BACKSTEP=%s ignored under "
+            "mamba_cache_mode=align (no extra prefill stops, no extra retained "
+            "Mamba boundaries)",
+            os.environ.get("B70_OFFLOAD_GDN_BACKSTEP", ""),
+        )
+    _B70_BACKSTEP_ALIGN_DISABLED = True
+    return True
+
+
 def b70_gdn_backstep() -> int:
     """B70 0014c: ``B70_OFFLOAD_GDN_BACKSTEP=N`` (default 0 = off)."""
     import os
+
+    if _B70_BACKSTEP_ALIGN_DISABLED:
+        return 0
     raw = os.environ.get("B70_OFFLOAD_GDN_BACKSTEP", "").strip()
     try:
         return max(0, int(raw)) if raw else 0
