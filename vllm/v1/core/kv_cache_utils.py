@@ -2196,7 +2196,10 @@ def _warn_if_unannotated_eagle_mamba(
 
     """
     spec_config = vllm_config.speculative_config
-    if spec_config is None or not spec_config.use_eagle():
+    # Annotation runs only under block drop (_annotate_eagle_groups), so a
+    # drafter that needs none (DFlash/DSpark, vllm-project/vllm#54163) has no
+    # group to find, by design.
+    if spec_config is None or not spec_config.use_eagle_block_drop():
         return
     if any(group.is_eagle_group for group in kv_cache_groups):
         return
