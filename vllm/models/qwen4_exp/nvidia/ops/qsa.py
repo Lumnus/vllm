@@ -1303,7 +1303,15 @@ def _warmup_attn2(
     partial_output_ptr = TritonWarmupTensor(torch.float32)
     partial_lse_ptr = TritonWarmupTensor(torch.float32)
     warmed = []
-    profiles = attn2.attn2_profiles(num_kv_heads, selection_width)
+    # B70-IP-K8: the int8-dot launches have their own regions and the ALIGN8
+    # specialization decided from the real K/V views.
+    i8dot = int((pth_scales or {}).get("I8DOT", 0))
+    if i8dot:
+        pth_scales = {
+            **pth_scales,
+            "ALIGN8": attn2.i8dot_align8(key_cache, value_cache, head_dim),
+        }
+    profiles = attn2.attn2_profiles(num_kv_heads, selection_width, i8dot=i8dot)
     for block_n, num_dchunk, tpp, warps, stages, extra in sorted(profiles):
         attn2._qsa_attn2_tile_kernel.warmup(
             q_ptr,

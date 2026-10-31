@@ -166,3 +166,57 @@ def test_i8dot_ignored_for_bf16_cache(impl, monkeypatch) -> None:
     monkeypatch.setenv(qsa_attn2.I8DOT_ENV, "2")
     b = ipf._run(case, impl, monkeypatch, False, False)
     assert torch.equal(a, b)
+
+
+# --------------------------------------------------------------------------
+# B70-IP-K8: int8-dot launch regions and the ALIGN8 decision
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "mode,stem",
+    [(0, "sparse_attn2_"), (1, "sparse_attn2_i8_"), (2, "sparse_attn2_i8pv_")],
+)
+@pytest.mark.parametrize(
+    "rows,pre,tail", [(64, False, "decode"), (4096, True, "prefill")]
+)
+def test_attn2_i8_regions(mode, stem, rows, pre, tail) -> None:
+    cfg = qsa_attn2.select_attn2_config(rows, 1, pre, 2051, mode)
+    assert cfg["region"] == stem + tail
+    if mode:
+        # The int8 shapes bf16 cannot compile (IGC SIGFPE guard) are allowed here.
+        assert cfg["num_warps"] > 1 and cfg["block_n"] >= 64
+        assert cfg["extra"] == {"grf_mode": "auto"}
+        assert HD // cfg["num_dchunk"] >= 32
+
+
+def test_attn2_i8_profiles_cover_both_regions() -> None:
+    prof = qsa_attn2.attn2_profiles(1, 2051, max_rows=4096, i8dot=2)
+    assert {p[0] for p in prof} == {128} and {p[3] for p in prof} == {4}
+
+
+@pytest.mark.parametrize("layout", ["NHD", "padded"])
+@pytest.mark.parametrize("nkv", [1, 2])
+def test_align8_true_for_inline_cells(layout, nkv) -> None:
+    from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
+
+    nb, page = 3, 16
+    content = 2 * (HD + 4)
+    if layout == "NHD":
+        cache = torch.zeros(nb, page, nkv, content, dtype=torch.int8).transpose(1, 2)
+    else:
+        page_elems = page * nkv * content + 4096
+        raw = torch.zeros(nb * page_elems + 64, dtype=torch.int8)
+        cache = torch.as_strided(
+            raw, (nb, nkv, page, content), (page_elems, content, nkv * content, 1), 64
+        )
+    k, v, _, _ = qsa_ops.qsa_pth_kv_views(cache, HD)
+    assert qsa_attn2.i8dot_align8(k, v, HD)
+    # Not the inline cell (separate tensors) or an odd base: no alignment claim.
+    assert not qsa_attn2.i8dot_align8(k, k.clone(), HD)
+    # A 4-byte (not 8-byte) aligned base: scale views still work, ALIGN8 must not.
+    under = torch.zeros(cache.untyped_storage().nbytes() + 8, dtype=torch.int8)
+    off = cache.storage_offset() + 4
+    odd = torch.as_strided(under, cache.shape, cache.stride(), off)
+    k2, v2, _, _ = qsa_ops.qsa_pth_kv_views(odd, HD)
+    assert not qsa_attn2.i8dot_align8(k2, v2, HD)

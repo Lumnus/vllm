@@ -154,6 +154,21 @@ def quantize_q_i8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q_i8, q_scale
 
 
+def i8dot_align8(
+    k_cache: torch.Tensor | object, v_cache: torch.Tensor | object, head_dim: int
+) -> bool:
+    """B70-IP-K8: True when the int8 K/V views are the inline per-token-head cell
+    (V = K + head_dim + 4 bytes, same strides) with 8-byte aligned K rows, so the
+    attn2 int8-dot gathers may assume it (ALIGN8). Works on warmup stand-ins."""
+    ks, vs = k_cache.stride(), v_cache.stride()
+    return (
+        tuple(ks) == tuple(vs)
+        and v_cache.data_ptr() - k_cache.data_ptr() == head_dim + 4
+        and k_cache.data_ptr() % 8 == 0
+        and all(s % 8 == 0 for s in ks[:3])
+    )
+
+
 def i8dot_kwargs(q_scale, mode: int) -> dict:
     """B70-IP-K7: the trailing kernel kwargs of an int8-dot launch ({} when off)."""
     if not mode:
@@ -226,7 +241,14 @@ def _qsa_attn2_tile_kernel(
     q_scale_ptr=None,
     stride_qs_row=0,
     I8DOT: tl.constexpr = 0,
+    ALIGN8: tl.constexpr = False,
 ) -> None:
+    # B70-IP-K8: ALIGN8 (I8DOT on the inline int8 per-token-head cell, checked on
+    # the host): the 520-B cell pitch is not a multiple of 16, so Triton cannot
+    # prove any alignment of a gathered row and emits byte loads. Every cell
+    # offset is a multiple of 8, and V sits head_dim + 4 bytes after K in the same
+    # cell; saying so (multiple_of 8, V addressed from the K pointer) lets the
+    # gathers vectorize (8-B K, 4-B V).
     # B70-IP-K7: I8DOT (needs KV_PTH) = q_ptr is int8 Q with one fp32 scale per
     # (token, q head) at q_scale_ptr. 1: S = dot(q_i8, k_i8) in int32 (DPAS
     # int8, no widening), scores = S * q_scale * k_scale in fp32. 2: also
@@ -304,6 +326,15 @@ def _qsa_attn2_tile_kernel(
                 + page_offset * stride_v_token
                 + kv_head * stride_v_head
             )
+            if ALIGN8:
+                cell_offset = tl.multiple_of(
+                    safe_page * stride_k_block
+                    + page_offset * stride_k_token
+                    + kv_head * stride_k_head,
+                    8,
+                )
+                k_base = k_cache_ptr + cell_offset
+                v_base = k_cache_ptr + cell_offset + (HEAD_DIM + 4)
 
             # Q.K, head_dim chunk by chunk (runtime loop: one chunk live).
             if I8DOT >= 1:
@@ -530,23 +561,70 @@ _DEFAULTS = {
         "num_stages": 1,
     },
 }
+# B70-IP-K8: the int8-dot launches (B70_QSA_I8DOT, aligned gathers). Measured on
+# a B70 (card 2, TP2 12q/1kv, width 2051, 32K context, kernel-only, graph-timed
+# decode): BLOCK_N 64 x 8 chunks (DC 32) with 2 subgroups and grf "auto":
+# prefill 4096 rows 11.2-11.4 ms vs 15.0 ms for the bf16 default above, decode
+# 64 rows 0.246 vs 0.30 ms. The same shape in bf16 does not compile (the IGC
+# SIGFPE below); in int8 it does. Measured on a B70.
+_DEFAULTS["sparse_attn2_i8_decode"] = {
+    "block_n": 64,
+    "num_dchunk": 8,
+    "tiles_per_prog": 1,
+    "row_chunk": 4096,
+    "num_warps": 2,
+    "num_stages": 1,
+}
+_DEFAULTS["sparse_attn2_i8_prefill"] = {
+    "block_n": 64,
+    "num_dchunk": 8,
+    "tiles_per_prog": 1,
+    "row_chunk": 512,
+    "num_warps": 2,
+    "num_stages": 1,
+}
+# B70_QSA_I8DOT=2 (int8 P.V too): BLOCK_N 128 with 4 subgroups. Measured: TP2
+# prefill 11.0 ms (bf16 14.9), decode 64 rows 0.170 ms (bf16 0.307), decode 8
+# rows 0.044 ms (bf16 0.091); TP1 prefill 22.1 ms (bf16 30.2).
+_DEFAULTS["sparse_attn2_i8pv_decode"] = {
+    **_DEFAULTS["sparse_attn2_i8_decode"],
+    "block_n": 128,
+    "num_warps": 4,
+}
+_DEFAULTS["sparse_attn2_i8pv_prefill"] = {
+    **_DEFAULTS["sparse_attn2_i8_prefill"],
+    "block_n": 128,
+    "num_warps": 4,
+}
 _DEFAULT_GRF = "256"
+_DEFAULT_GRF_I8 = "auto"
 # Rows at/above which a use_prefill_config call takes the prefill region.
 _PREFILL_ROWS = 2048
 
 
-def _region(num_rows: int, use_prefill_config: bool) -> str:
+def _region(num_rows: int, use_prefill_config: bool, i8dot: int = 0) -> str:
+    stem = {0: "sparse_attn2_", 1: "sparse_attn2_i8_", 2: "sparse_attn2_i8pv_"}[
+        int(i8dot)
+    ]
     if use_prefill_config and num_rows >= _PREFILL_ROWS:
-        return "sparse_attn2_prefill"
-    return "sparse_attn2_decode"
+        return stem + "prefill"
+    return stem + "decode"
 
 
 def select_attn2_config(
-    num_rows: int, num_kv_heads: int, use_prefill_config: bool, selection_width: int
+    num_rows: int,
+    num_kv_heads: int,
+    use_prefill_config: bool,
+    selection_width: int,
+    i8dot: int = 0,
 ) -> dict:
-    """Launch config of one call: a pure function of shapes (graph-capture stable)."""
+    """Launch config of one call: a pure function of shapes (graph-capture stable).
+
+    i8dot (B70-IP-K8, the B70_QSA_I8DOT mode) selects the int8-dot regions
+    (``sparse_attn2_i8_*`` for 1, ``sparse_attn2_i8pv_*`` for 2).
+    """
     del num_kv_heads
-    region = _region(num_rows, use_prefill_config)
+    region = _region(num_rows, use_prefill_config, i8dot)
 
     def get(field):
         return xpu_tune.get(region, field, _DEFAULTS[region][field])
@@ -556,7 +634,7 @@ def select_attn2_config(
     tiles_per_prog = get("tiles_per_prog")
     num_tiles = triton.cdiv(selection_width, block_n)
     num_warps = get("num_warps")
-    if num_warps > 1 and block_n >= 32:
+    if num_warps > 1 and block_n >= 32 and not i8dot:
         # IGC 2.41.5 dies with SIGFPE ("Internal Compiler Error: Floating point
         # exception") compiling these, which kills the process (measured: every
         # BLOCK_N 32/64 config with num_warps 2, Triton 3.8.0 and Intel main).
@@ -566,7 +644,7 @@ def select_attn2_config(
         )
     extra = xpu_tune.launch_extra(region)
     if xpu_tune.get(region, "grf_mode", None) is None:
-        extra = {"grf_mode": _DEFAULT_GRF}
+        extra = {"grf_mode": _DEFAULT_GRF_I8 if i8dot else _DEFAULT_GRF}
     return {
         "region": region,
         "block_n": block_n,
@@ -649,8 +727,10 @@ def qsa_sparse_paged_attention_attn2(
     group_size = q.shape[1] // num_kv_heads
     selection_width = logical_indices.shape[1] - 1
     cfg = select_attn2_config(
-        q.shape[0], num_kv_heads, use_prefill_config, selection_width
+        q.shape[0], num_kv_heads, use_prefill_config, selection_width, i8dot
     )
+    align8 = {"ALIGN8": i8dot_align8(k_cache, v_cache, head_dim)} if i8dot else {}
+    q_src = q_i8 if i8dot else q
     dc = head_dim // cfg["num_dchunk"]
     assert dc >= 16 and dc * cfg["num_dchunk"] == head_dim, "attn2 head_dim chunking"
     # int8 DPAS consumes K in steps of 32 (opsPerChan 4 x systolic depth 8).
@@ -684,8 +764,8 @@ def qsa_sparse_paged_attention_attn2(
             partial_lse,
             softmax_scale,
             output_scale,
-            q.stride(0),
-            q.stride(1),
+            q_src.stride(0),
+            q_src.stride(1),
             k_cache.stride(0),
             k_cache.stride(1),
             k_cache.stride(2),
@@ -712,6 +792,7 @@ def qsa_sparse_paged_attention_attn2(
             **cfg["extra"],
             **pth,
             **i8_kw,
+            **align8,
         )
         _qsa_attn2_merge_kernel[(rows, q.shape[1])](
             partial_output,
@@ -735,14 +816,14 @@ def qsa_sparse_paged_attention_attn2(
 
 
 def attn2_profiles(
-    num_kv_heads: int, selection_width: int, max_rows: int = 8192
+    num_kv_heads: int, selection_width: int, max_rows: int = 8192, i8dot: int = 0
 ) -> set[tuple]:
     """Every (block_n, num_dchunk, tiles_per_prog, warps, stages, extra) in use."""
     out = set()
     for num_rows in range(1, max_rows + 1):
         for use_prefill_config in (False, True):
             c = select_attn2_config(
-                num_rows, num_kv_heads, use_prefill_config, selection_width
+                num_rows, num_kv_heads, use_prefill_config, selection_width, i8dot
             )
             out.add(
                 (
