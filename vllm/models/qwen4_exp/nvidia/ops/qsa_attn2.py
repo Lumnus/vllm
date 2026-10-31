@@ -118,7 +118,22 @@ def _qsa_attn2_tile_kernel(
     BLOCK_N: tl.constexpr,
     NUM_DCHUNK: tl.constexpr,
     TILES_PER_PROG: tl.constexpr,
+    k_scale_ptr=None,
+    v_scale_ptr=None,
+    stride_ks_block=0,
+    stride_ks_token=0,
+    stride_ks_head=0,
+    stride_vs_block=0,
+    stride_vs_token=0,
+    stride_vs_head=0,
+    KV_PTH: tl.constexpr = False,
 ) -> None:
+    # B70-IP-K6: KV_PTH = int8 K/V with one fp32 scale per (token, kv head)
+    # (int8_per_token_head). The int8 rows are cast to bf16 (exact) for the
+    # dots; the K scale multiplies the FP32 scores column-wise after Q.K, the
+    # V scale multiplies P column-wise before P.V (fp32, then bf16), as
+    # TRITON_ATTN does. Pointer loads only (B70-IP-K1). Defaults keep the
+    # bf16/fp8 launches unchanged.
     DC: tl.constexpr = HEAD_DIM // NUM_DCHUNK
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
@@ -196,6 +211,16 @@ def _qsa_attn2_tile_kernel(
                 scores = tl.dot(
                     q_chunk, _attn2_dequant(k_chunk).to(q_chunk.dtype), acc=scores
                 )
+            if KV_PTH:
+                k_token_scale = tl.load(
+                    k_scale_ptr
+                    + safe_page * stride_ks_block
+                    + page_offset * stride_ks_token
+                    + kv_head * stride_ks_head,
+                    mask=valid,
+                    other=0.0,
+                )
+                scores = scores * k_token_scale[None, :]
 
             # Exact softmax over this tile.
             scores = tl.where(valid[None, :], scores * score_scale, -1.0e20)
@@ -227,6 +252,19 @@ def _qsa_attn2_tile_kernel(
                 * HEAD_DIM
             )
 
+            if KV_PTH:
+                v_token_scale = tl.load(
+                    v_scale_ptr
+                    + safe_page * stride_vs_block
+                    + page_offset * stride_vs_token
+                    + kv_head * stride_vs_head,
+                    mask=valid,
+                    other=0.0,
+                )
+                pv_weights = (probabilities * v_token_scale[None, :]).to(tl.bfloat16)
+            else:
+                pv_weights = probabilities
+
             # P.V, chunk by chunk; each [BM, DC] output chunk is stored at once.
             for c in range(NUM_DCHUNK):
                 v_chunk = _attn2_dequant(
@@ -236,7 +274,9 @@ def _qsa_attn2_tile_kernel(
                         other=0.0,
                     )
                 )
-                out_chunk = tl.dot(probabilities.to(v_chunk.dtype), v_chunk)
+                if KV_PTH:
+                    v_chunk = v_chunk.to(tl.bfloat16)
+                out_chunk = tl.dot(pv_weights.to(v_chunk.dtype), v_chunk)
                 tl.store(
                     part_rows + c * DC + dc_offsets[None, :],
                     out_chunk * inv_sum[:, None],
@@ -378,6 +418,32 @@ def select_attn2_config(
     }
 
 
+def pth_scale_kwargs(
+    k_scale_cache: torch.Tensor | None, v_scale_cache: torch.Tensor | None
+) -> dict:
+    """B70-IP-K6: the per-token-head scale kwargs of a sparse attention launch.
+
+    Empty for bf16/fp8 caches, so those launches keep the kernels' defaults.
+    """
+    if k_scale_cache is None:
+        assert v_scale_cache is None
+        return {}
+    assert v_scale_cache is not None
+    assert k_scale_cache.dtype == v_scale_cache.dtype == torch.float32
+    assert len(k_scale_cache.shape) == len(v_scale_cache.shape) == 3
+    return {
+        "k_scale_ptr": k_scale_cache,
+        "v_scale_ptr": v_scale_cache,
+        "stride_ks_block": k_scale_cache.stride(0),
+        "stride_ks_token": k_scale_cache.stride(1),
+        "stride_ks_head": k_scale_cache.stride(2),
+        "stride_vs_block": v_scale_cache.stride(0),
+        "stride_vs_token": v_scale_cache.stride(1),
+        "stride_vs_head": v_scale_cache.stride(2),
+        "KV_PTH": True,
+    }
+
+
 def merge_kwargs() -> dict:
     return {
         "num_warps": xpu_tune.get("merge", "num_warps", 2),
@@ -399,8 +465,15 @@ def qsa_sparse_paged_attention_attn2(
     softmax_scale: float,
     output_scale: float,
     block_m: int,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Launch attn2; the caller (qsa.qsa_sparse_paged_attention) validated inputs."""
+    """Launch attn2; the caller (qsa.qsa_sparse_paged_attention) validated inputs.
+
+    k_scale_cache/v_scale_cache (B70-IP-K6): fp32 [num_blocks, block_size,
+    num_kv_heads] views of an int8 per-token-head cache, else None.
+    """
+    pth = pth_scale_kwargs(k_scale_cache, v_scale_cache)
     head_dim = q.shape[2]
     num_kv_heads = k_cache.shape[2]
     group_size = q.shape[1] // num_kv_heads
@@ -464,6 +537,7 @@ def qsa_sparse_paged_attention_attn2(
             num_warps=cfg["num_warps"],
             num_stages=cfg["num_stages"],
             **cfg["extra"],
+            **pth,
         )
         _qsa_attn2_merge_kernel[(rows, q.shape[1])](
             partial_output,

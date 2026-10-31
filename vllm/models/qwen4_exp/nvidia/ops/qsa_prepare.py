@@ -101,6 +101,52 @@ def _store_rotated(dst, y, o1, o2, scale):
     tl.store(dst + HALF + rot, _to_dst_dtype(o2, dst, scale))
 
 
+@triton.jit
+def _quant_int8_pth(x, scale):
+    """B70-IP-K6: the Triton per-token-head writer's int8 rounding
+    (triton_reshape_and_cache_flash._reshape_cache_per_token_head):
+    x / scale, half away from zero, clamp to [-128, 127]."""
+    q = x * (1.0 / scale)
+    q = tl.where(q >= 0, q + 0.5, q - 0.5)
+    return tl.clamp(q, -128.0, 127.0).to(tl.int8)
+
+
+@triton.jit
+def _store_rotated_int8_pth(dst, y, o1, o2):
+    """B70-IP-K6: ``_store_rotated`` for an int8 per-token-head cache row.
+
+    Rounds the head to BF16 like the unfused path, takes one absmax scale over
+    the whole head (rotated and pass-through dims), stores the int8 head and
+    its fp32 scale right after it (inline layout of customize_spec).
+    """
+    HALF: tl.constexpr = o1.shape[0]
+    D: tl.constexpr = y.shape[0]
+    dims = tl.arange(0, D)
+    rot = tl.arange(0, HALF)
+    y = y.to(tl.bfloat16).to(tl.float32)
+    o1 = o1.to(tl.bfloat16).to(tl.float32)
+    o2 = o2.to(tl.bfloat16).to(tl.float32)
+    absmax = tl.maximum(
+        tl.max(tl.where(dims >= 2 * HALF, tl.abs(y), 0.0)),
+        tl.maximum(tl.max(tl.abs(o1)), tl.max(tl.abs(o2))),
+    )
+    scale = tl.maximum(absmax / 127.0, 1e-6)
+    tl.store(dst + dims, _quant_int8_pth(y, scale), mask=dims >= 2 * HALF)
+    tl.store(dst + rot, _quant_int8_pth(o1, scale))
+    tl.store(dst + HALF + rot, _quant_int8_pth(o2, scale))
+    tl.store((dst + D).to(tl.pointer_type(tl.float32), bitcast=True), scale)
+
+
+@triton.jit
+def _store_row_int8_pth(dst, x):
+    """B70-IP-K6: one int8 per-token-head row (V) plus its inline fp32 scale."""
+    D: tl.constexpr = x.shape[0]
+    x = x.to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(x)) / 127.0, 1e-6)
+    tl.store(dst + tl.arange(0, D), _quant_int8_pth(x, scale))
+    tl.store((dst + D).to(tl.pointer_type(tl.float32), bitcast=True), scale)
+
+
 @triton.jit(
     do_not_specialize=[
         "num_tokens",
@@ -171,6 +217,7 @@ def _qsa_prepare_kernel(
     MAIN_HK: tl.constexpr,
     MAIN_D: tl.constexpr,
     MAIN_PAGE_SIZE: tl.constexpr,
+    MAIN_KV_PTH: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_index_work = num_k_work + tl.cdiv(num_tokens, TILE_T_Q) * tl.cdiv(HQ, TILE_H_Q)
@@ -225,9 +272,15 @@ def _qsa_prepare_kernel(
                     + (slot % MAIN_PAGE_SIZE) * main_cache_stride_token
                     + kv_head * main_cache_stride_head
                 )
-                _store_rotated(dst, y, o1, o2, main_k_scale)
-                v = tl.load(src + MAIN_HK * MAIN_D + dims)
-                tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
+                if MAIN_KV_PTH:
+                    # B70-IP-K6: K(D) | K scale | V(D) | V scale per cell.
+                    _store_rotated_int8_pth(dst, y, o1, o2)
+                    v = tl.load(src + MAIN_HK * MAIN_D + dims)
+                    _store_row_int8_pth(dst + MAIN_D + 4, v)
+                else:
+                    _store_rotated(dst, y, o1, o2, main_k_scale)
+                    v = tl.load(src + MAIN_HK * MAIN_D + dims)
+                    tl.store(dst + MAIN_D + dims, _to_dst_dtype(v, dst, main_v_scale))
         else:
             out = (token * MAIN_HQ + head) * MAIN_D
             _store_rotated(main_q_out_ptr + out, y, o1, o2, None)
@@ -530,14 +583,27 @@ def qsa_prepare(
     main_slot_mapping: torch.Tensor,
     main_k_scale: float,
     main_v_scale: float,
+    main_kv_pth: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Normalize Q, compress K, then update the circular raw state.
 
     Also prepares the main attention (QK-norm/RoPE, gate copy, K/V cache write)
     and returns its Q and gate.
+
+    main_kv_pth (B70-IP-K6): ``main_kv_cache`` is an int8 per-token-head cache
+    ``(B, N, H, 2 * (D + 4))``; each K and V head is quantized with one fp32
+    absmax scale stored inline after it (main_k_scale/main_v_scale unused).
     """
     num_tokens = q.shape[0]
-    main_head_dim = main_kv_cache.shape[-1] // 2
+    if main_kv_pth:
+        assert main_kv_cache.dtype == torch.int8
+        main_head_dim = main_kv_cache.shape[-1] // 2 - 4
+        assert main_kv_cache.stride(-1) == 1
+        # Scale stores are 4-byte: every cell must start 4-byte aligned.
+        assert main_kv_cache.stride(1) % 4 == 0 and main_kv_cache.stride(2) % 4 == 0
+        assert main_kv_cache.stride(0) % 4 == 0 and main_kv_cache.data_ptr() % 4 == 0
+    else:
+        main_head_dim = main_kv_cache.shape[-1] // 2
     num_main_kv_heads = main_kv_cache.shape[2]
     num_main_q_heads = main_qkv.shape[1] // (2 * main_head_dim) - num_main_kv_heads
     main_q_out = main_qkv.new_empty(num_tokens, num_main_q_heads, main_head_dim)
@@ -642,6 +708,7 @@ def qsa_prepare(
         MAIN_HK=num_main_kv_heads,
         MAIN_D=main_head_dim,
         MAIN_PAGE_SIZE=main_kv_cache.shape[1],
+        **({"MAIN_KV_PTH": True} if main_kv_pth else {}),
         num_warps=1,
     )
     return main_q_out, main_gate_out

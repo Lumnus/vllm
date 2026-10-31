@@ -95,7 +95,18 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    k_scale_ptr=None,
+    v_scale_ptr=None,
+    stride_ks_block=0,
+    stride_ks_token=0,
+    stride_ks_head=0,
+    stride_vs_block=0,
+    stride_vs_token=0,
+    stride_vs_head=0,
+    KV_PTH: tl.constexpr = False,
 ) -> None:
+    # B70-IP-K6: KV_PTH = int8 per-token-head K/V (see qsa_attn2's tile
+    # kernel): int8 -> bf16 rows, K scale on the FP32 scores, V scale on P.
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
     split_id = tl.program_id(2)
@@ -187,14 +198,35 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         # caches the K dequant scale is already folded into softmax_scale on the
         # host.
         scores *= score_scale
+        if KV_PTH:
+            scale_offsets = (
+                safe_page * stride_ks_block
+                + page_offset * stride_ks_token
+                + kv_head * stride_ks_head
+            )
+            k_token_scale = tl.load(k_scale_ptr + scale_offsets, mask=valid, other=0.0)
+            scores = scores * k_token_scale[None, :]
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
         alpha = tl.math.exp2(max_value - next_max)
         probabilities = tl.where(
             valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
         )
+        if KV_PTH:
+            v_token_scale = tl.load(
+                v_scale_ptr
+                + safe_page * stride_vs_block
+                + page_offset * stride_vs_token
+                + kv_head * stride_vs_head,
+                mask=valid,
+                other=0.0,
+            )
+            pv_weights = (probabilities * v_token_scale[None, :]).to(tl.bfloat16)
+            values = values.to(tl.bfloat16)
+        else:
+            pv_weights = probabilities
         accumulator = tl.dot(
-            probabilities.to(values.dtype),
+            pv_weights.to(values.dtype),
             values,
             acc=accumulator * alpha[:, None],
         )
@@ -700,8 +732,15 @@ def qsa_sparse_paged_attention(
     v_scale: float | None = None,
     *,
     output_gate: torch.Tensor,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16 or FP8-e4m3 K/V caches.
+
+    B70-IP-K6: an int8 per-token-head cache (int8_per_token_head) comes as
+    int8 K/V views (head_dim wide; the inline scale bytes sit past them) plus
+    k_scale_cache/v_scale_cache, fp32 [num_blocks, block_size, num_kv_heads]
+    views of those scale bytes. The kernels apply the scales per token.
 
     An fp8 cache is a native e4m3 view on sm_89+ and the raw uint8 storage
     below sm_89 (no Triton fp8e4nv pointer type there); the kernel dequantizes
@@ -734,7 +773,16 @@ def qsa_sparse_paged_attention(
     assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
     assert q.dtype == torch.bfloat16
     assert k_cache.dtype == v_cache.dtype
-    is_fp8 = k_cache.dtype != torch.bfloat16
+    is_pth = k_scale_cache is not None or v_scale_cache is not None
+    if is_pth:
+        assert k_cache.dtype == torch.int8, "per-token-head QSA KV must be int8"
+        assert k_scale_cache is not None and v_scale_cache is not None
+        assert k_scale_cache.shape == v_scale_cache.shape == k_cache.shape[:3]
+        assert k_scale_cache.device == v_scale_cache.device == q.device
+        assert k_scale is None and v_scale is None
+    else:
+        assert k_cache.dtype != torch.int8, "int8 QSA KV needs its scale caches"
+    is_fp8 = k_cache.dtype not in (torch.bfloat16, torch.int8)
     if is_fp8:
         assert k_scale is not None and v_scale is not None
         # Host pre-multiply: fold the K dequant scale into the attention scale
@@ -788,6 +836,8 @@ def qsa_sparse_paged_attention(
             softmax_scale,
             output_scale,
             block_m,
+            k_scale_cache,
+            v_scale_cache,
         )
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
     block_n, partial_warps, num_tiles, num_splits = _select_config(
@@ -853,6 +903,7 @@ def qsa_sparse_paged_attention(
         BLOCK_N=block_n,
         num_warps=partial_warps,
         **_sparse_gqa_stage_kwargs(q.shape[0] * k_cache.shape[2], use_prefill_config),
+        **attn2.pth_scale_kwargs(k_scale_cache, v_scale_cache),
     )
     if num_splits == 1:
         return out
@@ -898,16 +949,80 @@ def _merge_kwargs() -> dict:
     }
 
 
+def qsa_pth_kv_views(
+    kv_cache: torch.Tensor, head_dim: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """B70-IP-K6: K/V and scale views of an int8 per-token-head QSA cache.
+
+    ``kv_cache`` is the layer's logical ``(B, H, N, C)`` int8 tensor, any
+    physical strides, with ``C = 2 * (head_dim + 4)``: each (block, head,
+    slot) cell holds ``K(head_dim) | K_scale(f32) | V(head_dim) | V_scale(f32)``,
+    the layout ``TritonAttentionBackend.customize_spec`` packs and
+    ``TritonAttentionImpl._ensure_scale_caches`` reads (same byte offsets and
+    strides). Returns ``(key, value)`` as ``(B, N, H, head_dim)`` int8 views
+    and ``(k_scale, v_scale)`` as ``(B, N, H)`` fp32 views. Pure views: no
+    byte of the cache is written (hybrid pages are shared with GDN state).
+    """
+    assert kv_cache.dtype == torch.int8 and kv_cache.ndim == 4
+    num_blocks, num_kv_heads, block_size, content = kv_cache.shape
+    padded = head_dim + 4
+    assert content == 2 * padded, (
+        f"int8 per-token-head QSA cache content {content} != 2 * ({head_dim} + 4)"
+    )
+    key_cache, value_cache = kv_cache.transpose(1, 2).split(padded, dim=-1)
+    key_cache = key_cache[..., :head_dim]
+    value_cache = value_cache[..., :head_dim]
+
+    def f32(nbytes: int) -> int:
+        assert nbytes % 4 == 0, "per-token-head scale views need 4-byte strides"
+        return nbytes // 4
+
+    base = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
+        kv_cache.untyped_storage()
+    )
+    stride_block, stride_head, stride_slot, _ = kv_cache.stride()
+    size = (num_blocks, block_size, num_kv_heads)
+    stride = (f32(stride_block), f32(stride_slot), f32(stride_head))
+    offset = kv_cache.storage_offset()
+    k_scale = torch.as_strided(base, size, stride, f32(offset + head_dim))
+    v_scale = torch.as_strided(base, size, stride, f32(offset + padded + head_dim))
+    return key_cache, value_cache, k_scale, v_scale
+
+
+def _warmup_pth_tensor(tensor: torch.Tensor) -> TritonWarmupTensor:
+    """Warmup stand-in with the runtime view's dtype, strides and alignment."""
+    return TritonWarmupTensor(
+        tensor.dtype,
+        aligned=tensor.data_ptr() % 16 == 0,
+        shape=tuple(tensor.shape),
+        strides=tuple(tensor.stride()),
+    )
+
+
 def warmup_qsa_sparse_paged_attention(
     kv_cache: torch.Tensor,
     block_table: torch.Tensor,
     *,
     num_query_heads: int,
     selection_width: int,
+    head_dim: int | None = None,
 ) -> tuple[tuple[int, int, int], ...]:
-    """Compile every production-reachable split-K/merge specialization."""
-    head_dim = kv_cache.shape[-1] // 2
-    key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
+    """Compile every production-reachable split-K/merge specialization.
+
+    B70-IP-K6: an int8 cache is int8 per-token-head; its K/V and scale views
+    (and their pointer alignment: V starts head_dim + 4 bytes into the cell)
+    are warmed as the runtime passes them.
+    """
+    pth_scales: dict = {}
+    if kv_cache.dtype == torch.int8:
+        assert head_dim is not None, "int8 per-token-head warmup needs head_dim"
+        key_cache, value_cache, k_scale, v_scale = qsa_pth_kv_views(kv_cache, head_dim)
+        pth_scales = attn2.pth_scale_kwargs(
+            _warmup_pth_tensor(k_scale), _warmup_pth_tensor(v_scale)
+        )
+    else:
+        head_dim = kv_cache.shape[-1] // 2
+        key_cache, value_cache = kv_cache.transpose(1, 2).split(head_dim, dim=-1)
     # An fp8 cache is allocated as uint8 storage; warm the dtype the impl hands
     # over: an e4m3 view on sm_89+, the raw bytes below.
     is_fp8 = kv_cache.dtype == torch.uint8
@@ -959,6 +1074,9 @@ def warmup_qsa_sparse_paged_attention(
         shape=tuple(value_cache.shape),
         strides=tuple(value_cache.stride()),
     )
+    if pth_scales:
+        k_cache_ptr = _warmup_pth_tensor(key_cache)
+        v_cache_ptr = _warmup_pth_tensor(value_cache)
     # +1: the packed buffer's trailing count column.
     indices_ptr = TritonWarmupTensor(torch.int32, shape=(num_rows, selection_width + 1))
     block_table_ptr = TritonWarmupTensor(
@@ -1000,6 +1118,7 @@ def warmup_qsa_sparse_paged_attention(
             block_m=block_m,
             head_dim=head_dim,
             selection_width=selection_width,
+            pth_scales=pth_scales,
         )
 
     warmed = []
@@ -1057,6 +1176,7 @@ def warmup_qsa_sparse_paged_attention(
             BLOCK_N=block_n,
             num_warps=warps,
             **dict(stage_items),
+            **pth_scales,
             grid=(num_rows, num_kv_heads, num_splits),
         )
         if num_splits > 1:
@@ -1103,6 +1223,7 @@ def _warmup_attn2(
     block_m,
     head_dim,
     selection_width,
+    pth_scales=None,
 ) -> tuple[tuple[int, int, int], ...]:
     """B70-QSA-K: compile every attn2 tile/merge specialization dispatch can pick."""
     head_stride = head_dim
@@ -1149,6 +1270,7 @@ def _warmup_attn2(
             num_warps=warps,
             num_stages=stages,
             **dict(extra),
+            **(pth_scales or {}),
             grid=(num_rows, num_kv_heads, 1),
         )
         attn2._qsa_attn2_merge_kernel.warmup(
@@ -1329,5 +1451,6 @@ __all__ = [
     "qsa_compress_groups_with_ratio",
     "qsa_sparse_paged_attention",
     "qsa_store_cache_rows",
+    "qsa_pth_kv_views",
     "warmup_qsa_sparse_paged_attention",
 ]
