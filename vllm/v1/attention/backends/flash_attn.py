@@ -294,6 +294,24 @@ class FlashAttentionBackend(AttentionBackend):
     ]
     head_size_v: int | None = None
 
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        """B70-IP-D2 (B70_PTH_FA_DECODE=1, XPU): int8_per_token_head gets
+        TRITON_ATTN's bytes per block (int8 K and V plus one fp32 scale each per
+        (token, KV head)), so page sizes, the hybrid page unify and B70-IP-K3
+        see the same pages as with TRITON_ATTN. The impl arranges those bytes as
+        the INT8 decode kernel's block-local split layout (b70_pth_fa)."""
+        spec = super().customize_spec(spec)
+        if spec.kv_quant_mode != KVQuantMode.INT8_PER_TOKEN_HEAD:
+            return spec
+        from vllm.v1.attention.backends import b70_pth_fa
+
+        if not b70_pth_fa.fa_decode_enabled():
+            return spec
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
+        return TritonAttentionBackend.customize_spec(spec)
+
     @staticmethod
     def _get_sm90_fa4_fp8_kv_block_size(
         kv_cache_spec: KVCacheSpec | None = None,
@@ -433,6 +451,11 @@ class FlashAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return True
+        if kv_cache_dtype == "int8_per_token_head":
+            # B70-IP-D2: native INT8 paged decode in vllm-xpu-kernels (XPU).
+            from vllm.v1.attention.backends import b70_pth_fa
+
+            return b70_pth_fa.fa_decode_enabled()
         if kv_cache_dtype not in cls.supported_kv_cache_dtypes:
             return False
         if is_quantized_kv_cache(kv_cache_dtype):
@@ -1146,6 +1169,34 @@ class FlashAttentionImpl(AttentionImpl):
                 " kv-cache on this device."
             )
 
+        # B70-IP-D2: int8_per_token_head on XPU (B70_PTH_FA_DECODE=1). Subclass
+        # impls that run their own kernels (QSA) hand this constructor "auto".
+        self._b70_fa_int8 = kv_cache_dtype == "int8_per_token_head"
+        if self._b70_fa_int8:
+            from vllm.v1.attention.backends import b70_pth_fa
+
+            if not b70_pth_fa.fa_decode_enabled():
+                raise NotImplementedError(
+                    "FLASH_ATTN serves int8_per_token_head only on XPU with "
+                    "B70_PTH_FA_DECODE=1"
+                )
+            if (
+                alibi_slopes is not None
+                or self.logits_soft_cap
+                or attn_type != AttentionType.DECODER
+                or head_size % 64 != 0
+            ):
+                raise NotImplementedError(
+                    "B70-IP-D2 int8_per_token_head FLASH_ATTN: decoder layers "
+                    "without ALiBi or soft-cap, head_size a multiple of 64 (got "
+                    f"{head_size}, attn_type {attn_type})"
+                )
+            # Split-layout views (a tuple), cleared by the runner after the
+            # profile run like TRITON_ATTN's scale views.
+            self._k_scale_cache: Any = None
+            self._v_scale_cache: Any = None
+            b70_pth_fa.log_fa_decode_once(head_size, num_kv_heads)
+
         self.sinks = sinks
         if self.sinks is not None:
             assert flash_attn_supports_sinks(), (
@@ -1255,6 +1306,20 @@ class FlashAttentionImpl(AttentionImpl):
                 output[:num_actual_tokens],
                 attn_metadata,
                 layer,
+            )
+
+        if getattr(self, "_b70_fa_int8", False):
+            # B70-IP-D2: native INT8 per-token-head decode; prefill via K4.
+            from vllm.v1.attention.backends import b70_pth_fa
+
+            return b70_pth_fa.fa_int8_forward(
+                self,
+                query,
+                kv_cache,
+                attn_metadata,
+                output,
+                num_actual_tokens,
+                _maybe_symmetrize_window(self.sliding_window, attn_metadata.causal),
             )
 
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
@@ -1469,6 +1534,31 @@ class FlashAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+
+        if getattr(self, "_b70_fa_int8", False):
+            # B70-IP-D2: TRITON_ATTN's per-token-head writer, through the
+            # block-local split views (no SYCL writer exists for this layout).
+            from vllm.v1.attention.backends import b70_pth_fa
+            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                triton_reshape_and_cache_flash_per_token_head_quant,
+            )
+
+            key_cache, value_cache, k_scale, v_scale = b70_pth_fa.pth_split_views(
+                self, kv_cache
+            )
+            # The Triton writer sizes its grid by key; cut the padding rows.
+            num_slots = slot_mapping.shape[0]
+            triton_reshape_and_cache_flash_per_token_head_quant(
+                key[:num_slots],
+                value[:num_slots],
+                key_cache,
+                value_cache,
+                k_scale,
+                v_scale,
+                slot_mapping,
+                kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+            )
             return
 
         # Scatter write into the KV cache using slot_mapping indices.
