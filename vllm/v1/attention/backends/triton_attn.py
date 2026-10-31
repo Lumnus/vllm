@@ -618,6 +618,22 @@ class TritonAttentionImpl(AttentionImpl):
             k_scale_cache = self._k_scale_cache
             v_scale_cache = self._v_scale_cache
             q_descale = k_descale = v_descale = None
+            # B70-IP-K4: prefill over int8 per-token-head KV through the XPU
+            # FA kernel (dequant-to-bf16 scratch); decode stays below.
+            if current_platform.is_xpu():
+                from vllm.v1.attention.backends import b70_pth_fa
+
+                b70_pth_fa.ensure_scratch(self, kv_cache, query.dtype)
+                if b70_pth_fa.maybe_fa_prefill(
+                    self,
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    output[:num_actual_tokens],
+                    attn_metadata,
+                    num_actual_tokens,
+                ):
+                    return output
         # FP8 per-tensor / auto path (original flow).
         else:
             kv_cache = kv_cache.transpose(1, 2)
