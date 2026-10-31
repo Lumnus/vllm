@@ -528,6 +528,15 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        # B70-IP-K4: the int8 prefill scratch is sized to max_model_len; the
+        # config is current here (model construction), not at forward.
+        self._b70_max_model_len = None
+        if self._is_per_token_head_quant and current_platform.is_xpu():
+            from vllm.config import get_current_vllm_config_or_none
+
+            _cfg = get_current_vllm_config_or_none()
+            if _cfg is not None and _cfg.model_config is not None:
+                self._b70_max_model_len = _cfg.model_config.max_model_len
 
         # Enable tensor descriptors for Q/K/V load/store on platforms that
         # benefit from HW 2D block reads (Intel XPU).  The dead branch

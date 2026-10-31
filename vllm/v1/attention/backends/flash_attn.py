@@ -1081,6 +1081,15 @@ class FlashAttentionImpl(AttentionImpl):
         else:
             self.sliding_window = (sliding_window - 1, 0)
         self.kv_cache_dtype = kv_cache_dtype
+        # B70-IP-K5: prefill scratch is sized to max_model_len (config is
+        # current here, not at forward).
+        self._b70_max_model_len = None
+        if current_platform.is_xpu():
+            from vllm.config import get_current_vllm_config_or_none
+
+            _cfg = get_current_vllm_config_or_none()
+            if _cfg is not None and _cfg.model_config is not None:
+                self._b70_max_model_len = _cfg.model_config.max_model_len
         if logits_soft_cap is None:
             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
             logits_soft_cap = 0
@@ -1289,6 +1298,31 @@ class FlashAttentionImpl(AttentionImpl):
         )
         k_descale = layer._k_scale.expand(descale_shape)
         v_descale = layer._v_scale.expand(descale_shape)
+
+        # B70-IP-K5: on XPU the FA kernel's fp8-KV path is ~2.2x slower than
+        # its bf16 path for prefill chunks; dequantize the referenced fp8
+        # blocks into a bf16 scratch and run FA bf16 (decode and spec-verify
+        # batches keep the fp8 kernel). B70_PTH_FA_PREFILL=0 turns it off.
+        if (
+            current_platform.is_xpu()
+            and is_quantized_kv_cache(self.kv_cache_dtype)
+            and self.dcp_world_size <= 1
+            and getattr(self, "_b70_k5_ok", True)
+        ):
+            from vllm.v1.attention.backends import b70_pth_fa
+
+            b70_pth_fa.ensure_scratch(self, kv_cache, query.dtype)
+            if b70_pth_fa.maybe_fa_prefill(
+                self,
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                output[:num_actual_tokens],
+                attn_metadata,
+                num_actual_tokens,
+                fp8_scales=(layer._k_scale, layer._v_scale),
+            ):
+                return output
 
         if self.dcp_world_size > 1:
             self._forward_with_dcp(
