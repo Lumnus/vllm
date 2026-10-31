@@ -2,6 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """B70-IP-K: W4A8 routed experts for the XPU int4 MoE (B70_MOE_W4A8=1).
 
+B70_MOE_W4A8=2 (B70-IP-L) runs the same routing through the cutlass Xe2 grouped GEMM
+with the native s8 x s4 DPAS (vllm_xpu_kernels ``cutlass_grouped_gemm_w4a8``, or the
+standalone _b70_w4a8_C in B70_W4A8_LIB_DIR) instead of the Triton kernels below.
+
 The int4 expert weights stay exactly the bytes ``XpuFusedMoe`` holds (GPTQ
 nibble order, signed int4 after ``implement_zp``: byte p of a row holds input
 k = 2p in the low nibble and k = 2p + 1 in the high nibble; bf16 scales
@@ -44,7 +48,35 @@ _WLOAD = int(os.environ.get("B70_MOE_W4A8_WLOAD", "2"))
 
 
 def enabled() -> bool:
-    return os.environ.get("B70_MOE_W4A8", "0") == "1"
+    return os.environ.get("B70_MOE_W4A8", "0") in ("1", "2")
+
+
+def cutlass_mode() -> bool:
+    """B70_MOE_W4A8=2 (IP-L): the cutlass Xe2 grouped GEMM with the s8 x s4 DPAS
+    (vllm_xpu_kernels ``cutlass_grouped_gemm_w4a8``) instead of the Triton kernels (=1)."""
+    return os.environ.get("B70_MOE_W4A8", "0") == "2"
+
+
+_CUTLASS = None
+
+
+def _cutlass():
+    """vllm_xpu_kernels.b70_moe_w4a8 when the wheel has it, else the staged copy in
+    B70_W4A8_LIB_DIR (next to _b70_w4a8_C*.so); the op is resolved once here."""
+    global _CUTLASS
+    if _CUTLASS is None:
+        try:
+            from vllm_xpu_kernels import b70_moe_w4a8 as mod
+        except ImportError:
+            import importlib.util
+
+            path = os.path.join(os.environ.get("B70_W4A8_LIB_DIR", ""), "b70_moe_w4a8.py")
+            spec = importlib.util.spec_from_file_location("b70_moe_w4a8_cutlass", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        mod.load_op()
+        _CUTLASS = mod
+    return _CUTLASS
 
 
 def min_tokens() -> int:
@@ -368,6 +400,27 @@ def apply(impl, output, hidden_states, topk_weights, topk_ids, expert_map=None) 
 
 
 _LOGGED = False
+_LOGGED_CUTLASS = False
+
+
+def _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids) -> bool:
+    global _LOGGED_CUTLASS
+    mod = _cutlass()
+    ok = getattr(impl, "_b70_w4a8_cutlass_ok", None)
+    if ok is None:
+        why = mod.eligible(impl)
+        ok = why is None
+        impl._b70_w4a8_cutlass_ok = ok
+        if why is not None:
+            logger.warning_once("B70-IP-L: MoE W4A8 (cutlass) refused (%s); stock W4A16 path", why)
+    if not ok:
+        return False
+    if not _LOGGED_CUTLASS:
+        _LOGGED_CUTLASS = True
+        logger.info("B70-IP-L: MoE W4A8 on (cutlass s8 x s4 DPAS): int4 g128 weights as stored, int8 "
+                    "per-token activations, batches >= %d tokens (B70_MOE_W4A8_MIN_TOKENS)", min_tokens())
+    mod.apply(impl, output, hidden_states, topk_weights, topk_ids)
+    return True
 
 
 def maybe_apply(impl, output, hidden_states, topk_weights, topk_ids) -> bool:
@@ -376,6 +429,8 @@ def maybe_apply(impl, output, hidden_states, topk_weights, topk_ids) -> bool:
     global _LOGGED
     if not enabled() or hidden_states.shape[0] < min_tokens():
         return False
+    if cutlass_mode():
+        return _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids)
     ok = getattr(impl, "_b70_w4a8_ok", None)
     if ok is None:
         why = eligible(impl)
