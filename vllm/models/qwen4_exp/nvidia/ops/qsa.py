@@ -104,9 +104,15 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     stride_vs_token=0,
     stride_vs_head=0,
     KV_PTH: tl.constexpr = False,
+    q_scale_ptr=None,
+    stride_qs_row=0,
+    I8DOT: tl.constexpr = 0,
 ) -> None:
     # B70-IP-K6: KV_PTH = int8 per-token-head K/V (see qsa_attn2's tile
     # kernel): int8 -> bf16 rows, K scale on the FP32 scores, V scale on P.
+    # B70-IP-K7: I8DOT (needs KV_PTH): int8 Q (q_ptr) x int8 K -> int32, then
+    # q_scale * k_scale in fp32; I8DOT 2 also does P.V as int8 x int8 -> int32
+    # (P * v_scale quantized per head row, scale = rowmax / 127).
     row = tl.program_id(0)
     kv_head = tl.program_id(1)
     split_id = tl.program_id(2)
@@ -123,14 +129,29 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     dim_offsets = tl.arange(0, HEAD_DIM)
     column_offsets = tl.arange(0, BLOCK_N)
     first_head = kv_head * GROUP_SIZE
-    query = tl.load(
-        q_ptr
-        + row * stride_q_row
-        + (first_head + head_offsets[:, None]) * stride_q_head
-        + dim_offsets[None, :],
-        mask=head_offsets[:, None] < GROUP_SIZE,
-        other=0.0,
-    )
+    if I8DOT >= 1:
+        query = tl.load(
+            q_ptr
+            + row * stride_q_row
+            + (first_head + head_offsets[:, None]) * stride_q_head
+            + dim_offsets[None, :],
+            mask=head_offsets[:, None] < GROUP_SIZE,
+            other=0,
+        )
+        q_token_scale = tl.load(
+            q_scale_ptr + row * stride_qs_row + first_head + head_offsets,
+            mask=head_offsets < GROUP_SIZE,
+            other=0.0,
+        )
+    else:
+        query = tl.load(
+            q_ptr
+            + row * stride_q_row
+            + (first_head + head_offsets[:, None]) * stride_q_head
+            + dim_offsets[None, :],
+            mask=head_offsets[:, None] < GROUP_SIZE,
+            other=0.0,
+        )
 
     max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
     normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -179,7 +200,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         )
         # e4m3 -> Q dtype is exact; keep the QK dot in Q's dtype (fp8 QK
         # measured slower here and less accurate).
-        keys = _maybe_dequant(keys).to(query.dtype)
+        if I8DOT == 0:
+            keys = _maybe_dequant(keys).to(query.dtype)
         values = tl.load(
             v_cache_ptr
             + safe_page[:, None] * stride_v_block
@@ -193,7 +215,10 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         # softmax) so fp16 has the range, its wider mantissa is more
         # accurate, and the fp8->fp16 upcast with an fp16 PV dot is faster.
         values = _maybe_dequant(values)
-        scores = tl.dot(query, keys)
+        if I8DOT >= 1:
+            scores = tl.dot(query, keys).to(tl.float32) * q_token_scale[:, None]
+        else:
+            scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16; for fp8
         # caches the K dequant scale is already folded into softmax_scale on the
         # host.
@@ -221,15 +246,28 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
                 mask=valid,
                 other=0.0,
             )
-            pv_weights = (probabilities * v_token_scale[None, :]).to(tl.bfloat16)
-            values = values.to(tl.bfloat16)
+            if I8DOT == 2:
+                pv_scaled = probabilities * v_token_scale[None, :]
+                p_scale = tl.maximum(tl.max(pv_scaled, axis=1) / 127.0, 1.0e-30)
+                pv_weights = tl.minimum(
+                    tl.floor(pv_scaled * (1.0 / p_scale)[:, None] + 0.5), 127.0
+                ).to(tl.int8)
+            else:
+                pv_weights = (probabilities * v_token_scale[None, :]).to(tl.bfloat16)
+                values = values.to(tl.bfloat16)
         else:
             pv_weights = probabilities
-        accumulator = tl.dot(
-            pv_weights.to(values.dtype),
-            values,
-            acc=accumulator * alpha[:, None],
-        )
+        if I8DOT == 2:
+            accumulator = (
+                accumulator * alpha[:, None]
+                + tl.dot(pv_weights, values).to(tl.float32) * p_scale[:, None]
+            )
+        else:
+            accumulator = tl.dot(
+                pv_weights.to(values.dtype),
+                values,
+                acc=accumulator * alpha[:, None],
+            )
         normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
         max_value = next_max
 
@@ -821,6 +859,11 @@ def qsa_sparse_paged_attention(
 
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = _qsa_block_m(group_size)
+    # B70-IP-K7: native int8 dots over an int8 per-token-head cache.
+    i8dot = attn2.i8dot_mode() if is_pth else 0
+    q_i8 = q_scale = None
+    if i8dot:
+        q_i8, q_scale = attn2.quantize_q_i8(q)
     if attn2.attn_impl() == "attn2":
         # B70-QSA-K: head_dim-chunked, all-heads-per-program kernel (qsa_attn2).
         return attn2.qsa_sparse_paged_attention_attn2(
@@ -838,6 +881,9 @@ def qsa_sparse_paged_attention(
             block_m,
             k_scale_cache,
             v_scale_cache,
+            q_i8,
+            q_scale,
+            i8dot,
         )
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
     block_n, partial_warps, num_tiles, num_splits = _select_config(
@@ -862,7 +908,7 @@ def qsa_sparse_paged_attention(
 
     partial_grid = (q.shape[0], k_cache.shape[2], num_splits)
     _qsa_sparse_paged_gqa_splitk_kernel[partial_grid](
-        q,
+        q_i8 if i8dot else q,
         k_cache,
         v_cache,
         logical_indices,
@@ -874,8 +920,8 @@ def qsa_sparse_paged_attention(
         softmax_scale,
         output_scale,
         output_gate_view,
-        q.stride(0),
-        q.stride(1),
+        (q_i8 if i8dot else q).stride(0),
+        (q_i8 if i8dot else q).stride(1),
         k_cache.stride(0),
         k_cache.stride(1),
         k_cache.stride(2),
@@ -904,6 +950,7 @@ def qsa_sparse_paged_attention(
         num_warps=partial_warps,
         **_sparse_gqa_stage_kwargs(q.shape[0] * k_cache.shape[2], use_prefill_config),
         **attn2.pth_scale_kwargs(k_scale_cache, v_scale_cache),
+        **attn2.i8dot_kwargs(q_scale, i8dot),
     )
     if num_splits == 1:
         return out
@@ -1095,6 +1142,31 @@ def warmup_qsa_sparse_paged_attention(
     head_stride = head_dim
     row_stride = num_query_heads * head_dim
     num_cache_blocks = triton_scalar_specialization_rep(kv_cache.shape[0])
+    # B70-IP-K7: the int8-dot variant takes an int8 Q, its scales and I8DOT;
+    # the Q quantizer is warmed on the bf16 Q layout the dispatch passes.
+    i8dot = attn2.i8dot_mode() if pth_scales else 0
+    if i8dot:
+        attn2._qsa_quant_q_kernel.warmup(
+            q_ptr,
+            TritonWarmupTensor(torch.int8),
+            TritonWarmupTensor(torch.float32),
+            row_stride,
+            head_stride,
+            NUM_QUERY_HEADS=num_query_heads,
+            HEAD_DIM=head_dim,
+            num_warps=1,
+            grid=(num_rows, num_query_heads),
+        )
+        q_ptr = TritonWarmupTensor(
+            torch.int8, shape=(num_rows, num_query_heads, head_dim)
+        )
+        pth_scales = {
+            **pth_scales,
+            **attn2.i8dot_kwargs(
+                TritonWarmupTensor(torch.float32, shape=(num_rows, num_query_heads)),
+                i8dot,
+            ),
+        }
 
     if attn2.attn_impl() == "attn2":
         return _warmup_attn2(
