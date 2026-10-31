@@ -7,6 +7,7 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
+import os
 from typing import Any
 
 import torch
@@ -31,6 +32,8 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
 from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
+
+_B70_PTH_TD_LOGGED = False
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
@@ -1026,6 +1029,29 @@ def unified_attention(
     _is_pow2_nq = (num_queries_per_kv & (num_queries_per_kv - 1)) == 0
     _is_pow2_hs = head_size == head_size_padded
     use_td_qo = use_td and _is_pow2_nq and _is_pow2_hs
+
+    # B70-IP-K1: per-token-head KV caches pack one fp32 scale after each
+    # head's data ([K(hs) | s | V(hs) | s] per slot), so the K/V row pitch and
+    # the V base are not 16-byte aligned (hs=256 int8: pitch 520 B, V at
+    # +260 B).  Xe2 2D block reads (tensor descriptors) need an aligned base
+    # and pitch and return wrong data otherwise (measured on B70: cos 0.22
+    # against an fp32 reference, 0.9998 with the pointer path).  Use the
+    # pointer path for K/V loads in these modes; Q/O descriptors stay.
+    # B70_PTH_TD_GUARD=0 restores the old behaviour (A/B only).
+    if (
+        use_td
+        and kv_quant_mode.is_per_token_head
+        and os.environ.get("B70_PTH_TD_GUARD", "1") != "0"
+    ):
+        use_td = False
+        global _B70_PTH_TD_LOGGED
+        if not _B70_PTH_TD_LOGGED:
+            _B70_PTH_TD_LOGGED = True
+            logger.info(
+                "B70-IP-K1 per-token-head KV: tensor-descriptor K/V loads "
+                "off (unaligned inline scales); Q/O TD=%s",
+                use_td_qo,
+            )
 
     # ``_load_q_td`` / ``_store_output_td`` flatten ``(num_queries_per_kv,
     # HEAD_SIZE)`` into a single contiguous inner axis.  That's only
