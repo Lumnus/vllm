@@ -19,6 +19,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_b70_ip_qsa_int8 as ipf  # noqa: E402  (also patches the interpreter)
+from test_b70_ip_qsa_int8 import pth_layout  # noqa: E402, F401  (pad16 / tight)
 
 from vllm.models.qwen4_exp.nvidia.ops import qsa_attn2  # noqa: E402
 
@@ -201,7 +202,7 @@ def test_align8_true_for_inline_cells(layout, nkv) -> None:
     from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 
     nb, page = 3, 16
-    content = 2 * (HD + 4)
+    content = 2 * ipf._half()
     if layout == "NHD":
         cache = torch.zeros(nb, page, nkv, content, dtype=torch.int8).transpose(1, 2)
     else:
@@ -212,6 +213,10 @@ def test_align8_true_for_inline_cells(layout, nkv) -> None:
         )
     k, v, _, _ = qsa_ops.qsa_pth_kv_views(cache, HD)
     assert qsa_attn2.i8dot_align8(k, v, HD)
+    # B70-IP-PAD16: V offset from the cell, 16-B gathers on the padded cell.
+    kw = qsa_attn2.i8dot_align_kwargs(k, v, HD)
+    assert kw["V_OFF"] == ipf._half()
+    assert kw["KV_ALIGN"] == (16 if os.environ["B70_PTH_PAD16"] == "1" else 8)
     # Not the inline cell (separate tensors) or an odd base: no alignment claim.
     assert not qsa_attn2.i8dot_align8(k, k.clone(), HD)
     # A 4-byte (not 8-byte) aligned base: scale views still work, ALIGN8 must not.

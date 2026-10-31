@@ -218,6 +218,7 @@ def _qsa_prepare_kernel(
     MAIN_D: tl.constexpr,
     MAIN_PAGE_SIZE: tl.constexpr,
     MAIN_KV_PTH: tl.constexpr = False,
+    MAIN_V_OFF: tl.constexpr = 0,
 ):
     pid = tl.program_id(0)
     num_index_work = num_k_work + tl.cdiv(num_tokens, TILE_T_Q) * tl.cdiv(HQ, TILE_H_Q)
@@ -273,10 +274,11 @@ def _qsa_prepare_kernel(
                     + kv_head * main_cache_stride_head
                 )
                 if MAIN_KV_PTH:
-                    # B70-IP-K6: K(D) | K scale | V(D) | V scale per cell.
+                    # B70-IP-K6: K(D) | K scale | pad | V(D) | V scale | pad
+                    # per cell, V at MAIN_V_OFF (B70-IP-PAD16); pads untouched.
                     _store_rotated_int8_pth(dst, y, o1, o2)
                     v = tl.load(src + MAIN_HK * MAIN_D + dims)
-                    _store_row_int8_pth(dst + MAIN_D + 4, v)
+                    _store_row_int8_pth(dst + MAIN_V_OFF, v)
                 else:
                     _store_rotated(dst, y, o1, o2, main_k_scale)
                     v = tl.load(src + MAIN_HK * MAIN_D + dims)
@@ -591,13 +593,23 @@ def qsa_prepare(
     and returns its Q and gate.
 
     main_kv_pth (B70-IP-K6): ``main_kv_cache`` is an int8 per-token-head cache
-    ``(B, N, H, 2 * (D + 4))``; each K and V head is quantized with one fp32
-    absmax scale stored inline after it (main_k_scale/main_v_scale unused).
+    ``(B, N, H, 2 * half)``, ``half`` = D + 4 rounded up to 16 B (B70-IP-PAD16;
+    tight with B70_PTH_PAD16=0), D the QK-norm width; each K and V head is
+    quantized with one fp32 absmax scale stored inline after it
+    (main_k_scale/main_v_scale unused).
     """
     num_tokens = q.shape[0]
+    main_v_off = 0
     if main_kv_pth:
+        from vllm.v1.attention.backends.triton_attn import pth_check_half
+
         assert main_kv_cache.dtype == torch.int8
-        main_head_dim = main_kv_cache.shape[-1] // 2 - 4
+        # B70-IP-PAD16: the head dim is the QK-norm width; V starts one cache
+        # half into the cell (16-B padded since vllm#62113, or tight).
+        main_head_dim = main_q_norm_weight.shape[-1]
+        assert main_kv_cache.shape[-1] % 2 == 0
+        main_v_off = main_kv_cache.shape[-1] // 2
+        pth_check_half(main_v_off, main_head_dim)
         assert main_kv_cache.stride(-1) == 1
         # Scale stores are 4-byte: every cell must start 4-byte aligned.
         assert main_kv_cache.stride(1) % 4 == 0 and main_kv_cache.stride(2) % 4 == 0
@@ -708,7 +720,7 @@ def qsa_prepare(
         MAIN_HK=num_main_kv_heads,
         MAIN_D=main_head_dim,
         MAIN_PAGE_SIZE=main_kv_cache.shape[1],
-        **({"MAIN_KV_PTH": True} if main_kv_pth else {}),
+        **({"MAIN_KV_PTH": True, "MAIN_V_OFF": main_v_off} if main_kv_pth else {}),
         num_warps=1,
     )
     return main_q_out, main_gate_out

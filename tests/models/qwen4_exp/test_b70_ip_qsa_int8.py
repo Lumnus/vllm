@@ -32,6 +32,7 @@ from vllm.models.qwen4_exp.nvidia.ops import qsa as qsa_ops
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
     TritonAttentionImpl,
+    pth_half_bytes,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode, get_kv_quant_mode
 
@@ -42,6 +43,20 @@ requires_interpreter = pytest.mark.skipif(
 
 HD = 256
 PTH = "int8_per_token_head"
+
+
+@pytest.fixture(autouse=True, params=["pad16", "tight"])
+def pth_layout(request, monkeypatch):
+    """B70-IP-PAD16: every test runs on vllm#62113's 16-B padded halves
+    (default, 544-B cell at HD 256) and on the tight 520-B cell
+    (B70_PTH_PAD16=0)."""
+    monkeypatch.setenv("B70_PTH_PAD16", "1" if request.param == "pad16" else "0")
+    return request.param
+
+
+def _half() -> int:
+    """Bytes of one K (or V) half of the cell under the active layout."""
+    return pth_half_bytes(HD)
 
 
 def _patch_interpreter_bf16() -> None:
@@ -118,8 +133,10 @@ def test_qsa_spec_packs_inline_scales_like_triton(nkv: int, block: int) -> None:
     spec = _spec(torch.int8, PTH, nkv, block)
     qsa = qsa_mod.Qwen4ExpQSAFlashAttentionBackend.customize_spec(spec)
     assert qsa == TritonAttentionBackend.customize_spec(spec)
-    assert qsa.state_content_bytes == 2 * (HD + 4)  # 520
-    assert qsa.page_size_bytes == block * nkv * 520
+    cell = 544 if os.environ["B70_PTH_PAD16"] == "1" else 520
+    assert 2 * _half() == cell
+    assert qsa.state_content_bytes == cell
+    assert qsa.page_size_bytes == block * nkv * cell
     # The hybrid alignment asks the first non-SSM backend, which in Qwen4Exp
     # is the indexer's state backend: it must answer the same page.
     assert QSAStateBackend.customize_spec(spec) == qsa
@@ -135,7 +152,7 @@ def test_qsa_spec_unchanged_for_bf16_and_fp8(dtype, mode) -> None:
 def _pth_cache(nb: int, nkv: int, bs: int, layout: str) -> torch.Tensor:
     """Logical (B, H, N, C) int8 cache, NHD or HND physical, optionally in a
     padded page (hybrid unify) at a nonzero storage offset."""
-    c = 2 * (HD + 4)
+    c = 2 * _half()
     if layout == "hnd":
         return torch.randint(-128, 128, (nb, nkv, bs, c), dtype=torch.int8)
     if layout == "nhd":
@@ -159,26 +176,31 @@ def test_pth_views_match_triton_and_write_nothing(layout: str, nkv: int) -> None
     # Same scale views as TRITON_ATTN (byte offsets and strides).
     ref = TritonAttentionImpl.__new__(TritonAttentionImpl)
     ref._k_scale_cache = ref._v_scale_cache = None
+    ref.head_size = HD
+    ref._kv_quant_mode = KVQuantMode.INT8_PER_TOKEN_HEAD
     ref._ensure_scale_caches(cache)
     for mine, theirs in ((ks, ref._k_scale_cache), (vs, ref._v_scale_cache)):
         assert mine.shape == theirs.shape == (5, 16, nkv)
         assert mine.stride() == theirs.stride()
         assert mine.storage_offset() == theirs.storage_offset()
         assert torch.equal(mine.view(torch.int32), theirs.view(torch.int32))
-    # Views address the documented bytes: K(hd) | ks | V(hd) | vs.
+    # Views address the documented bytes: K(hd) | ks | pad | V(hd) | vs | pad.
+    h = _half()
     ks[3, 7, nkv - 1] = 2.5
     vs[1, 2, 0] = -0.75
     cell = cache[3, nkv - 1, 7]
     assert cell[HD : HD + 4].contiguous().view(torch.float32).item() == 2.5
     assert torch.equal(k[3, 7, nkv - 1], cell[:HD])
     cell = cache[1, 0, 2]
-    assert cell[2 * HD + 4 :].contiguous().view(torch.float32).item() == -0.75
-    assert torch.equal(v[1, 2, 0], cell[HD + 4 : 2 * HD + 4])
+    assert cell[h + HD : h + HD + 4].contiguous().view(torch.float32).item() == -0.75
+    assert torch.equal(v[1, 2, 0], cell[h : h + HD])
+    assert v.data_ptr() - k.data_ptr() == h
 
 
-def test_pth_views_reject_wrong_content() -> None:
-    with pytest.raises(AssertionError):
-        qsa_ops.qsa_pth_kv_views(torch.zeros(2, 1, 16, 2 * HD, dtype=torch.int8), HD)
+@pytest.mark.parametrize("content", [2 * HD, 2 * (HD + 4) + 2, 2 * (HD + 20)])
+def test_pth_views_reject_wrong_content(content: int) -> None:
+    with pytest.raises(ValueError):
+        qsa_ops.qsa_pth_kv_views(torch.zeros(2, 1, 16, content, dtype=torch.int8), HD)
 
 
 def test_impl_accepts_int8_pth_and_logs_path(monkeypatch) -> None:
@@ -294,7 +316,7 @@ def _paged_case(hq: int, nkv: int, page: int, rows: int, width: int, seed: int):
     kc, vc = bf16_cache.transpose(1, 2).split(HD, dim=-1)
     kc.view(-1, nkv, HD)[slot_mapping] = key
     vc.view(-1, nkv, HD)[slot_mapping] = value
-    int8_cache = torch.zeros(nb, page, nkv, 2 * (HD + 4), dtype=torch.int8).transpose(
+    int8_cache = torch.zeros(nb, page, nkv, 2 * _half(), dtype=torch.int8).transpose(
         1, 2
     )
     q = torch.randn(rows, hq, HD, dtype=torch.bfloat16)
@@ -491,7 +513,8 @@ def test_fused_prepare_int8_matches_writer_formula(nkv: int) -> None:
         )
 
     bf16 = torch.zeros(nb, nkv, page, 2 * HD, dtype=torch.bfloat16).transpose(1, 2)
-    i8 = torch.zeros(nb, nkv, page, 2 * (HD + 4), dtype=torch.int8).transpose(1, 2)
+    h = _half()
+    i8 = torch.zeros(nb, nkv, page, 2 * h, dtype=torch.int8).transpose(1, 2)
     q16, g16 = run(bf16, False)
     q8, g8 = run(i8, True)
     assert torch.equal(q16, q8) and torch.equal(g16, g8)
@@ -499,18 +522,20 @@ def test_fused_prepare_int8_matches_writer_formula(nkv: int) -> None:
     live = slots[slots >= 0]
     k16 = bf16.reshape(-1, nkv, 2 * HD)[live, :, :HD]
     v16 = bf16.reshape(-1, nkv, 2 * HD)[live, :, HD:]
-    cells = i8.reshape(-1, nkv, 2 * (HD + 4))[live]
+    cells = i8.reshape(-1, nkv, 2 * h)[live]
     k_exp, ks_exp = quantize_pth(k16)
     v_exp, vs_exp = quantize_pth(v16)
     assert torch.equal(cells[..., :HD], k_exp)
-    assert torch.equal(cells[..., HD + 4 : 2 * HD + 4], v_exp)
+    assert torch.equal(cells[..., h : h + HD], v_exp)
     ks = cells[..., HD : HD + 4].contiguous().view(torch.float32).squeeze(-1)
-    vs = cells[..., 2 * HD + 4 :].contiguous().view(torch.float32).squeeze(-1)
+    vs = cells[..., h + HD : h + HD + 4].contiguous().view(torch.float32).squeeze(-1)
     assert torch.equal(ks, ks_exp) and torch.equal(vs, vs_exp)
+    # B70-IP-PAD16: the pad bytes after each scale are never written.
+    assert not cells[..., HD + 4 : h].any() and not cells[..., h + HD + 4 :].any()
     # Unwritten slots stay zero (slot -1 is skipped).
     written = torch.zeros(nb * page, dtype=torch.bool)
     written[live] = True
-    assert not i8.reshape(-1, nkv, 2 * (HD + 4))[~written].any()
+    assert not i8.reshape(-1, nkv, 2 * h)[~written].any()
 
 
 @requires_interpreter
@@ -520,7 +545,8 @@ def test_unfused_update_ignores_padded_rows(monkeypatch) -> None:
     impl = qsa_mod.Qwen4ExpQSAFlashAttentionImpl(
         12, HD, HD**-0.5, 1, None, None, PTH, None
     )
-    cache = torch.zeros(2, 16, 1, 2 * (HD + 4), dtype=torch.int8).transpose(1, 2)
+    h = _half()
+    cache = torch.zeros(2, 16, 1, 2 * h, dtype=torch.int8).transpose(1, 2)
     key = torch.full((8, 1, HD), float("nan"), dtype=torch.bfloat16)
     value = key.clone()
     key[:5] = torch.randn(5, 1, HD, dtype=torch.bfloat16)
@@ -537,4 +563,7 @@ def test_unfused_update_ignores_padded_rows(monkeypatch) -> None:
     assert torch.equal(vs.reshape(-1, 1)[slots[live]], vs_exp)
     written = torch.zeros(32, dtype=torch.bool)
     written[slots[live]] = True
-    assert not cache.transpose(1, 2).reshape(32, -1)[~written].any()
+    flat = cache.transpose(1, 2).reshape(32, -1)
+    assert not flat[~written].any()
+    # B70-IP-PAD16: the writer leaves the pad bytes of written cells alone.
+    assert not flat[:, HD + 4 : h].any() and not flat[:, h + HD + 4 :].any()

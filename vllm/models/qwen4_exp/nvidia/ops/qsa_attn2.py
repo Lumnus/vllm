@@ -154,19 +154,35 @@ def quantize_q_i8(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return q_i8, q_scale
 
 
+def i8dot_align_kwargs(
+    k_cache: torch.Tensor | object, v_cache: torch.Tensor | object, head_dim: int
+) -> dict:
+    """B70-IP-K8 / B70-IP-PAD16: the aligned-gather kwargs of an int8-dot attn2
+    launch. ALIGN8 is True when the int8 K/V views are the inline per-token-head
+    cell (V = K + one cache half, same strides, half >= head_dim + 4) with
+    K rows aligned to KV_ALIGN bytes (16 when the cell, its strides and its V
+    offset are all 16-B multiples, as with vllm#62113's padded halves; else 8).
+    V_OFF is the V offset in bytes. Works on warmup stand-ins (their data_ptr
+    is 0 or 1, so the V offset check fails and ALIGN8 stays off)."""
+    ks, vs = k_cache.stride(), v_cache.stride()
+    v_off = v_cache.data_ptr() - k_cache.data_ptr()
+    if not (
+        tuple(ks) == tuple(vs)
+        and head_dim + 4 <= v_off < head_dim + 4 + 16
+        and v_off % 4 == 0
+    ):
+        return {"ALIGN8": False}
+    for align in (16, 8):
+        if k_cache.data_ptr() % align == 0 and all(s % align == 0 for s in ks[:3]):
+            return {"ALIGN8": True, "KV_ALIGN": align, "V_OFF": v_off}
+    return {"ALIGN8": False}
+
+
 def i8dot_align8(
     k_cache: torch.Tensor | object, v_cache: torch.Tensor | object, head_dim: int
 ) -> bool:
-    """B70-IP-K8: True when the int8 K/V views are the inline per-token-head cell
-    (V = K + head_dim + 4 bytes, same strides) with 8-byte aligned K rows, so the
-    attn2 int8-dot gathers may assume it (ALIGN8). Works on warmup stand-ins."""
-    ks, vs = k_cache.stride(), v_cache.stride()
-    return (
-        tuple(ks) == tuple(vs)
-        and v_cache.data_ptr() - k_cache.data_ptr() == head_dim + 4
-        and k_cache.data_ptr() % 8 == 0
-        and all(s % 8 == 0 for s in ks[:3])
-    )
+    """B70-IP-K8: True when the int8-dot gathers may assume aligned cells."""
+    return i8dot_align_kwargs(k_cache, v_cache, head_dim)["ALIGN8"]
 
 
 def i8dot_kwargs(q_scale, mode: int) -> dict:
@@ -242,13 +258,16 @@ def _qsa_attn2_tile_kernel(
     stride_qs_row=0,
     I8DOT: tl.constexpr = 0,
     ALIGN8: tl.constexpr = False,
+    KV_ALIGN: tl.constexpr = 8,
+    V_OFF: tl.constexpr = 0,
 ) -> None:
     # B70-IP-K8: ALIGN8 (I8DOT on the inline int8 per-token-head cell, checked on
-    # the host): the 520-B cell pitch is not a multiple of 16, so Triton cannot
-    # prove any alignment of a gathered row and emits byte loads. Every cell
-    # offset is a multiple of 8, and V sits head_dim + 4 bytes after K in the same
-    # cell; saying so (multiple_of 8, V addressed from the K pointer) lets the
-    # gathers vectorize (8-B K, 4-B V).
+    # the host): Triton cannot prove the alignment of a gathered row and emits
+    # byte loads. Every cell offset is a multiple of KV_ALIGN, and V sits V_OFF
+    # bytes after K in the same cell; saying so (multiple_of KV_ALIGN, V
+    # addressed from the K pointer) lets the gathers vectorize. B70-IP-PAD16:
+    # with vllm#62113's 16-B halves (544-B cell, V_OFF 272 at head_dim 256)
+    # KV_ALIGN is 16 for K and V; the tight 520-B cell gives 8-B K, 4-B V.
     # B70-IP-K7: I8DOT (needs KV_PTH) = q_ptr is int8 Q with one fp32 scale per
     # (token, q head) at q_scale_ptr. 1: S = dot(q_i8, k_i8) in int32 (DPAS
     # int8, no widening), scores = S * q_scale * k_scale in fp32. 2: also
@@ -331,10 +350,10 @@ def _qsa_attn2_tile_kernel(
                     safe_page * stride_k_block
                     + page_offset * stride_k_token
                     + kv_head * stride_k_head,
-                    8,
+                    KV_ALIGN,
                 )
                 k_base = k_cache_ptr + cell_offset
-                v_base = k_cache_ptr + cell_offset + (HEAD_DIM + 4)
+                v_base = k_cache_ptr + cell_offset + V_OFF
 
             # Q.K, head_dim chunk by chunk (runtime loop: one chunk live).
             if I8DOT >= 1:
@@ -729,7 +748,7 @@ def qsa_sparse_paged_attention_attn2(
     cfg = select_attn2_config(
         q.shape[0], num_kv_heads, use_prefill_config, selection_width, i8dot
     )
-    align8 = {"ALIGN8": i8dot_align8(k_cache, v_cache, head_dim)} if i8dot else {}
+    align8 = i8dot_align_kwargs(k_cache, v_cache, head_dim) if i8dot else {}
     q_src = q_i8 if i8dot else q
     dc = head_dim // cfg["num_dchunk"]
     assert dc >= 16 and dc * cfg["num_dchunk"] == head_dim, "attn2 head_dim chunking"

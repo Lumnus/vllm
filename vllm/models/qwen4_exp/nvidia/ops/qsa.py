@@ -1002,20 +1002,23 @@ def qsa_pth_kv_views(
     """B70-IP-K6: K/V and scale views of an int8 per-token-head QSA cache.
 
     ``kv_cache`` is the layer's logical ``(B, H, N, C)`` int8 tensor, any
-    physical strides, with ``C = 2 * (head_dim + 4)``: each (block, head,
-    slot) cell holds ``K(head_dim) | K_scale(f32) | V(head_dim) | V_scale(f32)``,
-    the layout ``TritonAttentionBackend.customize_spec`` packs and
+    physical strides, with ``C = 2 * half``: each (block, head, slot) cell
+    holds ``K(head_dim) | K_scale(f32) | pad | V(head_dim) | V_scale(f32) |
+    pad``, the layout ``TritonAttentionBackend.customize_spec`` packs and
     ``TritonAttentionImpl._ensure_scale_caches`` reads (same byte offsets and
-    strides). Returns ``(key, value)`` as ``(B, N, H, head_dim)`` int8 views
-    and ``(k_scale, v_scale)`` as ``(B, N, H)`` fp32 views. Pure views: no
-    byte of the cache is written (hybrid pages are shared with GDN state).
+    strides). ``half`` comes from the cache (B70-IP-PAD16: 16-B padded, 272 B
+    at head_dim 256, or tight, 260 B, with B70_PTH_PAD16=0). Returns
+    ``(key, value)`` as ``(B, N, H, head_dim)`` int8 views and ``(k_scale,
+    v_scale)`` as ``(B, N, H)`` fp32 views. Pure views: no byte of the cache
+    is written (hybrid pages are shared with GDN state).
     """
+    from vllm.v1.attention.backends.triton_attn import pth_check_half
+
     assert kv_cache.dtype == torch.int8 and kv_cache.ndim == 4
     num_blocks, num_kv_heads, block_size, content = kv_cache.shape
-    padded = head_dim + 4
-    assert content == 2 * padded, (
-        f"int8 per-token-head QSA cache content {content} != 2 * ({head_dim} + 4)"
-    )
+    padded = content // 2
+    assert content % 2 == 0, f"int8 per-token-head QSA cache content {content}"
+    pth_check_half(padded, head_dim)
     key_cache, value_cache = kv_cache.transpose(1, 2).split(padded, dim=-1)
     key_cache = key_cache[..., :head_dim]
     value_cache = value_cache[..., :head_dim]
@@ -1057,7 +1060,7 @@ def warmup_qsa_sparse_paged_attention(
     """Compile every production-reachable split-K/merge specialization.
 
     B70-IP-K6: an int8 cache is int8 per-token-head; its K/V and scale views
-    (and their pointer alignment: V starts head_dim + 4 bytes into the cell)
+    (and their pointer alignment: V starts one cache half into the cell)
     are warmed as the runtime passes them.
     """
     pth_scales: dict = {}
@@ -1309,7 +1312,7 @@ def _warmup_attn2(
     if i8dot:
         pth_scales = {
             **pth_scales,
-            "ALIGN8": attn2.i8dot_align8(key_cache, value_cache, head_dim),
+            **attn2.i8dot_align_kwargs(key_cache, value_cache, head_dim),
         }
     profiles = attn2.attn2_profiles(num_kv_heads, selection_width, i8dot=i8dot)
     for block_n, num_dchunk, tpp, warps, stages, extra in sorted(profiles):
