@@ -228,6 +228,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 and weight.stride(0) != 1
             ):
                 layer.weight.data = weight.t().contiguous().t()
+            # B70-IP-W1: opt-in W8A8 int8 for BF16 dense linears (B70_DENSE_INT8=1).
+            from vllm.model_executor.layers.b70_dense_int8 import maybe_convert
+
+            maybe_convert(layer)
 
     def apply(
         self,
