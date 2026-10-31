@@ -91,7 +91,8 @@ def ensure_scratch(impl, kv_cache: torch.Tensor, dtype, force: bool = False) -> 
 
 
 def _dequant_blocks(src_data, src_scale, ids, dst, hs, chunk=4):
-    # src_data: (nb, bs, nkv, hs+pad) int8 view; src_scale: (nb, bs, nkv) fp32
+    # src_data: (nb, bs, nkv, >= hs) int8 view (an inline half, padded or not,
+    # or a D2 split view); src_scale: (nb, bs, nkv) fp32. Only [:hs] is read.
     n = ids.numel()
     for i in range(0, n, chunk):
         sel = ids[i : i + chunk]
@@ -259,8 +260,11 @@ def split_layout_views(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Block-local split views over one layer's int8 per-token-head cache.
 
-    ``kv_cache`` is the logical ``(B, H, N, 2 * (D + 4))`` int8 layer view vLLM
-    allocates for the spec (same bytes as TRITON_ATTN's inline layout). Each
+    ``kv_cache`` is the logical ``(B, H, N, C)`` int8 layer view vLLM
+    allocates for the spec (same bytes as TRITON_ATTN's inline layout: ``C =
+    2 * half``, ``half`` = D + 4 padded to 16 B since vllm#62113, B70-IP-PAD16;
+    the split layout uses ``H * N * (2D + 8)`` of the ``H * N * C`` bytes and
+    leaves the rest of the page unused). Each
     block is re-read as ``[int8 K|V (N, H, 2D) | K scales fp32 (N, H) |
     V scales fp32 (N, H)]``. Returns key / value int8 ``[B, N, H, D]`` with
     strides ``(page, H*2D, 2D, 1)`` (value = key + D bytes) and k_scale /
@@ -272,7 +276,9 @@ def split_layout_views(
     if kv_cache.dtype != torch.int8:
         raise ValueError(f"int8_per_token_head cache is int8, got {kv_cache.dtype}")
     num_blocks, nkv, block_size, content = kv_cache.shape
-    if nkv != num_kv_heads or content != 2 * (head_size + 4):
+    from vllm.v1.attention.backends.triton_attn import pth_half_ok
+
+    if nkv != num_kv_heads or content % 2 or not pth_half_ok(content // 2, head_size):
         raise ValueError(
             f"int8_per_token_head cache shape {tuple(kv_cache.shape)} does not match "
             f"num_kv_heads={num_kv_heads}, head_size={head_size}"

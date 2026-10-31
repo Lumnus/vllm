@@ -32,9 +32,20 @@ import pytest
 import torch
 
 from vllm.v1.attention.backends import b70_pth_fa
+from vllm.v1.attention.backends.triton_attn import pth_half_bytes
 
 INTERPRET = os.environ.get("TRITON_INTERPRET") == "1"
 HS = 256
+
+
+@pytest.fixture(autouse=True, params=["pad16", "tight"])
+def pth_layout(request, monkeypatch):
+    """B70-IP-PAD16: every test runs on vllm#62113's 16-B padded inline halves
+    (default; 544-B slot at HS 256) and on the tight 520-B slot
+    (B70_PTH_PAD16=0). D2 keeps the same page bytes as TRITON_ATTN either way;
+    its split layout uses the first H*N*(2D+8) bytes of each page."""
+    monkeypatch.setenv("B70_PTH_PAD16", "1" if request.param == "pad16" else "0")
+    return request.param
 
 
 class _XPU:
@@ -85,7 +96,7 @@ def kernel_ref_views(raw, block_size, nkv, hs):
 def make_layer_cache(nb, nkv, bs, hs=HS, nhd=True, pad=0, layer_off=0, fill=0x5A):
     """A vLLM-style logical (B, H, N, C) int8 layer view over a flat buffer.
     Returns (raw [nb, page] uint8 over the same bytes, kv_cache view)."""
-    c = 2 * (hs + 4)
+    c = 2 * pth_half_bytes(hs)
     page = bs * nkv * c + pad
     buf = torch.full((layer_off + nb * page,), fill, dtype=torch.uint8)
     raw = buf[layer_off:].view(nb, page)
@@ -99,11 +110,13 @@ def make_layer_cache(nb, nkv, bs, hs=HS, nhd=True, pad=0, layer_off=0, fill=0x5A
 def inline_views(kv_cache):
     """TRITON_ATTN / K4 views over the inline layout (TritonAttentionImpl)."""
     from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+    from vllm.v1.kv_cache_interface import KVQuantMode
 
     impl = object.__new__(TritonAttentionImpl)
     impl._k_scale_cache = None
     impl._v_scale_cache = None
-    impl._kv_quant_mode = None
+    impl.head_size = HS
+    impl._kv_quant_mode = KVQuantMode.INT8_PER_TOKEN_HEAD
     impl._ensure_scale_caches(kv_cache)
     padded = kv_cache.shape[-1] // 2
     k, v = kv_cache.transpose(1, 2).split(padded, dim=-1)
@@ -125,7 +138,7 @@ def _spec(block=64, nkv=2):
     )
 
 
-def test_spec_matches_triton_when_on(d2_on):
+def test_spec_matches_triton_when_on(d2_on, pth_layout):
     from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
     from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
 
@@ -134,7 +147,8 @@ def test_spec_matches_triton_when_on(d2_on):
         fa = FlashAttentionBackend.customize_spec(spec)
         tr = TritonAttentionBackend.customize_spec(spec)
         assert fa == tr
-        assert fa.page_size_bytes == block * nkv * 2 * (HS + 4)
+        slot = 544 if pth_layout == "pad16" else 520
+        assert fa.page_size_bytes == block * nkv * slot
     assert FlashAttentionBackend.supports_kv_cache_dtype("int8_per_token_head")
 
 
@@ -196,7 +210,7 @@ def test_split_views_contract(nhd, nkv, bs, pad, off):
 def test_split_views_refuse_bad_layouts():
     # head dims outside the block (LHBNC-like): not block-compact
     nb, nkv, bs = 3, 2, 64
-    c = 2 * (HS + 4)
+    c = 2 * pth_half_bytes(HS)
     buf = torch.zeros(nb * nkv * bs * c, dtype=torch.int8)
     kv = torch.as_strided(buf, (nb, nkv, bs, c), (bs * c, nb * bs * c, c, 1))
     with pytest.raises(ValueError, match="block-compact"):
@@ -209,6 +223,16 @@ def test_split_views_refuse_bad_layouts():
     _, kv = make_layer_cache(3, 2, 64, hs=96)
     with pytest.raises(ValueError, match="64-byte"):
         b70_pth_fa.split_layout_views(kv, 2, 96)
+
+
+@pytest.mark.parametrize("content", [2 * HS, 2 * (HS + 4) + 4, 2 * (HS + 24)])
+def test_split_views_refuse_wrong_content(content):
+    """B70-IP-PAD16: the content width must be a per-token-head cell for this
+    head size (tight or 16-B padded), not a fixed 2 * (D + 4)."""
+    buf = torch.zeros(3 * 2 * 64 * content, dtype=torch.int8)
+    kv = buf.view(3, 64, 2, content).transpose(1, 2)
+    with pytest.raises(ValueError, match="does not match"):
+        b70_pth_fa.split_layout_views(kv, 2, HS)
 
 
 def test_views_cache_follows_runner_reset():
