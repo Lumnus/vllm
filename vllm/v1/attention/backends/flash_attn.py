@@ -1108,8 +1108,6 @@ class FlashAttentionImpl(AttentionImpl):
         # current here, not at forward).
         self._b70_max_model_len = None
         if current_platform.is_xpu():
-            from vllm.config import get_current_vllm_config_or_none
-
             _cfg = get_current_vllm_config_or_none()
             if _cfg is not None and _cfg.model_config is not None:
                 self._b70_max_model_len = _cfg.model_config.max_model_len
