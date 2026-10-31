@@ -127,8 +127,9 @@ def test_tile_map(mod):
     assert seg_end.tolist() == torch.cumsum(counts, 0).tolist()
 
 
+@pytest.mark.parametrize("wload", [0, 1, 2])
 @pytest.mark.parametrize("bm,bn", [(16, 32), (32, 64)])
-def test_grouped_gemm_exact(mod, bm, bn):
+def test_grouped_gemm_exact(mod, bm, bn, wload):
     """Kernel == float64 reference of (int8 A) x (int4 W from the GPTQ words) with both scales."""
     gen = torch.Generator().manual_seed(2)
     e, k, n = 3, 256, 64
@@ -140,7 +141,7 @@ def test_grouped_gemm_exact(mod, bm, bn):
     aq, a_s = mod.quant_rows(x)
     tile_e, tile_r0, seg_end = mod.tile_map(counts, rows + 4, bm)
     out = torch.zeros((rows + 4, n), dtype=torch.float32)
-    mod.grouped_gemm(aq, a_s, w, ws, out, tile_e, tile_r0, seg_end, (bm, bn, 4))
+    mod.grouped_gemm(aq, a_s, w, ws, out, tile_e, tile_r0, seg_end, (bm, bn, 4, 0, wload))
     a_plain = deinterleave_inverse(aq).double()
     start = 0
     for ex, c in enumerate(counts.tolist()):
@@ -155,3 +156,50 @@ def test_grouped_gemm_exact(mod, bm, bn):
         torch.testing.assert_close(out[start:start + c].double(), ref, rtol=2e-6, atol=1e-6)
         start += c
     assert torch.all(out[rows:] == 0)  # rows past the last expert untouched
+
+
+@pytest.mark.parametrize("wload", [0, 1, 2])
+def test_grouped_gemm_dual_silu(mod, wload):
+    """gemm1 + SiLU*up fused (dual accumulators) == the plain kernel followed by SiLU*up."""
+    gen = torch.Generator().manual_seed(3)
+    e, k, inter = 2, 256, 64
+    q, scales, _ = gptq_random(e, k, 2 * inter, gen)
+    w, ws = to_xpu_layout(q, scales)
+    counts = torch.tensor([20, 9], dtype=torch.int32)
+    rows = int(counts.sum())
+    x = torch.randn((rows, k), generator=gen).to(torch.bfloat16)
+    aq, a_s = mod.quant_rows(x)
+    tile_e, tile_r0, seg_end = mod.tile_map(counts, rows, 16)
+    g1 = torch.zeros((rows, 2 * inter), dtype=torch.float32)
+    mod.grouped_gemm(aq, a_s, w, ws, g1, tile_e, tile_r0, seg_end, (16, 32, 4))
+    act = torch.zeros((rows, inter), dtype=torch.float32)
+    mod.grouped_gemm(aq, a_s, w, ws, act, tile_e, tile_r0, seg_end, (16, 32, 4, 0, wload), dual=True)
+    ref = torch.nn.functional.silu(g1[:, :inter]) * g1[:, inter:]
+    torch.testing.assert_close(act, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_gate_and_eligibility(mod, monkeypatch):
+    """Default off; below the token threshold the stock path runs; non-g128 / non-SiLU impls are refused."""
+    from types import SimpleNamespace
+
+    def impl(**kw):
+        d = dict(is_int4=True, activation="silu", gemm1_clamp_limit=None, w13_bias=None, w2_bias=None,
+                 w13=torch.zeros((2, 512, 128), dtype=torch.int8),
+                 gemm1_wei_scales=torch.zeros((2, 512, 2), dtype=torch.bfloat16),
+                 w2=torch.zeros((2, 256, 128), dtype=torch.int8),
+                 gemm2_wei_scales=torch.zeros((2, 256, 2), dtype=torch.bfloat16), inter_size=256)
+        d.update(kw)
+        return SimpleNamespace(**d)
+
+    assert mod.eligible(impl()) is None
+    assert mod.eligible(impl(activation="gelu")) is not None
+    assert mod.eligible(impl(gemm1_wei_scales=torch.zeros((2, 512, 4), dtype=torch.bfloat16))) is not None
+    assert mod.eligible(impl(is_int4=False)) is not None
+    x = torch.zeros((8, 256), dtype=torch.bfloat16)
+    monkeypatch.delenv("B70_MOE_W4A8", raising=False)
+    assert not mod.maybe_apply(impl(), x, x, None, None)
+    monkeypatch.setenv("B70_MOE_W4A8", "1")
+    monkeypatch.setenv("B70_MOE_W4A8_MIN_TOKENS", "64")
+    assert not mod.maybe_apply(impl(), x, x, None, None)  # 8 tokens < 64
+    monkeypatch.setenv("B70_MOE_W4A8_MIN_TOKENS", "1")
+    assert not mod.maybe_apply(impl(activation="gelu"), x, x, None, None)

@@ -6,7 +6,8 @@ The int4 expert weights stay exactly the bytes ``XpuFusedMoe`` holds (GPTQ
 nibble order, signed int4 after ``implement_zp``: byte p of a row holds input
 k = 2p in the low nibble and k = 2p + 1 in the high nibble; bf16 scales
 [E, N, K/128]). No copy, no repack. Activations are quantized per token to
-symmetric int8 (dynamic). The GEMM unpacks int4 -> int8 in registers (exact)
+symmetric int8 (dynamic). The GEMM unpacks int4 -> int8 in registers (exact; each nibble lands as 16x its value, one shift or
+mask per byte, the 1/16 folded into the group scale)
 and runs int8 x int8 -> int32 DPAS per 128-wide K group; each group's int32
 partial sum is scaled by the weight scale of (row of W, group) into an fp32
 accumulator, and the token's activation scale is applied once at the end.
@@ -34,8 +35,12 @@ GROUP = 128
 
 # (BLOCK_M, BLOCK_N, num_warps, large GRF) per GEMM; override with
 # B70_MOE_W4A8_CFG1 / B70_MOE_W4A8_CFG2 = "BM,BN,warps,grf".
-_DEFAULT_CFG1 = (64, 128, 8, 0)
-_DEFAULT_CFG2 = (64, 128, 8, 0)
+# Measured on a B70 at QFN shapes (IP-K, hot set, 4096-token step): WLOAD 2 with 32 x 256 x 8 warps is the
+# fastest; WLOAD 0/1 (an elementwise op on a B-operand int8 tile) compile to a ~50x slower kernel.
+_DEFAULT_CFG1 = (32, 256, 8, 0, 2)
+_DEFAULT_CFG2 = (32, 256, 8, 0, 2)
+# weight tile load scheme (see _b70_w4a8_wtile); a 5th CFG field overrides it per GEMM
+_WLOAD = int(os.environ.get("B70_MOE_W4A8_WLOAD", "2"))
 
 
 def enabled() -> bool:
@@ -44,6 +49,11 @@ def enabled() -> bool:
 
 def min_tokens() -> int:
     return int(os.environ.get("B70_MOE_W4A8_MIN_TOKENS", "64"))
+
+
+def fused_act() -> bool:
+    """gemm1 computes gate and up tiles together and writes silu(gate) * up (B70_MOE_W4A8_FUSED_ACT)."""
+    return os.environ.get("B70_MOE_W4A8_FUSED_ACT", "0") == "1"
 
 
 def uva_enabled() -> bool:
@@ -56,7 +66,8 @@ def _cfg(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
     if not raw:
         return default
     vals = [int(x) for x in raw.split(",")]
-    return tuple(vals + [0] * (4 - len(vals)))
+    vals += [0] * (4 - len(vals))
+    return tuple(vals) if len(vals) > 4 else tuple(vals) + (_WLOAD,)
 
 
 @triton.jit
@@ -111,13 +122,38 @@ def _b70_w4a8_quant_kernel(
 
 
 @triton.jit
+def _b70_w4a8_wtile(W, e_off, KP, NT, n0, g, BN: tl.constexpr, WLOAD: tl.constexpr):
+    """Weight bytes of group g for rows n0..n0+BN as (16 * lo, 16 * hi) int8 tiles: a nibble times 16 is
+    exact in int8 (low: x << 4, high: x & 0xF0), one op each; the caller folds the 1/16 into the scale. WLOAD 0: [64, BN] via a
+    column-major block load; 1: [BN, 64] row-major load, unpacked, transposed in registers to [64, BN];
+    2: [BN, 64] row-major (the caller runs the swapped product)."""
+    if WLOAD == 0:
+        p = tl.make_block_ptr(W + e_off, shape=(KP, NT), strides=(1, KP), offsets=(g * 64, n0),
+                              block_shape=(64, BN), order=(0, 1))
+        pw = tl.load(p)
+        return pw << 4, pw & -16
+    else:
+        p = tl.make_block_ptr(W + e_off, shape=(NT, KP), strides=(KP, 1), offsets=(n0, g * 64),
+                              block_shape=(BN, 64), order=(1, 0))
+        pw = tl.load(p)
+        lo = pw << 4
+        hi = pw & -16
+        if WLOAD == 1:
+            return tl.trans(lo), tl.trans(hi)
+        else:
+            return lo, hi
+
+
+@triton.jit
 def _b70_w4a8_gemm_kernel(
     A, As, W, Ws, Out, tile_e_ptr, tile_r0_ptr, seg_end_ptr,
     N, stride_we, stride_se,
-    K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
+    K: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, DUAL: tl.constexpr, WLOAD: tl.constexpr,
 ):
-    """Out[r, n] = As[r] * sum_g Ws[e, n, g] * sum_{k in g} A[r, k] * W[e, n, k] for the rows r of
-    one expert tile. A int8 [R, K] (groups de-interleaved), W int4 packed [E, N, K/2]."""
+    """DUAL: W holds [gate(N) | up(N)] rows and Out[r, n] = silu(gate) * up (gemm1 + act fused).
+    Otherwise Out[r, n] = As[r] * sum_g Ws[e, n, g] * sum_{k in g} A[r, k] * W[e, n, k] for the rows r of
+    one expert tile. A int8 [R, K] (groups de-interleaved), W int4 packed [E, N, K/2].
+    WLOAD 2 computes the transposed product (W . A^T, rows of W on the M side of the DPAS)."""
     pid_n = tl.program_id(0)
     pid_t = tl.program_id(1)
     e = tl.load(tile_e_ptr + pid_t)
@@ -128,52 +164,98 @@ def _b70_w4a8_gemm_kernel(
     n0 = pid_n * BN
     KP: tl.constexpr = K // 2
     G: tl.constexpr = K // 128
+    NT = (2 if DUAL else 1) * N
+    e_off = e.to(tl.int64) * stride_we
     a_lo = tl.make_block_ptr(A, shape=(r_end, K), strides=(K, 1), offsets=(r0, 0),
                              block_shape=(BM, 64), order=(1, 0))
     a_hi = tl.make_block_ptr(A, shape=(r_end, K), strides=(K, 1), offsets=(r0, 64),
                              block_shape=(BM, 64), order=(1, 0))
-    w_p = tl.make_block_ptr(W + e.to(tl.int64) * stride_we, shape=(KP, N), strides=(1, KP),
-                            offsets=(0, n0), block_shape=(64, BN), order=(0, 1))
     offs_n = n0 + tl.arange(0, BN)
     s_ptr = Ws + e.to(tl.int64) * stride_se + offs_n * G
-    acc = tl.zeros([BM, BN], dtype=tl.float32)
+    su_ptr = s_ptr + N * G
+    if WLOAD == 2:
+        acc = tl.zeros([BN, BM], dtype=tl.float32)
+        acc_u = tl.zeros([BN, BM], dtype=tl.float32)
+    else:
+        acc = tl.zeros([BM, BN], dtype=tl.float32)
+        acc_u = tl.zeros([BM, BN], dtype=tl.float32)
     for g in range(G):
         al = tl.load(a_lo, boundary_check=(0,))
         ah = tl.load(a_hi, boundary_check=(0,))
-        pw = tl.load(w_p)
-        wl = (pw << 4) >> 4  # low nibble, sign-extended: even k
-        wh = pw >> 4  # high nibble (arithmetic shift): odd k
-        part = tl.dot(al, wl, out_dtype=tl.int32)
-        part = tl.dot(ah, wh, acc=part, out_dtype=tl.int32)
-        sc = tl.load(s_ptr + g).to(tl.float32)
-        acc += part.to(tl.float32) * sc[None, :]
+        wl, wh = _b70_w4a8_wtile(W, e_off, KP, NT, n0, g, BN, WLOAD)
+        sc = tl.load(s_ptr + g).to(tl.float32) * 0.0625
+        if WLOAD == 2:
+            alt = tl.trans(al)
+            aht = tl.trans(ah)
+            part = tl.dot(wl, alt, out_dtype=tl.int32)
+            part = tl.dot(wh, aht, acc=part, out_dtype=tl.int32)
+            acc += part.to(tl.float32) * sc[:, None]
+        else:
+            part = tl.dot(al, wl, out_dtype=tl.int32)
+            part = tl.dot(ah, wh, acc=part, out_dtype=tl.int32)
+            acc += part.to(tl.float32) * sc[None, :]
+        if DUAL:
+            ul, uh = _b70_w4a8_wtile(W, e_off, KP, NT, N + n0, g, BN, WLOAD)
+            su = tl.load(su_ptr + g).to(tl.float32) * 0.0625
+            if WLOAD == 2:
+                pu = tl.dot(ul, alt, out_dtype=tl.int32)
+                pu = tl.dot(uh, aht, acc=pu, out_dtype=tl.int32)
+                acc_u += pu.to(tl.float32) * su[:, None]
+            else:
+                pu = tl.dot(al, ul, out_dtype=tl.int32)
+                pu = tl.dot(ah, uh, acc=pu, out_dtype=tl.int32)
+                acc_u += pu.to(tl.float32) * su[None, :]
         a_lo = tl.advance(a_lo, (0, 128))
         a_hi = tl.advance(a_hi, (0, 128))
-        w_p = tl.advance(w_p, (64, 0))
     offs_m = r0 + tl.arange(0, BM)
     asc = tl.load(As + offs_m, mask=offs_m < r_end, other=0.0)
-    acc = acc * asc[:, None]
+    if WLOAD == 2:
+        acc = acc * asc[None, :]
+        if DUAL:
+            acc = acc / (1.0 + tl.exp(-acc)) * (acc_u * asc[None, :])
+        res = tl.trans(acc)
+    else:
+        acc = acc * asc[:, None]
+        if DUAL:
+            acc = acc / (1.0 + tl.exp(-acc)) * (acc_u * asc[:, None])
+        res = acc
     o = tl.make_block_ptr(Out, shape=(r_end, N), strides=(N, 1), offsets=(r0, n0),
                           block_shape=(BM, BN), order=(1, 0))
-    tl.store(o, acc.to(Out.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(o, res.to(Out.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.jit
+def _b70_w4a8_tile_map_kernel(counts_ptr, tile_e_ptr, tile_r0_ptr, seg_end_ptr, n_exp,
+                              BM: tl.constexpr, EP2: tl.constexpr):
+    """Program e: the tiles of expert e (prefix sums over all experts' counts in registers)."""
+    e = tl.program_id(0)
+    offs = tl.arange(0, EP2)
+    c = tl.load(counts_ptr + offs, mask=offs < n_exp, other=0)
+    tiles = (c + BM - 1) // BM
+    sel = offs < e
+    row0 = tl.sum(tl.where(sel, c, 0), 0)
+    t0 = tl.sum(tl.where(sel, tiles, 0), 0)
+    ce = tl.load(counts_ptr + e)
+    tl.store(seg_end_ptr + e, row0 + ce)
+    for i in range(0, (ce + BM - 1) // BM):
+        tl.store(tile_e_ptr + t0 + i, e)
+        tl.store(tile_r0_ptr + t0 + i, row0 + i * BM)
 
 
 def tile_map(rows_per_expert: torch.Tensor, max_rows: int, bm: int):
     """Device-side (no host sync) tile -> (expert, first row) map over expert-contiguous rows.
     Returns tile_e [T] (-1 = idle program), tile_r0 [T], seg_end [E] (int32)."""
-    counts = rows_per_expert.to(torch.int64)
-    n_exp = counts.numel()
-    tiles = (counts + bm - 1) // bm
-    cum = torch.cumsum(tiles, 0)
-    seg_end = torch.cumsum(counts, 0)
+    n_exp = rows_per_expert.numel()
     n_tiles = (max_rows + bm - 1) // bm + n_exp
-    t = torch.arange(n_tiles, device=counts.device, dtype=torch.int64)
-    e = torch.searchsorted(cum, t, right=True)
-    ec = e.clamp(max=n_exp - 1)
-    local = t - (cum - tiles)[ec]
-    r0 = (seg_end - counts)[ec] + local * bm
-    tile_e = torch.where(e < n_exp, ec, torch.full_like(ec, -1))
-    return tile_e.to(torch.int32), r0.to(torch.int32), seg_end.to(torch.int32)
+    dev = rows_per_expert.device
+    tile_e = torch.full((n_tiles,), -1, dtype=torch.int32, device=dev)
+    tile_r0 = torch.empty((n_tiles,), dtype=torch.int32, device=dev)
+    seg_end = torch.empty((n_exp,), dtype=torch.int32, device=dev)
+    _b70_w4a8_tile_map_kernel[(n_exp,)](
+        rows_per_expert, tile_e, tile_r0, seg_end, n_exp,
+        BM=bm, EP2=triton.next_power_of_2(n_exp), num_warps=4,
+    )
+    return tile_e, tile_r0, seg_end
 
 
 def quant_rows(x: torch.Tensor, n_valid: torch.Tensor | None = None, silu_inter: int = 0):
@@ -192,18 +274,24 @@ def quant_rows(x: torch.Tensor, n_valid: torch.Tensor | None = None, silu_inter:
     return xq, xs
 
 
-def grouped_gemm(aq, a_s, w, ws, out, tile_e, tile_r0, seg_end, cfg):
-    """out[R, N] (bf16) for expert-contiguous int8 rows ``aq`` [R, K] and int4 weights ``w`` [E, N, K/2]."""
-    bm, bn, warps, grf = (tuple(cfg) + (0,))[:4]
+def grouped_gemm(aq, a_s, w, ws, out, tile_e, tile_r0, seg_end, cfg, dual=False):
+    """out[R, N] (bf16) for expert-contiguous int8 rows ``aq`` [R, K] and int4 weights ``w`` [E, N, K/2].
+    dual: ``w`` is [E, 2*N', K/2] gate|up and out[R, N'] = silu(gate) * up."""
+    cfg = tuple(cfg)
+    cfg = cfg + (0,) * (4 - len(cfg)) if len(cfg) < 4 else cfg
+    bm, bn, warps, grf, wload = cfg if len(cfg) >= 5 else cfg + (_WLOAD,)
     extra = {"grf_mode": "256"} if grf and os.environ.get("TRITON_INTERPRET") != "1" else {}
     n_exp, n, kp = w.shape
     k = kp * 2
-    assert ws.shape == (n_exp, n, k // GROUP) and n % bn == 0 and aq.shape[1] == k
+    assert ws.shape == (n_exp, n, k // GROUP) and aq.shape[1] == k
+    if dual:
+        n //= 2
+    assert n % bn == 0 and out.shape[1] == n
     grid = (n // bn, tile_e.numel())
     _b70_w4a8_gemm_kernel[grid](
         aq, a_s, w, ws, out, tile_e, tile_r0, seg_end,
         n, w.stride(0), ws.stride(0),
-        K=k, BM=bm, BN=bn, num_warps=warps, **extra,
+        K=k, BM=bm, BN=bn, DUAL=dual, WLOAD=wload, num_warps=warps, **extra,
     )
     return out
 
@@ -262,10 +350,16 @@ def apply(impl, output, hidden_states, topk_weights, topk_ids, expert_map=None) 
     cfg2 = _cfg("B70_MOE_W4A8_CFG2", _DEFAULT_CFG2)
     tile_e, tile_r0, seg_end = tile_map(rows_per_expert, n_moe, cfg1[0])
     inter = impl.inter_size
-    g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
-    grouped_gemm(remapped.view(torch.int8), remapped_scales.view(-1), impl.w13,
-                 impl.gemm1_wei_scales, g1, tile_e, tile_r0, seg_end, cfg1)
-    aq2, as2 = quant_rows(g1, seg_end[-1:], silu_inter=inter)
+    if fused_act() and inter % cfg1[1] == 0:
+        act = torch.empty((n_moe, inter), dtype=output.dtype, device=dev)
+        grouped_gemm(remapped.view(torch.int8), remapped_scales.view(-1), impl.w13,
+                     impl.gemm1_wei_scales, act, tile_e, tile_r0, seg_end, cfg1, dual=True)
+        aq2, as2 = quant_rows(act, seg_end[-1:])
+    else:
+        g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
+        grouped_gemm(remapped.view(torch.int8), remapped_scales.view(-1), impl.w13,
+                     impl.gemm1_wei_scales, g1, tile_e, tile_r0, seg_end, cfg1)
+        aq2, as2 = quant_rows(g1, seg_end[-1:], silu_inter=inter)
     if cfg2[0] != cfg1[0]:
         tile_e, tile_r0, seg_end = tile_map(rows_per_expert, n_moe, cfg2[0])
     g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
