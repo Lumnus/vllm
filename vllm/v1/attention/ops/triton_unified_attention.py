@@ -1031,12 +1031,16 @@ def unified_attention(
     use_td_qo = use_td and _is_pow2_nq and _is_pow2_hs
 
     # B70-IP-K1: per-token-head KV caches pack one fp32 scale after each
-    # head's data ([K(hs) | s | V(hs) | s] per slot), so the K/V row pitch and
-    # the V base are not 16-byte aligned (hs=256 int8: pitch 520 B, V at
-    # +260 B).  Xe2 2D block reads (tensor descriptors) need an aligned base
-    # and pitch and return wrong data otherwise (measured on B70: cos 0.22
-    # against an fp32 reference, 0.9998 with the pointer path).  Use the
-    # pointer path for K/V loads in these modes; Q/O descriptors stay.
+    # head's data ([K(hs) | s | pad | V(hs) | s | pad] per slot).  Xe2 2D
+    # block reads (tensor descriptors) need a 64-byte surface base and a
+    # 16-byte pitch and return wrong data otherwise (measured on B70 with the
+    # tight 520-B slot, V at +260 B: cos 0.22 against an fp32 reference,
+    # 0.9998 with the pointer path).  B70-IP-PAD16 (vllm#62113) pads each half
+    # to 16 B: hs=256 int8 is a 544-B pitch with V at +272 B.  The pitch is
+    # now 16-B aligned, but the per-(block, head) descriptor base is not 64-B
+    # aligned for V (+272 = 16 mod 64) nor, in NHD, for K of odd heads
+    # (544 = 32 mod 64), so the guard stays: pointer path for K/V loads in
+    # these modes (now 16-B vectorizable), Q/O descriptors stay.
     # B70_PTH_TD_GUARD=0 restores the old behaviour (A/B only).
     if (
         use_td

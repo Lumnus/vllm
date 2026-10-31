@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
@@ -47,6 +48,59 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+
+# B70-IP-PAD16: the one definition of the per-token-head slot half. Every
+# reader and writer of the inline layout (TRITON_ATTN, the QSA kernels and
+# fused writer, the B70-IP-D2 split views, the K4 dequant) derives its offsets
+# from this or from the cache tensor's content width, never from 2 * (D + 4).
+PTH_SCALE_BYTES = 4
+PTH_HALF_ALIGN = 16
+
+
+def pth_pad16_enabled() -> bool:
+    """B70_PTH_PAD16 (default 1): the vllm#62113 16-byte K/V halves. 0 packs
+    the halves tight again (data + scale), for an A/B of pool vs speed only."""
+    return os.environ.get("B70_PTH_PAD16", "1") != "0"
+
+
+def pth_half_bytes(
+    head_size: int,
+    dtype_size: int = 1,
+    kv_quant_mode: KVQuantMode = KVQuantMode.INT8_PER_TOKEN_HEAD,
+) -> int:
+    """Bytes of one K (or V) half of a per-token-head slot: the head's data,
+    its fp32 scale, then zero or more pad bytes. ``head_size`` is the logical
+    head size (INT4 packs two per byte)."""
+    data = (
+        head_size // 2
+        if kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD
+        else (head_size * dtype_size)
+    )
+    align = 1
+    if kv_quant_mode != KVQuantMode.INT4_PER_TOKEN_HEAD and pth_pad16_enabled():
+        align = PTH_HALF_ALIGN
+    return round_up(data + PTH_SCALE_BYTES, align)
+
+
+def pth_half_ok(half_bytes: int, data_bytes: int) -> bool:
+    """A cache's per-token-head half width fits a ``data_bytes`` head: room for
+    data + the fp32 scale, a 4-byte aligned scale, and no more padding than
+    either layout (tight or 16-B) produces."""
+    need = data_bytes + PTH_SCALE_BYTES
+    return (
+        need <= half_bytes < need + PTH_HALF_ALIGN
+        and half_bytes % PTH_SCALE_BYTES == 0
+        and data_bytes % PTH_SCALE_BYTES == 0
+    )
+
+
+def pth_check_half(half_bytes: int, data_bytes: int) -> None:
+    if not pth_half_ok(half_bytes, data_bytes):
+        raise ValueError(
+            f"per-token-head KV half {half_bytes} B does not fit a {data_bytes} B "
+            f"head + {PTH_SCALE_BYTES} B scale (tight or {PTH_HALF_ALIGN}-B padded)"
+        )
 
 
 # constants
@@ -288,15 +342,12 @@ class TritonAttentionBackend(AttentionBackend):
         mode = spec.kv_quant_mode
         if spec.state_content_bytes is not None or not mode.is_per_token_head:
             return spec
-        hs_k, hs_v = spec.head_size, spec.head_size_v
-        align = 16
-        if mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
-            hs_k, hs_v = hs_k // 2, hs_v // 2
-            align = 1
-        scale_bytes = get_dtype_size(torch.float32)
+        # B70-IP-PAD16: one definition (pth_half_bytes) for every reader;
+        # B70_PTH_PAD16=0 drops the 16-B pad (A/B only).
         dtype_size = get_dtype_size(spec.dtype)
         content = sum(
-            round_up(hs * dtype_size + scale_bytes, align) for hs in (hs_k, hs_v)
+            pth_half_bytes(hs, dtype_size, mode)
+            for hs in (spec.head_size, spec.head_size_v)
         )
         return replace(spec, state_content_bytes=content)
 
@@ -416,6 +467,8 @@ class TritonAttentionImpl(AttentionImpl):
         hs = self.head_size
         if self._kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
             hs //= 2
+        # B70-IP-PAD16: the cache's half must fit this head (tight or padded).
+        pth_check_half(padded_hs * dtype_sz, hs * dtype_sz)
 
         raw = kv_cache.untyped_storage()
         base_f32 = torch.tensor([], dtype=torch.float32, device=kv_cache.device).set_(
