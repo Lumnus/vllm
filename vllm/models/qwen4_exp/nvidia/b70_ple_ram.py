@@ -79,6 +79,8 @@ class Qwen4ExpPLEInt8RAMEmbedding(Qwen4ExpPLEInt8NVMeEmbedding):
         super().__init__(*args, **kwargs)
         self._table = None
         self._slab_tensors: list[torch.Tensor] = []
+        self._devgather = None  # B70-V7-PLEG
+        self._pleg_checked = False
 
     def _pinned_slab(self, rows: int, row_bytes: int) -> np.ndarray:
         t = torch.empty(rows, row_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
@@ -152,6 +154,44 @@ class Qwen4ExpPLEInt8RAMEmbedding(Qwen4ExpPLEInt8NVMeEmbedding):
             "rows [%d, %d), %s", rank, table.num_rows, pinned / 2**30, loaded_s, alloc_s,
             info["gbps"], "" if info["direct"] else " buffered", info["slabs"], check_s,
             self._own_heads.tolist(), tp_start, tp_end, path)
+        from . import b70_ple_devgather
+
+        if b70_ple_devgather.enabled():
+            self._devgather = b70_ple_devgather.DeviceGather(
+                self._slab_tensors, table.bounds, tp_start, tp_end, self._storage)
+            b70_ple_devgather.log_once(
+                f"rank {rank}, {len(self._slab_tensors)} slabs, rows [{tp_start}, {tp_end}), "
+                f"{self._storage} B/row; prepare_inputs no longer syncs for PLE")
+
+    # -- B70-V7-PLEG: device producer ------------------------------------
+    def device_fill(self, ids: torch.Tensor, query_start_loc: torch.Tensor,
+                    out: torch.Tensor | None = None) -> None:
+        """In-forward producer: rows of ``ids`` [T, heads] into the packed buffer."""
+        if out is None:
+            out = self._prefetch_buffer[: ids.shape[0]]
+        self._devgather(ids, query_start_loc, out)
+
+    def prepare_device(self, num_tokens_padded: int) -> None:
+        """B70-V7-PLEG bookkeeping for the consumer: no host work, no copy."""
+        self._check_capacity(num_tokens_padded)
+        self._prepared_tokens = num_tokens_padded
+
+    def check_device_gather(self, ids_dev: torch.Tensor, query_start_loc: torch.Tensor,
+                            num_tokens_padded: int) -> None:
+        """Once, on the first real step after ``prepare`` filled the stage on the host:
+        the device ids + gather must reproduce the stage bytes exactly."""
+        self._pleg_checked = True
+        tmp = torch.empty_like(self._prefetch_buffer[:num_tokens_padded])
+        self.device_fill(ids_dev, query_start_loc, tmp)
+        got = tmp.cpu()
+        want = self._stage[:num_tokens_padded]
+        bad = int((got != want).any(dim=-1).sum())
+        if bad:
+            raise RuntimeError(
+                f"B70-V7-PLEG device PLE gather differs from the host stage in {bad} of "
+                f"{num_tokens_padded * self._heads} (token, head) slots")
+        logger.info("B70-V7-PLEG check: device ids + gather equal the host stage "
+                    "(%d tokens x %d heads)", num_tokens_padded, self._heads)
 
     def _fill_stage(self, ids: np.ndarray, num_tokens: int, num_padded: int) -> None:
         stage = self._stage_np
