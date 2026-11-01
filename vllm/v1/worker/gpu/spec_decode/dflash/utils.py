@@ -56,6 +56,9 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     # no .model of its own.
     target_inner = getattr(target_language_model, "model", target_language_model)
     draft_inner = dflash_model.model
+    # B70-V7-KV8: needs the quant methods' processed weights, so after get_model.
+    if hasattr(draft_inner, "build_int8_context_kv"):
+        draft_inner.build_int8_context_kv()
 
     maybe_share_target_embed(dflash_model, draft_inner, target_inner)
 
