@@ -162,6 +162,13 @@ class LinearMethodBase(QuantizeMethodBase):
         raise NotImplementedError
 
 
+# B70-V2-AR: linear methods whose apply() returns a freshly allocated output (or a
+# view of one), so RowParallelLinear may all-reduce it in place (B70_AR_INPLACE=1).
+_B70_AR_OWNED_METHODS = frozenset(
+    {"UnquantizedLinearMethod", "B70Int8DenseMethod", "CompressedTensorsLinearMethod"}
+)
+
+
 class UnquantizedLinearMethod(LinearMethodBase):
     """Linear method without quantization."""
 
@@ -1785,7 +1792,15 @@ class RowParallelLinear(LinearBase):
         output_parallel = self.quant_method.apply(self, input_parallel, bias_)
 
         if self.reduce_results and self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output_parallel)
+            if type(self.quant_method).__name__ in _B70_AR_OWNED_METHODS:
+                # B70-V2-AR: a fresh GEMM output that nothing else holds.
+                from vllm.distributed.communication_op import (
+                    tensor_model_parallel_all_reduce_owned,
+                )
+
+                output = tensor_model_parallel_all_reduce_owned(output_parallel)
+            else:
+                output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
 
