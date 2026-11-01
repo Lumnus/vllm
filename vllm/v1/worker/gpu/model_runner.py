@@ -1668,6 +1668,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Draft logits are needed for probabilistic rejection sampling.
                 self.speculator.draft_logits,
                 invalid_drafts,
+                getattr(
+                    getattr(self.speculator, "candidate_sampler", None),
+                    "cached_candidate_ids",
+                    None,
+                ),
             )
 
         if shard_metadata is not None:
