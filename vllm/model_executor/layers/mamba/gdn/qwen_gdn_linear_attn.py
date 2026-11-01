@@ -24,6 +24,7 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
+from vllm.model_executor.layers import b70_i8_producer as b70_pq
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -947,6 +948,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         The RMSNormGated + quant sequence is eligible for fusion
         by the compilation pass when fuse_norm_quant is enabled.
         """
+        if (
+            b70_pq.site_on("gdn_out")
+            and core_attn_out.dim() == 3
+            and core_attn_out.dtype == torch.bfloat16
+            and self.norm.norm_before_gate
+            and self.norm.group_size is None
+            and self.norm.bias is None
+            and self.norm.activation in ("silu", "swish", "sigmoid")
+            and core_attn_out.shape[-1] == self.norm.weight.numel()
+            and b70_pq.consumer_is_w1(self.out_proj)
+            and b70_pq.emits("gdn_out", core_attn_out.shape[0])
+        ):
+            # B70-K2: gated RMSNorm writes out_proj's int8 rows in the same kernel.
+            y, xq, xs = b70_pq.gated_rmsnorm_quant(
+                core_attn_out, z, self.norm.weight, self.norm.eps, self.norm.activation
+            )
+            output, _ = self.out_proj(b70_pq.attach(y, xq, xs, "gdn_out"))
+            return output
         core_attn_out = self.norm(core_attn_out, z)
         output, _ = self.out_proj(core_attn_out.flatten(-2))
         return output

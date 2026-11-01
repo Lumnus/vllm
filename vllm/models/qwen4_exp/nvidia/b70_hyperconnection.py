@@ -31,6 +31,7 @@ from torch import nn
 
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
+from vllm.model_executor.layers import b70_i8_producer as b70_pq
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
@@ -48,6 +49,11 @@ from .ops.hc import (
     hc_combine_norm,
     hc_gate_mix,
     hc_silu,
+)
+from .ops.hc_i8 import (
+    hc_gate_mix_quant,
+    hc_silu_quant,
+    parallel_hc_gemm_silu_quant,
 )
 
 logger = init_logger(__name__)
@@ -316,7 +322,28 @@ class GatedResidual(nn.Module):
             from vllm_xpu_kernels.astra_structural import hc_up_mix
 
             return hc_up_mix(lora, self._astra_hc_up_weight, normalized)
-        return hc_gate_mix(normalized, self.input_mix_weight_up(lora), self.hc_count)
+        gate = self.input_mix_weight_up(lora)
+        if (
+            self.__dict__.get("_b70_i8_block", False)
+            and normalized.dtype == torch.bfloat16
+            and b70_pq.emits("hc_block", normalized.shape[0])
+        ):
+            # B70-K2: the gated mix also writes the block input's int8 rows for its
+            # W1 consumer (in_proj_qkvz / qkv_proj); the bf16 output is unchanged.
+            block_input, xq, xs = hc_gate_mix_quant(normalized, gate, self.hc_count)
+            return b70_pq.attach(block_input, xq, xs, "hc_block")
+        return hc_gate_mix(normalized, gate, self.hc_count)
+
+    def _i8_lora_emits(self, xn: torch.Tensor) -> bool:
+        """B70-K2: the HC up GEMM is W1 int8 and not the astra BF16 fused up."""
+        rows = xn.shape[0]
+        return (
+            b70_pq.site_on("hc_up")
+            and xn.dtype == torch.bfloat16
+            and not (self._astra_hc_up_weight is not None and 1 <= rows <= 8)
+            and b70_pq.consumer_is_w1(self.input_mix_weight_up)
+            and b70_pq.emits("hc_up", rows)
+        )
 
     def _down_gemm(self, xn: torch.Tensor) -> torch.Tensor:
         """Use ordered DFlash2 projection or the legacy target-only policy."""
@@ -385,9 +412,15 @@ class GatedResidual(nn.Module):
                         "B70-V2-HC: hc_silu fused into the parallel HC down finish "
                         "(B70_HC_SILU_FUSE=1)"
                     )
-                down, lora = parallel_hc_gemm_silu(
-                    xn, linear.weight, valid, self.lora_rank, self.hc_count
-                )
+                if self._i8_lora_emits(xn):
+                    down, lora, xq, xs = parallel_hc_gemm_silu_quant(
+                        xn, linear.weight, valid, self.lora_rank, self.hc_count
+                    )
+                    b70_pq.attach(lora, xq, xs, "hc_up")
+                else:
+                    down, lora = parallel_hc_gemm_silu(
+                        xn, linear.weight, valid, self.lora_rank, self.hc_count
+                    )
                 if self.use_combine:
                     injection = down[:, self.lora_rank : self.lora_rank + self.hc_count]
                     return lora, injection
@@ -400,6 +433,9 @@ class GatedResidual(nn.Module):
         else:
             lora = self._down_gemm(xn)
             injection = None
+        if self._i8_lora_emits(xn):
+            silu, xq, xs = hc_silu_quant(lora, self.hc_count)
+            return b70_pq.attach(silu, xq, xs, "hc_up"), injection
         return hc_silu(lora, self.hc_count), injection
 
     def mix(

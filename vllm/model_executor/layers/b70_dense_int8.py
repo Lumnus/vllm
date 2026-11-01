@@ -30,6 +30,11 @@ B70-K1 small-M kernels (needs the v7 vllm_xpu_kernels wheel; default off):
                                       GEMM, s8 x s8 DPAS). Missing ops -> W1 path.
   B70_DENSE_INT8_FUSED_MAX_M=<n>      default 64 (the fused op's ceiling)
   B70_DENSE_INT8_W8A16_MAX_M=<n>      default 8 (0 = fused W8A8 only)
+
+B70-K2 producer quant (b70_i8_producer, B70_I8_PRODUCER_QUANT=1): when the
+producing kernel already wrote x's int8 rows and per-token scales, apply()
+skips the quant and runs b70_int8_dense_mm_q (K1 b70_w8a8_gemm for small M,
+else this module's GEMMs on the same int8 rows).
   To reach the shared expert and in_proj_ba, also lower
   B70_DENSE_INT8_MIN_PARAMS (e.g. 0) and drop in_proj_ba from B70_DENSE_INT8_EXCLUDE.
 """
@@ -40,6 +45,7 @@ import re
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers import b70_i8_producer
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -160,6 +166,19 @@ class B70Int8DenseMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        pq = b70_i8_producer.take(x) if b70_i8_producer.ENABLED else None
+        if pq is not None:
+            # B70-K2: the producer already wrote x's int8 rows and scales.
+            out = torch.ops.vllm.b70_int8_dense_mm_q(
+                pq[0],
+                pq[1],
+                layer.weight,
+                layer.b70_int8_scale,
+                bias,
+                self.triton_max_m,
+                b70_i8_producer.layer_takes_k1(layer),
+            )
+            return out.view(*x.shape[:-1], layer.weight.shape[0])
         x_2d = x.reshape(-1, x.shape[-1])
         out = torch.ops.vllm.b70_int8_dense_mm(
             x_2d, layer.weight, layer.b70_int8_scale, bias, self.triton_max_m

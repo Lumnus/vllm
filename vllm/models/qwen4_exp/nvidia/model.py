@@ -18,6 +18,7 @@ from vllm.forward_context import get_forward_context, is_forward_context_availab
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
 )
+from vllm.model_executor.layers import b70_i8_producer as b70_pq
 from vllm.model_executor.layers.fusion.mm_input_norm import build_mm_input_norm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -345,6 +346,21 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     query_start_loc,
                     ngram_context,
                 )
+
+        if (
+            b70_pq.ENABLED
+            and "_b70_i8_block" not in attn_hc.__dict__
+            and not torch.compiler.is_compiling()
+        ):
+            # B70-K2: decided once, after load (W1 converts at load time): does the
+            # block input feed a W1 int8 linear the HC gate mix can quantize for?
+            if self.layer_type == "linear_attention":
+                consumer = getattr(self.linear_attn, "in_proj_qkvz", None)
+            else:
+                consumer = getattr(self.self_attn, "qkv_proj", None)
+            attn_hc._b70_i8_block = (
+                b70_pq.consumer_is_w1(consumer) and not self.use_hc_sequence_parallel
+            )
 
         # Fuse a pending combine with this HC module's mix when possible.
         if prev_block_output is not None:
