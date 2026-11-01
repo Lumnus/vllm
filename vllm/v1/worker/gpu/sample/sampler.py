@@ -20,6 +20,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+from vllm.v1.worker.gpu.sample import b70_sampler_fast as b70sm
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
@@ -91,9 +92,9 @@ class Sampler:
 
             self.cjk_mask = CjkMaskState(vllm_config, max_num_reqs, vocab_size, device)
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
-        # Whether processing may leave -inf in a request's logits (filters,
-        # forcing, logits processors) rather than only scale them.
-        self.may_mask_logits = np.zeros(max_num_reqs, dtype=bool)
+        # B70-SM: requests that need more than temperature / top-k / top-p / min-p
+        # (bias, penalties, bad words, thinking budget, custom processors).
+        self.needs_other_processing = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -106,12 +107,11 @@ class Sampler:
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
         needs_processing = self.sampling_states.add_request(req_idx, sampling_params)
-        may_mask = self.sampling_states.masks_logits(req_idx)
-        may_mask |= self.thinking_budget_state.add_request(req_idx, sampling_params)
+        needs_other = self.thinking_budget_state.add_request(req_idx, sampling_params)
         for processor in self.logits_processors:
-            may_mask |= processor.add_request(req_idx, sampling_params)
-        self.needs_logits_processing[req_idx] = needs_processing or may_mask
-        self.may_mask_logits[req_idx] = may_mask
+            needs_other |= processor.add_request(req_idx, sampling_params)
+        self.needs_other_processing[req_idx] = needs_other
+        self.needs_logits_processing[req_idx] = needs_processing | needs_other
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.cjk_mask is not None:
@@ -243,8 +243,14 @@ class Sampler:
         expanded_local_pos: torch.Tensor,
         seq_lens_upper_bound_np: np.ndarray,
         skip_top_k_top_p: bool = False,
+        b70_fast: bool = False,
     ) -> torch.Tensor:
-        if not np.any(self.needs_logits_processing[idx_mapping_np]):
+        if b70_fast:
+            # B70-SM: temperature, min-p, top-k and top-p are applied by the
+            # top-k-first kernels; only the other processors run here.
+            if not np.any(self.needs_other_processing[idx_mapping_np]):
+                return logits
+        elif not np.any(self.needs_logits_processing[idx_mapping_np]):
             return logits
 
         # Copy logits to a new FP32 tensor.
@@ -268,6 +274,9 @@ class Sampler:
         # or weaken it by scaling.
         self.thinking_budget_state.apply(logits, ctx)
 
+        if b70_fast:
+            return logits
+
         # Apply temperature in place.
         self.sampling_states.apply_temperature(
             logits, expanded_idx_mapping, idx_mapping_np
@@ -284,6 +293,18 @@ class Sampler:
             logits, expanded_idx_mapping, idx_mapping_np
         )
 
+    def _b70_fast_plain_ok(
+        self, logits: torch.Tensor, idx_mapping_np: np.ndarray, return_logprobs: bool
+    ) -> bool:
+        return (
+            not self.return_sampling_mask
+            and not self.use_fp64_gumbel
+            and not (return_logprobs and self.logprobs_mode in PROCESSED_LOGPROBS_MODES)
+            and logits.ndim == 2
+            and logits.stride(-1) == 1
+            and self.trace_replay_state is None
+        )
+
     def sample(
         self,
         logits: torch.Tensor,
@@ -296,6 +317,37 @@ class Sampler:
         seq_lens_upper_bound_np: np.ndarray,
         return_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if b70sm.enabled() and self._b70_fast_plain_ok(
+            logits, idx_mapping_np, return_logprobs
+        ):
+            kmax = b70sm.batch_params(
+                self.sampling_states, idx_mapping_np, logits.shape[-1]
+            )
+            if kmax is not None:
+                b70sm._log_once(
+                    "plain",
+                    "plain sampler: top-k-first support "
+                    f"(kmax={kmax}, KP={b70sm._kp(kmax)}, tile={b70sm.BLOCK}) active",
+                )
+                fast_logits = self.apply_sampling_params(
+                    logits,
+                    expanded_idx_mapping,
+                    idx_mapping,
+                    idx_mapping_np,
+                    pos,
+                    input_ids,
+                    expanded_local_pos,
+                    seq_lens_upper_bound_np,
+                    b70_fast=True,
+                )
+                sampled = b70sm.fast_sample(
+                    fast_logits,
+                    expanded_idx_mapping,
+                    self.sampling_states,
+                    pos,
+                    kmax,
+                )
+                return sampled, fast_logits
         processed_logits = self.apply_sampling_params(
             logits,
             expanded_idx_mapping,

@@ -16,6 +16,7 @@ from vllm.v1.worker.gpu.input_batch import (
     get_num_sampled_and_rejected,
 )
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
+from vllm.v1.worker.gpu.sample import b70_sampler_fast as b70sm
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -426,11 +427,77 @@ class RejectionSampler:
         )
         return sampled, num_sampled, logprobs_tensors, sampling_mask_tensors
 
+    def _b70_try_fast(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+        draft_logits: DraftLogitsCache | None,
+        draft_candidate_ids: torch.Tensor | None,
+        draft_sampled: torch.Tensor,
+        pos: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """B70-SM: top-k-first verification. None means run the stock path."""
+        s = self.sampler
+        if (
+            draft_logits is None
+            or draft_candidate_ids is None
+            # A sharded cache (batch-sharded sampling) verifies per owner rank.
+            or draft_logits.row_mapping is not None
+            or self.use_block_verification
+            or self.synthetic_conditional_rates is not None
+            or self.watermark_key is not None
+            or self.enable_adaptive_verification
+            or s.use_fp64_gumbel
+            or s.return_sampling_mask
+            or logits.ndim != 2
+            or logits.stride(-1) != 1
+            or draft_logits.values.stride(-1) != 1
+            or logits.shape[0] > get_max_chunk_logits(logits.shape[1])
+        ):
+            return None
+        idx_np = input_batch.idx_mapping_np
+        if s.get_logprobs_dims(idx_np) is not None:
+            return None
+        kmax = b70sm.batch_params(s.sampling_states, idx_np, logits.shape[1])
+        if kmax is None:
+            return None
+        b70sm._log_once(
+            "reject",
+            "rejection sampler: top-k-first verify "
+            f"(kmax={kmax}, KP={b70sm._kp(kmax)}, tile={b70sm.BLOCK}, "
+            f"draft candidates={draft_candidate_ids.shape[-1]}) active",
+        )
+        processed = s.apply_sampling_params(
+            logits,
+            input_batch.expanded_idx_mapping,
+            input_batch.idx_mapping,
+            idx_np,
+            pos,
+            draft_sampled,
+            input_batch.expanded_local_pos,
+            input_batch.seq_lens_cpu_upper_bound.numpy(),
+            b70_fast=True,
+        )
+        return b70sm.fast_reject(
+            processed,
+            draft_logits.values,
+            draft_candidate_ids,
+            draft_sampled,
+            pos,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            input_batch.expanded_idx_mapping,
+            s.sampling_states,
+            self.num_speculative_steps,
+            kmax,
+        )
+
     def __call__(
         self,
         logits: torch.Tensor,
         input_batch: InputBatch,
         draft_logits: DraftLogitsCache | None = None,
+        draft_candidate_ids: torch.Tensor | None = None,
     ) -> SamplerOutput:
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
@@ -445,22 +512,37 @@ class RejectionSampler:
             self.sampler.req_states.prefill_len.gpu,
         )
 
-        logprobs_dims = self.sampler.get_logprobs_dims(input_batch.idx_mapping_np)
-        chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
-        (
-            sampled,
-            num_sampled,
-            logprobs_tensors,
-            sampling_mask_tensors,
-        ) = self._verify_in_chunks(
-            logits,
-            input_batch,
-            draft_logits,
-            draft_sampled,
-            pos,
-            chunk_logit_limit,
-            logprobs_dims,
-        )
+        fast = None
+        if b70sm.enabled():
+            fast = self._b70_try_fast(
+                logits,
+                input_batch,
+                draft_logits,
+                draft_candidate_ids,
+                draft_sampled,
+                pos,
+            )
+        if fast is not None:
+            sampled, num_sampled = fast
+            logprobs_tensors = None
+            sampling_mask_tensors = None
+        else:
+            logprobs_dims = self.sampler.get_logprobs_dims(input_batch.idx_mapping_np)
+            chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
+            (
+                sampled,
+                num_sampled,
+                logprobs_tensors,
+                sampling_mask_tensors,
+            ) = self._verify_in_chunks(
+                logits,
+                input_batch,
+                draft_logits,
+                draft_sampled,
+                pos,
+                chunk_logit_limit,
+                logprobs_dims,
+            )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
