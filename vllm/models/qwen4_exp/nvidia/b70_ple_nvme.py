@@ -22,6 +22,12 @@ B70_PLE_INT8_PATH), B70_PLE_INT8_NVME_CACHE_GIB (total over ranks, default 8),
 B70_PLE_INT8_NVME_IO_THREADS, B70_PLE_INT8_NVME_READER, B70_PLE_INT8_NVME_STATS,
 B70_PLE_INT8_NVME_STATS_S, B70_PLE_INT8_NVME_BOOT_SAMPLE, PLE_TABLE_PATH (BF16
 cross-check, optional), B70_PLE_INT8_CROSSCHECK, B70_PLE_INT8_MAX_REL_ERR.
+
+B70-PLE-PRELOAD: B70_PLE_INT8_NVME_PRELOAD=1 (default 0) reads the rank's whole
+owned row range into the pinned cache at boot when the cache holds it
+(``ple_nvme.preload_cache``; B70_PLE_INT8_NVME_PRELOAD_THREADS,
+B70_PLE_INT8_NVME_PRELOAD_CHUNK_MIB); the boot sample rows are then compared
+byte for byte against the preloaded slab.
 """
 
 import json
@@ -141,7 +147,7 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
 
         from .ple_nvme import (PleNvmeRowStore, PleNvmeServer, PleNvmeStats,
                                PleRowCache, cache_rows_per_rank, owned_heads,
-                               safetensors_tensor_location)
+                               preload_cache, safetensors_tensor_location)
 
         if self._server is not None:
             raise RuntimeError("B70 PLE NVMe rejects reload")
@@ -177,10 +183,12 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
                 raise ValueError(f"INT8 PLE {path} disagrees with {ref_path}: {rel:.4f} > {lim}")
             del ref
         sample = int(os.environ.get("B70_PLE_INT8_NVME_BOOT_SAMPLE", "65536"))
+        own = own_bytes = None
         if sample > 0 and tp_end > tp_start:
             g = torch.Generator().manual_seed(20260929 + tp_start)
             own = torch.unique(torch.randint(tp_start, tp_end, (sample,), generator=g)).numpy()
-            sc = torch.from_numpy(store.read_rows(own))[:, dim:].contiguous().view(torch.float32)
+            own_bytes = store.read_rows(own)
+            sc = torch.from_numpy(own_bytes)[:, dim:].contiguous().view(torch.float32)
             if not bool(torch.isfinite(sc).all()) or bool((sc < 0).any()):
                 raise ValueError(f"INT8 PLE {path}: non-finite or negative row scale")
         sizes = owner.ngram_heads_vocab_sizes.detach().cpu().numpy()
@@ -197,6 +205,18 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
         self._slab_np = slab.numpy()
         cache = PleRowCache(tp_end - tp_start, capacity, self._storage, slab=self._slab_np)
         rank = get_tp_group().rank_in_group
+        preloaded = None
+        if os.environ.get("B70_PLE_INT8_NVME_PRELOAD", "0") == "1":
+            preloaded = preload_cache(
+                cache, store, tp_start, rank=rank,
+                threads=int(os.environ.get("B70_PLE_INT8_NVME_PRELOAD_THREADS", "4")),
+                chunk_bytes=int(float(os.environ.get(
+                    "B70_PLE_INT8_NVME_PRELOAD_CHUNK_MIB", "64")) * (1 << 20)))
+            # The O_DIRECT row reads of the boot sample vs the bulk preload.
+            if (preloaded is not None and own is not None
+                    and not np.array_equal(self._slab_np[own - tp_start], own_bytes)):
+                raise ValueError(f"INT8 PLE {path}: preloaded rows differ from row reads "
+                                 f"(rank {rank}, {own.shape[0]} sampled rows)")
         stats = PleNvmeStats(rank, float(os.environ.get("B70_PLE_INT8_NVME_STATS_S", "60")),
                              os.environ.get("B70_PLE_INT8_NVME_STATS", "0") == "1")
         self._server = PleNvmeServer(
@@ -205,9 +225,9 @@ class Qwen4ExpPLEInt8NVMeEmbedding(Qwen4ExpPLEPinnedHostEmbedding):
             sizes=sizes, offsets=offsets, eos_token_id=owner.eos_token_id,
             heads_per_ngram=owner.heads_per_ngram, cache=cache, store=store, stats=stats)
         logger.info("B70 PLE NVMe ready (rank %d, %s): cache %d rows (%.2f GiB pinned), "
-                    "own heads %s, rows [%d, %d), stage %d tokens", rank, path, capacity,
+                    "own heads %s, rows [%d, %d), stage %d tokens%s", rank, path, capacity,
                     capacity * self._storage / 2**30, self._own_heads.tolist(), tp_start,
-                    tp_end, self._capacity)
+                    tp_end, self._capacity, ", preloaded" if preloaded is not None else "")
 
     # -- producer (host, before forward / FULL replay) ---------------------
     def _check_capacity(self, num_tokens: int) -> None:
