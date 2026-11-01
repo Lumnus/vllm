@@ -344,13 +344,40 @@ def _capturing() -> bool:
         return False
 
 
+_dfa_swa_logged = False
+
+
+def draft_swa_enabled() -> bool:
+    """B70-V7-DFA: a non-causal sliding-window block (the DFlash drafter,
+    window 2048) may take the INT8 decode route (B70_DRAFT_FA_INT8=1)."""
+    return os.environ.get("B70_DRAFT_FA_INT8", "0") == "1"
+
+
 def _noncausal_rows_decode(
-    query, key_cache, value_cache, k_scale, v_scale, output, attn_metadata, impl
+    query,
+    key_cache,
+    value_cache,
+    k_scale,
+    v_scale,
+    output,
+    attn_metadata,
+    impl,
+    window_left: int = -1,
 ) -> None:
     """Non-causal small-q rows (DFlash draft blocks): every query row attends
     to its request's whole context, i.e. one q_len-1 decode row each. Graph-safe
     (no host sync); padded rows past query_start_loc[-1] read one slot of block 0
-    and are zeroed."""
+    and are zeroed.
+
+    B70-V7-DFA: ``window_left >= 0`` (a symmetric non-causal window ``(w, w)``)
+    gives every row the keys ``[seq_len - 1 - w, seq_len - 1]``, i.e. the
+    window measured from the block's last row. TRITON_ATTN measures it from
+    each row (``|q_pos - k_pos| <= w``), so a row ``j`` places before the block
+    end also sees ``j`` older keys there. The two agree while
+    ``seq_len <= w + 1``; past that each row ``j`` loses its ``j`` oldest keys
+    (at most q_len - 1 = 7 of 2048 for the DFlash K=7 drafter). The decode
+    kernel takes one scalar window, so the exact per-row edge is not
+    expressible in one launch."""
     from vllm._xpu_ops import xpu_ops
 
     total = query.shape[0]
@@ -380,6 +407,7 @@ def _noncausal_rows_decode(
         out=output,
         block_table=bt,
         seqused_k=used,
+        window_size=[window_left, 0] if window_left >= 0 else None,
         k_descale=k_scale,
         v_descale=v_scale,
         s_aux=impl.sinks,
@@ -444,6 +472,37 @@ def fa_int8_forward(
     if max_q <= spec_decode_max_qlen() and window_size is None:
         _noncausal_rows_decode(
             q, key_cache, value_cache, k_scale, v_scale, out, attn_metadata, impl
+        )
+        return output
+    if (
+        max_q <= spec_decode_max_qlen()
+        and window_size is not None
+        and window_size[0] == window_size[1]
+        and draft_swa_enabled()
+    ):
+        # B70-V7-DFA: the DFlash drafter's non-causal sliding window.
+        global _dfa_swa_logged
+        if not _dfa_swa_logged:
+            _dfa_swa_logged = True
+            logger.info(
+                "B70-V7-DFA non-causal sliding-window rows on the native INT8 "
+                "decode: window %d from the block end, max q %d, head_size %d, "
+                "kv heads %d",
+                window_size[0] + 1,
+                max_q,
+                impl.head_size,
+                impl.num_kv_heads,
+            )
+        _noncausal_rows_decode(
+            q,
+            key_cache,
+            value_cache,
+            k_scale,
+            v_scale,
+            out,
+            attn_metadata,
+            impl,
+            window_left=window_size[0],
         )
         return output
 
