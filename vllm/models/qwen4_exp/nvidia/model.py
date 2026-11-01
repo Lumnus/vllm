@@ -328,6 +328,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
             hidden_states, block_input, injection = attn_hc.combine_and_mix(
                 hidden_states, prev_block_output, prev_injection
             )
+            if self.__dict__.get("_b70_stash_combined", False):
+                # B70-V7-AUX: the materialized combine is the previous layer's
+                # completed state, i.e. the DFlash2 aux feature input.
+                self.__dict__["_b70_combined"] = hidden_states
         else:
             hidden_states, block_input, injection = attn_hc.mix(hidden_states)
 
@@ -554,6 +558,7 @@ class Qwen4ExpModel(nn.Module, DFlash2FeatureCapture):
             hidden_states = intermediate_tensors["hidden_states"]
 
         aux_hidden_states: list[torch.Tensor] = []
+        self._b70_aux_defer = None  # B70-V7-AUX
         full_num_tokens = positions.shape[-1]
         block_output = None
         injection = None
@@ -610,6 +615,8 @@ class Qwen4ExpModel(nn.Module, DFlash2FeatureCapture):
                 block_output = None
                 injection = None
                 hidden_states = hidden_states + deepstack_embed
+            if getattr(self, "_b70_aux_defer", None) is not None:
+                self.collect_deferred_feature(aux_hidden_states, layer_idx, layer)
             self.capture_completed_layer(
                 aux_hidden_states,
                 layer_idx,
