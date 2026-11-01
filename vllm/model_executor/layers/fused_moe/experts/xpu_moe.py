@@ -184,15 +184,35 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             output, hidden_states, topk_weights, topk_ids, activation, expert_map
         ):
             return
+        from vllm.model_executor.layers.fused_moe import b70_moe_kcut as _kcut
+
+        # B70-V2-MOE: rows_per_expert zeroed by the sentinel kernel (None: stock).
+        rows_per_expert = None
         if (self.moe_config.ep_size > 1
                 and getattr(self.fused_moe_impl, "_astra_groups", None) is None):
             # Avoid topk_ids = -1, remap them to an
             # expert not owned by this rank so they are skipped.
             sentinel = global_num_experts - 1 if self.moe_config.ep_rank == 0 else 0
-            topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
+            if _kcut.enabled():
+                topk_ids, rows_per_expert = _kcut.sentinel_and_zero(
+                    topk_ids, sentinel, self.fused_moe_impl.num_experts
+                )
+            else:
+                topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
         from vllm.model_executor.layers.fused_moe import b70_moe_w4a8 as _w4a8
 
-        if _w4a8.maybe_apply(self.fused_moe_impl, output, hidden_states, topk_weights, topk_ids):
+        if _w4a8.maybe_apply(
+            self.fused_moe_impl, output, hidden_states, topk_weights, topk_ids,
+            rows_per_expert=rows_per_expert,
+        ):
+            return
+        if rows_per_expert is not None and _kcut.stock_kernel_ok(
+            self.fused_moe_impl, a1q_scale
+        ):
+            _kcut.apply_kernel(
+                self.fused_moe_impl, output, hidden_states, topk_weights, topk_ids,
+                rows_per_expert, a1q_scale=a1q_scale,
+            )
             return
         self.fused_moe_impl.apply(
             output=output,

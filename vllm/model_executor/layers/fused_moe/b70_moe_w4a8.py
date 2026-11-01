@@ -403,7 +403,8 @@ _LOGGED = False
 _LOGGED_CUTLASS = False
 
 
-def _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids) -> bool:
+def _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids,
+                         rows_per_expert=None) -> bool:
     global _LOGGED_CUTLASS
     mod = _cutlass()
     ok = getattr(impl, "_b70_w4a8_cutlass_ok", None)
@@ -419,18 +420,29 @@ def _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids) ->
         _LOGGED_CUTLASS = True
         logger.info("B70-IP-L: MoE W4A8 on (cutlass s8 x s4 DPAS): int4 g128 weights as stored, int8 "
                     "per-token activations, batches >= %d tokens (B70_MOE_W4A8_MIN_TOKENS)", min_tokens())
+    if rows_per_expert is not None:
+        from vllm.model_executor.layers.fused_moe import b70_moe_kcut as _kcut
+
+        if _kcut.w4a8_cutlass_ok(mod):
+            # B70-V2-MOE: same GEMM/quant/gather calls; dead mask and zero fill dropped.
+            _kcut.apply_w4a8_cutlass(
+                mod, impl, output, hidden_states, topk_weights, topk_ids, rows_per_expert
+            )
+            return True
     mod.apply(impl, output, hidden_states, topk_weights, topk_ids)
     return True
 
 
-def maybe_apply(impl, output, hidden_states, topk_weights, topk_ids) -> bool:
+def maybe_apply(impl, output, hidden_states, topk_weights, topk_ids,
+                rows_per_expert=None) -> bool:
     """W4A8 when B70_MOE_W4A8=1, the batch has >= B70_MOE_W4A8_MIN_TOKENS tokens and ``impl`` is a
     plain int4 g128 SiLU XpuFusedMoe; False = caller runs the stock path."""
     global _LOGGED
     if not enabled() or hidden_states.shape[0] < min_tokens():
         return False
     if cutlass_mode():
-        return _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids)
+        return _maybe_apply_cutlass(impl, output, hidden_states, topk_weights, topk_ids,
+                                    rows_per_expert)
     ok = getattr(impl, "_b70_w4a8_ok", None)
     if ok is None:
         why = eligible(impl)
