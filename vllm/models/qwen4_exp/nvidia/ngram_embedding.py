@@ -31,6 +31,8 @@ from ..common.ops.ple import ple_ngram_ids
 from .b70_disk import Qwen4ExpPLEDiskBF16Embedding
 from .b70_ple_nvme import Qwen4ExpPLEInt8NVMeEmbedding
 from .b70_ple_nvme import enabled as _b70_ple_int8_nvme
+from .b70_ple_ram import Qwen4ExpPLEInt8RAMEmbedding
+from .b70_ple_ram import enabled as _b70_ple_int8_ram
 
 logger = init_logger(__name__)
 
@@ -222,7 +224,10 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         )
         if os.environ.get("B70_PLE_DISK_BF16") == "1":
             embedding_cls = Qwen4ExpPLEDiskBF16Embedding
-        if _b70_ple_int8_nvme():  # B70 0013 (L32 port): INT8 rows from NVMe
+        # PLE is either RAM native or on SSD; both flags set raises here.
+        if _b70_ple_int8_ram():  # B70-PLE-RAM (port of 0008): INT8 rows in pinned RAM
+            embedding_cls = Qwen4ExpPLEInt8RAMEmbedding
+        elif _b70_ple_int8_nvme():  # B70 0013 (L32 port): INT8 rows from NVMe
             embedding_cls = Qwen4ExpPLEInt8NVMeEmbedding
         # A TP reduce-scatter covers all vocabulary owners only when ETP=TP.
         self.use_reduce_scatter = (

@@ -21,7 +21,8 @@ Per TP rank, per step:
      owned by this rank, or a padding token: nothing stored, stays zero).
 
 Env contract (read in ngram_embedding.py, documented here):
-  B70_PLE_INT8_NVME=1               enable (requires B70_PLE_INT8=1)
+  B70_PLE_INT8_NVME=1               enable (v0.30: with B70_PLE_INT8=1; 0.32: exclusive
+                                    with B70_PLE_INT8=1, the RAM-native b70_ple_ram path)
   B70_PLE_INT8_NVME_PATH            table file (default B70_PLE_INT8_PATH)
   B70_PLE_INT8_NVME_CACHE_GIB       row cache, TOTAL over the TP ranks (default 8)
   B70_PLE_INT8_NVME_IO_THREADS      reader threads per rank (default 16)
