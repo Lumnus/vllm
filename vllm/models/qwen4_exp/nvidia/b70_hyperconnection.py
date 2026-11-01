@@ -55,6 +55,11 @@ logger = init_logger(__name__)
 # decode, prefill chunks) take the stock BF16 GEMM. The ordered Triton GEMM is 4.5x (64 rows) to 6.7x
 # (4096 rows) slower than F.linear on B70. Default: unbounded (wu1ff behaviour).
 _B70_HC_ORDERED_MAX_ROWS = int(os.environ.get("B70_HC_ORDERED_MAX_ROWS", str(1 << 30)))
+# B70-V2-HC: fold hc_silu into the parallel HC down GEMM's finish kernel (bitwise-
+# identical; one launch fewer per GatedResidual on the parallel route, i.e. rows <=
+# B70_HC_PARALLEL_MAX_ROWS). Default off.
+_B70_HC_SILU_FUSE = os.environ.get("B70_HC_SILU_FUSE", "0") == "1"
+_B70_HC_SILU_FUSE_LOGGED = False
 
 
 def _is_xpu() -> bool:
@@ -277,6 +282,54 @@ class GatedResidual(nn.Module):
             return self.input_mix_weight_down_block_inject(xn)
         return self.input_mix_weight_down(xn)
 
+    def _down_and_silu(
+        self, xn: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """(hc_silu(lora), injection) of the down projection.
+
+        B70-V2-HC fuses the silu when the ordered projection takes the parallel
+        route; otherwise the stock sequence runs."""
+        global _B70_HC_SILU_FUSE_LOGGED
+        if (
+            _B70_HC_SILU_FUSE
+            and self._ordered_hc
+            and xn.shape[0] <= _B70_HC_ORDERED_MAX_ROWS
+        ):
+            from .b70_hc_gemm import parallel_hc_gemm_silu, takes_parallel_route
+
+            linear = (
+                self.input_mix_weight_down_block_inject
+                if self.use_combine
+                else self.input_mix_weight_down
+            )
+            valid = self.lora_rank + (self.hc_count if self.use_combine else 0)
+            if (
+                xn.dtype == linear.weight.dtype == torch.bfloat16
+                and takes_parallel_route(xn, linear.weight, valid)
+            ):
+                if not _B70_HC_SILU_FUSE_LOGGED:
+                    _B70_HC_SILU_FUSE_LOGGED = True
+                    logger.info(
+                        "B70-V2-HC: hc_silu fused into the parallel HC down finish "
+                        "(B70_HC_SILU_FUSE=1)"
+                    )
+                down, lora = parallel_hc_gemm_silu(
+                    xn, linear.weight, valid, self.lora_rank, self.hc_count
+                )
+                if self.use_combine:
+                    injection = down[:, self.lora_rank : self.lora_rank + self.hc_count]
+                    return lora, injection
+                return lora, None
+        if self.use_combine:
+            # produce injection logits for combine
+            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
+            down_and_injection = self._down_gemm(xn)
+            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
+        else:
+            lora = self._down_gemm(xn)
+            injection = None
+        return hc_silu(lora, self.hc_count), injection
+
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -302,16 +355,7 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        if self.use_combine:
-            # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
-            down_and_injection = self._down_gemm(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
-        else:
-            lora = self._down_gemm(xn)
-            injection = None
-
-        lora = hc_silu(lora, self.hc_count)
+        lora, injection = self._down_and_silu(xn)
         block_input = self._mix_up(lora, xn)
 
         return hidden_states, block_input, injection
@@ -362,16 +406,7 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
-        if self.use_combine:
-            # produce injection logits for combine
-            split_sizes = [self.lora_rank, self.hc_count, self.pad_size]
-            down_and_injection = self._down_gemm(xn)
-            lora, injection, _ = down_and_injection.split(split_sizes, dim=-1)
-        else:
-            lora = self._down_gemm(xn)
-            injection = None
-
-        lora = hc_silu(lora, self.hc_count)
+        lora, injection = self._down_and_silu(xn)
         block_input = self._mix_up(lora, xn)
 
         return hidden_states, block_input, injection
