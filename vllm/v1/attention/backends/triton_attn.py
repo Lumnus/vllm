@@ -291,6 +291,9 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             softmax_segm_max=self.softmax_segm_max,
             softmax_segm_expsum=self.softmax_segm_expsum,
         )
+        from vllm.v1.attention.backends import b70_pth_fa as _b70_pth_fa
+
+        _b70_pth_fa.attach_host_lens(attn_metadata, common_attn_metadata)
         if self.max_seqs_64_segments > 0 and (
             self.max_seqs_64_segments < seq_lens.shape[0]
             or self.softmax_segm_max.shape[0] < num_actual_tokens

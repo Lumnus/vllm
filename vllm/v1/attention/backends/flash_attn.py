@@ -993,6 +993,9 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             max_num_splits=max_num_splits,
             causal=causal,
         )
+        from vllm.v1.attention.backends import b70_pth_fa as _b70_pth_fa
+
+        _b70_pth_fa.attach_host_lens(attn_metadata, common_attn_metadata)
 
         # Compute mm_prefix range tensor if the batch contains
         # multimodal tokens with bidirectional ranges.  Built for every FA
