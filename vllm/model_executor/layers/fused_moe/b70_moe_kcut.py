@@ -40,8 +40,9 @@ logger = init_logger(__name__)
 # AST fingerprints of the wheel functions the replicas were copied from
 # (the v6 vllm_xpu_kernels wheel).
 _FP = {
-    "XpuFusedMoe._apply_kernel": "32c13063d42ad5ae",
-    "b70_moe_w4a8.apply": "8e77c64b832b5251",
+    "XpuFusedMoe._apply_kernel": {"32c13063d42ad5ae"},  # v6, v7 (unchanged)
+    # v6; v7 (adds the B70_W4A8_FUSED_ACT branch)
+    "b70_moe_w4a8.apply": {"8e77c64b832b5251", "2bdb73e8f7e4f4b8"},
 }
 
 _ENABLED = os.environ.get("B70_MOE_KCUT", "0") == "1"
@@ -79,11 +80,11 @@ def _armed(key: str, func) -> bool:
             got = fingerprint(func)
         except (OSError, TypeError, SyntaxError) as e:
             got = f"unreadable ({e})"
-        ok = got == _FP[key]
+        ok = got in _FP[key]
         _FP_OK[key] = ok
         if not ok:
             logger.warning(
-                "B70-V2-MOE: %s fingerprint %s != %s (wheel changed); "
+                "B70-V2-MOE: %s fingerprint %s not in %s (wheel changed); "
                 "the wheel's own function runs",
                 key,
                 got,
@@ -319,22 +320,53 @@ def apply_w4a8_cutlass(
         local_experts_num=impl.local_experts_num,
     )
 
-    g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
-    op(
-        remapped.view(torch.int8),
-        remapped_sc,
-        impl.w13,
-        impl.gemm1_wei_scales,
-        impl.w13_bias,
-        g1,
-        rows_per_expert,
-        2 * inter,
-        hidden,
-        impl.num_experts,
-    )
-    act = torch.empty((n_moe, inter), dtype=output.dtype, device=dev)
-    impl.act_func(act, g1)
-    aq, asc = mod.quant_rows(act)
+    # v7: optional fused gemm1 epilogue (silu*up -> int8); v6 has no load_glu_op.
+    glu = None
+    if hasattr(mod, "load_glu_op") and mod.fused_act_enabled() and inter % 128 == 0:
+        glu = mod.load_glu_op()
+    if glu is not None:
+        if not getattr(mod, "_LOGGED_FUSED", True):
+            mod._LOGGED_FUSED = True
+            import logging
+
+            logging.getLogger("vllm_xpu_kernels").warning(
+                "B70-K1: W4A8 MoE fused gemm1 epilogue on (silu*up -> int8, "
+                "per-row x 128-col scales; inter=%d)",
+                inter,
+            )
+        aq = torch.empty((n_moe, inter), dtype=torch.int8, device=dev)
+        asc = torch.empty((n_moe, inter // 128), dtype=torch.float32, device=dev)
+        glu(
+            remapped.view(torch.int8),
+            remapped_sc,
+            impl.w13,
+            impl.gemm1_wei_scales,
+            impl.w13_bias,
+            aq,
+            asc,
+            rows_per_expert,
+            inter,
+            hidden,
+            impl.num_experts,
+        )
+    else:
+        g1 = torch.empty((n_moe, 2 * inter), dtype=output.dtype, device=dev)
+        op(
+            remapped.view(torch.int8),
+            remapped_sc,
+            impl.w13,
+            impl.gemm1_wei_scales,
+            impl.w13_bias,
+            g1,
+            rows_per_expert,
+            2 * inter,
+            hidden,
+            impl.num_experts,
+        )
+        act = torch.empty((n_moe, inter), dtype=output.dtype, device=dev)
+        impl.act_func(act, g1)
+        aq, asc = mod.quant_rows(act)
+
     g2 = torch.empty((n_moe, hidden), dtype=output.dtype, device=dev)
     op(
         aq,

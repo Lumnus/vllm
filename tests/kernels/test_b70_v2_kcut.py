@@ -23,6 +23,8 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 os.environ.setdefault("TRITON_INTERPRET", "1")
 WHEEL = os.environ.get("B70_V2_WHEEL_DIR", "")
+# Several wheel copies (e.g. v6:v7) for the W4A8 replica; defaults to WHEEL.
+WHEELS = [w for w in os.environ.get("B70_V2_WHEEL_DIRS", WHEEL).split(":") if w]
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
@@ -195,7 +197,7 @@ def _wheel_fn(path, qual, glb):
     code = textwrap.dedent("\n".join(lines))
     assert (
         kcut.fingerprint_node(ast.parse(code).body[0])
-        == kcut._FP[
+        in kcut._FP[
             "XpuFusedMoe._apply_kernel"
             if "XpuFusedMoe" in qual
             else "b70_moe_w4a8.apply"
@@ -303,26 +305,54 @@ def _quant_rows(x):
     return torch.round(xf / s).clamp_(-128, 127).to(torch.int8), s
 
 
-@needs_wheel
+def _glu_ref(A, A_scale, B, B_scale, bias, aq, asc, rows_per_expert, inter, K, E):
+    """CPU stand-in for cutlass_grouped_gemm_w4a8_silu_quant (shared by both sides)."""
+    g = grouped_ref(A, B, rows_per_expert, torch.float32, a_scale=A_scale)
+    act = (torch.nn.functional.silu(g[:, :inter]) * g[:, inter:]).view(
+        -1, inter // 128, 128
+    )
+    sc = (act.abs().amax(dim=-1) / 127.0).clamp_min(1e-10)
+    aq.copy_(
+        torch.round(act / sc[..., None])
+        .clamp_(-128, 127)
+        .view(-1, inter)
+        .to(torch.int8)
+    )
+    asc.copy_(sc)
+
+
+@pytest.mark.skipif(not WHEELS, reason="B70_V2_WHEEL_DIR(S) not set")
+@pytest.mark.parametrize("wheel", WHEELS)
+@pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("T", [1, 8, 64])
-def test_w4a8_cutlass_replica_bitwise(T):
+def test_w4a8_cutlass_replica_bitwise(T, fused, wheel):
     ref = RefOps()
     _install_ops(ref)
 
     def op(A, A_scale, B, B_scale, bias, D, rows_per_expert, N, K, E):
         D.copy_(grouped_ref(A, B, rows_per_expert, D.dtype, a_scale=A_scale))
 
+    path = os.path.join(wheel, "b70_moe_w4a8.py")
+    with open(path) as f:
+        has_glu = "def load_glu_op" in f.read()
+    glb = {
+        "torch": torch,
+        "load_op": lambda: op,
+        "quant_rows": _quant_rows,
+        "Optional": __import__("typing").Optional,
+    }
     mod = types.SimpleNamespace(load_op=lambda: op, quant_rows=_quant_rows)
-    stock = _wheel_fn(
-        os.path.join(WHEEL, "b70_moe_w4a8.py"),
-        "apply",
-        {
-            "torch": torch,
-            "load_op": mod.load_op,
-            "quant_rows": _quant_rows,
-            "Optional": __import__("typing").Optional,
-        },
-    )
+    if has_glu:
+        glb.update(
+            load_glu_op=lambda: _glu_ref,
+            fused_act_enabled=lambda: fused,
+            _LOGGED_FUSED=False,
+        )
+        mod.load_glu_op, mod.fused_act_enabled = (lambda: _glu_ref), (lambda: fused)
+        mod._LOGGED_FUSED = False
+    elif fused:
+        pytest.skip("this wheel has no fused gemm1 epilogue")
+    stock = _wheel_fn(path, "apply", glb)
     impl = FakeImpl(rank=2, seed=T)
     hs, ids, w, sentinel = _routing(T, impl, seed=T, nan_rows=(0,) if T > 1 else ())
     ids_s = torch.where(ids < 0, sentinel, ids)
