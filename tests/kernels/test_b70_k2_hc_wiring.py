@@ -16,13 +16,14 @@ os.environ["B70_I8_PRODUCER_QUANT"] = "1"
 os.environ["B70_HC_SILU_FUSE"] = "1"
 os.environ["B70_HC_ORDERED_MAX_ROWS"] = "32"
 
+import importlib.util  # noqa: E402
+
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
-import importlib.util  # noqa: E402
-
 _spec = importlib.util.spec_from_file_location(
-    "k2_pq_base", os.path.join(os.path.dirname(__file__), "test_b70_k2_producer_quant.py")
+    "k2_pq_base",
+    os.path.join(os.path.dirname(__file__), "test_b70_k2_producer_quant.py"),
 )
 base = importlib.util.module_from_spec(_spec)  # the bf16 interpreter patch + ref quant
 _spec.loader.exec_module(base)
@@ -31,16 +32,19 @@ from vllm.model_executor.layers import b70_i8_producer as pq  # noqa: E402
 
 @pytest.fixture(scope="module")
 def module():
-    from vllm import _custom_ops as ops
     import types
 
-    from vllm.models.qwen4_exp.nvidia import b70_hyperconnection as bhc
+    from vllm import _custom_ops as ops
     from vllm.model_executor.layers import b70_dense_int8 as D
     from vllm.models.qwen4_exp.common.hyperconnection import HyperConnectionConfig
+    from vllm.models.qwen4_exp.nvidia import b70_hyperconnection as bhc
     from vllm.models.qwen4_exp.nvidia.b70_hyperconnection import GatedResidual
 
     # W1's quant on CPU: the XPU reference (same bits as the native op).
-    ops.scaled_int8_quant = lambda x, s=None, a=None, sym=True: (*base.ref_quant(x), None)
+    ops.scaled_int8_quant = lambda x, s=None, a=None, sym=True: (
+        *base.ref_quant(x),
+        None,
+    )
     cfg = HyperConnectionConfig(
         hc_count=4,
         hidden_size=2560,

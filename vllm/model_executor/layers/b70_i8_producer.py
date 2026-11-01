@@ -50,6 +50,7 @@ import os
 import re
 
 import torch
+
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -396,3 +397,24 @@ direct_register_custom_op(
     _b70_int8_dense_mm_q,
     fake_impl=_b70_int8_dense_mm_q_fake,
 )
+
+
+_ATTR_G = "_b70_i8g"
+
+
+def attach_grouped(x: torch.Tensor, xq: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
+    """Hang (int8 rows, fp32 [M, G] per-(token, group) scales) of ``x`` on it."""
+    setattr(x, _ATTR_G, (xq, xs))
+    return x
+
+
+def take_grouped(
+    x: torch.Tensor, groups: int
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    pq = x.__dict__.get(_ATTR_G) if hasattr(x, "__dict__") else None
+    if pq is None:
+        return None
+    xq, xs = pq
+    if x.dim() != 2 or xq.shape != tuple(x.shape) or xs.shape != (x.shape[0], groups):
+        return None
+    return xq, xs
