@@ -41,6 +41,7 @@ from ..common.hyperconnection import (
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
 )
+from . import b70_compile_ops
 from .ops.hc import (
     grouped_gemma_rmsnorm,
     hc_combine,
@@ -120,6 +121,9 @@ class GatedResidual(nn.Module):
         self.use_combine = use_combine
         self._astra_hc_up_weight = None
         self._astra_hc_up_prepared = False
+        # B70-TC: name for the opaque compile ops (no-op unless B70_TORCH_COMPILE=1).
+        self._b70_layer_name = prefix
+        b70_compile_ops.register(prefix, self)
         spec = get_current_vllm_config().speculative_config
         self._ordered_hc = (
             spec is not None
@@ -276,6 +280,12 @@ class GatedResidual(nn.Module):
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if b70_compile_ops.ENABLED and torch.compiler.is_compiling():
+            # B70-TC: row-count dispatch runs at call time, not at trace time.
+            block_input, injection = torch.ops.vllm.b70_hc_mix(
+                hidden_states, self._b70_layer_name
+            )
+            return hidden_states, block_input, (injection if self.use_combine else None)
         if self._ordered_hc:
             from .b70_c1_graph import replay_hc
 
@@ -312,6 +322,11 @@ class GatedResidual(nn.Module):
         prev_block_output: torch.Tensor,
         prev_injection: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        if b70_compile_ops.ENABLED and torch.compiler.is_compiling():
+            out, block_input, injection = torch.ops.vllm.b70_hc_combine_and_mix(
+                hidden_states, prev_block_output, prev_injection, self._b70_layer_name
+            )
+            return out, block_input, (injection if self.use_combine else None)
         if self._ordered_hc:
             from .b70_c1_graph import replay_hc
 

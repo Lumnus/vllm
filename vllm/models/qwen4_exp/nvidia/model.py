@@ -7,6 +7,8 @@ from itertools import islice
 
 import torch
 from torch import nn
+
+from vllm.compilation.decorators import support_torch_compile
 from transformers import Qwen4ExpConfig, Qwen4ExpTextConfig
 
 from vllm import envs
@@ -85,6 +87,7 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 if current_platform.is_xpu():
+    from . import b70_compile_ops
     from .b70_hyperconnection import GatedResidual, HyperConnectionConfig
 else:
     from .hyperconnection import GatedResidual, HyperConnectionConfig
@@ -236,6 +239,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=f"{prefix}.ple",
                 use_sequence_parallel=self.use_hc_sequence_parallel,
             )
+            if current_platform.is_xpu():
+                b70_compile_ops.register(f"{prefix}.ple", self.ple)
 
         if layer_type == "linear_attention":
             self.linear_attn = QwenGatedDeltaNetAttention(
@@ -316,12 +321,30 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
             if input_ids is None or query_start_loc is None or ngram_context is None:
                 raise RuntimeError("PLE inputs were not prepared")
-            hidden_states = self.ple(
-                hidden_states,
-                input_ids,
-                query_start_loc,
-                ngram_context,
-            )
+            if (
+                current_platform.is_xpu()
+                and b70_compile_ops.ENABLED
+                and torch.compiler.is_compiling()
+            ):
+                # B70-TC: PLE is a splitting op (host-prepared rows, per-request
+                # short-conv state); it writes graph-owned storage.
+                ple_out = torch.empty_like(hidden_states)
+                torch.ops.vllm.b70_qwen4_exp_ple(
+                    hidden_states,
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                    ple_out,
+                    self.ple.prefix,
+                )
+                hidden_states = ple_out
+            else:
+                hidden_states = self.ple(
+                    hidden_states,
+                    input_ids,
+                    query_start_loc,
+                    ngram_context,
+                )
 
         # Fuse a pending combine with this HC module's mix when possible.
         if prev_block_output is not None:
@@ -421,6 +444,24 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
+def _b70_compile_enabled(vllm_config: VllmConfig) -> bool:
+    # B70-TC: upstream #55272 removed torch.compile for this implementation;
+    # B70_TORCH_COMPILE=1 restores it on XPU through b70_compile_ops.
+    return current_platform.is_xpu() and b70_compile_ops.ENABLED
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+        "query_start_loc": 0,
+        "ngram_context": 0,
+        "deepstack_input_embeds": 0,
+    },
+    enable_if=_b70_compile_enabled,
+)
 class Qwen4ExpModel(nn.Module, DFlash2FeatureCapture):
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | _EXTRA_WEIGHTS_MAPPER
 
