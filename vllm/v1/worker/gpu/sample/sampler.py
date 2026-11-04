@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES, LogprobsMode
 from vllm.sampling_params import SamplingParams
+from vllm.v1.sample import b70_cjk
 from vllm.v1.sample.ops.topk_topp_sampler import (
     apply_top_k_top_p,
     flashinfer_sample,
@@ -83,6 +84,13 @@ class Sampler:
         self.trace_replay_state = (
             TraceReplayState(req_states) if enable_trace_replay else None
         )
+        # B70-CJK: Han mask, applied by the model runner on the raw target
+        # logits (not a logits processor: no fp32 copy, covers verification).
+        self.cjk_mask = None
+        if b70_cjk.enabled():
+            from vllm.v1.worker.gpu.sample.cjk_mask import CjkMaskState
+
+            self.cjk_mask = CjkMaskState(vllm_config, max_num_reqs, vocab_size, device)
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
         # B70-SM: requests that need more than temperature / top-k / top-p / min-p
         # (bias, penalties, bad words, thinking budget, custom processors).
@@ -106,6 +114,8 @@ class Sampler:
         self.needs_logits_processing[req_idx] = needs_processing | needs_other
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
+        if self.cjk_mask is not None:
+            self.cjk_mask.add_request(req_idx, sampling_params)
         if self.trace_replay_state is not None:
             self.trace_replay_state.add_request(req_idx, sampling_params)
 
@@ -115,6 +125,8 @@ class Sampler:
             processor.apply_staged_writes()
         self.thinking_budget_state.apply_staged_writes()
         self.logprob_token_ids_state.apply_staged_writes()
+        if self.cjk_mask is not None:
+            self.cjk_mask.apply_staged_writes()
         if self.trace_replay_state is not None:
             self.trace_replay_state.apply_staged_writes()
 

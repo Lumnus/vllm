@@ -994,6 +994,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # top_k, top_p, and logprobs, using less GPU memory than what is possible
         # during actual execution.
         assert self.sampler is not None
+        if getattr(self.sampler, "cjk_mask", None) is not None:
+            self.sampler.cjk_mask.warmup(logits)  # B70-CJK: JIT before serving
         self.sampler(logits, dummy_input_batch)
 
     @torch.inference_mode()
@@ -1648,6 +1650,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 grammar_output.structured_output_request_ids,
                 grammar_output.num_acceptable_drafts,
+            )
+
+        # B70-CJK: Han mask in place on the target logits, before plain
+        # sampling and before every verification row of spec decode.
+        cjk_mask = getattr(self.sampler, "cjk_mask", None)
+        if cjk_mask is not None and logits.shape[0] > 0:
+            cjk_mask.apply(
+                logits, input_batch.expanded_idx_mapping, input_batch.idx_mapping_np
             )
 
         sampler_output: SamplerOutput | None
