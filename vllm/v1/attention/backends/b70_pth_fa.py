@@ -16,7 +16,7 @@ all layers (they run in sequence), allocated in the first eager forward (the
 memory-profile run) so the KV pool is sized around it. Sequences whose total
 context exceeds it are processed in groups.
 
-Env: B70_PTH_FA_PREFILL=0 turns it off; B70_PTH_FA_MIN_Q (default 64).
+Env: B70_PTH_FA_PREFILL=1 turns it on (default off: it halved 16-parallel prefill throughput on the Flash-Next engine and cost KV memory per card; on a single-card 27B it cost ~2.1 GiB and could block boot); B70_PTH_FA_MIN_Q (default 64).
 
 B70-IP-D2 (``B70_PTH_FA_DECODE=1``, default off): FLASH_ATTN on XPU accepts
 ``int8_per_token_head`` and decodes natively with the vllm-xpu-kernels INT8
@@ -48,7 +48,7 @@ _logged = False
 
 def _enabled() -> bool:
     return (
-        current_platform.is_xpu() and os.environ.get("B70_PTH_FA_PREFILL", "1") != "0"
+        current_platform.is_xpu() and os.environ.get("B70_PTH_FA_PREFILL", "0") == "1"
     )
 
 

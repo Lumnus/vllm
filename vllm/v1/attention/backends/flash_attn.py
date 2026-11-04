@@ -1368,7 +1368,7 @@ class FlashAttentionImpl(AttentionImpl):
         # B70-IP-K5: on XPU the FA kernel's fp8-KV path is ~2.2x slower than
         # its bf16 path for prefill chunks; dequantize the referenced fp8
         # blocks into a bf16 scratch and run FA bf16 (decode and spec-verify
-        # batches keep the fp8 kernel). B70_PTH_FA_PREFILL=0 turns it off.
+        # batches keep the fp8 kernel). B70_PTH_FA_PREFILL=1 turns it on (default off).
         if (
             current_platform.is_xpu()
             and is_quantized_kv_cache(self.kv_cache_dtype)
