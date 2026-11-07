@@ -60,6 +60,11 @@ class UVAOffloadConfig:
     Steps inside CUDA graphs never stage. CUDA and XPU.
     """
 
+    cpu_offload_stage_prefetch: bool = False
+    """With staging on, keep two buffers per staged weight shape and copy
+    the next layer's weights on a side stream while the current layer's
+    experts kernel runs."""
+
     @field_validator("cpu_offload_stage_min_tokens", mode="before")
     @classmethod
     def _parse_auto(cls, value: Any) -> Any:
@@ -75,9 +80,14 @@ class UVAOffloadConfig:
 
     def compile_factors(self) -> CompileFactors:
         """Provide the factors used for hashing UVAOffloadConfig. The staging
-        threshold is left out: it only acts inside the opaque moe_forward op."""
+        threshold and prefetch are left out: they only act inside the opaque
+        moe_forward op."""
         return get_compile_factors(
-            self, ignored_factors={"cpu_offload_stage_min_tokens"}
+            self,
+            ignored_factors={
+                "cpu_offload_stage_min_tokens",
+                "cpu_offload_stage_prefetch",
+            },
         )
 
 
