@@ -101,6 +101,16 @@ class SchedulerConfig:
     queued and running requests. Only applies when
     long_prefill_token_threshold is nonzero."""
 
+    mamba_align_fill_budget: bool = False
+    """With Mamba cache mode "align", prefill chunks that do not finish the
+    prompt end on a Mamba block boundary. When the next waiting request's
+    aligned chunk does not fit the token budget left in a step, the scheduler
+    normally stops admitting requests for that step. With this set, it keeps
+    that request at the head of the waiting queue, holds one request slot for
+    it, and fills the remaining budget from the waiting requests behind it
+    (for example short prompts whose final chunk needs no alignment). Only
+    applies when something was already scheduled in the step."""
+
     max_num_queued_reqs: int | None = Field(default=None, ge=0)
     """Maximum number of requests that can be in-flight (waiting or running)
     at the same time, or None for no limit. When the limit is reached, new
@@ -312,6 +322,7 @@ class SchedulerConfig:
             "max_num_inflight_kv_loads",
             "long_prefill_token_threshold",
             "long_prefill_token_threshold_adaptive",
+            "mamba_align_fill_budget",
             "max_num_queued_reqs",
             "max_num_queued_tokens",
             "enable_chunked_prefill",

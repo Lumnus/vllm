@@ -8935,3 +8935,89 @@ def test_cpu_encoder_input_updates_preserve_shm_handles():
     )
     assert scheduler.schedule().encoder_input_updates == {request.request_id: {1: None}}
     assert request.mm_features[0].data is handle
+
+
+def _mamba_align_fill_scheduler(fill_budget: bool, max_num_seqs: int = 16):
+    """Budget 1200 with 512-token Mamba blocks: a non-final chunk takes 1024."""
+    scheduler = create_scheduler(
+        max_num_seqs=max_num_seqs,
+        max_num_batched_tokens=1200,
+        max_model_len=2048,
+        block_size=512,
+        enable_prefix_caching=True,
+    )
+    scheduler.need_mamba_block_aligned_split = True
+    scheduler.scheduler_config.mamba_align_fill_budget = fill_budget
+    return scheduler
+
+
+def _mamba_align_fill_requests(num_short: int) -> list[Request]:
+    long_reqs = create_requests(
+        num_requests=2,
+        num_tokens=1800,
+        max_tokens=4,
+        block_size=512,
+        req_ids=["long0", "long1"],
+    )
+    short_reqs = create_requests(
+        num_requests=num_short,
+        num_tokens=100,
+        max_tokens=4,
+        block_size=512,
+        req_ids=[f"short{i}" for i in range(num_short)],
+    )
+    return long_reqs + short_reqs
+
+
+@pytest.mark.parametrize("fill_budget", [False, True])
+def test_mamba_align_fill_budget(fill_budget: bool):
+    """An unfit aligned chunk ends admission unless mamba_align_fill_budget."""
+    scheduler = _mamba_align_fill_scheduler(fill_budget)
+    for request in _mamba_align_fill_requests(num_short=1):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    # long1 needs a whole 512-token block but only 176 tokens are left.
+    expected = {"long0": 1024}
+    if fill_budget:
+        expected["short0"] = 100
+    assert output.num_scheduled_tokens == expected
+    # long1 stays at the head of the waiting queue either way.
+    assert scheduler.waiting.peek_request().request_id == "long1"
+
+
+def test_mamba_align_fill_budget_holds_a_slot():
+    """The skipped request keeps a slot: later requests take the others only."""
+    scheduler = _mamba_align_fill_scheduler(True, max_num_seqs=3)
+    for request in _mamba_align_fill_requests(num_short=2):
+        scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"long0": 1024, "short0": 100}
+    assert len(scheduler.running) == 2
+    assert scheduler.waiting.peek_request().request_id == "long1"
+
+
+def test_mamba_align_fill_budget_needs_progress():
+    """Nothing is skipped when no request was scheduled in the step."""
+    scheduler = _mamba_align_fill_scheduler(True)
+    original_split = scheduler._mamba_block_aligned_split
+    calls = []
+
+    def no_room_for_long1(request, num_new_tokens, *args):
+        calls.append(request.request_id)
+        if request.request_id == "long1":
+            return 0
+        return original_split(request, num_new_tokens, *args)
+
+    scheduler._mamba_block_aligned_split = no_room_for_long1
+    long1, short0 = _mamba_align_fill_requests(num_short=1)[1:]
+    scheduler.add_request(long1)
+    scheduler.add_request(short0)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {}
+    assert calls == ["long1"]

@@ -412,6 +412,18 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        if self.scheduler_config.mamba_align_fill_budget:
+            if self.need_mamba_block_aligned_split:
+                logger.info(
+                    "Mamba align: a waiting request whose block-aligned prefill "
+                    "chunk does not fit the remaining token budget keeps a "
+                    "request slot; later waiting requests fill the budget."
+                )
+            else:
+                logger.warning(
+                    "mamba_align_fill_budget has no effect: it applies only to "
+                    "Mamba cache mode 'align'."
+                )
         # TODO: Support models with multiple Mamba specs that require different
         # prefill checkpoint alignments instead of selecting the first one.
         self.mamba_prefill_checkpoint_alignment = next(
@@ -1017,6 +1029,9 @@ class Scheduler(SchedulerInterface):
             step_skipped_async_kv: deque[Request] = deque()
             # Async loads started this step: newer than any block-holder.
             step_started_kv_loads: list[Request] = []
+            # Request slots held for a waiting request whose Mamba-aligned
+            # chunk did not fit this step (mamba_align_fill_budget).
+            align_reserved_slots = 0
 
             def skip_request(from_queue: RequestQueue) -> None:
                 request_to_skip = from_queue.pop_request()
@@ -1038,7 +1053,8 @@ class Scheduler(SchedulerInterface):
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
                 loads_only = (
-                    num_running >= self.max_num_active_reqs or token_budget <= 0
+                    num_running >= self.max_num_active_reqs - align_reserved_slots
+                    or token_budget <= 0
                 )
                 if not loads_only:
                     # Requests holding KV blocks are always drained first, and are
@@ -1350,6 +1366,20 @@ class Scheduler(SchedulerInterface):
                             num_external_computed_tokens,
                         )
                         if num_new_tokens == 0:
+                            # The aligned chunk does not fit the budget left in
+                            # this step. Keep the request at the head with a
+                            # slot held for it, and fill the budget from the
+                            # requests behind it.
+                            if (
+                                self.scheduler_config.mamba_align_fill_budget
+                                and num_scheduled_tokens
+                                and num_running < self.max_num_active_reqs - 1
+                                and request_queue is not self.kv_holding_waiting
+                                and not self._holds_kv_blocks(request)
+                            ):
+                                align_reserved_slots = 1
+                                skip_request(request_queue)
+                                continue
                             break
                         if (
                             pad_spec_decode
