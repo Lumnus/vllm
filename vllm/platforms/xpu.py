@@ -252,6 +252,22 @@ class XPUPlatform(Platform):
                 "attention. Falling back to Triton Attention backend."
             )
             return AttentionBackendEnum.TRITON_ATTN.get_path()
+        elif (
+            kv_cache_dtype is not None
+            and kv_cache_dtype.endswith("_per_token_head")
+            and kv_cache_dtype != "int8_per_token_head"
+        ):
+            # Flash Attention on XPU reads per-token-head scales for INT8 only.
+            if selected_backend == AttentionBackendEnum.FLASH_ATTN:
+                raise ValueError(
+                    f"Flash Attention on XPU does not support kv_cache_dtype="
+                    f"{kv_cache_dtype}; use the Triton Attention backend."
+                )
+            logger.info_once(
+                "Using Triton Attention backend for %s KV cache on XPU.",
+                kv_cache_dtype,
+            )
+            return AttentionBackendEnum.TRITON_ATTN.get_path()
         elif dtype == torch.float32:
             logger.warning_once(
                 "Flash Attention on XPU does not support float32 dtype. "
