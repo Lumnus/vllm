@@ -48,6 +48,7 @@ if TYPE_CHECKING:
         VllmConfig,
     )
     from vllm.config.multimodal import VideoPruningMethod
+    from vllm.distributed.eplb.expert_weights import ExpertWeight
     from vllm.inputs import PromptType, TokensPrompt
     from vllm.lora.model_manager import LoRAModelManager
     from vllm.model_executor.layers.fused_moe import MoERunner
@@ -1054,7 +1055,7 @@ def is_hybrid(
 class MixtureOfExperts(Protocol):
     """Check if the model is a mixture of experts (MoE) model."""
 
-    expert_weights: MutableSequence[Sequence[Tensor]]
+    expert_weights: MutableSequence[Sequence["ExpertWeight"]]
     """
     Expert weights saved in this rank.
 

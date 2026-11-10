@@ -69,6 +69,12 @@ def run_rebalance_experts(
         eplb_stats.num_gpus,
         physical_to_logical_map_cpu,
     )
+    new_physical_to_logical_map = eplb_state.order_tiers(
+        model_state,
+        new_physical_to_logical_map,
+        global_expert_load_window,
+        eplb_stats.num_gpus,
+    )
     assert new_physical_to_logical_map.device == torch.device("cpu")
 
     return new_physical_to_logical_map

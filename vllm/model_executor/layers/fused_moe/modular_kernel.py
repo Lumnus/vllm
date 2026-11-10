@@ -10,6 +10,7 @@ from typing import Any, final
 import torch
 
 import vllm.envs as envs
+from vllm.distributed.eplb.expert_weights import ExpertWeight
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     ApplyMoEActivationConfig,
@@ -604,6 +605,14 @@ class FusedMoEExperts(ABC):
         default does nothing.
         """
         pass
+
+    def eplb_expert_weights(self, layer: torch.nn.Module) -> list[ExpertWeight] | None:
+        """The layer's expert tensors as EPLB should address them, one row
+        per local slot, when the experts keep their slots somewhere other
+        than the layer's `[num_local_experts, ...]` parameters (for example
+        in tiers, as `TieredExpertWeight`). None (the default): EPLB uses
+        views of the parameters."""
+        return None
 
     # Tensors this object allocates that its kernels read.
     kept_constants: tuple[str, ...] = ()

@@ -2008,6 +2008,7 @@ class VllmConfig:
         self._disable_cudagraphs_for_stock_torch_compile()
         self._validate_model_runner()
         self._resolve_extensible_kv_cache()
+        self._validate_eplb_world()
 
         self._validate_profiler_config()
         self._validate_batch_sharded_sampling()
@@ -3189,6 +3190,26 @@ class VllmConfig:
             unsupported.append("multimodal tower and connector LoRA")
 
         return unsupported
+
+    def _validate_eplb_world(self) -> None:
+        """EPLB balances the ranks of the EP group, which spans the TP x PCP x
+        DP ranks. On a single rank it only has work with expert slots in
+        tiers (`--cpu-offload-per-expert`)."""
+        pc = self.parallel_config
+        if not pc.enable_eplb or self.offload_config.uva.cpu_offload_per_expert:
+            return
+        if (
+            pc.tensor_parallel_size
+            * pc.prefill_context_parallel_size
+            * pc.data_parallel_size
+            <= 1
+        ):
+            raise ValueError(
+                "EPLB requires tensor, prefill-context, or data parallelism, "
+                f"but got TP={pc.tensor_parallel_size}, "
+                f"PCP={pc.prefill_context_parallel_size}, "
+                f"DP={pc.data_parallel_size} (or --cpu-offload-per-expert)."
+            )
 
     def _resolve_extensible_kv_cache(self) -> None:
         """Settle `enable_extensible_kv_cache`: on where supported if unset, an

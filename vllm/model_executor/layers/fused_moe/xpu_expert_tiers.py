@@ -1,0 +1,483 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Routed expert slots in device and host tiers on XPU, placed by EPLB.
+
+``--cpu-offload-gb`` offloads whole parameters in module order, so for a MoE
+model the first layers end up with every expert in host memory and the last
+ones with none. With ``--cpu-offload-per-expert`` (and ``--enable-eplb``) the
+budget is spent per expert slot instead: every MoE decoder layer keeps the
+same number of its local slots in pinned host memory (the slow tier, read by
+the kernels through UVA) and the rest in device memory (the fast tier).
+
+The slots are EPLB's physical slots. EPLB decides which logical expert sits
+in which slot from its load statistics and moves the bytes; it addresses a
+layer's tensors as ``TieredExpertWeight``, one row per slot across both
+storages, and its tier step keeps each rank's most-loaded experts in the fast
+slots. The slot -> tier row maps are fixed, so the experts here only run the
+stock grouped GEMM twice, over the fast and over the slow slots, each with an
+``expert_map`` that maps only its own slots (-1 elsewhere), and sum the two
+outputs. Every expert stays routable; results equal the all-resident layer up
+to the order of that sum.
+"""
+
+from typing import TYPE_CHECKING, Any
+
+import regex as re
+import torch
+
+from vllm.distributed.eplb.expert_weights import TieredExpertWeight
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
+
+if TYPE_CHECKING:
+    from vllm.config.offload import OffloadConfig
+
+logger = init_logger(__name__)
+
+# Decoder layers only: other MoE layers (e.g. MTP) keep their experts in VRAM, so
+# the budget below is exact.
+_LAYER_RE = re.compile(r"(?:^|\.)(?:model|language_model)\.layers\.(\d+)\.")
+_EXPERT_PARAMS = (
+    "w13_qweight",
+    "w13_scales",
+    "w13_qzeros",
+    "w13_bias",
+    "w2_qweight",
+    "w2_scales",
+    "w2_qzeros",
+    "w2_bias",
+)
+# The kernel tensors EPLB moves, in the order of the fast and the slow impl.
+_TIER_FIELDS = (
+    ("w13", "w13"),
+    ("w2", "w2"),
+    ("gemm1_wei_scales", "w13_scales"),
+    ("gemm2_wei_scales", "w2_scales"),
+)
+
+
+def _uva_enabled() -> bool:
+    """The decision `UVAOffloader` takes: host views are available and not
+    disabled with VLLM_WEIGHT_OFFLOADING_DISABLE_UVA."""
+    import vllm.envs as envs
+    from vllm.utils.platform_utils import is_uva_available
+
+    return is_uva_available() and not envs.VLLM_WEIGHT_OFFLOADING_DISABLE_UVA
+
+
+def selects_expert_tiers(offload_config: "OffloadConfig") -> bool:
+    """True when the offload settings put expert slots in tiers.
+
+    Raises ValueError when they ask for it while UVA is disabled or
+    unavailable: slow slots are only ever read through host views, there is no
+    copy fallback as in `UVAOffloader`.
+    """
+    uva = offload_config.uva
+    selected = (
+        uva.cpu_offload_per_expert
+        and current_platform.is_xpu()
+        and offload_config.offload_backend in ("auto", "uva")
+        and offload_config.prefetch.offload_group_size == 0
+        and uva.cpu_offload_gb > 0
+    )
+    if selected and not _uva_enabled():
+        raise ValueError(
+            "--cpu-offload-per-expert reads the slow expert slots from pinned "
+            "host memory through UVA, which is disabled "
+            "(VLLM_WEIGHT_OFFLOADING_DISABLE_UVA) or unavailable on this "
+            "platform. Drop it to offload parameters in module order."
+        )
+    if uva.cpu_offload_per_expert and not current_platform.is_xpu():
+        logger.warning_once(
+            "--cpu-offload-per-expert is supported on XPU only; offloading "
+            "parameters in module order"
+        )
+    return bool(selected)
+
+
+def _tier_config() -> "OffloadConfig | None":
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    if config is None or not selects_expert_tiers(config.offload_config):
+        return None
+    if not config.parallel_config.enable_eplb:
+        raise ValueError(
+            "--cpu-offload-per-expert places experts with EPLB: add --enable-eplb "
+            "(with --enable-expert-parallel), on one rank too."
+        )
+    return config.offload_config
+
+
+def expert_bytes(
+    quant_method: Any,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    params_dtype: torch.dtype,
+) -> int:
+    """One routed expert's packed weights and scales, as
+    ``AutoGPTQMoEMethod.create_weights`` lays them out (int32-packed qweight,
+    ``params_dtype`` scales per group)."""
+    quant_config = quant_method.quant_config
+    w13_out = quant_method.moe.w13_num_shards * intermediate_size_per_partition
+    pack = quant_config.pack_factor
+    groups13 = groups2 = 1
+    if quant_config.group_size != -1:
+        groups13 = hidden_size // quant_config.group_size
+        groups2 = intermediate_size_per_partition // quant_config.group_size
+    qweight = (
+        hidden_size // pack * w13_out
+        + intermediate_size_per_partition // pack * hidden_size
+    ) * torch.int32.itemsize
+    scales = (groups13 * w13_out + groups2 * hidden_size) * params_dtype.itemsize
+    return qweight + scales
+
+
+def budget_slow_slots(
+    gb: float, num_layers: int, expert_bytes: int, num_local: int
+) -> int:
+    """Slow slots per layer per rank that ``gb`` per rank pays for.
+
+    At least one slot stays fast in each layer.
+    """
+    slow = int(gb * 2**30 / max(num_layers * expert_bytes, 1))
+    return max(0, min(slow, num_local - 1))
+
+
+class _PinnedArena:
+    """Pinned host memory carved from 1 GiB chunks (first fit, 4 KiB aligned).
+
+    The pinned allocator rounds each block up to a power of two, which can waste
+    up to half of a layer's slow slots. Chunks of exactly 2^30 B are not
+    rounded, so ``--cpu-offload-gb`` is close to the host memory it takes.
+
+    The arena lives as long as the process: releasing a model does not free its
+    chunks, and a second model loaded in the same process adds chunks to it.
+    """
+
+    CHUNK = 1 << 30
+    ALIGN = 4096
+
+    def __init__(self) -> None:
+        self.chunks: list[torch.Tensor] = []
+        self.used: list[int] = []
+        self.total = 0
+
+    def empty(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        nbytes = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
+        for i, used in enumerate(self.used):
+            if used + nbytes <= self.chunks[i].numel():
+                break
+        else:
+            size = (
+                self.CHUNK if nbytes <= self.CHUNK else 1 << (nbytes - 1).bit_length()
+            )
+            self.chunks.append(torch.empty(size, dtype=torch.uint8, pin_memory=True))
+            self.used.append(0)
+            self.total += size
+            i, used = len(self.chunks) - 1, 0
+        self.used[i] = used + -(-nbytes // self.ALIGN) * self.ALIGN
+        return self.chunks[i][used : used + nbytes].view(dtype).view(shape)
+
+    @property
+    def gib(self) -> float:
+        return self.total / 2**30
+
+
+_ARENA = _PinnedArena()
+
+
+def _repack_int4_pinned(qweight: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """GPTQ int32 ``[E, in/8, out]`` (CPU) -> signed-int4 bytes ``[E, out, in/2]``.
+
+    The layout transform of the method's post-load step plus ``implement_zp``,
+    run on ``device`` a few experts at a time into pinned host memory, so device
+    temporaries stay small.
+    """
+    from vllm_xpu_kernels.fused_moe_interface import implement_zp
+
+    e, k8, n = qweight.shape
+    out = _ARENA.empty((e, n, k8 * 4), torch.uint8)
+    step = 16
+    for i in range(0, e, step):
+        chunk = qweight[i : i + step].to(device)
+        packed = chunk.transpose(1, 2).contiguous().view(torch.uint8)
+        out[i : i + chunk.shape[0]].copy_(implement_zp(packed))
+    return out
+
+
+def _pin(t: torch.Tensor) -> torch.Tensor:
+    """A pinned copy of ``t``."""
+    pinned = _ARENA.empty(tuple(t.shape), t.dtype)
+    pinned.copy_(t)
+    return pinned
+
+
+def _xpu_fused_moe() -> Any:
+    from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
+
+    return XpuFusedMoe
+
+
+def _slot_maps(
+    local_of: dict[int, int], num_global: int, num_fast: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Physical expert id -> row of the fast and of the slow tier, -1 elsewhere."""
+    fast_map = torch.full((num_global,), -1, dtype=torch.int32)
+    slow_map = torch.full((num_global,), -1, dtype=torch.int32)
+    for g, slot in local_of.items():
+        if slot < 0:
+            continue
+        if slot < num_fast:
+            fast_map[g] = slot
+        else:
+            slow_map[g] = slot - num_fast
+    return fast_map, slow_map
+
+
+class ExpertTiers:
+    """One layer's local expert slots: ``[0, num_fast)`` in device memory,
+    ``[num_fast, num_local)`` in pinned host memory."""
+
+    def __init__(
+        self,
+        layer_name: str,
+        local_of: dict[int, int],
+        num_global: int,
+        num_local: int,
+        num_fast: int,
+    ):
+        assert 0 < num_fast < num_local
+        self.layer_name = layer_name
+        self.local_of = local_of  # physical expert id -> local slot, -1 elsewhere
+        self.num_global = num_global
+        self.num_local = num_local
+        self.num_fast = num_fast
+        self.twins: dict[str, torch.nn.Parameter] = {}
+        self._param_names: dict[int, str] = {}
+        self.slow: dict[str, torch.Tensor] = {}  # pinned, kernel layout
+        self.slow_views: dict[str, torch.Tensor] = {}
+        self.fast_map: torch.Tensor | None = None
+        self.slow_map: torch.Tensor | None = None
+        self._impls: tuple[Any, Any] | None = None
+
+    @property
+    def num_slow(self) -> int:
+        return self.num_local - self.num_fast
+
+    def attach_twins(self, layer: torch.nn.Module) -> None:
+        """A pageable CPU twin ``[num_slow, ...]`` for every per-expert param."""
+        for name, param in layer.named_parameters(recurse=False):
+            if (
+                name not in _EXPERT_PARAMS
+                or param.ndim == 0
+                or param.shape[0] != self.num_fast
+            ):
+                continue
+            twin = torch.nn.Parameter(
+                # explicit CPU: the model is built under a default-device context
+                torch.zeros(
+                    (self.num_slow, *param.shape[1:]), dtype=param.dtype, device="cpu"
+                ),
+                requires_grad=False,
+            )
+            for key, value in vars(param).items():
+                if not key.startswith("_"):
+                    setattr(twin, key, value)
+            self.twins[name] = twin
+            self._param_names[id(param)] = name
+
+    def route(
+        self, param: torch.nn.Parameter, slot: int
+    ) -> tuple[torch.nn.Parameter, int]:
+        """(param, row) the loader should write local slot ``slot`` into."""
+        if slot < self.num_fast:
+            return param, slot
+        name = self._param_names.get(id(param))
+        if name is None:
+            raise RuntimeError(
+                f"{self.layer_name}: no slow-slot twin for a param of shape "
+                f"{tuple(param.shape)}"
+            )
+        return self.twins[name], slot - self.num_fast
+
+    def finalize(self, layer: torch.nn.Module, moe_kernel: Any) -> None:
+        """Repack the slow twins into pinned kernel-layout tensors; wire the
+        kernel."""
+        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+        for bias in ("w13_bias", "w2_bias"):
+            if getattr(layer, bias, None) is not None:
+                raise NotImplementedError(
+                    f"{self.layer_name}: --cpu-offload-per-expert does not support "
+                    f"{bias}"
+                )
+        experts = getattr(moe_kernel, "fused_experts", None)
+        if experts is None or not hasattr(experts, "tiers"):
+            raise NotImplementedError(
+                "--cpu-offload-per-expert needs XPUExperts, got "
+                f"{type(experts).__name__}"
+            )
+        twins, self.twins, self._param_names = self.twins, {}, {}
+        device: torch.device = getattr(layer, "w13_weight").device  # noqa: B009
+        for key in ("w13", "w2"):
+            self.slow[key] = _repack_int4_pinned(
+                twins.pop(f"{key}_qweight").data, device
+            )
+            scales = twins.pop(f"{key}_scales").data.transpose(1, 2).contiguous()
+            self.slow[f"{key}_scales"] = _pin(
+                scales.to(getattr(layer, f"{key}_scales").dtype)
+            )
+        del twins  # qzeros: symmetric int4 has none on XPU
+        for key, tensor in self.slow.items():
+            view = get_accelerator_view_from_cpu_tensor(tensor)
+            # Host memory seen from the device.
+            view._vllm_is_uva_offloaded = True  # type: ignore[attr-defined]
+            self.slow_views[key] = view
+        fast_map, slow_map = _slot_maps(self.local_of, self.num_global, self.num_fast)
+        self.fast_map, self.slow_map = fast_map.to(device), slow_map.to(device)
+        experts.tiers = self
+
+    def impls(
+        self,
+        w1: torch.Tensor,
+        w1_scale: torch.Tensor,
+        w2: torch.Tensor,
+        w2_scale: torch.Tensor,
+        topk: int,
+        activation: str,
+        gemm1_clamp_limit: float | None,
+    ) -> tuple[Any, Any]:
+        """(fast, slow) ``XpuFusedMoe``, built once."""
+        if self._impls is None:
+            XpuFusedMoe = _xpu_fused_moe()
+            # ep_size > 1 only makes XpuFusedMoe index through the expert_map
+            # given here.
+            common: dict[str, Any] = {
+                "n_experts_per_token": topk,
+                "activation": activation,
+                "ep_rank": 0,
+                "ep_size": 2,
+                "gemm1_clamp_limit": gemm1_clamp_limit,
+            }
+            fast = XpuFusedMoe(
+                w13=w1,
+                w13_scales=w1_scale,
+                w13_bias=None,
+                w2=w2,
+                w2_scales=w2_scale,
+                w2_bias=None,
+                num_experts=self.num_fast,
+                expert_map=self.fast_map,
+                **common,
+            )
+            sw13, sw2 = self.slow_views["w13"], self.slow_views["w2"]
+            # already signed int4, in kernel layout
+            sw13.xpu_fused_moe = True  # type: ignore[attr-defined]
+            slow = XpuFusedMoe(
+                w13=sw13,
+                w13_scales=self.slow_views["w13_scales"],
+                w13_bias=None,
+                w2=sw2,
+                w2_scales=self.slow_views["w2_scales"],
+                w2_bias=None,
+                num_experts=self.num_slow,
+                expert_map=self.slow_map,
+                **common,
+            )
+            # Sizes come from the uint8 view; the kernel reads packed int4 as int8.
+            slow.w13, slow.w2 = sw13.view(torch.int8), sw2.view(torch.int8)
+            slow.w13._vllm_is_uva_offloaded = True
+            slow.w2._vllm_is_uva_offloaded = True
+            self._impls = (fast, slow)
+        return self._impls
+
+    def eplb_weights(self) -> list[TieredExpertWeight]:
+        """The tensors the two impls read, as EPLB's per-slot rows."""
+        assert self._impls is not None, "the impls are built at weight processing"
+        fast, slow = self._impls
+        weights = []
+        for impl_field, _ in _TIER_FIELDS:
+            parts = [getattr(impl, impl_field) for impl in (fast, slow)]
+            parts = [p.view(p.shape[0], -1) for p in parts]
+            if parts[0].dtype != parts[1].dtype:  # packed int4: int8 vs uint8
+                parts = [p.view(torch.uint8) for p in parts]
+            weights.append(TieredExpertWeight(parts, self.on_rows_written))
+        return weights
+
+    def on_rows_written(self, slots: list[int]) -> None:
+        """EPLB wrote slow slots. Nothing caches them here."""
+        return
+
+
+def remap_unrouted(
+    topk_ids: torch.Tensor, num_global: int, ep_rank: int
+) -> torch.Tensor:
+    """The stock remap of ``topk_ids == -1`` to an expert this rank doesn't own.
+
+    That expert is -1 in both maps, so both kernel calls skip the row.
+    """
+    sentinel = num_global - 1 if ep_rank == 0 else 0
+    return torch.where(topk_ids < 0, topk_ids.new_full((), sentinel), topk_ids)
+
+
+def maybe_tier(
+    layer_name: str,
+    moe_config: Any,
+    expert_map_manager: Any,
+    quant_method: Any,
+    moe_quant_params: dict[str, Any],
+) -> ExpertTiers | None:
+    """Tiers for this layer, or None: the setting is off or doesn't apply."""
+    config = _tier_config()
+    if config is None:
+        return None
+    from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQMoEMethod
+
+    if (
+        not isinstance(quant_method, AutoGPTQMoEMethod)
+        or quant_method.quant_config.weight_bits != 4
+    ):
+        logger.warning_once(
+            "--cpu-offload-per-expert supports int4 GPTQ experts only; %s "
+            "experts stay in VRAM",
+            type(quant_method).__name__,
+        )
+        return None
+    if _LAYER_RE.search(layer_name) is None:
+        logger.info_once(
+            "--cpu-offload-per-expert: %s is not a decoder layer; its experts "
+            "stay in VRAM",
+            layer_name,
+        )
+        return None
+    num_global = moe_config.num_experts  # logical + redundant: EPLB's slots
+    local_of = {g: expert_map_manager.map_global_to_local(g) for g in range(num_global)}
+    num_local = sum(1 for slot in local_of.values() if slot >= 0)
+    from vllm.config import get_current_vllm_config
+
+    num_layers = get_current_vllm_config().model_config.hf_text_config.num_hidden_layers
+    bytes_each = expert_bytes(
+        quant_method,
+        moe_quant_params["hidden_size"],
+        moe_quant_params["intermediate_size_per_partition"],
+        moe_quant_params["params_dtype"],
+    )
+    num_slow = budget_slow_slots(
+        config.uva.cpu_offload_gb, num_layers, bytes_each, num_local
+    )
+    if num_slow == 0:
+        return None
+    logger.info_once(
+        "--cpu-offload-per-expert: --cpu-offload-gb %s: %d of %d expert slots per "
+        "layer per rank in host memory (%d B each, %d layers); EPLB places the "
+        "experts",
+        config.uva.cpu_offload_gb,
+        num_slow,
+        num_local,
+        bytes_each,
+        num_layers,
+    )
+    return ExpertTiers(
+        layer_name, local_of, num_global, num_local, num_local - num_slow
+    )

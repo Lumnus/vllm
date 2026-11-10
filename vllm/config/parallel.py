@@ -131,9 +131,18 @@ class EPLBConfig:
     into the same file. A missing or unreadable file starts from the identity
     placement."""
 
+    tier_hysteresis: float = Field(default=1.1, ge=1.0)
+    """With expert slots in tiers (`--cpu-offload-per-expert`), an expert in a
+    slow slot takes the fast slot of a rank's least-loaded fast expert only
+    while it carries more than this times that expert's load, so experts of
+    near-equal load do not move back and forth."""
+
     def compile_factors(self) -> CompileFactors:
-        # Where the loads are kept does not change the graph.
-        return get_compile_factors(self, ignored_factors={"state_path"})
+        # Where the loads are kept and when experts change tiers do not
+        # change the graph.
+        return get_compile_factors(
+            self, ignored_factors={"state_path", "tier_hysteresis"}
+        )
 
     @property
     def migration_batching_enabled(self) -> bool:
@@ -623,20 +632,9 @@ class ParallelConfig:
                 )
             if not self.enable_expert_parallel:
                 raise ValueError("enable_expert_parallel must be True to use EPLB.")
-            # The EP group spans the TP x PCP x DP ranks. EPLB therefore needs
-            # TP, PCP, or DP > 1.
-            if (
-                self.tensor_parallel_size
-                * self.prefill_context_parallel_size
-                * self.data_parallel_size
-                <= 1
-            ):
-                raise ValueError(
-                    "EPLB requires tensor, prefill-context, or data parallelism, "
-                    f"but got TP={self.tensor_parallel_size}, "
-                    f"PCP={self.prefill_context_parallel_size}, "
-                    f"DP={self.data_parallel_size}."
-                )
+            # One EP rank (TP x PCP x DP == 1) is checked by VllmConfig: EPLB
+            # places experts between the slot tiers of that rank with
+            # --cpu-offload-per-expert.
 
         if not self.enable_eplb:
             if self.eplb_config.num_redundant_experts not in (None, 0):

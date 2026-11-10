@@ -732,6 +732,8 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             backend=self.wna16_moe_backend,
             routing_tables=layer._expert_routing_tables(),
         )
+        if layer.expert_tiers is not None:
+            layer.expert_tiers.finalize(layer, self.moe_kernel)
 
     @property
     def supports_eplb(self) -> bool:

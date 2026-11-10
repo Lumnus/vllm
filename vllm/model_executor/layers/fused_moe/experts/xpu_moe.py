@@ -3,6 +3,7 @@
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed.eplb.expert_weights import ExpertWeight
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -11,6 +12,10 @@ from vllm.model_executor.layers.fused_moe.config import (
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
+)
+from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
+    ExpertTiers,
+    remap_unrouted,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
@@ -32,6 +37,9 @@ if current_platform.is_xpu():
 
 
 class XPUExperts(mk.FusedMoEExpertsModular):
+    # Expert slots in device and host tiers, set by ExpertTiers.finalize.
+    tiers: ExpertTiers | None = None
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -127,14 +135,35 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             gemm1_clamp_limit=self.gemm1_clamp_limit,
         )
 
+    def _tier_impls(self, w1: torch.Tensor, w2: torch.Tensor, topk: int):
+        assert self.tiers is not None
+        assert self.w1_scale is not None and self.w2_scale is not None
+        return self.tiers.impls(
+            w1,
+            self.w1_scale,
+            w2,
+            self.w2_scale,
+            topk,
+            self.moe_config.activation.value,
+            self.gemm1_clamp_limit,
+        )
+
+    def eplb_expert_weights(self, layer: torch.nn.Module) -> list[ExpertWeight] | None:
+        if self.tiers is None:
+            return None
+        return list(self.tiers.eplb_weights())
+
     def finalize_weight_storage(self, layer: torch.nn.Module) -> None:
         """Build the XpuFusedMoe now, so its relayout lands before EPLB (or
         anything else) takes views of the expert tensors."""
-        if self.fused_moe_impl is not None:
-            return
         w13 = getattr(layer, "w13_weight", None)
         w2 = getattr(layer, "w2_weight", None)
         if w13 is None or w2 is None:
+            return
+        if self.tiers is not None:
+            self._tier_impls(w13, w2, self.moe_config.experts_per_token)
+            return
+        if self.fused_moe_impl is not None:
             return
         self._build_impl(
             w13,
@@ -178,6 +207,9 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         expert_tokens_meta: mk.ExpertTokensMetadata | None,
         apply_router_weight_on_input: bool,
     ):
+        if self.tiers is not None:
+            self._apply_tiered(output, hidden_states, w1, w2, topk_weights, topk_ids)
+            return
         if self.fused_moe_impl is None:
             # Methods that skip finalize_weight_storage build it on first use.
             self._build_impl(w1, w2, topk_ids.size(-1), activation, expert_map)
@@ -194,6 +226,38 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             topk_ids=topk_ids,
             a1q_scale=a1q_scale,
         )
+
+    def _apply_tiered(
+        self,
+        output: torch.Tensor,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> None:
+        """Experts in the fast slots plus experts in the slow slots, summed."""
+        tiers = self.tiers
+        assert tiers is not None
+        fast, slow = self._tier_impls(w1, w2, topk_ids.size(-1))
+        if self.moe_config.ep_size > 1:
+            topk_ids = remap_unrouted(
+                topk_ids, tiers.num_global, self.moe_config.ep_rank
+            )
+        fast.apply(
+            output=output,
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+        slow_out = torch.empty_like(output)
+        slow.apply(
+            output=slow_out,
+            hidden_states=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+        output.add_(slow_out)
 
 
 class XPUExpertsFp8(XPUExperts):

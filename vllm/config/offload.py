@@ -43,6 +43,18 @@ class UVAOffloadConfig:
     This allows distinguishing parameters like "w2_weight" and "w2_weight_scale".
     """
 
+    cpu_offload_per_expert: bool = False
+    """Spend `cpu_offload_gb` on routed expert slots instead of whole
+    parameters (XPU, int4 GPTQ/AutoRound experts; needs --enable-eplb). Every
+    MoE decoder layer keeps the same number of its local expert slots in
+    pinned host memory, read by the kernels through UVA, and the rest in
+    device memory. EPLB places the experts: its load statistics decide which
+    experts take the device slots, its rearrangement moves them, and with
+    `--eplb-config` `state_path` the placement survives restarts. Works on a
+    single rank too. The budget goes to routed experts only:
+    `cpu_offload_params` is ignored. Refused when UVA is disabled
+    (`VLLM_WEIGHT_OFFLOADING_DISABLE_UVA`)."""
+
 
 @config
 class PrefetchOffloadConfig:
