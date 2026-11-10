@@ -1346,6 +1346,23 @@ def get_nvcc_cuda_version() -> Version:
     return nvcc_cuda_version
 
 
+B70_LINE = "l34"
+
+
+def _b70_version(version: str) -> str:
+    """The public part of the scm version, tagged with the B70 line and commit."""
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short=10", "HEAD"],
+            cwd=ROOT_DIR,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        sha = "unknown"
+    return f"{version.split('+', 1)[0]}+b70.{B70_LINE}.g{sha}"
+
+
 def get_vllm_version() -> str:
     # Allow overriding the version. This is useful to build platform-specific
     # wheels (e.g. CPU, TPU) without modifying the source.
@@ -1357,6 +1374,11 @@ def get_vllm_version() -> str:
             git_describe_command=VLLM_GIT_DESCRIBE_COMMAND,
         )
 
+    version = get_version(git_describe_command=VLLM_GIT_DESCRIBE_COMMAND)
+    # B70: the built artifact names its engine line and the commit it was built
+    # from, e.g. 0.20.2.dev307+b70.l34.g0123456789.xpu.
+    version = _b70_version(version)
+    os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = version
     version = get_version(
         write_to="vllm/_version.py",
         git_describe_command=VLLM_GIT_DESCRIBE_COMMAND,

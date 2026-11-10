@@ -8,7 +8,8 @@ except Exception as e:
 
     warnings.warn(f"Failed to read commit hash:\n{e}", RuntimeWarning, stacklevel=2)
 
-    __version__ = "dev"
+    # B70: a source tree run without a build still names its engine line.
+    __version__ = "dev+b70.l34"
     __version_tuple__ = (0, 0, __version__)
 
 
