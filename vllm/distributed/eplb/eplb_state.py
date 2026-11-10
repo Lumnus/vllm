@@ -53,6 +53,7 @@ from vllm.utils.torch_utils import PIN_MEMORY
 
 from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
+from .eplb_state_file import read_expert_loads, write_expert_loads
 from .eplb_utils import CpuGpuEvent
 from .policy import EPLB_POLICIES, AbstractEplbPolicy, DefaultEplbPolicy
 from .rebalance_execute import (
@@ -231,6 +232,9 @@ class EplbModelState:
     pointers remain stable across CUDA-graph replays.  The router kernel
     indexes this list with `dbo_current_ubatch_id()`.
     """
+    has_saved_load: bool = False
+    """`last_expert_load` holds loads read from `EPLBConfig.state_path` that
+    `restore_saved_placement` has not placed the experts by yet."""
 
 
 class EplbState:
@@ -546,6 +550,82 @@ class EplbState:
             num_unpadded_tokens_tensors=num_unpadded_tokens_tensors,
         )
         self.model_states[hash_config_cached(model_config)] = model_state
+        if self.parallel_config.eplb_config.state_path is not None:
+            self._read_saved_load(model_state)
+
+    def _read_saved_load(self, model_state: EplbModelState) -> None:
+        """Fill `last_expert_load` from `EPLBConfig.state_path`."""
+        path = self.parallel_config.eplb_config.state_path
+        assert path is not None
+        saved = read_expert_loads(path)
+        model = model_state.model
+        found = 0
+        for layer_idx, layer in enumerate(model.moe_layers):
+            loads = saved.get(layer.layer_name)
+            if loads is None:
+                continue
+            if len(loads) != model.num_logical_experts:
+                logger.warning(
+                    "EPLB: %s has %d saved loads for %d logical experts in %s; "
+                    "not used",
+                    layer.layer_name,
+                    len(loads),
+                    model.num_logical_experts,
+                    path,
+                )
+                continue
+            model_state.last_expert_load[layer_idx].copy_(
+                torch.tensor(loads, dtype=torch.int64)
+            )
+            found += 1
+        model_state.has_saved_load = found > 0
+        logger.info(
+            "EPLB: saved expert loads for %d of %d MoE layers of %s in %s",
+            found,
+            model.num_moe_layers,
+            model_state.model_name,
+            path,
+        )
+
+    def restore_saved_placement(self) -> None:
+        """Place the experts by the loads read from `EPLBConfig.state_path`,
+        once, before serving. A blocking rearrangement on every EP rank; the
+        decision follows EP rank 0, which also supplies the loads."""
+        ep_group = get_ep_group().device_group
+        pending = torch.tensor(
+            [any(s.has_saved_load for s in self.model_states.values())],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        if ep_group.rank() != 0:
+            pending.zero_()
+        all_reduce(pending, group=ep_group)
+        with gpu_sync_allowed():
+            restore = bool(pending.item())
+        if restore:
+            self.rearrange(use_last_expert_load=True, blocking=True)
+        for model_state in self.model_states.values():
+            model_state.has_saved_load = False
+
+    def _save_expert_load(self, global_expert_load_windows: list[torch.Tensor]) -> None:
+        """Write the loads a rearrangement uses to `EPLBConfig.state_path`."""
+        path = self.parallel_config.eplb_config.state_path
+        assert path is not None
+        layers: dict[str, list[int]] = {}
+        for model_state, window in zip(
+            self.model_states.values(), global_expert_load_windows
+        ):
+            with gpu_sync_allowed():
+                loads = window.cpu().tolist()
+            for layer, layer_loads in zip(model_state.model.moe_layers, loads):
+                if sum(layer_loads) > 0:  # no traffic must not erase a state
+                    layers[layer.layer_name] = [int(x) for x in layer_loads]
+        if not layers:
+            return
+        try:
+            write_expert_loads(path, layers)
+        except OSError as err:
+            logger.warning("EPLB: cannot write the expert loads to %s: %s", path, err)
 
     def prepare_forward(
         self,
@@ -807,6 +887,7 @@ class EplbState:
         is_profile: bool = False,
         rank_mapping: dict[int, int] | None = None,
         use_last_expert_load: bool = False,
+        blocking: bool = False,
     ) -> torch.Tensor | None:
         """Rearrange the experts according to the current load.
 
@@ -817,6 +898,7 @@ class EplbState:
             rank_mapping (dict[int, int] | None): The rank mapping
                 when scaling is done in EEP.
             use_last_expert_load: Use the last reshuffle's logical-expert totals.
+            blocking: Move the weights before returning, also in async mode.
 
         """
         ep_group = get_ep_group().device_group
@@ -825,14 +907,15 @@ class EplbState:
         start_event = None
         end_event = None
         is_main_rank = ep_rank == 0
+        sync = not self.is_async or is_profile or blocking
         if is_main_rank:
-            if not self.is_async or is_profile:
+            if sync:
                 start_event = torch.Event(enable_timing=True)
                 end_event = torch.Event(enable_timing=True)
                 start_event.record()
             logger.info(
                 "Rearranging experts %s %s...",
-                "(async mode)" if self.is_async else "sync mode",
+                "sync mode" if sync else "(async mode)",
                 "(profile)" if is_profile else "",
             )
 
@@ -871,6 +954,13 @@ class EplbState:
             global_expert_load_windows.append(global_expert_load_window)
         # Perform all-reduce to get the expert load across all ranks for each model
         global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
+        if (
+            self.parallel_config.eplb_config.state_path is not None
+            and is_main_rank
+            and not is_profile
+            and not use_last_expert_load
+        ):
+            self._save_expert_load(global_expert_load_windows)
 
         # TODO(bowen): Treat differently for prefill and decode nodes
         eplb_model_state = next(iter(self.model_states.values()))
@@ -908,7 +998,7 @@ class EplbState:
         ):
             if not is_profile:
                 eplb_model_state.last_expert_load = global_expert_load_window
-            if not self.is_async or is_profile:
+            if sync:
                 # Get new expert mappings for the model. The policy runs on the
                 # host, so the load window and current map have to come back.
                 with gpu_sync_allowed():
@@ -1022,7 +1112,7 @@ class EplbState:
                 )
                 eplb_model_state.rebalanced = True
         # Signal async thread to start transferring layers
-        if self.is_async and (not is_profile):
+        if not sync:
             self.rearrange_event.record()
         return None
 
