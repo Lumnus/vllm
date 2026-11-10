@@ -222,6 +222,14 @@ def triton_scaled_mm(
             # BLOCK_M must cover M: every row block re-reads the whole weight.
             tile_shape = (triton.next_power_of_2(M), 32, 128)
             num_warps = 8
+        elif current_platform.is_xpu() and M > 64:
+            # With fewer warps per tile the int32 accumulator spills registers.
+            if M <= 128:
+                tile_shape = (128, 128, 32)
+                num_warps = 16
+            else:
+                tile_shape = (256, 128, 128)
+                num_warps = 32
         elif next_power_of_2_M <= 32:
             tile_shape = (64, 64, 256) if is_small_N else (64, 128, 256)
         elif next_power_of_2_M <= 64:
