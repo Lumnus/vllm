@@ -290,6 +290,22 @@ class FlashAttentionBackend(AttentionBackend):
         "fp8_e4m3",
     ]
 
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        """On XPU, int8_per_token_head reserves the bytes per block of
+        TRITON_ATTN's per-token-head spec, so both backends see the same page
+        sizes; the impl reads them in the decode kernel's split layout
+        (vllm.v1.attention.ops.xpu_int8_per_token_head)."""
+        spec = super().customize_spec(spec)
+        if (
+            current_platform.is_xpu()
+            and spec.kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+        ):
+            from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
+            return TritonAttentionBackend.customize_spec(spec)
+        return spec
+
     @staticmethod
     def _get_sm90_fa4_fp8_kv_block_size(
         kv_cache_spec: KVCacheSpec | None = None,
@@ -399,6 +415,9 @@ class FlashAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return True
+        if kv_cache_dtype == "int8_per_token_head":
+            # Native INT8 paged decode in vllm-xpu-kernels.
+            return current_platform.is_xpu()
         if kv_cache_dtype not in cls.supported_kv_cache_dtypes:
             return False
         if is_quantized_kv_cache(kv_cache_dtype):
@@ -442,6 +461,8 @@ class FlashAttentionBackend(AttentionBackend):
                 return "SM90 d512 FP8 KV requires a block size divisible by 64"
             if use_sparse:
                 return "SM90 d512 FP8 KV does not support block sparsity"
+        if kv_cache_dtype == "int8_per_token_head" and head_size % 64 != 0:
+            return "int8_per_token_head KV requires a head size divisible by 64"
         if has_sink and device_capability < DeviceCapability(9, 0):
             return "sink not supported on compute capability < 9.0"
         if (
@@ -512,6 +533,11 @@ class FlashAttentionMetadata:
     max_num_splits: int = 0
 
     causal: bool | torch.Tensor = True
+
+    # Host copies from the common metadata; the XPU int8_per_token_head
+    # prefill groups sequences with them (no device-to-host reads).
+    query_start_loc_cpu: torch.Tensor | None = None
+    seq_lens_cpu_upper_bound: torch.Tensor | None = None
 
     # PrefixLM bidirectional range containing each scheduled query token.
     # Shape: (num_actual_tokens, 2) int32, absolute [start, end] bounds;
@@ -593,6 +619,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         vllm_config: "VllmConfig",
         kv_cache_spec: "KVCacheSpec",
     ) -> AttentionCGSupport:
+        if (
+            current_platform.is_xpu()
+            and isinstance(kv_cache_spec, AttentionSpec)
+            and kv_cache_spec.kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD
+        ):
+            # Uniform decode batches run the native INT8 decode kernel; batches
+            # with prefill rows dequantize through a host-planned loop.
+            return AttentionCGSupport.UNIFORM_BATCH
         return cls._cudagraph_support
 
     def _get_scheduler_metadata(
@@ -935,6 +969,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             scheduler_metadata=scheduler_metadata,
             max_num_splits=max_num_splits,
             causal=causal,
+            query_start_loc_cpu=common_attn_metadata.query_start_loc_cpu,
+            seq_lens_cpu_upper_bound=common_attn_metadata.seq_lens_cpu_upper_bound,
         )
 
         # Compute mm_prefix range tensor if the batch contains
@@ -1083,6 +1119,9 @@ class FlashAttentionImpl(AttentionImpl):
                 " kv-cache on this device."
             )
 
+        if kv_cache_dtype == "int8_per_token_head":
+            self._init_int8_per_token_head_kv(vllm_config)
+
         self.sinks = sinks
         if self.sinks is not None:
             assert flash_attn_supports_sinks(), (
@@ -1125,6 +1164,177 @@ class FlashAttentionImpl(AttentionImpl):
             self._dcp_max_num_tokens = (
                 vllm_config.scheduler_config.max_num_batched_tokens
             )
+
+    def _init_int8_per_token_head_kv(self, vllm_config: VllmConfig | None) -> None:
+        """int8_per_token_head runs on XPU only, through the native INT8 paged
+        decode of vllm-xpu-kernels (prefill via a dequantized scratch)."""
+        from vllm.v1.attention.ops import xpu_int8_per_token_head as int8_kv
+
+        unsupported = []
+        if not current_platform.is_xpu():
+            unsupported.append("XPU only")
+        if self.attn_type != AttentionType.DECODER:
+            unsupported.append(f"decoder attention only, got {self.attn_type}")
+        if self.alibi_slopes is not None:
+            unsupported.append("ALiBi")
+        if self.logits_soft_cap:
+            unsupported.append("soft-capping")
+        if self.head_size % 64 != 0:
+            unsupported.append(f"head size {self.head_size} not divisible by 64")
+        if self.dcp_world_size > 1:
+            unsupported.append("decode context parallelism")
+        if vllm_config is None or vllm_config.model_config is None:
+            unsupported.append("no model config (prefill scratch size)")
+        if unsupported:
+            raise NotImplementedError(
+                "FlashAttention int8_per_token_head KV cache: unsupported "
+                f"configuration ({'; '.join(unsupported)}). Use "
+                "--attention-backend TRITON_ATTN."
+            )
+        assert vllm_config is not None
+        model_dtype = vllm_config.model_config.dtype
+        assert isinstance(model_dtype, torch.dtype)
+        reason = int8_kv.int8_kv_decode_supported(self.head_size, model_dtype)
+        if reason is not None:
+            raise NotImplementedError(
+                "FlashAttention int8_per_token_head KV cache needs a "
+                "vllm-xpu-kernels build with INT8 per-token-head paged decode; "
+                f"the installed build failed it ({reason}). Use "
+                "--attention-backend TRITON_ATTN or upgrade vllm-xpu-kernels."
+            )
+        self._int8_kv_max_model_len = vllm_config.model_config.max_model_len
+        self._int8_kv_block_size = vllm_config.cache_config.block_size
+        self._int8_kv_scratch_dtype = model_dtype
+        self._int8_kv_views: tuple[tuple, tuple[torch.Tensor, ...]] | None = None
+        logger.info_once(
+            "FlashAttention int8_per_token_head KV cache on XPU: native INT8 "
+            "paged decode (query length <= %d per sequence), prefill through "
+            "a dequantized %s scratch.",
+            int8_kv.decode_max_query_len(),
+            model_dtype,
+        )
+
+    def _int8_kv_prefill_scratch(
+        self, block_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One layer's K and V scratch in blocks of `block_size`, from the
+        workspace sized in the profiling run (cache block size, which bounds
+        the kernel block size from above)."""
+        from vllm.v1.attention.ops.xpu_int8_per_token_head import (
+            prefill_scratch_tokens,
+        )
+
+        tokens = prefill_scratch_tokens(
+            self._int8_kv_max_model_len, self._int8_kv_block_size
+        )
+        shape = (tokens, self.num_kv_heads, self.head_size)
+        key_flat, value_flat = current_workspace_manager().get_simultaneous(
+            (shape, self._int8_kv_scratch_dtype),
+            (shape, self._int8_kv_scratch_dtype),
+        )
+        num_blocks = tokens // block_size
+        blocks = (num_blocks, block_size, self.num_kv_heads, self.head_size)
+        return (
+            key_flat[: num_blocks * block_size].view(blocks),
+            value_flat[: num_blocks * block_size].view(blocks),
+        )
+
+    def _int8_kv_split_views(self, kv_cache: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        key = (kv_cache.data_ptr(), tuple(kv_cache.shape), tuple(kv_cache.stride()))
+        if self._int8_kv_views is None or self._int8_kv_views[0] != key:
+            from vllm.v1.attention.ops.xpu_int8_per_token_head import (
+                split_layout_views,
+            )
+
+            views = split_layout_views(kv_cache, self.num_kv_heads, self.head_size)
+            self._int8_kv_views = (key, views)
+        return self._int8_kv_views[1]
+
+    def _forward_int8_per_token_head(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: FlashAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        from vllm.v1.attention.ops import xpu_int8_per_token_head as int8_kv
+
+        causal = attn_metadata.causal
+        if (
+            not isinstance(causal, bool)
+            or attn_metadata.mm_prefix_query_range_tensor is not None
+            or attn_metadata.rswa_prefix_lens is not None
+        ):
+            raise NotImplementedError(
+                "FlashAttention int8_per_token_head KV cache: per-request "
+                "causal masks, multimodal prefix ranges and R-SWA are not "
+                "supported."
+            )
+        n = attn_metadata.num_actual_tokens
+        key_cache, value_cache, k_scale, v_scale = self._int8_kv_split_views(kv_cache)
+        window = _maybe_symmetrize_window(self.sliding_window, causal)
+        window_size = list(window) if window is not None else None
+        max_q = attn_metadata.max_query_len
+        if (causal or max_q == 1) and max_q <= int8_kv.decode_max_query_len():
+            int8_kv.forward_decode(
+                query[:n],
+                key_cache,
+                value_cache,
+                k_scale,
+                v_scale,
+                output[:n],
+                attn_metadata.query_start_loc,
+                max_q,
+                attn_metadata.seq_lens,
+                attn_metadata.max_seq_len,
+                attn_metadata.block_table,
+                self.scale,
+                window_size,
+                self.sinks,
+            )
+            return output
+
+        if int8_kv.is_graph_capturing():
+            # The prefill path plans its groups on the host.
+            raise RuntimeError(
+                "FlashAttention int8_per_token_head KV cache: a batch with "
+                f"max query length {max_q} (causal={causal}) cannot be captured "
+                "in a full graph; full graphs cover uniform causal decode "
+                "batches only."
+            )
+        if attn_metadata.query_start_loc_cpu is None:
+            raise NotImplementedError(
+                "FlashAttention int8_per_token_head KV cache: prefill needs "
+                "the host query_start_loc."
+            )
+        num_seqs = attn_metadata.query_start_loc.numel() - 1
+        seq_ub = attn_metadata.seq_lens_cpu_upper_bound
+        seq_lens_ub = (
+            seq_ub[:num_seqs].tolist()
+            if seq_ub is not None
+            else [attn_metadata.max_seq_len] * num_seqs
+        )
+        key_scratch, value_scratch = self._int8_kv_prefill_scratch(key_cache.shape[1])
+        int8_kv.forward_prefill(
+            query[:n],
+            key_cache,
+            value_cache,
+            k_scale,
+            v_scale,
+            output[:n],
+            key_scratch,
+            value_scratch,
+            attn_metadata.query_start_loc,
+            attn_metadata.query_start_loc_cpu,
+            attn_metadata.seq_lens,
+            seq_lens_ub,
+            attn_metadata.block_table,
+            self.scale,
+            causal,
+            window_size,
+            self.sinks,
+        )
+        return output
 
     def _descale(
         self, scale: torch.Tensor, scale_float: float, shape: tuple[int, int]
@@ -1191,6 +1401,9 @@ class FlashAttentionImpl(AttentionImpl):
 
         if attn_metadata is None:
             # Profiling run.
+            if self.kv_cache_dtype == "int8_per_token_head":
+                # Claim the prefill scratch so KV cache sizing accounts for it.
+                self._int8_kv_prefill_scratch(self._int8_kv_block_size)
             return output.fill_(0)
 
         attn_type = self.attn_type
@@ -1217,6 +1430,11 @@ class FlashAttentionImpl(AttentionImpl):
                 output[:num_actual_tokens],
                 attn_metadata,
                 layer,
+            )
+
+        if self.kv_cache_dtype == "int8_per_token_head":
+            return self._forward_int8_per_token_head(
+                query, kv_cache, attn_metadata, output
             )
 
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
@@ -1396,6 +1614,28 @@ class FlashAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+
+        if self.kv_cache_dtype == "int8_per_token_head":
+            from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+                triton_reshape_and_cache_flash_per_token_head_quant,
+            )
+
+            key_cache, value_cache, k_scale, v_scale = self._int8_kv_split_views(
+                kv_cache
+            )
+            # The writer's grid follows key's rows; slot_mapping is unpadded.
+            num_slots = slot_mapping.shape[0]
+            triton_reshape_and_cache_flash_per_token_head_quant(
+                key[:num_slots],
+                value[:num_slots],
+                key_cache,
+                value_cache,
+                k_scale,
+                v_scale,
+                slot_mapping,
+                kv_quant_mode=KVQuantMode.INT8_PER_TOKEN_HEAD,
+            )
             return
 
         # Scatter write into the KV cache using slot_mapping indices.

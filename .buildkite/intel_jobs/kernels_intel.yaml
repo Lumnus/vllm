@@ -74,3 +74,30 @@ steps:
       pytest -v -s
       kernels/attention/test_xpu_mla_sparse.py
       v1/attention/test_xpu_mla_sparse_backend.py'
+
+- label: ":intel: (BMG) XPU FlashAttention INT8 per-token-head KV Tests"
+  key: xpu-fa-int8-per-token-head-tests
+  timeout_in_minutes: 20
+  device: intel_gpu
+  agent_tags:
+    label: production
+    gpu: 1+
+    mem: 16+
+  no_plugin: true
+  working_dir: "."
+  env:
+    REGISTRY: "public.ecr.aws/q9t5s3a7"
+    REPO: "vllm-ci-test-repo"
+    VLLM_TEST_DEVICE: "xpu"
+  source_file_dependencies:
+    - vllm/v1/attention/backends/flash_attn.py
+    - vllm/v1/attention/ops/xpu_int8_per_token_head.py
+    - tests/kernels/attention/test_xpu_fa_int8_per_token_head.py
+    - tests/v1/attention/test_xpu_fa_int8_per_token_head_backend.py
+  commands:
+    - >-
+      bash .buildkite/scripts/hardware_ci/run-intel-test.sh
+      'cd tests &&
+      pytest -v -s
+      kernels/attention/test_xpu_fa_int8_per_token_head.py
+      v1/attention/test_xpu_fa_int8_per_token_head_backend.py'
