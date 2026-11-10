@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kInt4Static32,
     kInt8Dynamic32Sym,
+    kInt8DynamicTokenSym,
     kInt8StaticChannelSym,
     kLutBStatic,
     kMxfp4Dynamic,
@@ -51,6 +52,7 @@ QUANT_KEY_NAMES: dict[str, QuantKey] = {
     "mxfp4": kMxfp4Dynamic,
     "nvfp4_per_token": kNvfp4DynamicToken,
     "int8_per_channel_static": kInt8StaticChannelSym,
+    "int8_per_token": kInt8DynamicTokenSym,
     "lut_b": kLutBStatic,
     # Dynamic per-32-element int8 activations (RDNA3 MXFP4 W4A8 GEMV).
     "int8_per_group_32": kInt8Dynamic32Sym,
@@ -296,6 +298,12 @@ _ONLINE_SHORTHANDS: dict[str, QuantizationConfigArgs] = {
     # MoE stays unquantized (no `moe` field).
     "mxfp4_hadamard32": QuantizationConfigArgs(
         linear=QuantSpec(weight=kMxfp4Static, hadamard_size=32),
+    ),
+    # Per-output-channel INT8 weight scale + dynamic per-token INT8 activation
+    # (W8A8), on linear and MoE layers.
+    "int8_per_channel": QuantizationConfigArgs(
+        linear=QuantSpec(weight=kInt8StaticChannelSym),
+        moe=QuantSpec(weight=kInt8StaticChannelSym),
     ),
     # INT8 weight-only on MoE; linear stays unquantized (no `linear` field).
     # TODO: this is broken since at least #41566, as Int8OnlineMoEMethod
