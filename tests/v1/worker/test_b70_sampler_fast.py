@@ -219,6 +219,13 @@ def _spec_case(r, steps, v, seed, temp=0.7, k=20, p=0.9, kd=16):
     return tl_, draft, cand, dtok
 
 
+def _cache(draft):
+    """Main's draft-logits cache shape for a replicated cache: rows = requests."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(values=draft, row_mapping=None)
+
+
 def _run_both(tl_, draft, cand, dtok, temp, k, p, seeds, steps, v):
     r = tl_.shape[0]
     n = r * (steps + 1)
@@ -236,7 +243,7 @@ def _run_both(tl_, draft, cand, dtok, temp, k, p, seeds, steps, v):
     proc = apply_top_k_top_p_pytorch(proc, torch.full((n,), k), torch.full((n,), p))
     s_stock, n_stock = rejection_sample(
         proc,
-        draft,
+        _cache(draft),
         draft_sampled,
         cu,
         pos,
@@ -437,26 +444,29 @@ def test_gate_and_fallbacks_in_rejection_sampler(monkeypatch):
     logits = tl_.reshape(n, v)
 
     def call(**over):
-        args = dict(draft_logits=draft, draft_candidate_ids=cand, invalid_drafts=None)
+        args = dict(draft_logits=_cache(draft), draft_candidate_ids=cand)
         args.update(over)
         return rs._b70_try_fast(
             logits,
             ib,
             args["draft_logits"],
             args["draft_candidate_ids"],
-            args["invalid_drafts"],
             ds,
             pos,
         )
 
-    monkeypatch.delenv("B70_SAMPLER_FAST", raising=False)
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
     assert not sm.enabled()
-    monkeypatch.setenv("B70_SAMPLER_FAST", "1")
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
     assert sm.enabled()
     out = call()
     assert out is not None and out[1].shape == (r,)
     assert call(draft_candidate_ids=None) is None  # drafter without cached candidates
-    assert call(invalid_drafts=torch.zeros(n, dtype=torch.bool)) is None  # grammar
+    sharded = _cache(draft)
+    sharded.row_mapping = torch.arange(r, dtype=torch.int32)
+    assert call(draft_logits=sharded) is None  # batch-sharded cache
     st.min_p.gpu[0] = 0.05
     st.min_p.np[0] = 0.05
     assert call() is None  # min_p
