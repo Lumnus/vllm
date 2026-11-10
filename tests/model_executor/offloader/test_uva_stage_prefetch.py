@@ -195,7 +195,7 @@ def test_staged_read_sees_its_own_layer(dev, seed):
     stager = UVAExpertStager(min_tokens=1024, prefetch=True)
     layers = _layers(7)
     reads: list = []
-    for step in range(6):
+    for _ in range(6):
         _step(stager, dev, layers, reads, rng)
         dev.run_some(rng, rng.randint(0, 20))
         # A decode-sized gap: nothing stages, nothing is read.
