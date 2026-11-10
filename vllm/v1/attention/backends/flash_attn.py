@@ -1293,6 +1293,14 @@ class FlashAttentionImpl(AttentionImpl):
             )
             return output
 
+        if int8_kv.is_graph_capturing():
+            # The prefill path plans its groups on the host.
+            raise RuntimeError(
+                "FlashAttention int8_per_token_head KV cache: a batch with "
+                f"max query length {max_q} (causal={causal}) cannot be captured "
+                "in a full graph; full graphs cover uniform causal decode "
+                "batches only."
+            )
         if attn_metadata.query_start_loc_cpu is None:
             raise NotImplementedError(
                 "FlashAttention int8_per_token_head KV cache: prefill needs "

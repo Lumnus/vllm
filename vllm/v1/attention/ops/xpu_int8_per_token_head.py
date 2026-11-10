@@ -170,6 +170,14 @@ def int8_kv_decode_supported(head_size: int, dtype: torch.dtype) -> str | None:
     return None
 
 
+def is_graph_capturing() -> bool:
+    """Whether the current XPU stream is capturing a graph."""
+    capturing = getattr(
+        getattr(torch, "xpu", None), "is_current_stream_capturing", None
+    )
+    return bool(capturing()) if capturing is not None else False
+
+
 # ---------------------------------------------------------------------------
 # Prefill: dequantize the referenced blocks into a paged scratch
 # ---------------------------------------------------------------------------
