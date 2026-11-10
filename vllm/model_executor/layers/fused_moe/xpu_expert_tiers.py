@@ -406,8 +406,11 @@ class ExpertTiers:
         return weights
 
     def on_rows_written(self, slots: list[int]) -> None:
-        """EPLB wrote slow slots. Nothing caches them here."""
-        return
+        """EPLB wrote slow slots (on the current stream, between steps):
+        copies of the slow tier staged ahead of time are stale."""
+        from vllm.model_executor.offloader.base import get_offloader
+
+        get_offloader().invalidate_staged()
 
 
 def remap_unrouted(

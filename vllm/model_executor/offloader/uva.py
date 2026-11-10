@@ -64,8 +64,13 @@ class _PrefetchRing:
 
     def invalidate(self) -> None:
         """Forget which weights the buffers hold. The next stage() of every
-        weight copies it again, after the kernels that read the buffers."""
+        weight copies it again, after everything enqueued on the current
+        stream so far: the kernels that read the buffers, and the in-place
+        writes that made the copies stale (EPLB moving expert rows)."""
         self.owner = [None, None]
+        written = self._mod.Event()
+        written.record(self._mod.current_stream())
+        self.free = [written, written]
 
     def _load(self, i: int, weight: torch.Tensor) -> None:
         with self._mod.stream(self.stream):

@@ -284,7 +284,9 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             topk_ids=topk_ids,
         )
         slow_out = torch.empty_like(output)
-        slow.apply(
+        # Large steps read the slow tier from a device copy
+        # (--cpu-offload-stage-min-tokens).
+        staged_impl(slow, hidden_states.size(0), "slow").apply(
             output=slow_out,
             hidden_states=hidden_states,
             topk_weights=topk_weights,

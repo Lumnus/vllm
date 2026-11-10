@@ -303,3 +303,32 @@ def test_flag_plumbing_defaults_off():
 
     # Like the threshold, the flag acts only inside the opaque moe_forward op.
     assert offload(False).compile_factors() == offload(True).compile_factors()
+
+
+def _write_on_compute_then_step(dev, seed: int) -> bool:
+    """EPLB rewrites layer 0's rows on the compute stream between two steps
+    and invalidates; True when every read of the next step saw the new bytes."""
+    stager, layers = _after_two_steps(dev)
+    dev.compute.ops.append(lambda: layers[0].data.fill_(-5.0) is not None)
+    stager.invalidate()
+    reads: list = []
+    _step(stager, dev, layers, reads, random.Random(seed))
+    dev.drain()
+    return len(reads) == 4 and all(ok for _, ok, _ in reads)
+
+
+def test_invalidate_orders_the_reload_after_writes_on_the_compute_stream(dev):
+    """The reload of an invalidated weight waits for what the compute stream
+    held when it was invalidated, so it cannot copy ahead of the write."""
+    assert all(_write_on_compute_then_step(dev, seed) for seed in range(30))
+
+
+def test_reload_runs_ahead_of_the_write_without_the_ordering(dev, monkeypatch):
+    """Control: forgetting the owners alone lets the side stream copy layer 0
+    before the compute stream has rewritten it, in some schedules."""
+    monkeypatch.setattr(
+        uva._PrefetchRing,
+        "invalidate",
+        lambda self: setattr(self, "owner", [None, None]),
+    )
+    assert not all(_write_on_compute_then_step(dev, seed) for seed in range(30))
