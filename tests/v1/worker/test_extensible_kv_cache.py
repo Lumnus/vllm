@@ -315,7 +315,8 @@ def test_freeing_the_cache_lifts_the_torch_memory_cap(monkeypatch):
         lambda fraction, device: fractions.append(fraction),
     )
     kv_cache = object.__new__(ExtensibleKVCache)
-    kv_cache.buffer = SimpleNamespace(device=torch.device("cpu"), free=lambda: None)
+    # The cap goes to the buffer's device module, here the patched torch.cuda.
+    kv_cache.buffer = SimpleNamespace(device=torch.device("cuda"), free=lambda: None)
     kv_cache.num_committed_blocks = 2
     kv_cache.set_torch_memory_limit(25 << 30)
     kv_cache.free()
