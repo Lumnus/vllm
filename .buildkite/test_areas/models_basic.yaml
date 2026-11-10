@@ -476,6 +476,7 @@ steps:
   - vllm/models/qwen4_exp/
   - vllm/config/compilation.py
   - vllm/v1/attention/backends/short_conv_attn.py
+  - vllm/v1/attention/backends/triton_attn.py
   - tests/models/qwen4_exp/
   commands:
     - >-
@@ -496,6 +497,7 @@ steps:
       models/qwen4_exp/test_qsa_fp8_levers.py
       models/qwen4_exp/test_fp8_draft_prefix_cache.py
       models/qwen4_exp/test_xpu_hc.py
+      models/qwen4_exp/test_qsa_int8_kv.py
 
 - label: ":nvidia: (B200) Qwen3.5"
   key: qwen3-5-unit-tests-b200
