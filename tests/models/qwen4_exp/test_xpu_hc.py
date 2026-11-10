@@ -136,6 +136,61 @@ def _check_kernels_against_unfused() -> None:
         print(f"{dtype} fused: bitwise with the same kernels unfused")
 
 
+def _check_split_k_down() -> None:
+    """The DFlash2 split-K down projection: each row is the same whatever else is
+    in the batch, the folded silu is hc_silu of the stored value, and the result
+    stays within BF16 rounding of the stock GEMM."""
+    from vllm.models.qwen4_exp.nvidia.ops.hc import hc_silu
+    from vllm.models.qwen4_exp.xpu import hc_gemm
+
+    w = _weights(torch.bfloat16)
+    down = _merged_down(w)
+    valid = LOWRANK + HC
+    torch.manual_seed(2)
+    xn = torch.randn(8, HC_DIM).to(torch.bfloat16)
+    assert hc_gemm.takes_parallel_route(xn, down)
+    out, lora = hc_gemm.parallel_hc_gemm_silu(xn, down, valid, LOWRANK, HC)
+    for rows in (1, 3, 5):
+        part, part_lora = hc_gemm.parallel_hc_gemm_silu(
+            xn[:rows].contiguous(), down, valid, LOWRANK, HC
+        )
+        assert torch.equal(part, out[:rows]), rows
+        assert torch.equal(part_lora, lora[:rows]), rows
+    assert torch.equal(lora, hc_silu(out[:, :LOWRANK].contiguous(), HC))
+    assert torch.count_nonzero(out[:, valid:]) == 0
+    reference = F.linear(xn.float(), down.float())[:, :valid]
+    ulps = _ulps(out[:, :valid], reference.to(torch.bfloat16))
+    print(f"split-K down: {ulps:.2f} ulps against the fp32 GEMM")
+    assert ulps <= 1.0
+
+    # The op with the batch-invariant route equals its pieces.
+    flat = torch.randn(4, HC_DIM).to(torch.bfloat16)
+    mixed, inject = hc_module.hc_mix(flat, w.norm, down, w.up, EPS, HC, LOWRANK, True)
+    xn4 = hc_module.grouped_gemma_rmsnorm(flat, w.norm, EPS, HC)
+    d4, l4 = hc_gemm.parallel_hc_gemm_silu(xn4, down, valid, LOWRANK, HC)
+    assert torch.equal(inject, d4[:, LOWRANK:valid])
+    assert torch.equal(mixed, hc_module.hc_gate_mix(xn4, F.linear(l4, w.up), HC))
+    print("split-K down: batch-invariant, silu bitwise, op equals its pieces")
+
+
+def test_split_k_down_is_batch_invariant() -> None:
+    root = Path(__file__).parents[3]
+    code = (
+        "from tests.models.qwen4_exp.test_xpu_hc import "
+        "_check_split_k_down\n_check_split_k_down()\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=root,
+        env={**os.environ, "TRITON_INTERPRET": "1"},
+        timeout=300,
+        capture_output=True,
+        text=True,
+    )
+    print(result.stdout)
+    assert result.returncode == 0, result.stderr[-4000:] + result.stdout
+
+
 def test_kernels_against_unfused() -> None:
     root = Path(__file__).parents[3]
     code = (
