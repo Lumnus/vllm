@@ -9,6 +9,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from datetime import timedelta
+from typing import cast
 
 import numpy as np
 import torch
@@ -24,6 +25,7 @@ from vllm.distributed.device_communicators.pynccl_wrapper import (
     ncclDataTypeEnum,
 )
 from vllm.distributed.eplb.eplb_utils import device_stream
+from vllm.distributed.eplb.expert_weights import ExpertWeight
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     get_pp_group,
@@ -851,7 +853,7 @@ class SymmMemEplbCommunicator(EplbCommunicator):
 def create_eplb_communicator(
     group_coordinator: GroupCoordinator,
     backend: str,
-    expert_weights: Sequence[Sequence[torch.Tensor]],
+    expert_weights: Sequence[Sequence[ExpertWeight]],
     expert_buffer: Sequence[torch.Tensor] | None,
 ) -> EplbCommunicator:
     """Create an EPLB communicator for the given backend.
@@ -878,6 +880,18 @@ def create_eplb_communicator(
     """
     first_layer = expert_weights[0] if expert_weights else []
     tensor_device_type = first_layer[0].device.type if first_layer else "cpu"
+    if backend in ("nixl", "symm_mem") and any(
+        not isinstance(w, torch.Tensor) for layer in expert_weights for w in layer
+    ):
+        # Both register whole expert tensors for one-sided access.
+        raise ValueError(
+            f"EPLB communicator '{backend}' needs each expert weight in one "
+            "device tensor; with experts in tiered slots "
+            "(--cpu-offload-per-expert) use 'torch_gloo', 'torch_nccl', "
+            "'pynccl' or 'torch_xccl'."
+        )
+    plain_weights = cast(Sequence[Sequence[torch.Tensor]], expert_weights)
+    plain_first_layer = cast(Sequence[torch.Tensor], first_layer)
     torch_group = (
         group_coordinator.cpu_group
         if tensor_device_type == "cpu"
@@ -936,7 +950,7 @@ def create_eplb_communicator(
         return _create_pynccl()
 
     if backend == "symm_mem":
-        return SymmMemEplbCommunicator(group_coordinator, first_layer)
+        return SymmMemEplbCommunicator(group_coordinator, plain_first_layer)
     elif backend == "nixl":
         if not has_nixl():
             raise RuntimeError(
@@ -951,7 +965,7 @@ def create_eplb_communicator(
         try:
             return NixlEplbCommunicator(
                 cpu_group=group_coordinator.cpu_group,
-                all_expert_weights=expert_weights,
+                all_expert_weights=plain_weights,
                 expert_buffer=expert_buffer,
             )
         except Exception as exc:

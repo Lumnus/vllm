@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
@@ -34,7 +34,9 @@ from vllm.model_executor.utils import copy_weight_, kernel_parameters
 from vllm.utils.math_utils import cdiv
 
 if TYPE_CHECKING:
+    from vllm.distributed.eplb.expert_weights import ExpertWeight
     from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExperts
+    from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import ExpertTiers
 
 
 logger = init_logger(__name__)
@@ -81,6 +83,8 @@ class RoutedExperts(PluggableLayer):
 
     # Hash-routing table, owned by the gate.
     hash_indices_table: torch.Tensor | None = None
+    # Expert slots in device and host tiers (--cpu-offload-per-expert).
+    expert_tiers: "ExpertTiers | None" = None
 
     def __init__(
         self,
@@ -229,7 +233,25 @@ class RoutedExperts(PluggableLayer):
             "global_num_experts": moe_config.num_experts,
         }
 
+        # Expert slots in tiers (XPU, --cpu-offload-per-expert): the fast
+        # slots become the params, the slow ones load into CPU twins.
+        from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
+            maybe_tier,
+        )
+
+        self.expert_tiers = maybe_tier(
+            self.layer_name,
+            moe_config,
+            self.expert_map_manager,
+            self.quant_method,
+            moe_quant_params,
+        )
+        if self.expert_tiers is not None:
+            moe_quant_params["num_experts"] = self.expert_tiers.num_fast
+
         self.quant_method.create_weights(layer=self, **moe_quant_params)
+        if self.expert_tiers is not None:
+            self.expert_tiers.attach_twins(self)
 
         loader = self.shared_expert_online_loader
         if loader is not None and loader.stages_shared_experts:
@@ -784,6 +806,15 @@ class RoutedExperts(PluggableLayer):
             if loaded is not None:
                 return loaded if return_success else None
 
+        # Expert slots in tiers: a fast slot loads into its param row, a slow
+        # one into its CPU twin.
+        if self.expert_tiers is not None:
+            if len(loaded_weight.shape) == 3:
+                raise NotImplementedError(
+                    "--cpu-offload-per-expert: fused 3-D expert tensors"
+                )
+            param, expert_id = self.expert_tiers.route(param, expert_id)
+
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ/AWQ (K-first format).
         # should be whatever dimension intermediate_size_per_partition is
@@ -1324,7 +1355,7 @@ class RoutedExperts(PluggableLayer):
 
         return fused_mapping + per_expert_mapping
 
-    def get_expert_weights(self) -> Iterable[torch.Tensor]:
+    def get_expert_weights(self) -> "Sequence[ExpertWeight]":
         def _maybe_make_contiguous(
             name: str, p: torch.nn.Parameter
         ) -> torch.nn.Parameter:
@@ -1368,6 +1399,9 @@ class RoutedExperts(PluggableLayer):
         moe_kernel = getattr(self.quant_method, "moe_kernel", None)
         if moe_kernel is not None:
             moe_kernel.fused_experts.finalize_weight_storage(self)
+            slots = moe_kernel.fused_experts.eplb_expert_weights(self)
+            if slots is not None:
+                return slots
 
         # Kernel views of the params: live ones only, under their runtime names
         # (an aliased checkpoint name such as `w13_weight_packed` is reported as

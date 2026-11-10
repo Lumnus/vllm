@@ -55,6 +55,11 @@ from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
 from .eplb_state_file import read_expert_loads, write_expert_loads
 from .eplb_utils import CpuGpuEvent
+from .expert_weights import (
+    fast_slot_count,
+    new_expert_buffer,
+    order_slots_by_tier,
+)
 from .policy import EPLB_POLICIES, AbstractEplbPolicy, DefaultEplbPolicy
 from .rebalance_execute import (
     AsyncEplbLayerResult,
@@ -232,6 +237,10 @@ class EplbModelState:
     pointers remain stable across CUDA-graph replays.  The router kernel
     indexes this list with `dbo_current_ubatch_id()`.
     """
+    fast_slots: list[int | None] | None = None
+    """Per MoE layer, the fast-tier slots of each rank when the layer keeps
+    its expert slots in tiers (`TieredExpertWeight`), else None; None when
+    no layer does."""
     has_saved_load: bool = False
     """`last_expert_load` holds loads read from `EPLBConfig.state_path` that
     `restore_saved_placement` has not placed the experts by yet."""
@@ -514,7 +523,7 @@ class EplbState:
         expert_buffer = (
             None
             if backend == "symm_mem"
-            else [torch.empty_like(w) for w in model.expert_weights[0]]
+            else [new_expert_buffer(w) for w in model.expert_weights[0]]
         )
         communicator = create_eplb_communicator(
             group_coordinator=get_eplb_group(),
@@ -549,6 +558,9 @@ class EplbState:
             communicator=communicator,
             num_unpadded_tokens_tensors=num_unpadded_tokens_tensors,
         )
+        fast_slots = [fast_slot_count(ws) for ws in model.expert_weights]
+        if any(f is not None for f in fast_slots):
+            model_state.fast_slots = fast_slots
         self.model_states[hash_config_cached(model_config)] = model_state
         if self.parallel_config.eplb_config.state_path is not None:
             self._read_saved_load(model_state)
@@ -586,6 +598,26 @@ class EplbState:
             model_state.model_name,
             path,
         )
+
+    def order_tiers(
+        self,
+        model_state: EplbModelState,
+        physical_to_logical_map: torch.Tensor,
+        load: torch.Tensor,
+        num_ranks: int,
+    ) -> torch.Tensor:
+        """The policy's placement with each rank's most-loaded experts in its
+        fast slots, for layers whose slots are in tiers (CPU tensors)."""
+        if model_state.fast_slots is None:
+            return physical_to_logical_map
+        ordered = order_slots_by_tier(
+            physical_to_logical_map.numpy(),
+            load.float().numpy(),
+            model_state.fast_slots,
+            num_ranks,
+            self.parallel_config.eplb_config.tier_hysteresis,
+        )
+        return torch.from_numpy(ordered)
 
     def restore_saved_placement(self) -> None:
         """Place the experts by the loads read from `EPLBConfig.state_path`,
@@ -1013,6 +1045,12 @@ class EplbState:
                     num_nodes,
                     num_gpus,
                     old_physical_to_logical_map,
+                )
+                new_physical_to_logical_map = self.order_tiers(
+                    eplb_model_state,
+                    new_physical_to_logical_map,
+                    load_window_cpu,
+                    num_gpus,
                 )
 
                 skip_rearrange = False

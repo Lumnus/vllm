@@ -606,6 +606,7 @@ class EngineArgs:
     offload_backend: str = OffloadConfig.offload_backend
     cpu_offload_gb: float = UVAOffloadConfig.cpu_offload_gb
     cpu_offload_params: set[str] = get_field(UVAOffloadConfig, "cpu_offload_params")
+    cpu_offload_per_expert: bool = UVAOffloadConfig.cpu_offload_per_expert
     offload_group_size: int = PrefetchOffloadConfig.offload_group_size
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
@@ -1492,6 +1493,9 @@ class EngineArgs:
         offload_group.add_argument("--cpu-offload-gb", **uva_kwargs["cpu_offload_gb"])
         offload_group.add_argument(
             "--cpu-offload-params", **uva_kwargs["cpu_offload_params"]
+        )
+        offload_group.add_argument(
+            "--cpu-offload-per-expert", **uva_kwargs["cpu_offload_per_expert"]
         )
         offload_group.add_argument(
             "--offload-group-size",
@@ -2898,6 +2902,7 @@ class EngineArgs:
             uva=UVAOffloadConfig(
                 cpu_offload_gb=self.cpu_offload_gb,
                 cpu_offload_params=self.cpu_offload_params,
+                cpu_offload_per_expert=self.cpu_offload_per_expert,
             ),
             prefetch=PrefetchOffloadConfig(
                 offload_group_size=self.offload_group_size,

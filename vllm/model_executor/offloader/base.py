@@ -170,8 +170,22 @@ def create_offloader(offload_config: "OffloadConfig") -> BaseOffloader:
             mode="cpu",
         )
     elif backend == "uva":
+        from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
+            selects_expert_tiers,
+        )
+
+        max_gb = uva.cpu_offload_gb
+        if selects_expert_tiers(offload_config):
+            # The routed expert slots take the whole budget, at load.
+            max_gb = 0
+            if uva.cpu_offload_params:
+                logger.warning(
+                    "--cpu-offload-per-expert spends --cpu-offload-gb on routed "
+                    "expert slots only; --cpu-offload-params %s is ignored",
+                    sorted(uva.cpu_offload_params),
+                )
         return UVAOffloader(
-            cpu_offload_max_bytes=int(uva.cpu_offload_gb * 1024**3),
+            cpu_offload_max_bytes=int(max_gb * 1024**3),
             cpu_offload_params=uva.cpu_offload_params,
         )
     else:

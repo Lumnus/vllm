@@ -14,6 +14,11 @@ from torch.distributed import ProcessGroup, all_gather
 
 from vllm.distributed.eplb.eplb_communicator import EplbCommunicator
 from vllm.distributed.eplb.eplb_utils import CpuGpuEvent, device_stream
+from vllm.distributed.eplb.expert_weights import (
+    ExpertWeight,
+    new_expert_buffer,
+    notify_rows_written,
+)
 from vllm.distributed.eplb.migration_scheduler import (
     MigrationFlow,
     schedule_migration_batches,
@@ -208,7 +213,7 @@ def _execute_migration_batch(
     old_rows: dict[int, int],
     new_rows: dict[int, int],
     ep_rank: int,
-    expert_weights: Sequence[torch.Tensor],
+    expert_weights: Sequence[ExpertWeight],
     expert_weights_buffers: Sequence[torch.Tensor],
     communicator: EplbCommunicator,
     layer_idx: int,
@@ -247,7 +252,7 @@ def _execute_migration_batches(
     old_indices: np.ndarray,
     new_indices: np.ndarray,
     ep_rank: int,
-    expert_weights: Sequence[torch.Tensor],
+    expert_weights: Sequence[ExpertWeight],
     expert_weights_buffers: Sequence[torch.Tensor],
     communicator: EplbCommunicator,
     layer_idx: int,
@@ -308,7 +313,7 @@ def move_to_buffer(
     num_local_experts: int,
     old_indices: np.ndarray,
     new_indices: np.ndarray,
-    expert_weights: Sequence[torch.Tensor],
+    expert_weights: Sequence[ExpertWeight],
     expert_weights_buffers: Sequence[torch.Tensor],
     stream: torch.Stream | None,
     ep_rank: int,
@@ -501,8 +506,8 @@ def move_to_buffer(
 
 
 def move_from_buffer(
-    expert_weights: Sequence[torch.Tensor],
-    expert_weights_buffers: list[torch.Tensor],
+    expert_weights: Sequence[ExpertWeight],
+    expert_weights_buffers: Sequence[torch.Tensor],
     transfer_metadata: TransferMetadata,
     new_indices: np.ndarray,
     ep_rank: int,
@@ -584,20 +589,23 @@ def _copy_rows_kernel(
 
 
 def copy_rows(
-    dst: Sequence[torch.Tensor],
+    dst: Sequence[ExpertWeight],
     dst_rows: list[int],
-    src: Sequence[torch.Tensor],
+    src: Sequence[ExpertWeight],
     src_rows: list[int],
 ) -> None:
     """`d[i].copy_(s[j])` for every tensor pair `(d, s)` and row pair `(i, j)`,
-    in one launch per tensor on CUDA (expert weights are contiguous)."""
-    if not dst[0].is_cuda:
+    in one launch per tensor on CUDA (expert weights are contiguous). Tiered
+    weights hear which of their rows were written."""
+    if not all(isinstance(t, torch.Tensor) and t.is_cuda for t in (*dst, *src)):
         for d, s in zip(dst, src):
             for i, j in zip(dst_rows, src_rows):
                 d[i].copy_(s[j], non_blocking=True)
+        notify_rows_written(dst, dst_rows)
         return
     rows = async_tensor_h2d(dst_rows + src_rows, dst[0].device, torch.int32)
     for d, s in zip(dst, src):
+        assert isinstance(d, torch.Tensor) and isinstance(s, torch.Tensor)
         row_len = d.numel() // d.shape[0]
         block = 16384 // d.element_size()
         _copy_rows_kernel[(len(dst_rows), triton.cdiv(row_len, block))](
@@ -608,7 +616,7 @@ def copy_rows(
 def transfer_layer(
     old_layer_indices: torch.Tensor,
     new_layer_indices: torch.Tensor,
-    expert_weights: Sequence[torch.Tensor],
+    expert_weights: Sequence[ExpertWeight],
     expert_weights_buffer: Sequence[torch.Tensor],
     ep_group: ProcessGroup,
     communicator: EplbCommunicator,
@@ -699,7 +707,7 @@ def transfer_layer(
 def rearrange_expert_weights_inplace(
     old_global_expert_indices: torch.Tensor,
     new_global_expert_indices: torch.Tensor,
-    expert_weights: Sequence[Sequence[torch.Tensor]],
+    expert_weights: Sequence[Sequence[ExpertWeight]],
     expert_buffer: Sequence[torch.Tensor],
     ep_group: ProcessGroup,
     communicator: EplbCommunicator,
@@ -764,14 +772,14 @@ def rearrange_expert_weights_inplace(
             # Backends that pre-allocate their own transfer buffers
             # skip this to avoid the extra memory spike during profiling.
             profile_buffer: list[torch.Tensor] = [
-                torch.empty_like(w) for w in first_layer_weights
+                new_expert_buffer(w) for w in first_layer_weights
             ]
             for weight, buffer in zip(expert_weights[0], profile_buffer):
                 dummy_recv_buffer = [buffer for _ in range(ep_size)]
                 torch.distributed.barrier()
                 all_gather(
                     dummy_recv_buffer,
-                    weight,
+                    weight if isinstance(weight, torch.Tensor) else buffer,
                     group=ep_group,
                 )
         return
