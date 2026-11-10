@@ -18,6 +18,12 @@ _DECODE_BLOCK_N = 64
 # Intel Triton 3.8 rejects tl.dot with N below the sub-group size (16), and a
 # plain decode scores N = 1 query row x 4 heads.
 _DECODE_MIN_DOT_N = 16 if current_platform.is_xpu() else 1
+# (TILE_R, BLOCK_N, K_TILES, STAGES, num_warps) of the BF16 prefill scorer on Xe2.
+# The fastest measured on a B70 (Triton 3.8.0+xpu, IGC 2.41.5) at 4,096 rows: 1.0 ms
+# at 32K of context and 4.3 ms at 131K, against 11.2 and 45.9 for the GB300 launch,
+# whose tile spills. Keep the warps: at this tile num_warps 2 compiles and scores
+# wrong. FP8 has no such sweep and keeps the GB300 launch.
+_XPU_BF16_PREFILL_LAUNCH = (32, 128, 16, 1, 16)
 
 
 @triton.jit
@@ -387,6 +393,17 @@ def warmup_qsa_mqa_paged_decode(
     return profiles
 
 
+def _prefill_launch(dtype: torch.dtype) -> tuple[int, int, int, int, int]:
+    """(TILE_R, BLOCK_N, K_TILES, STAGES, num_warps) of the prefill scorer."""
+    # tuned on GB300
+    if dtype == torch.float8_e4m3fn:
+        return 32, 64, 16, 2, 8
+    if current_platform.is_xpu():
+        return _XPU_BF16_PREFILL_LAUNCH
+    # tuned on GB300
+    return 64, 64, 16, 2, 4
+
+
 def _prefill_logits(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -411,13 +428,8 @@ def _prefill_logits(
         num_queries, logits_width
     )
 
-    # tuned on GB300
-    if k_cache.dtype == torch.float8_e4m3fn:
-        TILE_R, STAGES, num_warps = 32, 2, 8
-    else:
-        TILE_R, STAGES, num_warps = 64, 2, 4
-    BLOCK_N = 64
-    K_TILES = 16
+    launch = _prefill_launch(k_cache.dtype)
+    TILE_R, BLOCK_N, K_TILES, STAGES, num_warps = launch
     grid = (
         page_table.shape[0],
         triton.cdiv(min(num_queries, max_query_len), TILE_R),

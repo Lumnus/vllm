@@ -457,6 +457,7 @@ steps:
       models/qwen4_exp/test_xpu_mtp.py
       models/qwen4_exp/test_ple.py
       models/qwen4_exp/test_xpu_pp.py
+      models/qwen4_exp/test_xpu_qsa_indexer.py
       models/qwen4_exp/test_qsa_attn2.py
       models/qwen4_exp/test_xpu_ple.py
       models/qwen4_exp/test_xpu_ple_layer.py
