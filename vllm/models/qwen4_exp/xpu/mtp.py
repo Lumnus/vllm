@@ -108,7 +108,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             config.hidden_size,
         )
 
-        # fc stage: two separate projections (BF16, unquantized).
+        # fc stage: two separate projections. They take the quantization config
+        # like the MTP decoder layer; the checkpoints keep them BF16, so they are
+        # quantized only by an online config that names them.
         self.pre_fc_norm_embedding = HyperConnectionRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -120,7 +122,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             config.hidden_size,
             bias=False,
             return_bias=False,
-            quant_config=None,  # MTP fc is BF16
+            quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.fc_embedding",
         )
         self.fc_hidden = ReplicatedLinear(
@@ -128,7 +130,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             config.hidden_size,
             bias=False,
             return_bias=False,
-            quant_config=None,  # MTP fc is BF16
+            quant_config=vllm_config.quant_config,
             prefix=f"{prefix}.fc_hidden",
         )
 
