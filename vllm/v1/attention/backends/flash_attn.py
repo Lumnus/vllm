@@ -1118,8 +1118,7 @@ class FlashAttentionImpl(AttentionImpl):
                 " kv-cache on this device."
             )
 
-        self.int8_per_token_head_kv = kv_cache_dtype == "int8_per_token_head"
-        if self.int8_per_token_head_kv:
+        if kv_cache_dtype == "int8_per_token_head":
             self._init_int8_per_token_head_kv(vllm_config)
 
         self.sinks = sinks
@@ -1393,7 +1392,7 @@ class FlashAttentionImpl(AttentionImpl):
 
         if attn_metadata is None:
             # Profiling run.
-            if self.int8_per_token_head_kv:
+            if self.kv_cache_dtype == "int8_per_token_head":
                 # Claim the prefill scratch so KV cache sizing accounts for it.
                 self._int8_kv_prefill_scratch(self._int8_kv_block_size)
             return output.fill_(0)
@@ -1424,7 +1423,7 @@ class FlashAttentionImpl(AttentionImpl):
                 layer,
             )
 
-        if self.int8_per_token_head_kv:
+        if self.kv_cache_dtype == "int8_per_token_head":
             return self._forward_int8_per_token_head(
                 query, kv_cache, attn_metadata, output
             )
@@ -1608,7 +1607,7 @@ class FlashAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
 
-        if self.int8_per_token_head_kv:
+        if self.kv_cache_dtype == "int8_per_token_head":
             from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
                 triton_reshape_and_cache_flash_per_token_head_quant,
             )
