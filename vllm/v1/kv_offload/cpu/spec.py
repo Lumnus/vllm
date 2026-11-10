@@ -179,12 +179,11 @@ class CPUOffloadingSpec(OffloadingSpec):
         """Whether the worker CPU buffer is the shared mmap region (vs a private
         per-rank tensor); replicated-layout dedup is gated on this being True."""
         # On XPU each rank keeps a private pinned (USM host) tensor. The shared
-        # /dev/shm region is only host-registered (prepare_for_device_copy), which SYCL reports
-        # as usm::alloc::unknown, so every CPU->GPU load in swap_blocks_batch
-        # goes through a pinned staging buffer from torch's caching host
-        # allocator; those power-of-two blocks stay cached (measured 3.25 GiB
-        # per rank after one kvreplay). A USM host pool is copied directly
-        # (kernels PR3 path, snapshot_src=False) and needs no /dev/shm.
+        # /dev/shm region is only host-registered, which SYCL reports as
+        # usm::alloc::unknown, so every CPU->GPU load in swap_blocks_batch goes
+        # through a pinned staging buffer from torch caching host allocator,
+        # whose power-of-two blocks stay cached (3.25 GiB per rank measured after
+        # one replay). A USM host pool is copied directly and needs no /dev/shm.
         if current_platform.is_xpu():
             logger.info_once(
                 "KV offload pool is private USM host memory per rank on XPU "
