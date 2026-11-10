@@ -290,7 +290,8 @@ vllm serve Qwen/Qwen3.5-35B-A3B \
       (`lm_head`), so `"re:.*"` and `"*"` do not select it, for example
       weight-only FP8:
       `"re:.*lm_head$": {"weight": "fp8_per_channel_static", "activation": None}`.
-    - The lm_head supports per-channel FP8 only: `fp8_per_channel` (W8A8) or
+    - The lm_head supports per-channel schemes only: `int8_per_channel`
+      (INT8 W8A8), `fp8_per_channel` (W8A8) or
       `fp8_per_channel_static` with `"activation": None` (weight-only; CUDA and
       XPU only, use `fp8_per_channel` on ROCm). Other schemes, a tied lm_head and
       one the checkpoint already quantizes raise an error. It cannot be combined

@@ -73,6 +73,9 @@ class Int8PerChannelOnlineLinearMethod(OnlineLinearBase):
     weight_quant_key = kInt8StaticChannelSym
     activation_quant_key: QuantKey | None = kInt8DynamicTokenSym
     accepts_activation_override = True
+    # Per-row scales stay local to each vocab shard, and padded rows quantize
+    # to zero, as with the FP8 per-channel method.
+    supports_lm_head = True
 
     def __init__(self, activation_quant_key: QuantKey | None = kInt8DynamicTokenSym):
         super().__init__()
