@@ -48,10 +48,6 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
         self.fused_moe_impl: XpuFusedMoe | None = None
         is_xe2_or_xe3 = torch.ops._xpu_C.is_xe2_arch() or torch.ops._xpu_C.is_xe3_arch()
-        if not is_xe2_or_xe3:
-            raise NotImplementedError(
-                "XPUExperts is only supported on Intel Xe2/Xe3 GPUs"
-            )
         self._expects_unquantized_inputs = is_xe2_or_xe3
 
     @property
@@ -141,6 +137,8 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             ):
                 w1 = w1.view(torch.float4_e2m1fn_x2)
                 w2 = w2.view(torch.float4_e2m1fn_x2)
+            # XpuFusedMoe relayouts the loaded [E, N, K] weights and scales
+            # in place for this device's grouped GEMM.
             self.fused_moe_impl = XpuFusedMoe(
                 w13=w1,
                 w13_scales=self.w1_scale,
