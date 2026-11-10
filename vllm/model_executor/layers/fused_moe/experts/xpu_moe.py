@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -36,9 +38,40 @@ if current_platform.is_xpu():
     from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
 
 
+_STAGED_FIELDS = ("w13", "w2", "gemm1_wei_scales", "gemm2_wei_scales")
+
+
+def staged_impl(impl: "XpuFusedMoe", num_tokens: int, slot: str) -> "XpuFusedMoe":
+    """``impl``, or a shallow copy that reads its UVA-offloaded weights and
+    scales from the offloader's staging buffers for this step
+    (``--cpu-offload-stage-min-tokens``). XpuFusedMoe holds its own weight
+    tensors, so the experts stage them here instead of through the w1/w2
+    arguments of the modular kernel."""
+    from vllm.model_executor.offloader.base import get_offloader
+
+    offloader = get_offloader()
+    staged: dict[str, torch.Tensor] = {}
+    for field in _STAGED_FIELDS:
+        tensor = getattr(impl, field, None)
+        if tensor is None:
+            continue
+        copy_ = offloader.maybe_stage(tensor, num_tokens, f"{slot}.{field}")
+        if copy_ is not tensor:
+            staged[field] = copy_
+    if not staged:
+        return impl
+    impl = copy.copy(impl)
+    for field, tensor in staged.items():
+        setattr(impl, field, tensor)
+    return impl
+
+
 class XPUExperts(mk.FusedMoEExpertsModular):
     # Expert slots in device and host tiers, set by ExpertTiers.finalize.
     tiers: ExpertTiers | None = None
+    # apply() reads the weights of the XpuFusedMoe it builds on first use, and
+    # stages those itself (staged_impl).
+    reads_weight_args = False
 
     def __init__(
         self,
@@ -219,7 +252,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             # expert not owned by this rank so they are skipped.
             sentinel = global_num_experts - 1 if self.moe_config.ep_rank == 0 else 0
             topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
-        self.fused_moe_impl.apply(
+        staged_impl(self.fused_moe_impl, hidden_states.size(0), "experts").apply(
             output=output,
             hidden_states=hidden_states,
             topk_weights=topk_weights,
