@@ -122,7 +122,11 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from ..common.ops.ple import ple_conv, ple_gate, ple_ngram_ids
 
 # nvidia.qsa imports nvidia.model, which imports nvidia.qsa: load the model first.
-from ..nvidia.model import get_qsa_topk_buffer_width
+from ..nvidia.model import (
+    _QWEN4_EXP_IGNORED_MISSING_SUFFIXES,
+    _remap_qsa_cache_scale_name,
+    get_qsa_topk_buffer_width,
+)
 from ..nvidia.ngram_embedding import _maps_entry
 from ..nvidia.qsa import Qwen4ExpQSAAttention
 from .hyperconnection import HyperConnection, _WeightContainer
@@ -1313,11 +1317,19 @@ class Qwen4ExpModel(Qwen3NextModel):
         # Indexer tensors of layers that run dense (no QSA indexer in the
         # config, or a layer type that is not indexed) are dropped and
         # reported.
+        # Serialized main-cache scales of QSA layers move onto the QSA owner's
+        # ``_k_scale``/``_v_scale``, as on CUDA.
         saw_indexer = False
+        qsa_layer_ids = frozenset(
+            index
+            for index, layer in enumerate(self.layers)
+            if isinstance(getattr(layer, "self_attn", None), Qwen4ExpQSAAttention)
+        )
 
         def route(weights: Iterable[tuple[str, torch.Tensor]]):
             nonlocal saw_indexer
             for name, tensor in weights:
+                name = _remap_qsa_cache_scale_name(name, qsa_layer_ids)
                 match = _INDEXER_RE.match(name)
                 if match is not None and not isinstance(
                     getattr(self.layers[int(match.group(1))], "self_attn", None),
@@ -1334,7 +1346,10 @@ class Qwen4ExpModel(Qwen3NextModel):
                     continue
                 yield name, tensor
 
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self,
+            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
+        )
         loaded = loader.load_weights(route(weights), mapper=self.hf_to_vllm_mapper)
         if saw_indexer:
             _report_dense_qsa(self.config, self.max_model_len)
@@ -1574,6 +1589,7 @@ class Qwen4ExpForCausalLM(
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_prefixes=["mtp.", "model.visual."],
+            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
@@ -1790,6 +1806,7 @@ class Qwen4ExpForConditionalGeneration(
         loader = AutoWeightsLoader(
             self,
             ignore_unexpected_prefixes=["mtp."],
+            ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
         return loader.load_weights(weights, mapper=mapper)
 

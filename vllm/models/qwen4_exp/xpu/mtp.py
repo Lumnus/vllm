@@ -324,6 +324,10 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
         self.quant_config = vllm_config.quant_config
         super().__init__()
         self.config = config
+        logger.info(
+            "Qwen4Exp MTP draft KV cache dtype: %s.",
+            vllm_config.cache_config.cache_dtype,
+        )
         self.model = Qwen4ExpMultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
