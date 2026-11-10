@@ -2126,7 +2126,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the EPLB meta.
         ubatch_slices = ubatch_state.slices if ubatch_state is not None else None
         self.eplb.prepare_forward(
-            self.model_config, input_batch.num_tokens, ubatch_slices
+            self.model_config,
+            input_batch.num_tokens,
+            ubatch_slices,
+            input_batch=input_batch,
         )
 
         self.step_timing.record_batch(
