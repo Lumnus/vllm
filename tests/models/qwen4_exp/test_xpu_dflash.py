@@ -42,14 +42,26 @@ class _Layer:
         self.mlp_hyper_connection = _HC(calls, index)
 
     def __call__(
-        self, positions, hidden_states, residual, block_output, injection, **_
+        self,
+        positions,
+        hidden_states,
+        residual,
+        block_output,
+        injection,
+        return_combined=False,
+        **_,
     ):
         if residual is None:
             residual = hidden_states.unsqueeze(1).expand(-1, HC, -1).contiguous()
         if block_output is not None:
-            residual = residual + block_output.unsqueeze(1) * injection.unsqueeze(-1)
+            # The combine the real layer's combine_and_mix applies.
+            weight = 2 * torch.sigmoid(injection / HC).unsqueeze(-1)
+            residual = residual + block_output.unsqueeze(1) * weight
+        combined = residual
         scale = self.index + 1.0
         block = residual.sum(dim=1) * scale / 16
+        if return_combined:
+            return residual, block, residual[:, :, 0] / scale, combined
         return residual, block, residual[:, :, 0] / scale
 
 
@@ -94,9 +106,10 @@ def test_aux_layers_are_the_completed_stream_means(monkeypatch) -> None:
     plain, _ = _run((), monkeypatch)
     (hidden, aux), calls = _run((2, 6), monkeypatch)
 
-    # The target's results do not change, and boundary n reads layer n - 1.
+    # The target's results do not change, and boundary n reads layer n - 1. Both
+    # boundaries have a next layer on this rank, which applies the combine.
     assert torch.equal(hidden, plain)
-    assert calls == [1, 5]
+    assert calls == []
     assert len(aux) == 2
 
     # The same features from a target stepped by hand.
@@ -118,8 +131,17 @@ def test_aux_layers_are_the_completed_stream_means(monkeypatch) -> None:
 
 def test_aux_layers_count_from_the_rank_start(monkeypatch) -> None:
     (_, aux), calls = _run((2, 6), monkeypatch, start=2)
-    assert calls == [5]
+    assert calls == []
     assert len(aux) == 1
+
+
+def test_aux_layer_at_the_rank_end_combines_itself(monkeypatch) -> None:
+    plain, _ = _run((), monkeypatch)
+    (hidden, aux), calls = _run((2, 8), monkeypatch)
+    assert torch.equal(hidden, plain)
+    # Boundary 8 is the last layer of the rank: no next layer to reuse.
+    assert calls == [7]
+    assert len(aux) == 2
 
 
 def _draft(**overrides) -> SimpleNamespace:
