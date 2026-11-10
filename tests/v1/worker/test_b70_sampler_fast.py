@@ -319,7 +319,7 @@ def test_reject_greedy_and_mixed_rows():
         )
     s_s, n_s = rejection_sample(
         proc,
-        draft,
+        _cache(draft),
         ds,
         cu,
         pos,
@@ -414,6 +414,10 @@ def test_gate_and_fallbacks_in_rejection_sampler(monkeypatch):
         use_fp64_gumbel = False
         return_sampling_mask = False
         sampling_states = st
+
+        def get_logprobs_dims(self, idx):
+            n = int(st.num_logprobs[idx].max())
+            return None if n < 0 else (n, 0)
 
         def apply_sampling_params(self, logits, *a, **kw):
             assert kw["b70_fast"] is True
