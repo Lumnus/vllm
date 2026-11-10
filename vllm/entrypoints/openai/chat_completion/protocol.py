@@ -789,6 +789,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.ec_transfer_params:
             # Pass in ec_transfer_params via extra_args
             extra_args["ec_transfer_params"] = self.ec_transfer_params
+        from vllm.v1.sample import b70_cjk
+
+        if b70_cjk.enabled():  # B70-CJK: per-request Han-mask gate
+            try:
+                extra_args = b70_cjk.chat_extra_args(
+                    extra_args, self.messages, self.model_extra
+                )
+            except ValueError as e:
+                raise VLLMValidationError(str(e), parameter=b70_cjk.XARG) from e
         return SamplingParams.from_optional(
             n=self.n,
             **sampling_params,

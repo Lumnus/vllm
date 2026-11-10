@@ -1054,6 +1054,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_reqs, num_reqs, self.input_buffers
         )
 
+        if getattr(self.sampler, "cjk_mask", None) is not None:
+            self.sampler.cjk_mask.warmup(logits)  # B70-CJK: JIT before serving
         # Default pass: compiles the kernels the first real step uses (logits in
         # the model dtype, no per-request processing).
         self.sampler(logits, dummy_input_batch)
@@ -1739,6 +1741,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch,
                 grammar_output.structured_output_request_ids,
                 grammar_output.grammar_bitmask,
+            )
+
+        # B70-CJK: Han mask in place on the target logits, before plain
+        # sampling and before every verification row of spec decode.
+        cjk_mask = getattr(self.sampler, "cjk_mask", None)
+        if cjk_mask is not None and logits.shape[0] > 0:
+            cjk_mask.apply(
+                logits, input_batch.expanded_idx_mapping, input_batch.idx_mapping_np
             )
 
         sampler_output: SamplerOutput | None
