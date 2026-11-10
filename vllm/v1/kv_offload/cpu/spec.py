@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import os
 from typing import Any
 
 from typing_extensions import override
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_offload.base import (
@@ -26,9 +26,7 @@ from vllm.v1.kv_offload.cpu.shared_offload_region import (
     SharedOffloadRegion,
 )
 
-
-def envs_b70_private_pinned() -> bool:
-    return os.environ.get("B70_OFFLOAD_PRIVATE_PINNED", "0") == "1"
+logger = init_logger(__name__)
 
 
 def _all_workers_barrier() -> None:
@@ -180,15 +178,18 @@ class CPUOffloadingSpec(OffloadingSpec):
     def _uses_shared_region(self) -> bool:
         """Whether the worker CPU buffer is the shared mmap region (vs a private
         per-rank tensor); replicated-layout dedup is gated on this being True."""
-        # B70-V32-RC1: B70_OFFLOAD_PRIVATE_PINNED=1 keeps a private pinned (USM
-        # host) tensor per rank on XPU, as 0.30 did. The shared /dev/shm region
+        # On XPU each rank keeps a private pinned (USM host) tensor. The shared /dev/shm region
         # is only host-registered (prepare_for_device_copy), which SYCL reports
         # as usm::alloc::unknown, so every CPU->GPU load in swap_blocks_batch
         # goes through a pinned staging buffer from torch's caching host
         # allocator; those power-of-two blocks stay cached (measured 3.25 GiB
         # per rank after one kvreplay). A USM host pool is copied directly
         # (kernels PR3 path, snapshot_src=False) and needs no /dev/shm.
-        if current_platform.is_xpu() and envs_b70_private_pinned():
+        if current_platform.is_xpu():
+            logger.info_once(
+                "KV offload pool is private USM host memory per rank on XPU "
+                "(direct swap_blocks_batch copies, no shared /dev/shm region)."
+            )
             return False
         return (
             current_platform.is_cuda_alike() and not current_platform.is_rocm()
