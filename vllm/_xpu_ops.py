@@ -981,7 +981,39 @@ def _selective_scan_fwd_kernel(
 _OPS_REGISTERED = False
 
 
+def native_int8_quant_available() -> bool:
+    """Whether vllm-xpu-kernels registers the per-token int8 quant op."""
+    return hasattr(torch.ops._C, "dynamic_per_token_scaled_int8_quant")
+
+
+def dynamic_per_token_int8_quant_native(
+    input: torch.Tensor, scale_dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Symmetric per-token int8 quant on the vllm-xpu-kernels op.
+
+    Same rule as ``xpu_ops.dynamic_per_token_int8_quant_ref(x, True, 8)``.
+    Returns ``(q [..., K] int8, scale [..., 1] scale_dtype)``.
+    """
+    x = input.contiguous()
+    q = torch.empty(x.shape, dtype=torch.int8, device=x.device)
+    s = torch.empty(x.shape[:-1] + (1,), dtype=scale_dtype, device=x.device)
+    torch.ops._C.dynamic_per_token_scaled_int8_quant(q, x, s)
+    return q, s
+
+
 class xpu_ops:
+    @staticmethod
+    def dynamic_per_token_int8_quant(
+        input: torch.Tensor, use_sym_quant: bool, bits: int
+    ):
+        """Per-token int8 quant: the native op for symmetric 8-bit when the
+        kernels provide it, else the torch.compile reference. Same outputs as
+        the reference: int8 values, scales in ``input.dtype``, zero points."""
+        if use_sym_quant and bits == 8 and native_int8_quant_available():
+            q, s = dynamic_per_token_int8_quant_native(input, input.dtype)
+            return q, s, torch.zeros(s.shape, dtype=torch.int32, device=s.device)
+        return xpu_ops.dynamic_per_token_int8_quant_ref(input, use_sym_quant, bits)
+
     @staticmethod
     @torch.compile
     def dynamic_per_token_int8_quant_ref(

@@ -1891,7 +1891,8 @@ def scaled_int8_quant(
 
     """
     if current_platform.is_xpu():
-        # XPU has no _C int8 quant op; use the torch.compile reference.
+        # Dynamic per-token: the vllm-xpu-kernels op when present, else the
+        # torch.compile reference.
         if not symmetric:
             raise NotImplementedError(
                 "asymmetric int8 activation quantization is unsupported on XPU"
@@ -1900,8 +1901,17 @@ def scaled_int8_quant(
             q = (input.to(torch.float32) / scale).round().clamp(-128, 127)
             return q.to(torch.int8), scale, None
 
-        from vllm._xpu_ops import xpu_ops
+        from vllm._xpu_ops import (
+            dynamic_per_token_int8_quant_native,
+            native_int8_quant_available,
+            xpu_ops,
+        )
 
+        if native_int8_quant_available():
+            q, scales = dynamic_per_token_int8_quant_native(
+                input.contiguous(), torch.float32
+            )
+            return q, scales.reshape(-1, 1), None
         q, scales, _ = xpu_ops.dynamic_per_token_int8_quant_ref(
             input.contiguous(), True, 8
         )
