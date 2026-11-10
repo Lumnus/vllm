@@ -48,8 +48,8 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     maybe_prefix,
 )
+from vllm.models.qwen4_exp.xpu.hyperconnection import HyperConnection
 from vllm.models.qwen4_exp.xpu.model import (
-    HyperConnection,
     Qwen4ExpDecoderLayer,
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpModel,
@@ -155,7 +155,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         )
 
         # Top-level hyper-connection mixer acts as the final output norm.
-        self.hyper_connection_mixer = HyperConnection(config, has_inject=False)
+        self.hyper_connection_mixer = HyperConnection(
+            config, has_inject=False, prefix=f"{prefix}.hyper_connection_mixer"
+        )
 
     def make_empty_intermediate_tensors(
         self, batch_size: int, dtype: torch.dtype, device: torch.device
@@ -240,32 +242,34 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             # The fc stage already produces the wide state, so hand it to the
             # decoder layer as ``residual``; passing it as ``hidden_states``
             # with ``residual=None`` would make the layer broadcast one
-            # stream into hc identical copies.
+            # stream into hc identical copies. The layer does not consume
+            # ``hidden_states`` then.
             residual = self._fc_stage(inputs_embeds, wide_hidden)
-            # Not consumed by the layer when ``residual`` is not None.
-            x = residual.mean(dim=1)
+            x = inputs_embeds
         else:
             x = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         mtp_layer = self.layers[current_step_idx]
-        # The layer re-broadcasts x [T, n_embd] to the wide state when
-        # residual is None, runs attention + MoE, and returns
-        # (collapsed [T, n_embd], wide [T, hc, n_embd]).
-        _collapsed, wide_out = mtp_layer(
+        wide_out, block_output, injection = mtp_layer(
             hidden_states=x,
             residual=residual,
             positions=positions,
         )
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors(
-                {"hidden_states": _collapsed, "residual": wide_out}
+            # PP carries the wide state, not a pending combine.
+            wide_out = mtp_layer.mlp_hyper_connection.combine(
+                wide_out, block_output, injection
             )
+            return IntermediateTensors({"hidden_states": x, "residual": wide_out})
 
-        # Final output norm = the top-level hyper-connection mixer.
-        out, _ = self.hyper_connection_mixer.mix(wide_out)
+        # Final output norm = the top-level hyper-connection mixer, which applies
+        # the layer's combine.
+        wide_out, out, _ = self.hyper_connection_mixer.combine_and_mix(
+            wide_out, block_output, injection
+        )
         # Return (collapsed, wide-flat). The speculator sizes its
         # multi-step feedback buffer for the HC-widened residual, so the
         # feedback tensor must be the wide state; ``out`` stays the
