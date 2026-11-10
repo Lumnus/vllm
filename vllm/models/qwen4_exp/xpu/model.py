@@ -1032,14 +1032,22 @@ class Qwen4ExpDecoderLayer(nn.Module):
         positions: torch.Tensor = None,
         block_output: torch.Tensor | None = None,
         injection: torch.Tensor | None = None,
+        return_combined: bool = False,
         **kwargs: object,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         # hidden_states: [T, n_embd] (only consumed when residual is None)
         # residual: [T, hc, n_embd] (the wide hyper-connection state)
         # block_output, injection: the previous layer's combine, still pending
+        # return_combined: also return the wide state with that combine applied
+        # (the previous layer's completed output), which this layer computes anyway
         if residual is None:
             # First layer: broadcast the embedding to `hc` identical streams.
             residual = hidden_states.unsqueeze(1).expand(-1, self.hc, -1).contiguous()
+        assert not return_combined or block_output is not None
+        combined = residual
 
         # PLE (n-gram table) at the configured layer, before the attention mix.
         if self.ple is not None:
@@ -1048,6 +1056,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 residual = self.attn_hyper_connection.combine(
                     residual, block_output, injection
                 )
+                combined = residual
                 block_output = None
             residual = self.ple(residual)
 
@@ -1058,6 +1067,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             residual, cur, inject = self.attn_hyper_connection.combine_and_mix(
                 residual, block_output, injection
             )
+            combined = residual
         if self.layer_type == "linear_attention":
             cur = self.linear_attn(hidden_states=cur)
         else:
@@ -1070,6 +1080,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
         cur = self.mlp(cur)
 
         # The wide state, and this layer's combine for the next mix to apply.
+        if return_combined:
+            return residual, cur, inject, combined
         return residual, cur, inject
 
 
@@ -1279,24 +1291,41 @@ class Qwen4ExpModel(Qwen3NextModel):
 
         aux_hidden_states: list[torch.Tensor] = []
         block_output = injection = None
+        # DFlash2 reads a completed layer, averaged over the streams. The combine
+        # stays pending for the next mix, so the target's own results don't change
+        # with a drafter attached; the next layer of this rank applies it anyway
+        # and hands the completed state back, bitwise equal to a separate combine.
+        reuse_next_combine = False
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer), self.start_layer
         ):
-            residual, block_output, injection = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                residual=residual,
-                block_output=block_output,
-                injection=injection,
-            )
-            if layer_idx + 1 in self.aux_hidden_state_layers:
-                # DFlash2 reads a completed layer, averaged over the streams. The
-                # combine stays pending for the next mix, so the target's own
-                # results don't change with a drafter attached.
-                completed = layer.mlp_hyper_connection.combine(
-                    residual, block_output, injection
+            if reuse_next_combine:
+                residual, block_output, injection, completed = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    block_output=block_output,
+                    injection=injection,
+                    return_combined=True,
                 )
                 aux_hidden_states.append(completed.mean(dim=1))
+            else:
+                residual, block_output, injection = layer(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    block_output=block_output,
+                    injection=injection,
+                )
+            reuse_next_combine = False
+            if layer_idx + 1 in self.aux_hidden_state_layers:
+                if layer_idx + 1 < self.end_layer:
+                    reuse_next_combine = True
+                else:
+                    completed = layer.mlp_hyper_connection.combine(
+                        residual, block_output, injection
+                    )
+                    aux_hidden_states.append(completed.mean(dim=1))
 
         if not get_pp_group().is_last_rank:
             # PP carries the wide state, not a pending combine.
