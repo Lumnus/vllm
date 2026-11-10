@@ -1237,9 +1237,12 @@ class Qwen4ExpModel(Qwen3NextModel):
         # residual state [T, hc, n_embd] (flattened to [T, hc * n_embd]).
         # Allocate a buffer when speculative decoding (MTP) is enabled so the
         # drafter can read the pre-mixer residual after each target step.
+        # DFlash reads the auxiliary layers instead.
         spec_config = vllm_config.speculative_config
-        needs_mtp_hidden = spec_config is not None and (
-            spec_config.use_eagle() or spec_config.uses_draft_model()
+        needs_mtp_hidden = (
+            spec_config is not None
+            and not spec_config.use_dflash()
+            and (spec_config.use_eagle() or spec_config.uses_draft_model())
         )
         if get_pp_group().is_last_rank and needs_mtp_hidden:
             self._mtp_hidden_buffer = torch.empty(
@@ -1262,7 +1265,7 @@ class Qwen4ExpModel(Qwen3NextModel):
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1274,8 +1277,11 @@ class Qwen4ExpModel(Qwen3NextModel):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
+        aux_hidden_states: list[torch.Tensor] = []
         block_output = injection = None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer), self.start_layer
+        ):
             residual, block_output, injection = layer(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1283,6 +1289,14 @@ class Qwen4ExpModel(Qwen3NextModel):
                 block_output=block_output,
                 injection=injection,
             )
+            if layer_idx + 1 in self.aux_hidden_state_layers:
+                # DFlash2 reads a completed layer, averaged over the streams. The
+                # combine stays pending for the next mix, so the target's own
+                # results don't change with a drafter attached.
+                completed = layer.mlp_hyper_connection.combine(
+                    residual, block_output, injection
+                )
+                aux_hidden_states.append(completed.mean(dim=1))
 
         if not get_pp_group().is_last_rank:
             # PP carries the wide state, not a pending combine.
@@ -1302,10 +1316,11 @@ class Qwen4ExpModel(Qwen3NextModel):
         # Expose the wide residual state to the MTP draft model (flattened
         # [T, hc * n_embd]). Valid after each target step.
         if self._mtp_hidden_buffer is not None:
-            assert residual is not None
             _nt = residual.shape[0]
             self._mtp_hidden_buffer[:_nt].copy_(residual.flatten(1))
 
+        if self.aux_hidden_state_layers:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

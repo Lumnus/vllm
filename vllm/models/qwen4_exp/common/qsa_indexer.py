@@ -852,7 +852,12 @@ class QSARawKeyCache(_QSAIndexerCache):
         # overwrite a committed key the next step needs to close the group.
         span = self.compress_ratio + vllm_config.num_speculative_tokens
         capacity = round_up(span, self.compress_ratio)
+        # A wider ring is equally correct, it only adds slack. So when the minimum
+        # doesn't divide the block, take the next whole-group size that does: 7
+        # drafts need 12, and the 832-token block on XPU takes 16.
         block_size = vllm_config.cache_config.block_size
+        while block_size % capacity and capacity < block_size:
+            capacity += self.compress_ratio
         assert block_size % capacity == 0, (
             f"QSA ring capacity {capacity} must divide the attention block "
             f"size {block_size}"

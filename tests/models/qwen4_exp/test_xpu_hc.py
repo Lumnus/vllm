@@ -294,6 +294,7 @@ def test_model_materializes_the_last_combine(monkeypatch, is_last_rank) -> None:
         end_layer=len(layers),
         hyper_connection_mixer=mixer,
         _mtp_hidden_buffer=buffer,
+        aux_hidden_state_layers=(),
     )
 
     expected = embedding.unsqueeze(1).expand(-1, HC, -1).contiguous()
