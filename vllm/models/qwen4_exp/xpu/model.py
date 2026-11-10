@@ -156,14 +156,18 @@ def _is_file_backed(tensor: torch.Tensor) -> bool | None:
 def _report_dense_qsa(config: Qwen4ExpTextConfig, max_model_len: int) -> None:
     """Report (once) that checkpoint QSA indexer weights are ignored.
 
-    QSA attends to at most ``indexer_budget`` selected tokens, so dense
-    attention is expected to match it only while a sequence fits the budget.
+    The indexed layers run QSA when the config names an indexer
+    (``indexer_n_heads``). Without one they run dense attention, and the
+    checkpoint's indexer tensors have no owner. QSA attends to at most
+    ``indexer_budget`` selected tokens, so dense attention is expected to match
+    it only while a sequence fits the budget.
     """
     budget = getattr(config, "indexer_budget", None)
     if budget is not None and max_model_len > budget:
         logger.warning_once(
-            "The checkpoint ships QSA indexer weights, but the XPU backend runs "
-            "dense attention and ignores them. Dense attention is only expected "
+            "The checkpoint ships QSA indexer weights, but the config sets no "
+            "indexer (indexer_n_heads), so the indexed layers run dense attention "
+            "and ignore them. Dense attention is only expected "
             "to match the sparse model while a sequence fits the indexer budget "
             "(%d tokens); with max_model_len=%d, longer sequences attend to every "
             "token and may diverge from the reference. Use --max-model-len %d to "
@@ -174,9 +178,9 @@ def _report_dense_qsa(config: Qwen4ExpTextConfig, max_model_len: int) -> None:
         )
     else:
         logger.info_once(
-            "Ignoring the checkpoint's QSA indexer weights: the XPU backend runs "
-            "dense attention, expected to match QSA within max_model_len=%d "
-            "(indexer budget %s).",
+            "Ignoring the checkpoint's QSA indexer weights: the config sets no "
+            "indexer (indexer_n_heads), so the indexed layers run dense attention, "
+            "expected to match QSA within max_model_len=%d (indexer budget %s).",
             max_model_len,
             budget,
         )
