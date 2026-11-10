@@ -95,6 +95,55 @@ class XPUExperts(mk.FusedMoEExpertsModular):
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
 
+    def _build_impl(
+        self,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk: int,
+        activation: MoEActivation,
+        expert_map: torch.Tensor | None,
+    ) -> None:
+        if (
+            self.quant_config is not None
+            and self.quant_config.weight_quant_dtype == "mxfp4"
+        ):
+            w1 = w1.view(torch.float4_e2m1fn_x2)
+            w2 = w2.view(torch.float4_e2m1fn_x2)
+        # XpuFusedMoe relayouts the loaded [E, N, K] weights and scales for
+        # this device's grouped GEMM, rebinding the parameters' storage.
+        self.fused_moe_impl = XpuFusedMoe(
+            w13=w1,
+            w13_scales=self.w1_scale,
+            w13_bias=self.w1_bias,
+            w2=w2,
+            w2_scales=self.w2_scale,
+            w2_bias=self.w2_bias,
+            n_experts_per_token=topk,
+            activation=activation.value,
+            num_experts=self.moe_config.num_local_experts,
+            ep_rank=self.moe_config.ep_rank,
+            ep_size=self.moe_config.ep_size,
+            expert_map=expert_map,
+            gemm1_clamp_limit=self.gemm1_clamp_limit,
+        )
+
+    def finalize_weight_storage(self, layer: torch.nn.Module) -> None:
+        """Build the XpuFusedMoe now, so its relayout lands before EPLB (or
+        anything else) takes views of the expert tensors."""
+        if self.fused_moe_impl is not None:
+            return
+        w13 = getattr(layer, "w13_weight", None)
+        w2 = getattr(layer, "w2_weight", None)
+        if w13 is None or w2 is None:
+            return
+        self._build_impl(
+            w13,
+            w2,
+            self.moe_config.experts_per_token,
+            self.moe_config.activation,
+            getattr(layer, "expert_map", None),
+        )
+
     def workspace_shapes(
         self,
         M: int,
@@ -130,30 +179,8 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         apply_router_weight_on_input: bool,
     ):
         if self.fused_moe_impl is None:
-            topk = topk_ids.size(-1)
-            if (
-                self.quant_config is not None
-                and self.quant_config.weight_quant_dtype == "mxfp4"
-            ):
-                w1 = w1.view(torch.float4_e2m1fn_x2)
-                w2 = w2.view(torch.float4_e2m1fn_x2)
-            # XpuFusedMoe relayouts the loaded [E, N, K] weights and scales
-            # in place for this device's grouped GEMM.
-            self.fused_moe_impl = XpuFusedMoe(
-                w13=w1,
-                w13_scales=self.w1_scale,
-                w13_bias=self.w1_bias,
-                w2=w2,
-                w2_scales=self.w2_scale,
-                w2_bias=self.w2_bias,
-                n_experts_per_token=topk,
-                activation=activation.value,
-                num_experts=self.moe_config.num_local_experts,
-                ep_rank=self.moe_config.ep_rank,
-                ep_size=self.moe_config.ep_size,
-                expert_map=expert_map,
-                gemm1_clamp_limit=self.gemm1_clamp_limit,
-            )
+            # Methods that skip finalize_weight_storage build it on first use.
+            self._build_impl(w1, w2, topk_ids.size(-1), activation, expert_map)
         assert self.fused_moe_impl is not None
         if self.moe_config.ep_size > 1:
             # Avoid topk_ids = -1, remap them to an

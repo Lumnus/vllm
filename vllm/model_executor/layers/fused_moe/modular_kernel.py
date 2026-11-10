@@ -593,6 +593,18 @@ class FusedMoEExperts(ABC):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:  # noqa: B027
         pass
 
+    def finalize_weight_storage(self, layer: torch.nn.Module) -> None:  # noqa: B027
+        """Settle the storage of the layer's expert tensors.
+
+        Experts whose kernels would otherwise relayout the weights on their
+        first `apply()` (and so rebind the parameters' storage) do it here.
+        Called once the layer's weights are processed and before anything
+        keeps views of them: EPLB moves expert rows through such views, so
+        they must be the bytes the kernels read. Must be idempotent; the
+        default does nothing.
+        """
+        pass
+
     # Tensors this object allocates that its kernels read.
     kept_constants: tuple[str, ...] = ()
 

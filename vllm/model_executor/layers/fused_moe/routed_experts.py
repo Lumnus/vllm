@@ -1363,6 +1363,12 @@ class RoutedExperts(PluggableLayer):
                 torch.transpose(p.data, 1, 2), requires_grad=False
             )
 
+        # EPLB moves the bytes the kernels read: experts that relayout their
+        # weights lazily settle them before views are taken.
+        moe_kernel = getattr(self.quant_method, "moe_kernel", None)
+        if moe_kernel is not None:
+            moe_kernel.fused_experts.finalize_weight_storage(self)
+
         # Kernel views of the params: live ones only, under their runtime names
         # (an aliased checkpoint name such as `w13_weight_packed` is reported as
         # `w13_weight`, which the name filters below expect).
