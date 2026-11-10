@@ -742,6 +742,20 @@ class QSAIndexerBackend(AttentionBackend):
         "fp8_e4m3",
     ]
 
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        """The indexer's state caches build their own specs and never call this.
+        The platform's hybrid block alignment asks the first non-SSM backend for
+        the main attention's per-token page, and in Qwen4Exp the indexer's state
+        caches register before their QSA owner, so this answers for the main KV:
+        an int8 per-token-head main cache carries TRITON_ATTN's inline scales, as
+        the QSA backend packs it. Every other spec comes back unchanged."""
+        if not spec.kv_quant_mode.is_per_token_head:
+            return spec
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+
+        return TritonAttentionBackend.customize_spec(spec)
+
     @staticmethod
     def get_name() -> str:
         return "QWEN4_EXP_QSA_INDEXER"
