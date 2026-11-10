@@ -131,9 +131,36 @@ class EPLBConfig:
     into the same file. A missing or unreadable file starts from the identity
     placement."""
 
+    decode_token_weight: float = Field(default=1.0, ge=0)
+    """Weight of a decode token in the expert load EPLB balances by.
+    With `prefill_token_weight`, chooses whose routing the placement
+    serves: 1 and 1 (the default) count every token alike; a larger decode
+    weight favours decode (latency-bound serving), a larger prefill weight
+    favours prefill (long prompts, batch work); any ratio is allowed, and 0
+    leaves that phase out. Each step's counts are weighted by the step's
+    token mix (the router counts tokens without knowing their phase), so a
+    mixed step weighs in by its share of prefill and decode tokens. The
+    weights also order the expert slot tiers where a layer has them."""
+    prefill_token_weight: float = Field(default=1.0, ge=0)
+    """Weight of a prefill token in the expert load; see
+    `decode_token_weight`."""
+
+    @property
+    def weights_tokens(self) -> bool:
+        """Whether the load is weighted by phase (not the default)."""
+        return (self.decode_token_weight, self.prefill_token_weight) != (1, 1)
+
     def compile_factors(self) -> CompileFactors:
-        # Where the loads are kept does not change the graph.
-        return get_compile_factors(self, ignored_factors={"state_path"})
+        # Where the loads are kept and how they are weighted do not change
+        # the graph.
+        return get_compile_factors(
+            self,
+            ignored_factors={
+                "state_path",
+                "decode_token_weight",
+                "prefill_token_weight",
+            },
+        )
 
     @property
     def migration_batching_enabled(self) -> bool:
@@ -150,6 +177,10 @@ class EPLBConfig:
                 "async EPLB due to NCCL multi-stream conflicts. Use "
                 "'torch_gloo' or 'nixl' instead, or leave communicator "
                 "unset for automatic selection."
+            )
+        if self.decode_token_weight == 0 and self.prefill_token_weight == 0:
+            raise ValueError(
+                "decode_token_weight and prefill_token_weight cannot both be 0."
             )
         if self.log_balancedness and self.log_balancedness_interval <= 0:
             raise ValueError("log_balancedness_interval must be greater than 0.")

@@ -214,10 +214,20 @@ class EPLBController:
         model_config: ModelConfig,
         num_unpadded_tokens: int,
         ubatch_slices: list | None = None,
+        input_batch: Any | None = None,
     ) -> None:
         if self.state is None or not self.parallel_config.enable_eplb:
             return
-        self.state.prepare_forward(model_config, num_unpadded_tokens, ubatch_slices)
+        num_prefill_tokens = None
+        if self.parallel_config.eplb_config.weights_tokens and input_batch is not None:
+            n = input_batch.num_reqs
+            prefilling = input_batch.is_prefilling_np[:n]
+            num_prefill_tokens = int(
+                input_batch.num_scheduled_tokens[:n][prefilling].sum()
+            )
+        self.state.prepare_forward(
+            model_config, num_unpadded_tokens, ubatch_slices, num_prefill_tokens
+        )
 
     def setup_from_mapping(
         self,

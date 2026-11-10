@@ -283,6 +283,11 @@ class EplbState:
         first call to `_propagate_shared_tensors`.
         """
         self._should_record_value: bool | None = None
+        self._step_token_weight: float = 1.0
+        """Weight of the coming step's load, from its decode/prefill mix
+        (`EPLBConfig.decode_token_weight` / `prefill_token_weight`)."""
+        self._window_token_weights: list[float] = []
+        """The weight of each step in the load window."""
         """Last value written to `should_record_tensor`."""
         self._pending_balancedness: deque[
             tuple[int, int, torch.Event, list[tuple[str, torch.Tensor]]]
@@ -472,6 +477,7 @@ class EplbState:
         )
         expert_load_pass = expert_load_pass_buffer[:, : model.num_physical_experts]
         self.expert_load_window_size = self.parallel_config.eplb_config.window_size
+        self._window_token_weights = [1.0] * self.expert_load_window_size
         expert_load_window = torch.zeros(
             (
                 self.expert_load_window_size,
@@ -619,7 +625,7 @@ class EplbState:
                 loads = window.cpu().tolist()
             for layer, layer_loads in zip(model_state.model.moe_layers, loads):
                 if sum(layer_loads) > 0:  # no traffic must not erase a state
-                    layers[layer.layer_name] = [int(x) for x in layer_loads]
+                    layers[layer.layer_name] = [round(x) for x in layer_loads]
         if not layers:
             return
         try:
@@ -632,9 +638,10 @@ class EplbState:
         model_config: ModelConfig,
         num_unpadded_tokens: int,
         ubatch_slices: list | None = None,
+        num_prefill_tokens: int | None = None,
     ) -> None:
         """Fill the per-[u]batch `num_unpadded_tokens` tensors before a
-        forward pass.
+        forward pass, and weigh the step's load by its token mix.
 
         Args:
             model_config: Identifies which `EplbModelState` to update.
@@ -643,8 +650,13 @@ class EplbState:
             ubatch_slices: When DBO is active, a list of
                 `UBatchSlice` objects describing each micro-batch's
                 token range.  When `None`, only `tensors[0]` is filled.
+            num_prefill_tokens: Tokens of requests still in prefill; the
+                rest decode. Only read when the load is weighted by phase.
 
         """
+        self._step_token_weight = self.step_token_weight(
+            num_unpadded_tokens, num_prefill_tokens
+        )
         model_state = self.model_states.get(hash_config_cached(model_config))
         if model_state is None or model_state.num_unpadded_tokens_tensors is None:
             return
@@ -659,6 +671,22 @@ class EplbState:
                 # correct count.
                 val = max(0, min(num_unpadded_tokens, ts.stop) - ts.start)
                 tensors[i].fill_(val)
+
+    def step_token_weight(
+        self, num_tokens: int, num_prefill_tokens: int | None
+    ) -> float:
+        """The weight of a step of `num_tokens` tokens, `num_prefill_tokens`
+        of them prefill: the token-weighted mean of the two phase weights."""
+        config = self.parallel_config.eplb_config
+        if not config.weights_tokens or num_prefill_tokens is None:
+            return 1.0
+        if num_tokens <= 0:
+            return 0.0
+        prefill = min(max(num_prefill_tokens, 0), num_tokens)
+        decode = num_tokens - prefill
+        return (
+            config.decode_token_weight * decode + config.prefill_token_weight * prefill
+        ) / num_tokens
 
     def step(
         self,
@@ -757,6 +785,9 @@ class EplbState:
                     eplb_model_state.expert_load_pass.zero_()
 
             if should_record:
+                self._window_token_weights[self.expert_load_window_step] = (
+                    self._step_token_weight
+                )
                 self.expert_load_window_step += 1
                 if self.expert_load_window_step >= self.expert_load_window_size:
                     self.expert_load_window_step = 0
@@ -950,7 +981,21 @@ class EplbState:
                 src=expert_load_window,
             )
 
-            global_expert_load_window = logical_expert_load_window[..., :-1].sum(dim=0)
+            if self.parallel_config.eplb_config.weights_tokens:
+                # Each window step weighed by its decode/prefill mix.
+                step_weights = torch.tensor(
+                    self._window_token_weights,
+                    dtype=torch.float32,
+                    device=logical_expert_load_window.device,
+                )
+                global_expert_load_window = (
+                    logical_expert_load_window[..., :-1].float()
+                    * step_weights[:, None, None]
+                ).sum(dim=0)
+            else:
+                global_expert_load_window = logical_expert_load_window[..., :-1].sum(
+                    dim=0
+                )
             global_expert_load_windows.append(global_expert_load_window)
         # Perform all-reduce to get the expert load across all ranks for each model
         global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
