@@ -69,6 +69,17 @@ class WNA16MoEBackend(Enum):
     RDNA3 = "RDNA3"
 
 
+# Backends whose processed weights stay expert-major: every tensor the kernels
+# read has one contiguous row per local expert (packed weights, group scales,
+# zero points, biases), so EPLB can move experts as rows.
+_EPLB_BACKENDS = frozenset({WNA16MoEBackend.TRITON, WNA16MoEBackend.XPU})
+
+
+def wna16_backend_supports_eplb(backend: WNA16MoEBackend) -> bool:
+    """Whether EPLB can rearrange the experts `backend` runs."""
+    return backend in _EPLB_BACKENDS
+
+
 def backend_to_kernel_cls(
     backend: WNA16MoEBackend,
 ) -> list[type[mk.FusedMoEExperts]]:

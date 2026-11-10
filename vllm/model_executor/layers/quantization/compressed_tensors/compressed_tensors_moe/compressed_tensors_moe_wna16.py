@@ -24,6 +24,7 @@ from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     make_wna16_moe_kernel,
     make_wna16_moe_quant_config,
     select_wna16_moe_backend,
+    wna16_backend_supports_eplb,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
     CompressedTensorsMoEMethod,
@@ -539,4 +540,4 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
 
     @property
     def supports_eplb(self) -> bool:
-        return self.wna16_backend == WNA16MoEBackend.TRITON
+        return wna16_backend_supports_eplb(self.wna16_backend)

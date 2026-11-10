@@ -36,6 +36,7 @@ from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
     convert_to_wna16_moe_kernel_format,
     make_wna16_moe_kernel,
     select_wna16_moe_backend,
+    wna16_backend_supports_eplb,
 )
 from vllm.model_executor.layers.linear import LinearMethodBase, set_weight_attrs
 from vllm.model_executor.layers.quantization import QuantizationMethods
@@ -731,6 +732,10 @@ class AutoGPTQMoEMethod(FusedMoEMethodBase):
             backend=self.wna16_moe_backend,
             routing_tables=layer._expert_routing_tables(),
         )
+
+    @property
+    def supports_eplb(self) -> bool:
+        return wna16_backend_supports_eplb(self.wna16_moe_backend)
 
     def get_fused_moe_quant_config(self, layer: RoutedExperts) -> FusedMoEQuantConfig:
         if self.wna16_moe_backend == WNA16MoEBackend.HUMMING:
