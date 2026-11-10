@@ -121,6 +121,20 @@ class EPLBConfig:
     additional sequential communication steps. This option only applies to
     async EPLB and is disabled by default."""
 
+    state_path: str | None = None
+    """JSON file that keeps the expert load EPLB balanced by, per MoE layer:
+    `{"<layer name>": [load per logical expert], ...}`. At start, before the
+    memory profile, the experts of the layers found in it are placed by those
+    loads (one rearrangement), so a restarted server does not begin from the
+    identity placement. Each rearrangement then writes the loads of the window
+    it used. EP rank 0 of each pipeline stage writes; stages merge their layers
+    into the same file. A missing or unreadable file starts from the identity
+    placement."""
+
+    def compile_factors(self) -> CompileFactors:
+        # Where the loads are kept does not change the graph.
+        return get_compile_factors(self, ignored_factors={"state_path"})
+
     @property
     def migration_batching_enabled(self) -> bool:
         """Whether contention-aware batching is active for this configuration."""

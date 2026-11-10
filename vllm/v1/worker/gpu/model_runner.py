@@ -564,6 +564,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         eplb_models_added |= self.eplb.maybe_register_model(
             self.model, self.model_config
         )
+        self.eplb.maybe_restore_saved_placement(eplb_models_added, load_dummy_weights)
         self.eplb.maybe_start_async_loop(eplb_models_added, load_dummy_weights)
 
         if not self.is_first_pp_rank:

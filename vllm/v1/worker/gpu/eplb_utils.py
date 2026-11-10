@@ -174,6 +174,19 @@ class EPLBController:
         self._has_registered_models = True
         return True
 
+    def maybe_restore_saved_placement(
+        self, eplb_models_added: bool, load_dummy_weights: bool = False
+    ) -> None:
+        """Place the experts by the loads kept in `EPLBConfig.state_path`."""
+        if (
+            not eplb_models_added
+            or load_dummy_weights
+            or self.state is None
+            or self.parallel_config.eplb_config.state_path is None
+        ):
+            return
+        self.state.restore_saved_placement()
+
     def maybe_start_async_loop(
         self, eplb_models_added: bool, load_dummy_weights: bool = False
     ) -> None:
