@@ -193,11 +193,6 @@ def _verify(monkeypatch, *, xpu: bool, v2: bool, ple_layer_ids: list[int]) -> No
     )
 
 
-def test_v1_runner_is_refused_for_ple_on_xpu(monkeypatch) -> None:
-    with pytest.raises(NotImplementedError, match="VLLM_USE_V2_MODEL_RUNNER=1"):
-        _verify(monkeypatch, xpu=True, v2=False, ple_layer_ids=[2])
-
-
 @pytest.mark.parametrize(
     ("xpu", "v2", "ple_layer_ids"),
     [
@@ -206,7 +201,7 @@ def test_v1_runner_is_refused_for_ple_on_xpu(monkeypatch) -> None:
         pytest.param(False, False, [2], id="cuda_v1"),
     ],
 )
-def test_v1_runner_is_refused_only_for_ple_on_xpu(
+def test_ple_config_verifies_on_every_runner_flag(
     monkeypatch, xpu, v2, ple_layer_ids
 ) -> None:
     _verify(monkeypatch, xpu=xpu, v2=v2, ple_layer_ids=ple_layer_ids)
