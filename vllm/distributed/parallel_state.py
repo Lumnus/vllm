@@ -25,7 +25,6 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
-import os
 import pickle
 import weakref
 from collections import deque, namedtuple
