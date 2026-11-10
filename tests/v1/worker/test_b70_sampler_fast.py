@@ -17,7 +17,6 @@ os.environ.setdefault("TRITON_INTERPRET", "1")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import numpy as np  # noqa: E402
-import pytest  # noqa: E402
 import torch  # noqa: E402
 from scipy import stats  # noqa: E402
 
@@ -46,7 +45,9 @@ class States:
         self.top_k = _T(torch.tensor(top_k, dtype=torch.int32))
         self.top_p = _T(torch.tensor(top_p, dtype=torch.float32))
         self.seeds = _T(torch.tensor(seeds, dtype=torch.int64))
-        self.min_p = _T(torch.zeros(len(temp)) if min_p is None else torch.tensor(min_p))
+        self.min_p = _T(
+            torch.zeros(len(temp)) if min_p is None else torch.tensor(min_p)
+        )
 
 
 def ref_support(logits, temp, k, p):
@@ -144,9 +145,12 @@ def test_support_matches_stock_pytorch_masks():
         elif got != want:
             # only acceptable when a tie sits on the k-th value or the nucleus edge
             vals = {float(scaled[r][t]) for t in got ^ want}
-            assert any(v in {float(scaled[r][t]) for t in tie_class} or
-                       sum(1 for t in range(V) if float(scaled[r][t]) == v) > 1
-                       for v in vals), (r, got ^ want)
+            assert any(
+                v in {float(scaled[r][t]) for t in tie_class}
+                or sum(1 for t in range(V) if float(scaled[r][t]) == v) > 1
+                for v in vals
+            ), (r, got ^ want)
+
 
 def test_fast_sample_chisquare_and_greedy():
     n = 1200
@@ -159,7 +163,7 @@ def test_fast_sample_chisquare_and_greedy():
     # distinct seeds per row give independent draws
     st.seeds.gpu.copy_(torch.randint(0, 2**62, (n,), dtype=torch.int64))
     got = sm.fast_sample(logits, eim, st, pos, 20, block=BLK)
-    (kept, lp), = ref_support(base, [0.7], [20], [0.9])
+    ((kept, lp),) = ref_support(base, [0.7], [20], [0.9])
     probs = np.exp(lp)
     cnt = np.array([(got == t).sum().item() for t in kept], dtype=np.float64)
     assert cnt.sum() == n, "sampled outside the support"
@@ -187,15 +191,13 @@ def test_fast_sample_chisquare_and_greedy():
 
 
 def _spec_case(r, steps, v, seed, temp=0.7, k=20, p=0.9, kd=16):
-    """r requests x (steps+1) rows. Draft = dense fp32 [r, steps, v] with kd finite
+    """R requests x (steps+1) rows. Draft = dense fp32 [r, steps, v] with kd finite
     candidates; draft tokens sampled from q."""
     g = torch.Generator().manual_seed(seed)
     tl_ = (torch.randn(r, steps + 1, v, generator=g) * 2.5).to(torch.bfloat16)
     cand = torch.stack(
         [
-            torch.stack(
-                [torch.randperm(v, generator=g)[:kd] for _ in range(steps)]
-            )
+            torch.stack([torch.randperm(v, generator=g)[:kd] for _ in range(steps)])
             for _ in range(r)
         ]
     )  # [r, steps, kd]
@@ -206,7 +208,9 @@ def _spec_case(r, steps, v, seed, temp=0.7, k=20, p=0.9, kd=16):
             top = torch.topk(tl_[a, s_].float(), 6).indices
             cand[a, s_, :6] = top
             # q close to the target head (temperature-scaled logits + noise)
-            dscore[a, s_, :6] = tl_[a, s_].float()[top] + torch.randn(6, generator=g) * 0.4
+            dscore[a, s_, :6] = (
+                tl_[a, s_].float()[top] + torch.randn(6, generator=g) * 0.4
+            )
     draft = torch.full((r, steps, v), -float("inf"))
     draft.scatter_(2, cand, dscore)
     q = torch.softmax(dscore / temp, dim=-1)
@@ -229,9 +233,7 @@ def _run_both(tl_, draft, cand, dtok, temp, k, p, seeds, steps, v):
     st = States([temp] * r, [k] * r, [p] * r, seeds)
     # stock: temperature + top-k/top-p on an fp32 copy, then the stock kernels
     proc = logits.float() / temp
-    proc = apply_top_k_top_p_pytorch(
-        proc, torch.full((n,), k), torch.full((n,), p)
-    )
+    proc = apply_top_k_top_p_pytorch(proc, torch.full((n,), k), torch.full((n,), p))
     s_stock, n_stock = rejection_sample(
         proc,
         draft,
@@ -266,7 +268,9 @@ def test_reject_matches_stock_tokenwise():
     r, steps, v = 24, 7, 2048
     tl_, draft, cand, dtok = _spec_case(r, steps, v, 11)
     seeds = list(range(100, 100 + r))
-    s_s, n_s, s_f, n_f = _run_both(tl_, draft, cand, dtok, 0.7, 20, 0.9, seeds, steps, v)
+    s_s, n_s, s_f, n_f = _run_both(
+        tl_, draft, cand, dtok, 0.7, 20, 0.9, seeds, steps, v
+    )
     assert n_s.tolist() == n_f.tolist(), (n_s.tolist(), n_f.tolist())
     for a in range(r):
         m = int(n_s[a])
@@ -307,8 +311,17 @@ def test_reject_greedy_and_mixed_rows():
             proc[rows], torch.full((steps + 1,), ks[a]), torch.full((steps + 1,), ps[a])
         )
     s_s, n_s = rejection_sample(
-        proc, draft, ds, cu, pos, idx_mapping, eim, local,
-        st.temperature.gpu, st.seeds.gpu, steps,
+        proc,
+        draft,
+        ds,
+        cu,
+        pos,
+        idx_mapping,
+        eim,
+        local,
+        st.temperature.gpu,
+        st.seeds.gpu,
+        steps,
     )
     s_f, n_f = sm.fast_reject(
         logits, draft, cand, ds, pos, cu, idx_mapping, eim, st, steps, 32, block=BLK
@@ -328,7 +341,9 @@ def test_first_token_marginal_equals_target_and_acceptance():
     row = (torch.randn(1, v, generator=g) * 2.5).to(torch.bfloat16)
     tl_ = row.reshape(1, 1, v).expand(r, 2, v).contiguous()
     kd = 16
-    cand1 = torch.cat([torch.topk(row[0].float(), 8).indices, torch.randperm(v, generator=g)[:8]])
+    cand1 = torch.cat(
+        [torch.topk(row[0].float(), 8).indices, torch.randperm(v, generator=g)[:8]]
+    )
     cand1 = torch.unique(cand1)[:kd]
     kd = cand1.numel()
     dscore1 = torch.randn(kd, generator=g) * 1.5
@@ -341,7 +356,7 @@ def test_first_token_marginal_equals_target_and_acceptance():
     seeds = torch.randint(0, 2**62, (r,), generator=g).tolist()
     s_s, n_s, s_f, n_f = _run_both(tl_, draft, cand, dtok, temp, k, p, seeds, steps, v)
 
-    (kept, lp), = ref_support(row, [temp], [k], [p])
+    ((kept, lp),) = ref_support(row, [temp], [k], [p])
     pt = dict(zip(kept, np.exp(lp)))
     qd = dict(zip(cand1.tolist(), q.numpy()))
     for name, s_, n_ in (("stock", s_s, n_s), ("fast", s_f, n_f)):
@@ -409,7 +424,9 @@ def test_gate_and_fallbacks_in_rejection_sampler(monkeypatch):
     ib = SimpleNamespace(
         idx_mapping_np=np.arange(r),
         idx_mapping=torch.arange(r, dtype=torch.int32),
-        expanded_idx_mapping=torch.arange(r, dtype=torch.int32).repeat_interleave(steps + 1),
+        expanded_idx_mapping=torch.arange(r, dtype=torch.int32).repeat_interleave(
+            steps + 1
+        ),
         expanded_local_pos=torch.arange(steps + 1, dtype=torch.int32).repeat(r),
         seq_lens_cpu_upper_bound=torch.zeros(r, dtype=torch.int32),
         cu_num_logits=torch.arange(0, n + 1, steps + 1, dtype=torch.int32),
@@ -423,8 +440,13 @@ def test_gate_and_fallbacks_in_rejection_sampler(monkeypatch):
         args = dict(draft_logits=draft, draft_candidate_ids=cand, invalid_drafts=None)
         args.update(over)
         return rs._b70_try_fast(
-            logits, ib, args["draft_logits"], args["draft_candidate_ids"],
-            args["invalid_drafts"], ds, pos,
+            logits,
+            ib,
+            args["draft_logits"],
+            args["draft_candidate_ids"],
+            args["invalid_drafts"],
+            ds,
+            pos,
         )
 
     monkeypatch.delenv("B70_SAMPLER_FAST", raising=False)

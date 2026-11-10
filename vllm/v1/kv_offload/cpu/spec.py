@@ -178,8 +178,8 @@ class CPUOffloadingSpec(OffloadingSpec):
     def _uses_shared_region(self) -> bool:
         """Whether the worker CPU buffer is the shared mmap region (vs a private
         per-rank tensor); replicated-layout dedup is gated on this being True."""
-        # On XPU each rank keeps a private pinned (USM host) tensor. The shared /dev/shm region
-        # is only host-registered (prepare_for_device_copy), which SYCL reports
+        # On XPU each rank keeps a private pinned (USM host) tensor. The shared
+        # /dev/shm region is only host-registered (prepare_for_device_copy), which SYCL reports
         # as usm::alloc::unknown, so every CPU->GPU load in swap_blocks_batch
         # goes through a pinned staging buffer from torch's caching host
         # allocator; those power-of-two blocks stay cached (measured 3.25 GiB
