@@ -40,6 +40,12 @@ batch: the drafter reads the target's features, and a verify step of 8 rows has
 to reproduce what one row computes. Up to ``hc_gemm.PARALLEL_MAX_ROWS`` rows the
 down GEMM then runs split-K in a fixed order with ``hc_silu`` folded in, and for
 1-8 rows the up GEMM and the gated mix run as one native kernel when it loads.
+
+The merged down and injection GEMM takes the model's quantization config. When an
+online INT8 config names it (``quantization_config.targets``), its weight is int8
+per output row and the GEMM runs as W8A8 on vllm-xpu-kernels'
+``int8_dense_w8a8_fused_gemm``: per-token int8 activations and exact int32
+accumulation, so a row's result does not depend on the batch it runs in.
 """
 
 from collections.abc import Sequence
@@ -51,7 +57,11 @@ from transformers import Qwen4ExpTextConfig
 
 from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
-from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    UnquantizedLinearMethod,
+)
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op, eager_bypass_custom_op
 
@@ -81,6 +91,17 @@ class _WeightContainer(nn.Module):
         self.weight = nn.Parameter(torch.empty(*shape))
 
 
+def int8_down_gemm(
+    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor
+) -> torch.Tensor:
+    """``x`` ``[T, K]`` bf16 @ int8 ``weight`` ``[N, K]`` with fp32 row scales
+    ``[N, 1]``: per-token int8 quant and an s8 x s8 GEMM with exact int32
+    accumulation (vllm-xpu-kernels). Batch-invariant per row."""
+    return torch.ops._xpu_C.int8_dense_w8a8_fused_gemm(
+        x.contiguous(), weight, weight_scale, None
+    )
+
+
 def _gate_mix_and_inject(
     xn: torch.Tensor,
     down_weight: torch.Tensor,
@@ -88,9 +109,20 @@ def _gate_mix_and_inject(
     hc: int,
     lowrank: int,
     batch_invariant: bool = False,
+    down_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``xn``: normalized ``[T, hc * n_embd]``. Returns the block input and the
-    injection logits, which are empty when ``down_weight`` has no injection rows."""
+    injection logits, which are empty when ``down_weight`` has no injection rows.
+    With ``down_scale``, ``down_weight`` is int8 ``[N, K]`` and the down GEMM runs
+    INT8 W8A8."""
+    if down_scale is not None:
+        down = int8_down_gemm(xn, down_weight, down_scale)
+        lora = hc_silu(down[:, :lowrank], hc)
+        if batch_invariant and hc_gemm.takes_native_up(lora, up_weight):
+            block_input = hc_gemm.native_up_mix(lora, up_weight, xn, xn.shape[1] // hc)
+        else:
+            block_input = hc_gate_mix(xn, F.linear(lora, up_weight), hc)
+        return block_input, down[:, lowrank : lowrank + hc]
     if batch_invariant and hc_gemm.takes_parallel_route(xn, down_weight):
         # Columns past the down and injection rows are the merged GEMM's padding.
         valid = min(down_weight.shape[0], lowrank + hc)
@@ -114,10 +146,11 @@ def hc_mix(
     hc: int,
     lowrank: int,
     batch_invariant: bool = False,
+    down_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     xn = grouped_gemma_rmsnorm(hidden, norm_weight, eps, hc)
     return _gate_mix_and_inject(
-        xn, down_weight, up_weight, hc, lowrank, batch_invariant
+        xn, down_weight, up_weight, hc, lowrank, batch_invariant, down_scale
     )
 
 
@@ -132,12 +165,13 @@ def hc_combine_and_mix(
     hc: int,
     lowrank: int,
     batch_invariant: bool = False,
+    down_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     combined, xn = hc_combine_norm(
         hidden, block_output, injection, norm_weight, eps, hc
     )
     block_input, new_injection = _gate_mix_and_inject(
-        xn, down_weight, up_weight, hc, lowrank, batch_invariant
+        xn, down_weight, up_weight, hc, lowrank, batch_invariant, down_scale
     )
     return combined, block_input, new_injection
 
@@ -151,6 +185,7 @@ def _hc_mix_fake(
     hc: int,
     lowrank: int,
     batch_invariant: bool = False,
+    down_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tokens = hidden.shape[0]
     down = hidden.new_empty((tokens, down_weight.shape[0]))
@@ -170,6 +205,7 @@ def _hc_combine_and_mix_fake(
     hc: int,
     lowrank: int,
     batch_invariant: bool = False,
+    down_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     block_input, new_injection = _hc_mix_fake(
         hidden, norm_weight, down_weight, up_weight, eps, hc, lowrank
@@ -264,6 +300,7 @@ class HyperConnection(nn.Module):
         config: Qwen4ExpTextConfig,
         has_inject: bool = True,
         prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
         self.hc = config.hc_count
@@ -284,7 +321,7 @@ class HyperConnection(nn.Module):
                 self.hc_dim,
                 [self.lowrank, self.hc] + ([pad] if pad else []),
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=f"{prefix}.input_mix_weight_down_block_inject",
                 return_bias=False,
                 disable_tp=True,
@@ -292,11 +329,38 @@ class HyperConnection(nn.Module):
         else:
             self.input_mix_weight_down = _WeightContainer([self.lowrank, self.hc_dim])
 
+    def _down_operands(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The down weight, and its row scales when it is INT8."""
+        if not self.has_inject:
+            return self.input_mix_weight_down.weight, None
+        layer = self.input_mix_weight_down_block_inject
+        if isinstance(layer.quant_method, UnquantizedLinearMethod):
+            return layer.weight, None
+        weight = layer.weight
+        scale = getattr(layer, "weight_scale", None)
+        if weight.dtype != torch.int8 or scale is None:
+            raise NotImplementedError(
+                f"{layer.prefix}: the HC down projection runs BF16 or online INT8 "
+                f"(int8_per_channel); {type(layer.quant_method).__name__} is not "
+                "supported. Leave it out of quantization_config.targets."
+            )
+        if not hasattr(torch.ops._xpu_C, "int8_dense_w8a8_fused_gemm"):
+            raise NotImplementedError(
+                "The INT8 HC down projection needs vllm-xpu-kernels with "
+                "int8_dense_w8a8_fused_gemm."
+            )
+        logger.info_once(
+            "XPU HC down projection: INT8 W8A8 (per-token int8 activations, "
+            "exact int32 accumulation)."
+        )
+        # The INT8 linear kernels keep the weight as a [K, N] view of [N, K] rows.
+        if weight.shape[-1] != self.hc_dim:
+            weight = weight.t()
+        return weight, scale
+
     @property
     def _down_weight(self) -> torch.Tensor:
-        if self.has_inject:
-            return self.input_mix_weight_down_block_inject.weight
-        return self.input_mix_weight_down.weight
+        return self._down_operands()[0]
 
     def _flat(self, wide: torch.Tensor) -> torch.Tensor:
         return wide.reshape(wide.shape[0], self.hc_dim)
@@ -306,15 +370,17 @@ class HyperConnection(nn.Module):
 
     def mix(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # x: [T, hc, n_embd]
+        down_weight, down_scale = self._down_operands()
         return _mix_op(
             self._flat(x),
             self.hc_norm.weight,
-            self._down_weight,
+            down_weight,
             self.input_mix_weight_up.weight,
             self.eps,
             self.hc,
             self.lowrank,
             self.batch_invariant,
+            down_scale,
         )
 
     def combine_and_mix(
@@ -324,17 +390,19 @@ class HyperConnection(nn.Module):
         inject: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # residual: [T, hc, n_embd]; block_out: [T, n_embd]; inject: [T, hc]
+        down_weight, down_scale = self._down_operands()
         combined, mixed, new_inject = _combine_and_mix_op(
             self._flat(residual),
             block_out,
             inject,
             self.hc_norm.weight,
-            self._down_weight,
+            down_weight,
             self.input_mix_weight_up.weight,
             self.eps,
             self.hc,
             self.lowrank,
             self.batch_invariant,
+            down_scale,
         )
         return self._wide(combined), mixed, new_inject
 
