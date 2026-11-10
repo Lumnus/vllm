@@ -139,16 +139,25 @@ def _check_kernels_against_unfused() -> None:
 def _check_split_k_down() -> None:
     """The DFlash2 split-K down projection: each row is the same whatever else is
     in the batch, the folded silu is hc_silu of the stored value, and the result
-    stays within BF16 rounding of the stock GEMM."""
+    is the GEMM up to the sum order. The interpreter's tl.dot does not take BF16,
+    so the kernels run in fp32 here; the route itself is BF16-only."""
     from vllm.models.qwen4_exp.nvidia.ops.hc import hc_silu
     from vllm.models.qwen4_exp.xpu import hc_gemm
 
-    w = _weights(torch.bfloat16)
+    w16 = _weights(torch.bfloat16)
+    assert hc_gemm.takes_parallel_route(
+        torch.randn(8, HC_DIM).to(torch.bfloat16), _merged_down(w16)
+    )
+    assert not hc_gemm.takes_parallel_route(torch.randn(8, HC_DIM), _merged_down(w16))
+    assert not hc_gemm.takes_parallel_route(
+        torch.randn(9, HC_DIM).to(torch.bfloat16), _merged_down(w16)
+    )
+
+    w = _weights(torch.float32)
     down = _merged_down(w)
     valid = LOWRANK + HC
     torch.manual_seed(2)
-    xn = torch.randn(8, HC_DIM).to(torch.bfloat16)
-    assert hc_gemm.takes_parallel_route(xn, down)
+    xn = torch.randn(8, HC_DIM)
     out, lora = hc_gemm.parallel_hc_gemm_silu(xn, down, valid, LOWRANK, HC)
     for rows in (1, 3, 5):
         part, part_lora = hc_gemm.parallel_hc_gemm_silu(
@@ -158,13 +167,14 @@ def _check_split_k_down() -> None:
         assert torch.equal(part_lora, lora[:rows]), rows
     assert torch.equal(lora, hc_silu(out[:, :LOWRANK].contiguous(), HC))
     assert torch.count_nonzero(out[:, valid:]) == 0
-    reference = F.linear(xn.float(), down.float())[:, :valid]
-    ulps = _ulps(out[:, :valid], reference.to(torch.bfloat16))
-    print(f"split-K down: {ulps:.2f} ulps against the fp32 GEMM")
-    assert ulps <= 1.0
+    reference = F.linear(xn, down)[:, :valid]
+    ulps = _ulps(out[:, :valid], reference)
+    print(f"split-K down: {ulps:.2f} fp32 ulps against the GEMM")
+    assert ulps <= 64
 
     # The op with the batch-invariant route equals its pieces.
-    flat = torch.randn(4, HC_DIM).to(torch.bfloat16)
+    hc_gemm.takes_parallel_route = lambda *_: True
+    flat = torch.randn(4, HC_DIM)
     mixed, inject = hc_module.hc_mix(flat, w.norm, down, w.up, EPS, HC, LOWRANK, True)
     xn4 = hc_module.grouped_gemma_rmsnorm(flat, w.norm, EPS, HC)
     d4, l4 = hc_gemm.parallel_hc_gemm_silu(xn4, down, valid, LOWRANK, HC)
