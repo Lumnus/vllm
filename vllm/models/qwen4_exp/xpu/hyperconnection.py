@@ -34,6 +34,12 @@ round once at each materialized tensor.
 The kernels sit behind custom ops, like the PLE gate, so they stay opaque to
 ``torch.compile`` and run at call time with the real row count. HC holds no
 per-request state, so these ops do not split a piecewise graph.
+
+Under a DFlash2 drafter the target's HC down projection must not depend on the
+batch: the drafter reads the target's features, and a verify step of 8 rows has
+to reproduce what one row computes. Up to ``hc_gemm.PARALLEL_MAX_ROWS`` rows the
+down GEMM then runs split-K in a fixed order with ``hc_silu`` folded in, and for
+1-8 rows the up GEMM and the gated mix run as one native kernel when it loads.
 """
 
 from collections.abc import Sequence
@@ -43,7 +49,10 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 
+from vllm.config import get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
+from vllm.platforms import current_platform
 from vllm.utils.torch_utils import direct_register_custom_op, eager_bypass_custom_op
 
 from ..nvidia.ops.hc import (
@@ -53,6 +62,9 @@ from ..nvidia.ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
+from . import hc_gemm
+
+logger = init_logger(__name__)
 
 
 class _WeightContainer(nn.Module):
@@ -75,9 +87,19 @@ def _gate_mix_and_inject(
     up_weight: torch.Tensor,
     hc: int,
     lowrank: int,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``xn``: normalized ``[T, hc * n_embd]``. Returns the block input and the
     injection logits, which are empty when ``down_weight`` has no injection rows."""
+    if batch_invariant and hc_gemm.takes_parallel_route(xn, down_weight):
+        # Columns past the down and injection rows are the merged GEMM's padding.
+        valid = min(down_weight.shape[0], lowrank + hc)
+        down, lora = hc_gemm.parallel_hc_gemm_silu(xn, down_weight, valid, lowrank, hc)
+        if hc_gemm.takes_native_up(lora, up_weight):
+            block_input = hc_gemm.native_up_mix(lora, up_weight, xn, xn.shape[1] // hc)
+        else:
+            block_input = hc_gate_mix(xn, F.linear(lora, up_weight), hc)
+        return block_input, down[:, lowrank : lowrank + hc]
     down = F.linear(xn, down_weight)
     gate = F.linear(hc_silu(down[:, :lowrank], hc), up_weight)
     return hc_gate_mix(xn, gate, hc), down[:, lowrank : lowrank + hc]
@@ -91,9 +113,12 @@ def hc_mix(
     eps: float,
     hc: int,
     lowrank: int,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     xn = grouped_gemma_rmsnorm(hidden, norm_weight, eps, hc)
-    return _gate_mix_and_inject(xn, down_weight, up_weight, hc, lowrank)
+    return _gate_mix_and_inject(
+        xn, down_weight, up_weight, hc, lowrank, batch_invariant
+    )
 
 
 def hc_combine_and_mix(
@@ -106,12 +131,13 @@ def hc_combine_and_mix(
     eps: float,
     hc: int,
     lowrank: int,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     combined, xn = hc_combine_norm(
         hidden, block_output, injection, norm_weight, eps, hc
     )
     block_input, new_injection = _gate_mix_and_inject(
-        xn, down_weight, up_weight, hc, lowrank
+        xn, down_weight, up_weight, hc, lowrank, batch_invariant
     )
     return combined, block_input, new_injection
 
@@ -124,6 +150,7 @@ def _hc_mix_fake(
     eps: float,
     hc: int,
     lowrank: int,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tokens = hidden.shape[0]
     down = hidden.new_empty((tokens, down_weight.shape[0]))
@@ -142,6 +169,7 @@ def _hc_combine_and_mix_fake(
     eps: float,
     hc: int,
     lowrank: int,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     block_input, new_injection = _hc_mix_fake(
         hidden, norm_weight, down_weight, up_weight, eps, hc, lowrank
@@ -183,6 +211,29 @@ _combine_and_mix_op = eager_bypass_custom_op(
 _combine_op = eager_bypass_custom_op("qwen4_exp_xpu_hc_combine", hc_combine)
 
 
+def _dflash2_target() -> bool:
+    """A BF16 target on XPU serving a DFlash2 drafter."""
+    vllm_config = get_current_vllm_config()
+    spec = vllm_config.speculative_config
+    model_config = vllm_config.model_config
+    on = (
+        current_platform.is_xpu()
+        and spec is not None
+        and spec.method == "dflash"
+        and spec.draft_model_config is not None
+        and spec.draft_model_config.architectures == ["DFlash2DraftModel"]
+        and model_config is not None
+        and model_config.dtype == torch.bfloat16
+    )
+    if on:
+        logger.info_once(
+            "DFlash2 target HC: batch-invariant split-K down projection up to %d "
+            "rows with hc_silu fused; native up + gated mix for 1-8 rows.",
+            hc_gemm.PARALLEL_MAX_ROWS,
+        )
+    return on
+
+
 class HyperConnection(nn.Module):
     """Hyper-connection mix/combine block.
 
@@ -219,6 +270,7 @@ class HyperConnection(nn.Module):
         self.lowrank = config.hc_lowrank
         self.eps = config.rms_norm_eps
         self.has_inject = has_inject
+        self.batch_invariant = _dflash2_target()
 
         self.hc_norm = _WeightContainer([self.hc_dim])
         self.input_mix_weight_up = _WeightContainer([self.hc_dim, self.lowrank])
@@ -260,6 +312,7 @@ class HyperConnection(nn.Module):
             self.eps,
             self.hc,
             self.lowrank,
+            self.batch_invariant,
         )
 
     def combine_and_mix(
@@ -279,6 +332,7 @@ class HyperConnection(nn.Module):
             self.eps,
             self.hc,
             self.lowrank,
+            self.batch_invariant,
         )
         return self._wide(combined), mixed, new_inject
 
