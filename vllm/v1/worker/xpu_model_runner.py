@@ -47,11 +47,15 @@ def _torch_cuda_wrapper():
     torch.cuda.set_stream = partial(torch.xpu.set_stream)
 
     # torch.xpu.Event does not accept the ``blocking`` or ``external`` kwargs
-    # that torch.cuda.Event supports, so drop them here.
-    def _xpu_event(*args, blocking=None, external=None, **kwargs):
-        return torch.xpu.Event(*args, **kwargs)
+    # that torch.cuda.Event supports, so drop them here. A subclass, not a
+    # function, so ``torch.cuda.Event`` stays a type: annotations such as
+    # ``torch.cuda.Event | None`` are evaluated when a model module is
+    # imported inside this wrapper.
+    class _XPUEvent(torch.xpu.Event):
+        def __new__(cls, *args, blocking=None, external=None, **kwargs):
+            return super().__new__(cls, *args, **kwargs)
 
-    torch.cuda.Event = _xpu_event
+    torch.cuda.Event = _XPUEvent
     if supports_xpu_graph():
         torch.cuda.graph = partial(torch.xpu.graph)
         torch.cuda.CUDAGraph = torch.xpu.XPUGraph
