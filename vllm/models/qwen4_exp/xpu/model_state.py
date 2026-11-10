@@ -102,7 +102,8 @@ class Qwen4ExpModelState(MambaHybridModelState):
         query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
         stage_ple_rows(
             self.ple_layers,
-            input_batch.input_ids,
+            input_batch,
+            req_states,
             query_start_loc,
             self._prepare_ngram_context(input_batch, req_states),
         )

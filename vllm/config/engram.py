@@ -44,6 +44,26 @@ class EngramConfig:
     rows on the host instead of allocating the table. Takes precedence over
     cpu_offload."""
 
+    int8_table_path: str | None = None
+    """XPU: a Qwen4Exp PLE table of INT8 rows with one scale per row, about half
+    the size of a BF16 table, built with
+    ``python -m vllm.models.qwen4_exp.xpu.ple_int8``. cpu_offload or disk_offload
+    places it as they place the checkpoint's table."""
+
+    disk_row_cache_gib: float = 8.0
+    """XPU: the pinned host cache of disk_offload rows, in GiB over all TP ranks.
+    Must hold two steps of rows, or the boot refuses it."""
+
+    disk_read_threads: int = 16
+    """XPU: threads per TP rank that read disk_offload rows on a cache miss."""
+
+    disk_lookahead: bool = True
+    """XPU: read the rows of a prefill's next chunk ahead of its step, into the
+    disk_offload row cache."""
+
+    disk_stats_interval_s: float = 0.0
+    """XPU: seconds between disk_offload row cache log lines per rank; 0 for none."""
+
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.
     Otherwise, each DP rank has a separate TP-sharded embedding replica."""
@@ -55,7 +75,8 @@ class EngramConfig:
     by FABRIC handle where supported, else /dev/shm (which then needs capacity
     and a shared IPC namespace). Defaults to enabled whenever the other settings
     allow it, falling back to per-replica tables when DP replicas are not
-    co-located on one node or the host cannot hold them."""
+    co-located on one node or the host cannot hold them. Off by default on XPU,
+    where the Qwen4Exp PLE tables are per replica."""
 
     use_thp: bool = False
     """Back private CPU-offloaded tables with transparent huge pages (best
@@ -77,6 +98,8 @@ class EngramConfig:
     def _validate_shared_memory(self) -> Self:
         if self.dp_shared_memory and not self.cpu_offload:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
+        if self.int8_table_path and not (self.cpu_offload or self.disk_offload):
+            raise ValueError("int8_table_path requires cpu_offload or disk_offload")
         if self.use_thp and (not self.cpu_offload or self.dp_shared_memory):
             raise ValueError(
                 "use_thp requires cpu_offload=True and dp_shared_memory=False"
@@ -99,24 +122,40 @@ class EngramConfig:
                 "EngramConfig requires a model with supported Engram "
                 "embeddings and non-empty n-gram layer ids."
             )
-        if self.disk_offload:
-            from vllm.platforms import current_platform
+        from vllm.platforms import current_platform
 
-            if field != "ple_layer_ids" or not (
-                current_platform.is_cuda() or current_platform.is_xpu()
-            ):
-                raise ValueError(
-                    "disk_offload requires a Qwen4Exp model on CUDA or XPU"
-                )
+        if self.disk_offload and (
+            field != "ple_layer_ids"
+            or not (current_platform.is_cuda() or current_platform.is_xpu())
+        ):
+            raise ValueError("disk_offload requires a Qwen4Exp model on CUDA or XPU")
+        defaults = type(self)()
+        changed = [
+            name
+            for name in (
+                "int8_table_path",
+                "disk_row_cache_gib",
+                "disk_read_threads",
+                "disk_lookahead",
+                "disk_stats_interval_s",
+            )
+            if getattr(self, name) != getattr(defaults, name)
+        ]
+        if changed and (field != "ple_layer_ids" or not current_platform.is_xpu()):
+            raise ValueError(f"{changed} require a Qwen4Exp model on XPU")
 
     def resolve_dp_shared_memory(self, parallel_config: "ParallelConfig") -> None:
         """Share host tables by default wherever the configuration permits."""
+        from vllm.platforms import current_platform
+
         if self.dp_shared_memory is None:
+            # The XPU Qwen4Exp PLE tables keep one copy per DP replica.
             self.dp_shared_memory = (
                 self.cpu_offload
                 and not self.use_thp
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
+                and not current_platform.is_xpu()
             )
 
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:

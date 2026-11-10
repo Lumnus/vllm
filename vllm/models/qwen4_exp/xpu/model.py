@@ -22,11 +22,13 @@ The attention, GDN, and MoE sub-blocks are reused verbatim from
 ``qwen3_next`` / the GDN module.
 """
 
-from collections.abc import Iterable
+import os
+from collections.abc import Iterable, Sequence
 from dataclasses import replace
 from itertools import islice
 from typing import ClassVar
 
+import numpy as np
 import regex as re
 import torch
 from torch import nn
@@ -40,6 +42,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
+    get_tp_group,
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -69,6 +72,8 @@ from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBa
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    pad_vocab_size,
+    vocab_range_from_global_vocab_size,
 )
 from vllm.model_executor.models.interfaces import (
     HasInnerState,
@@ -118,13 +123,17 @@ from ..common.ops.ple import ple_conv, ple_gate, ple_ngram_ids
 
 # nvidia.qsa imports nvidia.model, which imports nvidia.qsa: load the model first.
 from ..nvidia.model import get_qsa_topk_buffer_width
-from ..nvidia.ngram_embedding import (
-    Qwen4ExpNGramEmbedding,
-    Qwen4ExpPLEDiskOffloadEmbedding,
-    Qwen4ExpPLENvFp4EmbeddingMethod,
-)
+from ..nvidia.ngram_embedding import _maps_entry
 from ..nvidia.qsa import Qwen4ExpQSAAttention
 from .hyperconnection import HyperConnection, _WeightContainer
+from .ple_int8 import MAX_REL_ERROR, decode_rows, read_table_header, relative_l2
+from .ple_rows import RowExtent, merge_extents
+from .ple_table import (
+    DiskRowTable,
+    PinnedRowTable,
+    RowFormat,
+    build_row_table,
+)
 
 logger = init_logger(__name__)
 
@@ -159,17 +168,11 @@ def _is_file_backed(tensor: torch.Tensor) -> bool | None:
     safetensors hands out zero-copy mmap views whose storage reports no
     filename, so look the data pointer up in ``/proc/self/maps`` instead.
     """
-    ptr = tensor.data_ptr()
     try:
-        with open("/proc/self/maps") as maps:
-            for line in maps:
-                fields = line.split()
-                lo, hi = (int(x, 16) for x in fields[0].split("-"))
-                if lo <= ptr < hi:
-                    return len(fields) > 5 and fields[5].startswith("/")
+        path, _ = _maps_entry(tensor.data_ptr())
     except OSError:
         return None
-    return False
+    return path.startswith("/")
 
 
 def _report_dense_qsa(config: Qwen4ExpTextConfig, max_model_len: int) -> None:
@@ -251,7 +254,7 @@ class _PLETableFinalizer(QuantizeMethodBase):
 class Qwen4ExpPLE(nn.Module, MambaBase):
     """Per-Layer Embedding (n-gram table) for Qwen4-Exp, layer 1 only.
 
-    The n-gram table (320M rows: ~95 GiB in BF16, ~48 GiB in FP8) never
+    The n-gram table (320M rows: ~95 GiB in BF16, ~48 GiB in FP8 or INT8) never
     becomes a device param. ``--engram-config`` places it:
 
     - Default (``cpu_offload`` and ``disk_offload`` off): the checkpoint's
@@ -259,17 +262,21 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
       ``weight_scale``) are kept as the loader's zero-copy mmap views of the
       checkpoint files, so the table lives in the page cache (shared across TP
       ranks); rows are gathered on host and only those move to the device.
-    - ``cpu_offload``: the shared pinned table, each rank holding its share and
-      the forward reading it through UVA, as on ROCm. No host read.
-    - ``disk_offload``: the shared disk table, as on CUDA: rows are read from
-      the checkpoint files, without relying on the page cache staying warm.
+    - ``cpu_offload``: each rank holds its share in pinned slabs and the forward
+      gathers rows through UVA (``PinnedRowTable``). No host read.
+    - ``disk_offload``: the rows stay in the files, behind a pinned row cache
+      with direct reads and read-ahead (``DiskRowTable``).
+
+    Either of the last two takes its rows from the checkpoint, or from the INT8
+    table at ``int8_table_path``. The checkpoint's shards then stay unread, except
+    for a sample that checks the table belongs to this checkpoint.
 
     ``Qwen4ExpModelState`` runs ``stage_ple_rows`` before the forward: 16 row
     ids per token are hashed on device from the step's tokens and the request's
     preceding tokens (``ngram_context``, rebuilt every step from the token
-    history). The two file-backed tables read them back and copy the rows to a
-    fixed device buffer. The forward only reads a fixed buffer, so graphs replay
-    it.
+    history). The tables that read on the host read them back and copy the rows
+    to a fixed device buffer. The forward only reads fixed buffers, so graphs
+    replay it.
 
     The rest follows the CUDA/ROCm PLE layer and runs the shared kernels:
     key/value proj -> grouped
@@ -284,7 +291,6 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         config: Qwen4ExpTextConfig,
         vllm_config: VllmConfig,
         prefix: str = "",
-        ple_dense_layer_id: int = 0,
     ):
         super().__init__()
         self.hc = config.hc_count
@@ -329,42 +335,28 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         self.norm_query = _WeightContainer([self.hc_dim])
         self.norm_conv = _WeightContainer([self.hc_dim])
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        self.ple_embedding = PLEEmbedding(self.ngram, self.n_heads)
+        # Runs the post-load validation of the table.
+        self.quant_method = _PLETableFinalizer()
+        self.vllm_config = vllm_config
+        self.vocab_padding = int(config.make_ngram_vocab_size_divisible_by)
+        self.max_tokens = max_tokens
         engram_config = vllm_config.engram_config
         self.table_is_mapped = engram_config is None or not (
             engram_config.cpu_offload or engram_config.disk_offload
         )
-        self.ple_embedding: PLEEmbedding | Qwen4ExpNGramEmbedding
-        if self.table_is_mapped:
-            self.ple_embedding = PLEEmbedding(self.ngram, self.n_heads)
-            # Runs the post-load validation of the mapped table.
-            self.quant_method = _PLETableFinalizer()
-        else:
-            self.ple_embedding = Qwen4ExpNGramEmbedding(
-                config,
-                int(config.ple_embed_dim),
-                ple_dense_layer_id,
-                max_tokens,
-                data_parallel_rank=vllm_config.parallel_config.data_parallel_rank,
-                prefix=f"{prefix}.ple_embedding",
-                quant_config=vllm_config.quant_config,
-                params_dtype=vllm_config.model_config.dtype,
-            )
-            method = self.ple_embedding.ngram_embedding.embedding_method
-            if isinstance(method, Qwen4ExpPLENvFp4EmbeddingMethod):
-                raise NotImplementedError(
-                    "NVFP4 Qwen4Exp PLE tables are not supported on XPU yet; use a "
-                    "checkpoint with a BF16 or FP8 PLE table."
-                )
-        self.table_on_disk = not self.table_is_mapped and isinstance(
-            self.ple_embedding.ngram_embedding, Qwen4ExpPLEDiskOffloadEmbedding
+        self.int8_table_path = (
+            None if engram_config is None else engram_config.int8_table_path
         )
+        self.row_table: PinnedRowTable | DiskRowTable | None = None
         logger.info_once(
-            "XPU PLE table: %s (--engram-config %s).",
+            "XPU PLE table: %s, rows from %s (--engram-config %s).",
             "in the mapped checkpoint files"
             if self.table_is_mapped
-            else "read from the checkpoint files"
-            if self.table_on_disk
-            else "in pinned host memory, looked up through UVA",
+            else "read from disk through a row cache"
+            if engram_config is not None and engram_config.disk_offload
+            else "in pinned host memory",
+            self.int8_table_path or "the checkpoint",
             str(engram_config),
         )
 
@@ -381,14 +373,21 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         # The host ones are written only after the step's stream sync, so after
         # the previous step's copy has finished.
         self._row_ids = torch.zeros(max_tokens, self.n_heads, dtype=torch.int64)
+        pin = self._row_ids.device.type == "xpu"
+        if self.table_is_mapped or (
+            engram_config is not None and engram_config.disk_offload
+        ):
+            self._host_ids = torch.empty(
+                max_tokens,
+                self.n_heads,
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=pin,
+            )
         if not self.table_is_mapped:
             return
         embed_dim = self.n_heads * self.head_dim
         self._staged_rows = torch.zeros(max_tokens, embed_dim, dtype=torch.bfloat16)
-        pin = self._staged_rows.device.type == "xpu"
-        self._host_ids = torch.empty(
-            max_tokens, self.n_heads, dtype=torch.int64, device="cpu", pin_memory=pin
-        )
         self._host_rows = torch.empty(
             max_tokens, embed_dim, dtype=torch.bfloat16, device="cpu", pin_memory=pin
         )
@@ -465,10 +464,13 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         self._ckpt_shards[index] = tensor.detach()
 
     def finalize_table(self) -> None:
-        """Validate the n-gram table once all weights are loaded."""
+        """Validate the n-gram table once all weights are loaded, then open it."""
         if not self._ckpt_shards and self._dummy_load:
             return
         if not self._ckpt_shards:
+            if self.int8_table_path is not None:
+                self._open_row_table()
+                return
             raise ValueError(
                 "The checkpoint ships no PLE n-gram table (`ngram_embedding.shard_*`)"
             )
@@ -493,6 +495,10 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
                 raise ValueError("FP8 PLE checkpoint is missing its global scale")
         elif self._ckpt_dtype != torch.bfloat16:
             raise ValueError(f"Unsupported PLE n-gram table dtype {self._ckpt_dtype}")
+        if not self.table_is_mapped:
+            self._open_row_table()
+            self._ckpt_shards.clear()
+            return
         table_gib = (
             total_rows * self.head_dim * self._ckpt_shards[0].element_size() / 2**30
         )
@@ -510,6 +516,112 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             self._ckpt_dtype,
             table_gib,
         )
+
+    def _ple_constants(self) -> dict[str, np.ndarray]:
+        emb = self.ple_embedding
+        return {
+            "multipliers": emb.layer_multipliers.detach().cpu().numpy(),
+            "sizes": emb.ngram_heads_vocab_sizes.detach().cpu().numpy(),
+            "offsets": emb.ngram_heads_offsets.detach().cpu().numpy(),
+        }
+
+    def _checkpoint_extents(self, row_bytes: int) -> list[RowExtent]:
+        """Where the checkpoint's shards lie in its files."""
+        extents = []
+        for index in sorted(self._ckpt_shards):
+            shard = self._ckpt_shards[index]
+            # The loader hands over mmap views, so find their files here.
+            path, offset = _maps_entry(shard.data_ptr())
+            if not path or not os.path.isfile(path):
+                raise ValueError(
+                    f"PLE shard {index} is not a file-backed view "
+                    f"({path or 'anonymous'}); --engram-config places the table "
+                    "from files"
+                )
+            extents.append(RowExtent(path, offset, shard.shape[0]))
+        return merge_extents(extents, row_bytes)
+
+    def _int8_table_extents(
+        self, constants: dict[str, np.ndarray]
+    ) -> tuple[list[RowExtent], int]:
+        """Open the INT8 table, refusing one built for another hash layout."""
+        path = self.int8_table_path
+        assert path is not None
+        data_start, rows, row_bytes, layout = read_table_header(path)
+        if row_bytes != self.head_dim + 4:
+            raise ValueError(
+                f"{path}: rows of {row_bytes} B, expected {self.head_dim + 4}"
+            )
+        for key, name in (
+            ("ngram_heads_offsets", "offsets"),
+            ("ngram_heads_vocab_sizes", "sizes"),
+            ("layer_multipliers", "multipliers"),
+        ):
+            if not np.array_equal(layout[key], constants[name]):
+                raise ValueError(f"{path}: {key} differs from this checkpoint")
+        return [RowExtent(path, data_start, rows)], rows
+
+    def _open_row_table(self) -> None:
+        constants = self._ple_constants()
+        if self.int8_table_path is not None:
+            row_format = RowFormat("int8", self.head_dim)
+            extents, table_rows = self._int8_table_extents(constants)
+        else:
+            if self._ckpt_dtype == torch.float8_e4m3fn:
+                assert self._ckpt_scale is not None
+                scale = self._ckpt_scale.to(self._row_ids.device)
+                row_format = RowFormat("fp8", self.head_dim, scale)
+            else:
+                row_format = RowFormat("bf16", self.head_dim)
+            extents = self._checkpoint_extents(row_format.row_bytes)
+            table_rows = sum(extent.num_rows for extent in extents)
+        needed = int((constants["offsets"] + constants["sizes"]).max())
+        padded = pad_vocab_size(needed, self.vocab_padding)
+        if table_rows < padded:
+            raise ValueError(f"PLE table holds {table_rows} rows, needs {padded}")
+        group = get_tp_group()
+        rank_range = vocab_range_from_global_vocab_size(
+            padded, group.rank_in_group, group.world_size
+        )
+        self.row_table = build_row_table(
+            self.vllm_config,
+            row_format,
+            (int(rank_range[0]), int(rank_range[1])),
+            extents,
+            max_tokens=self.max_tokens,
+            heads=self.n_heads,
+            device=self._row_ids.device,
+            ple_constants=constants,
+            eos_token_id=self.eos,
+            heads_per_ngram=self.per_gram,
+        )
+        if row_format.kind == "int8" and self._ckpt_shards:
+            self._check_int8_table(extents[0], rank_range)
+
+    def _check_int8_table(self, extent: RowExtent, rank_range: Sequence[int]) -> None:
+        """Refuse a table whose sampled rows are not this checkpoint's."""
+        rows = torch.randint(
+            int(rank_range[0]),
+            int(rank_range[1]),
+            (4096,),
+            generator=torch.Generator().manual_seed(20260928),
+        )
+        row_bytes = self.head_dim + 4
+        packed = np.empty((rows.numel(), row_bytes), dtype=np.uint8)
+        with open(extent.path, "rb") as handle:
+            for slot, row in enumerate(rows.tolist()):
+                handle.seek(extent.offset + row * row_bytes)
+                packed[slot] = np.frombuffer(handle.read(row_bytes), dtype=np.uint8)
+        error = relative_l2(
+            decode_rows(torch.from_numpy(packed)),
+            self._gather_rows(rows).to(torch.float32),
+        )
+        logger.info_once("INT8 PLE table against the checkpoint: rel L2 %.4f", error)
+        if error > MAX_REL_ERROR:
+            raise ValueError(
+                f"{self.int8_table_path} is not this checkpoint's table: "
+                f"relative L2 {error:.4f} above {MAX_REL_ERROR}"
+            )
 
     def _gather_rows(self, rows: torch.Tensor) -> torch.Tensor:
         """Host-side gather of n-gram rows -> ``[N, head_dim]`` BF16 on CPU."""
@@ -539,7 +651,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
 
     @property
     def reads_rows_on_host(self) -> bool:
-        return self.table_is_mapped or self.table_on_disk
+        return self.table_is_mapped or isinstance(self.row_table, DiskRowTable)
 
     def hash_rows(
         self,
@@ -561,15 +673,19 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             heads_per_ngram=self.per_gram,
             output=self._row_ids[: input_ids.shape[0]],
         )
-        if self.table_on_disk:
-            self.ple_embedding.ngram_embedding.copy_ids_to_host(ids)
-        elif self.table_is_mapped:
+        if self.reads_rows_on_host:
             self._host_ids[: ids.shape[0]].copy_(ids, non_blocking=True)
 
-    def stage_rows(self, num_tokens: int) -> None:
+    def stage_rows(self, input_batch, req_states) -> None:
         """Read the step's rows on host and queue their copy to the device."""
-        if self.table_on_disk:
-            self.ple_embedding.ngram_embedding.stage_rows(num_tokens)
+        num_tokens = input_batch.input_ids.numel()
+        if isinstance(self.row_table, DiskRowTable):
+            self.row_table.stage(
+                self._host_ids[: input_batch.num_tokens].numpy(),
+                num_tokens,
+                input_batch,
+                req_states,
+            )
             return
         if not self.table_is_mapped:
             return
@@ -583,12 +699,14 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
         """This step's n-gram embeddings ``[T, n_heads * head_dim]`` on device."""
         if self.table_is_mapped:
             return self._staged_rows[:num_tokens]
-        embedding = self.ple_embedding.ngram_embedding
-        if self.table_on_disk:
-            rows = embedding.staged_rows(num_tokens)
-        else:
-            rows = embedding.sync_lookup(self._row_ids[:num_tokens]).flatten(-2)
-        return embedding.dequantize(rows, dtype)
+        if isinstance(self.row_table, DiskRowTable):
+            return self.row_table.lookup(num_tokens, dtype)
+        if isinstance(self.row_table, PinnedRowTable):
+            return self.row_table.lookup(self._row_ids[:num_tokens], dtype)
+        # A dummy load has no table.
+        return self._row_ids.new_zeros(
+            (num_tokens, self.n_heads * self.head_dim), dtype=dtype
+        )
 
     def short_conv(
         self,
@@ -747,7 +865,8 @@ def _ple_layer(layer_name: str) -> Qwen4ExpPLE:
 
 def stage_ple_rows(
     layers: list[Qwen4ExpPLE],
-    input_ids: torch.Tensor,
+    input_batch,
+    req_states,
     query_start_loc: torch.Tensor,
     ngram_context: torch.Tensor,
 ) -> None:
@@ -759,6 +878,7 @@ def stage_ple_rows(
     so the read has to wait for both. A pinned table has no host read and no
     sync: its lookup reads the hashed ids in queue order.
     """
+    input_ids = input_batch.input_ids
     for layer in layers:
         layer.hash_rows(input_ids, query_start_loc, ngram_context)
     if input_ids.device.type != "cpu" and any(
@@ -767,7 +887,7 @@ def stage_ple_rows(
         with gpu_sync_allowed():
             torch.accelerator.synchronize()
     for layer in layers:
-        layer.stage_rows(input_ids.numel())
+        layer.stage_rows(input_batch, req_states)
 
 
 def qwen4_exp_xpu_ple_lookup(output: torch.Tensor, layer_name: str) -> None:
@@ -851,14 +971,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.ple = None
         ple_layer_indices = {v - 1 for v in config.ple_layer_ids}
         if self.layer_idx in ple_layer_indices:
-            self.ple = Qwen4ExpPLE(
-                config,
-                vllm_config,
-                prefix=f"{prefix}.ple",
-                ple_dense_layer_id=sorted(set(config.ple_layer_ids)).index(
-                    self.layer_idx + 1
-                ),
-            )
+            self.ple = Qwen4ExpPLE(config, vllm_config, prefix=f"{prefix}.ple")
 
         # Hyper-connections replace the per-layer RMSNorm + residual add.
         self.attn_hyper_connection = HyperConnection(
@@ -1217,9 +1330,8 @@ class Qwen4ExpModel(Qwen3NextModel):
                     ple = getattr(self.layers[int(match.group(1))], "ple", None)
                     if ple is None:
                         continue
-                    if ple.table_is_mapped:
-                        ple.accept_checkpoint_tensor(match.group(2), tensor)
-                        continue
+                    ple.accept_checkpoint_tensor(match.group(2), tensor)
+                    continue
                 yield name, tensor
 
         loader = AutoWeightsLoader(self)
