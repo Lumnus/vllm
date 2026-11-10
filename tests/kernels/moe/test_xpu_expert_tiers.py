@@ -460,3 +460,23 @@ def test_split_layer_matches_the_resident_layer():
     assert err < 1e-2, err
     tiered = tiers.eplb_weights()
     assert tiered[0].parts[1].data_ptr() == host["w13"].data_ptr()
+
+
+def test_eplb_writes_into_the_slow_tier_drop_staged_copies(monkeypatch):
+    """A row EPLB writes into a slow slot invalidates the offloader's staged
+    copies; writes into fast slots do not."""
+    import vllm.model_executor.offloader.base as offloader_base
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        offloader_base,
+        "get_offloader",
+        lambda: SimpleNamespace(invalidate_staged=lambda: calls.append(1)),
+    )
+    layer, experts, _ = _built_layer(monkeypatch)
+    experts.finalize_weight_storage(layer)
+    w2 = experts.eplb_expert_weights(layer)[1]
+    w2.rows_written([0, 1])
+    assert calls == []
+    w2.rows_written([1, 3])
+    assert calls == [1]
