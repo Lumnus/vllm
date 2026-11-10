@@ -450,9 +450,14 @@ class XpuVmmDriver(VmmDriver):
 
     def __init__(self) -> None:
         import torch
-        import vllm_xpu_kernels._C  # noqa: F401
+        import vllm_xpu_kernels._xpu_C  # noqa: F401
 
-        self._ops = torch.ops._C
+        self._ops = torch.ops._xpu_C
+        if not hasattr(self._ops, "vmm_reserve"):
+            raise RuntimeError(
+                "the installed vllm-xpu-kernels has no VMM ops "
+                "(vllm-project/vllm-xpu-kernels#692)"
+            )
 
     def error_string(self, code: int) -> str:
         # The ops raise with the SYCL error message instead of returning codes.
