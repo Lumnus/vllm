@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -3066,9 +3067,7 @@ def swap_blocks_batch(
             # copy is queued (the CPU->GPU direction of the KV offload pool),
             # so pinned sources need no call-time snapshot: they are copied
             # directly in stream order (vllm-xpu-kernels snapshot_src=False).
-            torch.ops._C_cache_ops.swap_blocks_batch(
-                src_ptrs, dst_ptrs, sizes, False
-            )
+            torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes, False)
         else:
             torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
     else:
