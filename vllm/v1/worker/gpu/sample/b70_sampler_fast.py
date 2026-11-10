@@ -159,9 +159,7 @@ def _merge_kernel(
 @triton.jit
 def _draft_lse(dbase, cand_ptr, kd, kd_mask, temp):
     cand = tl.load(cand_ptr + kd, mask=kd_mask, other=0)
-    dl = (
-        tl.load(dbase + cand, mask=kd_mask, other=-float("inf")).to(tl.float32) / temp
-    )
+    dl = tl.load(dbase + cand, mask=kd_mask, other=-float("inf")).to(tl.float32) / temp
     dm = tl.max(dl, axis=0)
     return dm + tl.log(tl.sum(tl.exp(dl - dm), axis=0))
 
@@ -228,7 +226,9 @@ def _fast_reject_kernel(
             else:
                 lp = tl.load(logp_ptr + logit_idx * KP + kk)
                 t_lp = tl.max(tl.where(row_ids == d, lp, -float("inf")), axis=0)
-                dbase = draft_logits_ptr + req_state * draft_stride_0 + i * draft_stride_1
+                dbase = (
+                    draft_logits_ptr + req_state * draft_stride_0 + i * draft_stride_1
+                )
                 dlse = _draft_lse(
                     dbase,
                     cand_ids_ptr + req_state * cand_stride_0 + i * cand_stride_1,
@@ -327,9 +327,7 @@ def _kp(kmax: int) -> int:
     return 16 if kmax <= 16 else 32
 
 
-def batch_params(
-    states, idx_mapping_np: np.ndarray, vocab_size: int
-) -> int | None:
+def batch_params(states, idx_mapping_np: np.ndarray, vocab_size: int) -> int | None:
     """Host-side eligibility on the sampling params; returns the batch's max top-k
     (>= 1) or None when the stock path must run. No device access."""
     temp = states.temperature.np[idx_mapping_np]
