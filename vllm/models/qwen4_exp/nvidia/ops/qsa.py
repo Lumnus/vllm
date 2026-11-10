@@ -806,6 +806,7 @@ def qsa_sparse_paged_attention(
         output_gate_view,
         softmax_scale,
         output_scale,
+        pth_scales,
     )
 
 
@@ -821,9 +822,13 @@ def _qsa_sparse_paged_splitk(
     output_gate_view: torch.Tensor,
     softmax_scale: float,
     output_scale: float,
+    pth_scales: dict,
 ) -> torch.Tensor:
-    """The split-K kernel (and merge) at _select_config's config."""
-    is_fp8 = k_cache.dtype != torch.bfloat16
+    """The split-K kernel (and merge) at _select_config's config.
+
+    ``pth_scales``: the scale kwargs of an int8 per-token-head cache, else empty.
+    """
+    is_fp8 = k_cache.dtype not in (torch.bfloat16, torch.int8)
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     if current_platform.is_xpu():
