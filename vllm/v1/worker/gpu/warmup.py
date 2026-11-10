@@ -584,6 +584,18 @@ def _warmup_kernels(
 
         worker_sample_tokens(grammar_output)
 
+        # Compile the top-k-first sampler kernels here, not on a request.
+        from vllm.v1.worker.gpu.sample import b70_sampler_fast
+
+        candidate_sampler = getattr(model_runner.speculator, "candidate_sampler", None)
+        if b70_sampler_fast.enabled() and candidate_sampler is not None:
+            b70_sampler_fast.warmup(
+                model_runner.device,
+                model_runner.vocab_size,
+                candidate_sampler.num_steps,
+                candidate_sampler.top_k,
+            )
+
         # Per-request state carried across the decode steps.
         req_computed = [prompt_len] * num_reqs
         req_blocks = [list(prefill_block_counts) for _ in range(num_reqs)]

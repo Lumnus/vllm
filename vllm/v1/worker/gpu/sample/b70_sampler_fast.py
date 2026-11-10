@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """B70-SM: top-k-first temperature sampling and spec-decode verification.
 
-Gate: B70_SAMPLER_FAST=1 (default off; unset keeps the stock path bit for bit).
+Active on XPU; every other platform keeps the stock path bit for bit.
 
 The served config samples with top-k 20 (generation_config), so after top-k the
 target distribution lives on <= 20 tokens, and the DFlash2 drafter's proposal q
@@ -37,8 +37,6 @@ above KMAX, grammar bitmasks, block/synthetic/adaptive verification, watermarkin
 fp64 Gumbel, drafters without cached candidates.
 """
 
-import os
-
 import numpy as np
 import torch
 
@@ -56,7 +54,9 @@ _logged: set[str] = set()
 
 
 def enabled() -> bool:
-    return os.environ.get("B70_SAMPLER_FAST", "0") == "1"
+    from vllm.platforms import current_platform
+
+    return current_platform.is_xpu()
 
 
 def _log_once(tag: str, msg: str) -> None:
