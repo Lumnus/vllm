@@ -15,7 +15,7 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 
 
 def tensor_model_parallel_all_reduce_owned(input_: torch.Tensor) -> torch.Tensor:
-    """All-reduce a tensor the caller owns (B70-V2-AR: in place if B70_AR_INPLACE=1)."""
+    """All-reduce a tensor the caller owns (in place where the communicator can)."""
     return get_tp_group().all_reduce_owned(input_)
 
 
