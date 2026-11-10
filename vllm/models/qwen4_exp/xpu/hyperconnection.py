@@ -49,7 +49,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 
-from vllm.config import get_current_vllm_config
+from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.platforms import current_platform
@@ -213,7 +213,9 @@ _combine_op = eager_bypass_custom_op("qwen4_exp_xpu_hc_combine", hc_combine)
 
 def _dflash2_target() -> bool:
     """A BF16 target on XPU serving a DFlash2 drafter."""
-    vllm_config = get_current_vllm_config()
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return False
     spec = vllm_config.speculative_config
     model_config = vllm_config.model_config
     on = (
