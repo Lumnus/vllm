@@ -461,6 +461,7 @@ steps:
       models/qwen4_exp/test_xpu_ple.py
       models/qwen4_exp/test_xpu_ple_layer.py
       models/qwen4_exp/test_xpu_hc.py
+      models/qwen4_exp/test_xpu_vision_norm.py
 
 - label: ":nvidia: (B200) Qwen3.5"
   key: qwen3-5-unit-tests-b200
