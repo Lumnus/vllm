@@ -526,7 +526,7 @@ def test_suspended_runs_the_stock_path(monkeypatch):
 def test_kernel_warmup_runs_greedy_batches_on_the_stock_verify(monkeypatch):
     """With the fast path on, kernel warm-up runs the greedy batches once more
     with it suspended, so the stock rejection kernels compile for model-dtype
-    logits too."""
+    logits too; that pass uses two requests, not the full batch."""
     from types import SimpleNamespace
 
     from vllm.platforms import current_platform
@@ -535,8 +535,10 @@ def test_kernel_warmup_runs_greedy_batches_on_the_stock_verify(monkeypatch):
     monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
     passes = []
 
-    def fake_warmup_kernels(runner, execute_model, sample_tokens, greedy=False):
-        passes.append((greedy, sm.enabled()))
+    def fake_warmup_kernels(
+        runner, execute_model, sample_tokens, greedy=False, max_num_reqs=None
+    ):
+        passes.append((greedy, sm.enabled(), max_num_reqs))
 
     monkeypatch.setattr(warmup, "_warmup_kernels", fake_warmup_kernels)
     runner = SimpleNamespace(
@@ -546,7 +548,7 @@ def test_kernel_warmup_runs_greedy_batches_on_the_stock_verify(monkeypatch):
         speculator=None,
     )
     warmup.warmup_kernels(runner, None, None)
-    assert passes == [(False, True), (True, True), (True, False)]
+    assert passes == [(False, True, None), (True, True, None), (True, False, 2)]
     assert sm.enabled()
 
 

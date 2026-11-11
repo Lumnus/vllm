@@ -432,7 +432,9 @@ def warmup_kernels(
             if b70_sampler_fast.enabled():
                 # The top-k-first verify takes the greedy batches above. The
                 # stock rejection kernels it falls back on (logprobs, top-k
-                # off, ...) see model-dtype logits in serving as well.
+                # off, ...) see model-dtype logits in serving as well. Two
+                # requests reach the same logit-count classes as a full batch
+                # (1, not a multiple of 16, a multiple of 16).
                 logger.info(
                     "Warming up the stock rejection sampler on model-dtype logits."
                 )
@@ -442,6 +444,7 @@ def warmup_kernels(
                         worker_execute_model,
                         worker_sample_tokens,
                         greedy=True,
+                        max_num_reqs=2,
                     )
     finally:
         model_runner.adaptive_verification = adaptive_verification
@@ -527,6 +530,7 @@ def _warmup_kernels(
     worker_execute_model: Callable[[SchedulerOutput], Any],
     worker_sample_tokens: Callable[[GrammarOutput | None], Any],
     greedy: bool = False,
+    max_num_reqs: int | None = None,
 ) -> None:
     if model_runner.vllm_config.is_mm_encoder_only:
         return
@@ -571,10 +575,11 @@ def _warmup_kernels(
     decode_block_counts = [block_count(decode_len, s) for s in kv_cache_specs]
     max_blocks_per_req = sum(decode_block_counts)
 
+    max_seqs = model_runner.scheduler_config.max_num_seqs
+    if max_num_reqs is not None:
+        max_seqs = min(max_seqs, max_num_reqs)
     num_reqs = _cap_num_warmup_reqs(
-        model_runner,
-        model_runner.scheduler_config.max_num_seqs,
-        max(prompt_len, decode_query_len),
+        model_runner, max_seqs, max(prompt_len, decode_query_len)
     )
     block_tables = getattr(model_runner, "block_tables", None)
     null_blocks = block_tables is not None and (
