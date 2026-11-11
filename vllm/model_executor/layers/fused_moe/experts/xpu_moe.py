@@ -13,7 +13,6 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
-from vllm.model_executor.layers.fused_moe.experts import xpu_ep_dispatch
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
@@ -36,6 +35,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp8Static,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
@@ -69,6 +69,43 @@ def staged_impl(impl: "XpuFusedMoe", num_tokens: int, slot: str) -> "XpuFusedMoe
     for field, tensor in staged.items():
         setattr(impl, field, tensor)
     return impl
+
+
+# n_ids is not specialised: one compiled variant serves every batch size.
+@triton.jit(do_not_specialize=["n_ids"])
+def _sentinel_ids_kernel(
+    ids_ptr, out_ptr, n_ids, sentinel, counts_ptr, n_experts, BLOCK: tl.constexpr
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < n_ids
+    x = tl.load(ids_ptr + offs, mask=m, other=0)
+    tl.store(out_ptr + offs, tl.where(x < 0, sentinel, x).to(x.dtype), mask=m)
+    tl.store(
+        counts_ptr + offs, tl.zeros([BLOCK], dtype=tl.int32), mask=offs < n_experts
+    )
+
+
+def sentinel_ids_and_counts(
+    topk_ids: torch.Tensor, sentinel: int, num_local_experts: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``where(topk_ids < 0, sentinel, topk_ids)`` and a zeroed int32
+    ``rows_per_expert`` for the fused MoE to fill, in one launch."""
+    ids = topk_ids.contiguous()
+    out = torch.empty_like(ids)
+    counts = torch.empty((num_local_experts,), dtype=torch.int32, device=ids.device)
+    block = 256
+    grid = (max(triton.cdiv(max(ids.numel(), num_local_experts), block), 1),)
+    _sentinel_ids_kernel[grid](
+        ids,
+        out,
+        ids.numel(),
+        sentinel,
+        counts,
+        num_local_experts,
+        BLOCK=block,
+        num_warps=1,
+    )
+    return out.view(topk_ids.shape), counts
 
 
 class XPUExperts(mk.FusedMoEExpertsModular):
@@ -255,18 +292,17 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             self._build_impl(w1, w2, topk_ids.size(-1), activation, expert_map)
         assert self.fused_moe_impl is not None
         impl = staged_impl(self.fused_moe_impl, hidden_states.size(0), "experts")
+        ep_kwargs: dict = {}
         if self.moe_config.ep_size > 1:
             # Avoid topk_ids = -1, remap them to an
-            # expert not owned by this rank so they are skipped.
+            # expert not owned by this rank so they are skipped. The same
+            # kernel zeroes rows_per_expert, and with every id valid the fused
+            # MoE skips its padding-row mask.
             sentinel = global_num_experts - 1 if self.moe_config.ep_rank == 0 else 0
-            if a1q_scale is None and xpu_ep_dispatch.eligible(
-                impl, hidden_states, output, self.impl_apply_kwargs
-            ):
-                xpu_ep_dispatch.apply(
-                    impl, output, hidden_states, topk_weights, topk_ids, sentinel
-                )
-                return
-            topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
+            topk_ids, rows_per_expert = sentinel_ids_and_counts(
+                topk_ids, sentinel, impl.num_experts
+            )
+            ep_kwargs = {"ids_valid": True, "rows_per_expert": rows_per_expert}
         impl.apply(
             output=output,
             hidden_states=hidden_states,
@@ -274,6 +310,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             topk_ids=topk_ids,
             a1q_scale=a1q_scale,
             **self.impl_apply_kwargs,
+            **ep_kwargs,
         )
 
     def _apply_tiered(
