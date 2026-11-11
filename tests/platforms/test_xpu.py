@@ -123,3 +123,54 @@ def test_uses_runtime_once_initialized(sysman, monkeypatch):
     monkeypatch.setattr(torch.xpu, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.xpu, "get_device_name", lambda i: "from runtime")
     assert xpu_platform.XPUPlatform.get_device_name() == "from runtime"
+
+
+def test_device_properties_use_runtime_once_initialized(monkeypatch):
+    from vllm.utils import platform_utils
+
+    props = types.SimpleNamespace(local_mem_size=131072, name="Device A")
+    monkeypatch.setattr(platform_utils, "xpu_is_initialized", lambda: True)
+    monkeypatch.setattr(torch.xpu, "get_device_properties", lambda i: props)
+    assert platform_utils.xpu_get_device_properties(0, ("local_mem_size", "name")) == (
+        131072,
+        "Device A",
+    )
+
+
+def test_linear_attention_import_does_not_query_triton(monkeypatch):
+    """Importing the linear attention ops must not reach the Triton driver,
+    whose utilities need a stream and so initialize the XPU runtime."""
+    import importlib
+
+    import triton
+
+    from vllm.platforms import current_platform
+    from vllm.utils import platform_utils
+
+    # Resolve the platform with the real Sysman before faking it.
+    if not current_platform.is_xpu():
+        pytest.skip("needs the XPU platform")
+    monkeypatch.setitem(sys.modules, "pyzes", _fake_pyzes())
+    monkeypatch.delenv("ZE_AFFINITY_MASK", raising=False)
+    _forbid_runtime(monkeypatch)
+
+    class NoDriver:
+        @property
+        def active(self):
+            raise AssertionError("the Triton driver must not be queried")
+
+    monkeypatch.setattr(triton.runtime, "driver", NoDriver())
+    monkeypatch.setattr(
+        platform_utils, "xpu_get_device_properties", lambda device, names: (131072,)
+    )
+    from vllm.third_party.flash_linear_attention.ops import utils
+
+    try:
+        utils = importlib.reload(utils)
+        assert utils.device == "xpu"
+        assert utils.is_intel and not utils.is_intel_alchemist
+        assert utils.check_shared_mem() is True
+        assert utils.check_shared_mem("hopper") is False
+    finally:
+        monkeypatch.undo()
+        importlib.reload(utils)

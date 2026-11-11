@@ -40,6 +40,23 @@ def cuda_get_device_properties(
         return executor.submit(cuda_get_device_properties, device, names, True).result()
 
 
+def xpu_get_device_properties(
+    device, names: Sequence[str], init_xpu=False
+) -> tuple[Any, ...]:
+    """Get specified XPU device property values without initializing XPU in
+    the current process."""
+    if init_xpu or xpu_is_initialized():
+        props = torch.xpu.get_device_properties(device)
+        return tuple(getattr(props, name) for name in names)
+
+    # Run in subprocess to avoid initializing XPU as a side effect. The
+    # runtime would stay for the lifetime of this process and hold device
+    # memory on every visible device. XPU supports only spawn.
+    mp_ctx = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(max_workers=1, mp_context=mp_ctx) as executor:
+        return executor.submit(xpu_get_device_properties, device, names, True).result()
+
+
 @cache
 def is_pin_memory_available() -> bool:
     from vllm.platforms import current_platform
