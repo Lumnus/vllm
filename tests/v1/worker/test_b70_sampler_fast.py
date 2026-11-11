@@ -19,7 +19,6 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
-from scipy import stats  # noqa: E402
 
 from vllm.triton_utils import tl, tldevice  # noqa: E402
 
@@ -73,6 +72,25 @@ def ref_support(logits, temp, k, p):
         lp = kv - (kv.max() + np.log(np.exp(kv - kv.max()).sum()))
         out.append((kept, lp))
     return out
+
+
+def _chisquare_pvalue(observed: np.ndarray, expected: np.ndarray) -> float:
+    """Pearson's goodness-of-fit p-value with len - 1 degrees of freedom: the
+    chi-square survival function at x with k degrees of freedom is Q(k/2, x/2)."""
+    statistic = float(((observed - expected) ** 2 / expected).sum())
+    dof = len(observed) - 1
+    return float(
+        torch.special.gammaincc(
+            torch.tensor(dof / 2, dtype=torch.float64),
+            torch.tensor(statistic / 2, dtype=torch.float64),
+        )
+    )
+
+
+def test_chisquare_pvalue_closed_form():
+    # Two degrees of freedom: the survival function is exp(-x / 2); x = 10 here.
+    p = _chisquare_pvalue(np.array([10.0, 20.0, 30.0]), np.array([20.0, 20.0, 20.0]))
+    assert p == pytest.approx(np.exp(-5.0), rel=1e-12)
 
 
 def _quantised(n, v, seed, scale=3.0):
@@ -175,9 +193,9 @@ def test_fast_sample_chisquare_and_greedy():
     if pooled_e[-1] < 5:
         pooled_o, pooled_e = pooled_o[:-1], pooled_e[:-1]
     pooled_e = pooled_e * pooled_o.sum() / pooled_e.sum()
-    chi = stats.chisquare(pooled_o, pooled_e)
-    print("chi-square p =", chi.pvalue, "bins", len(pooled_o))
-    assert chi.pvalue > 1e-3
+    pvalue = _chisquare_pvalue(pooled_o, pooled_e)
+    print("chi-square p =", pvalue, "bins", len(pooled_o))
+    assert pvalue > 1e-3
 
     # greedy rows and top-k=1 rows
     g = _quantised(4, V, 4)
@@ -388,9 +406,9 @@ def test_first_token_marginal_equals_target_and_acceptance():
         if pe[-1] < 5:
             po, pe = po[:-1], pe[:-1]
         pe = pe * po.sum() / pe.sum()
-        c = stats.chisquare(po, pe)
-        print(name, "first-token chi-square p =", c.pvalue, "bins", len(po))
-        assert c.pvalue > 1e-3, name
+        pvalue = _chisquare_pvalue(po, pe)
+        print(name, "first-token chi-square p =", pvalue, "bins", len(po))
+        assert pvalue > 1e-3, name
     # same decisions as stock, draw for draw
     same = (n_s == n_f).float().mean().item()
     tokmatch = float((s_s[:, 0] == s_f[:, 0]).float().mean())
