@@ -116,7 +116,10 @@ def test_falls_back_to_runtime(monkeypatch):
     monkeypatch.setattr(xpu_platform, "_sysman_device_name_and_memory", lambda i: None)
     monkeypatch.setattr(torch.xpu, "is_initialized", lambda: False)
     monkeypatch.setattr(torch.xpu, "get_device_name", lambda i: "from runtime")
+    said = []
+    monkeypatch.setattr(xpu_platform, "_log_sysman_fallback", lambda: said.append(1))
     assert xpu_platform.XPUPlatform.get_device_name() == "from runtime"
+    assert said
 
 
 def test_uses_runtime_once_initialized(sysman, monkeypatch):
