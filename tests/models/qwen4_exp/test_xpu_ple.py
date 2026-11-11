@@ -175,6 +175,28 @@ def _stage(ple: Qwen4ExpPLE, num_tokens: int = ROW_IDS.shape[0]) -> None:
     )
 
 
+def test_row_staging_waits_for_its_stream_only(monkeypatch) -> None:
+    """The host read waits for the current stream, not for the device: another
+    stream may hold an async EPLB transfer whose peers are still in this step."""
+    waited: list[str] = []
+    monkeypatch.setattr(
+        torch.accelerator, "synchronize", lambda *a, **k: waited.append("device")
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "current_stream",
+        lambda *a, **k: SimpleNamespace(synchronize=lambda: waited.append("stream")),
+    )
+    layer = SimpleNamespace(
+        reads_rows_on_host=True,
+        hash_rows=lambda *args: None,
+        stage_rows=lambda *args: waited.append("staged"),
+    )
+    on_device = SimpleNamespace(input_ids=SimpleNamespace(device=torch.device("meta")))
+    stage_ple_rows([layer], on_device, None, None, None)  # type: ignore[list-item]
+    assert waited == ["stream", "staged"]
+
+
 NO_OFFLOAD = EngramConfig(cpu_offload=False)
 FORMATS = ["bf16", "fp8", "int8"]
 
