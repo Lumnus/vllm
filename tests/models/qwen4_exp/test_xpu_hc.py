@@ -322,9 +322,6 @@ def test_decoder_layers_delay_each_combine(monkeypatch) -> None:
         residual, block_output, injection = layer(
             hidden_states=embedding,
             residual=residual,
-            input_ids=torch.zeros(TOKENS, dtype=torch.int64),
-            query_start_loc=torch.tensor([0, TOKENS]),
-            ngram_context=torch.zeros(1, 2, dtype=torch.int64),
             block_output=block_output,
             injection=injection,
         )
@@ -371,8 +368,6 @@ def test_model_materializes_the_last_combine(monkeypatch, is_last_rank) -> None:
         input_ids=torch.zeros(TOKENS, dtype=torch.int64),
         positions=torch.arange(TOKENS),
         inputs_embeds=embedding,
-        query_start_loc=torch.tensor([0, TOKENS]),
-        ngram_context=torch.zeros(1, 2, dtype=torch.int64),
     )
     if is_last_rank:
         torch.testing.assert_close(out, mixer.mix(expected)[0])
