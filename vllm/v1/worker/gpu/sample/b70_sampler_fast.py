@@ -482,9 +482,24 @@ def fast_sample(
     return sampled
 
 
-def warmup(device, vocab_size: int, num_steps: int, num_candidates: int) -> None:
-    """JIT-compile every kernel shape the fast path can take (KP in {16, 32}) on
-    dedicated initialised tensors, so no first request pays for compilation."""
+def warmup(
+    device,
+    vocab_size: int,
+    num_steps: int,
+    num_candidates: int,
+    logits_dtype: torch.dtype = torch.bfloat16,
+) -> None:
+    """JIT-compile every kernel specialisation the fast path takes in serving, so
+    no request pays for compilation.
+
+    Triton compiles one binary per combination of constexprs and argument dtypes,
+    so the warm-up tensors carry the dtypes the model runner passes: int64
+    request indices (InputBatch ``idx_mapping`` / ``expanded_idx_mapping``),
+    int32 draft tokens (they share ``input_ids``' dtype) and ``cu_num_logits``,
+    int64 positions, and logits either in the model dtype (no other logits
+    processor ran) or in float32 (the copy ``apply_sampling_params`` makes when
+    one did). KP takes both of its values (16 and 32).
+    """
     from types import SimpleNamespace
 
     def t(x):
@@ -492,28 +507,32 @@ def warmup(device, vocab_size: int, num_steps: int, num_candidates: int) -> None
 
     r = 1
     n = r * (num_steps + 1)
-    logits = (
+    base = (
         torch.arange(vocab_size, device=device, dtype=torch.float32)
         .unsqueeze(0)
         .repeat(n, 1)
         / vocab_size
-    ).to(torch.bfloat16)
+    )
     states = SimpleNamespace(
         temperature=t(torch.full((r,), 0.7, device=device)),
         top_k=t(torch.full((r,), 20, dtype=torch.int32, device=device)),
         top_p=t(torch.full((r,), 0.9, device=device)),
         seeds=t(torch.ones(r, dtype=torch.int64, device=device)),
     )
-    eim = torch.zeros(n, dtype=torch.int32, device=device)
+    eim = torch.zeros(n, dtype=torch.int64, device=device)
     pos = torch.arange(n, dtype=torch.int64, device=device)
     draft = torch.full((r, num_steps, vocab_size), -float("inf"), device=device)
     cand = torch.zeros(r, num_steps, num_candidates, dtype=torch.int64, device=device)
-    ds = torch.full((n,), -1, dtype=torch.int64, device=device)
+    ds = torch.full((n,), -1, dtype=torch.int32, device=device)
     cu = torch.tensor([0, n], dtype=torch.int32, device=device)
-    idx = torch.zeros(r, dtype=torch.int32, device=device)
-    for kmax in (16, KMAX):
-        states.top_k.gpu.fill_(kmax)
-        fast_reject(logits, draft, cand, ds, pos, cu, idx, eim, states, num_steps, kmax)
-        fast_sample(logits, eim, states, pos, kmax)
+    idx = torch.zeros(r, dtype=torch.int64, device=device)
+    for dtype in dict.fromkeys((logits_dtype, torch.float32)):
+        logits = base.to(dtype)
+        for kmax in (16, KMAX):
+            states.top_k.gpu.fill_(kmax)
+            fast_reject(
+                logits, draft, cand, ds, pos, cu, idx, eim, states, num_steps, kmax
+            )
+            fast_sample(logits, eim, states, pos, kmax)
     if torch.device(device).type != "cpu":
         torch.accelerator.synchronize()

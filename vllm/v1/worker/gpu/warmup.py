@@ -594,6 +594,7 @@ def _warmup_kernels(
                 model_runner.vocab_size,
                 candidate_sampler.num_steps,
                 candidate_sampler.top_k,
+                logits_dtype=model_runner.dtype,
             )
 
         # Per-request state carried across the decode steps.
