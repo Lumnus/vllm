@@ -8,31 +8,54 @@
 3. fast_reject vs the stock rejection_sample on identical inputs: token-for-token
    agreement, per-token acceptance probability, and the marginal law of the first
    emitted token (must equal the target distribution).
+
+Triton reads TRITON_INTERPRET when a kernel is decorated, so it is set while this
+module imports the sampler and restored afterwards: the rest of the session keeps
+its own environment. The accelerator coverage test lives in
+test_topk_first_sampler_warmup.py.
 """
 
 import os
 
-os.environ.setdefault("TRITON_INTERPRET", "1")
-# vllm.triton_utils keeps Triton on with zero active drivers only in this case
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+# vllm.triton_utils keeps Triton on with zero active drivers only with
+# CUDA_VISIBLE_DEVICES set to "".
+_INTERPRETER_ENV = {"TRITON_INTERPRET": "1", "CUDA_VISIBLE_DEVICES": ""}
+_SAVED_ENV = {name: os.environ.get(name) for name in _INTERPRETER_ENV}
+for _name, _value in _INTERPRETER_ENV.items():
+    os.environ.setdefault(_name, _value)
+_INTERPRETED = os.environ["TRITON_INTERPRET"] == "1"
 
 import numpy as np  # noqa: E402
 import pytest  # noqa: E402
 import torch  # noqa: E402
 
 from vllm.triton_utils import tl, tldevice  # noqa: E402
-
-# libdevice.log1p has no interpreter lowering (the stock _resample_kernel and this
-# module both call it); stand in log(1 + x) so both run, identically, on CPU. Only
-# under the interpreter: a compiled kernel cannot reference a Python function.
-if os.environ["TRITON_INTERPRET"] == "1":
-    tldevice.log1p = lambda x: tl.log(1.0 + x)
-
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch  # noqa: E402
 from vllm.v1.worker.gpu.sample import topk_first_sampler as sm  # noqa: E402
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (  # noqa: E402
     rejection_sample,
 )
+
+for _name, _value in _SAVED_ENV.items():
+    if _value is None:
+        os.environ.pop(_name, None)
+    else:
+        os.environ[_name] = _value
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _interpreter_log1p():
+    """libdevice.log1p has no interpreter lowering (the stock _resample_kernel
+    and the sampler both call it): stand in log(1 + x) for this module's tests,
+    so both run identically on CPU. Only under the interpreter: a compiled
+    kernel cannot reference a Python function."""
+    if not _INTERPRETED:
+        yield
+        return
+    original = tldevice.log1p
+    tldevice.log1p = lambda x: tl.log(1.0 + x)
+    yield
+    tldevice.log1p = original
 
 
 class _T:
@@ -552,55 +575,6 @@ def test_kernel_warmup_runs_greedy_batches_on_the_stock_verify(monkeypatch):
     assert sm.enabled()
 
 
-def _num_compiled(fn) -> int:
-    return sum(len(c[0]) for c in fn.device_caches.values())
-
-
-@pytest.mark.skipif(
-    not torch.accelerator.is_available(), reason="needs an accelerator for Triton"
-)
-def test_warmup_covers_serving_specialisations():
-    """After warmup(), calls with the dtypes the model runner passes (int64
-    request indices, int32 draft tokens, bf16 or fp32 logits, both KP values)
-    compile nothing new."""
-    from types import SimpleNamespace
-
-    kernels = (
-        sm._split_topk_kernel,
-        sm._merge_kernel,
-        sm._fast_reject_kernel,
-        sm._fast_sample_kernel,
-    )
-    if not all(hasattr(k, "device_caches") for k in kernels):
-        pytest.skip("this Triton has no per-device kernel cache")
-    dev = torch.accelerator.current_accelerator()
-    v, steps, nc = 3 * sm.BLOCK + 17, 7, 16
-    sm.warmup(dev, v, steps, nc, logits_dtype=torch.bfloat16)
-    before = [_num_compiled(k) for k in kernels]
-
-    r = 3
-    n = r * (steps + 1)
-    states = SimpleNamespace(
-        temperature=SimpleNamespace(gpu=torch.tensor([0.7, 0.0, 1.0], device=dev)),
-        top_k=SimpleNamespace(
-            gpu=torch.tensor([20, 1, 5], dtype=torch.int32, device=dev)
-        ),
-        top_p=SimpleNamespace(gpu=torch.tensor([0.9, 1.0, 0.95], device=dev)),
-        seeds=SimpleNamespace(gpu=torch.arange(r, dtype=torch.int64, device=dev)),
-    )
-    idx_mapping = torch.arange(r, dtype=torch.int64, device=dev)
-    eim = idx_mapping.repeat_interleave(steps + 1)
-    pos = torch.arange(n, dtype=torch.int64, device=dev)
-    cu = torch.arange(0, n + 1, steps + 1, dtype=torch.int32, device=dev)
-    draft = torch.randn(r, steps, v, device=dev)
-    cand = torch.randint(0, v, (r, steps, nc), dtype=torch.int64, device=dev)
-    ds = torch.randint(0, v, (n,), dtype=torch.int32, device=dev)
-    for dtype in (torch.bfloat16, torch.float32):
-        logits = torch.randn(n, v, device=dev).to(dtype)
-        for kmax in (20, 1):
-            sm.fast_reject(
-                logits, draft, cand, ds, pos, cu, idx_mapping, eim, states, steps, kmax
-            )
-            sm.fast_sample(logits, eim, states, pos, kmax)
-    torch.accelerator.synchronize()
-    assert [_num_compiled(k) for k in kernels] == before
+def test_module_leaves_the_session_environment_alone():
+    for name, value in _SAVED_ENV.items():
+        assert os.environ.get(name) == value
