@@ -75,41 +75,62 @@ def _runner(static_forward_context, groups, block_tables):
     )
 
 
-def _int8_attention(calls, name, numel=6):
+def _int8_attention(calls, name, numel=6, head_size=128):
     def warmup_int8_kv_prefill(kv_cache, block_table):
         calls.append((name, tuple(kv_cache.shape), tuple(block_table.shape)))
 
     return SimpleNamespace(
         impl=SimpleNamespace(
             kv_cache_dtype="int8_per_token_head",
+            num_kv_heads=2,
+            head_size=head_size,
             warmup_int8_kv_prefill=warmup_int8_kv_prefill,
         ),
         kv_cache=torch.zeros(numel),
     )
 
 
-def test_hooks_run_once_with_the_layers_block_table():
-    calls: list = []
-
+def _short_conv(calls, name, key):
     def warmup_short_conv():
-        calls.append("short conv")
+        calls.append(name)
         return True
 
+    return SimpleNamespace(
+        warmup_short_conv=warmup_short_conv, short_conv_warmup_key=lambda: key
+    )
+
+
+def test_hooks_run_once_per_layer_variant():
+    """One layer per distinct constexpr key: two PLE layers with the same key
+    and two attention layers with the same shape warm once each; a layer with
+    another head size warms again."""
+    calls: list = []
     context = {
-        "model.layers.1.ple": SimpleNamespace(warmup_short_conv=warmup_short_conv),
+        "model.layers.1.ple": _short_conv(calls, "ple 1", ("same",)),
+        "model.layers.2.ple": _short_conv(calls, "ple 2", ("same",)),
+        "model.layers.5.ple": _short_conv(calls, "ple 5", ("other",)),
         "model.layers.3.attn": _int8_attention(calls, "layer 3"),
         "model.layers.7.attn": _int8_attention(calls, "layer 7"),
+        "model.layers.9.attn": _int8_attention(calls, "layer 9", head_size=256),
         "model.layers.0.attn": SimpleNamespace(
             impl=SimpleNamespace(kv_cache_dtype="auto"), kv_cache=torch.zeros(6)
         ),
     }
     runner = _runner(
         context,
-        [["model.layers.1.ple"], ["model.layers.3.attn", "model.layers.7.attn"]],
+        [
+            ["model.layers.1.ple", "model.layers.2.ple", "model.layers.5.ple"],
+            ["model.layers.3.attn", "model.layers.7.attn", "model.layers.9.attn"],
+        ],
         [torch.zeros(4, 1, dtype=torch.int32), torch.zeros(4, 37, dtype=torch.int32)],
     )
     warmup.warmup_mixed_batch_kernels(runner)
-    assert calls == ["short conv", ("layer 3", (6,), (4, 37))]
+    assert calls == [
+        "ple 1",
+        "ple 5",
+        ("layer 3", (6,), (4, 37)),
+        ("layer 9", (6,), (4, 37)),
+    ]
 
 
 def test_runner_without_block_tables_skips_the_int8_hook():
@@ -127,7 +148,10 @@ def test_unbound_or_ungrouped_layers_are_skipped():
     context = {
         "a": _int8_attention(calls, "unbound", numel=0),
         "b": _int8_attention(calls, "ungrouped"),
-        "c": SimpleNamespace(warmup_short_conv=lambda: False),
+        "c": SimpleNamespace(
+            warmup_short_conv=lambda: calls.append("c"),
+            short_conv_warmup_key=lambda: None,
+        ),
     }
     runner = _runner(context, [["a"]], [torch.zeros(4, 37, dtype=torch.int32)])
     warmup.warmup_mixed_batch_kernels(runner)

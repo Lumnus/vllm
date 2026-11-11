@@ -461,8 +461,12 @@ def warmup_mixed_batch_kernels(model_runner: GPUModelRunner) -> None:
     """Compile kernel specialisations that only real mixed batches reach: the
     short convolution of a spec decode beside a prefill (int64 token maps), and
     the INT8 KV prefill dequantization at multi-block scratch strides. Needs
-    the KV cache bound."""
-    warmed: list[str] = []
+    the KV cache bound.
+
+    A compiled kernel depends on its layer's constexprs and strides, so one
+    layer is warmed per distinct key, not only the first layer of a kind."""
+    short_conv_keys: set = set()
+    int8_kv_keys: set = set()
     # The INT8 KV hook reads the V2 runner's per-group block tables.
     input_block_tables = getattr(
         getattr(model_runner, "block_tables", None), "input_block_tables", None
@@ -470,17 +474,13 @@ def warmup_mixed_batch_kernels(model_runner: GPUModelRunner) -> None:
     static_forward_context = model_runner.compilation_config.static_forward_context
     for layer_name, layer in static_forward_context.items():
         warmup_short_conv = getattr(layer, "warmup_short_conv", None)
-        if (
-            warmup_short_conv is not None
-            and "short conv" not in warmed
-            and warmup_short_conv()
-        ):
-            warmed.append("short conv")
+        if warmup_short_conv is not None:
+            key = layer.short_conv_warmup_key()
+            if key is not None and key not in short_conv_keys and warmup_short_conv():
+                short_conv_keys.add(key)
         impl = getattr(layer, "impl", None)
-        if (
-            getattr(impl, "kv_cache_dtype", None) == "int8_per_token_head"
-            and hasattr(impl, "warmup_int8_kv_prefill")
-            and "int8 kv prefill" not in warmed
+        if getattr(impl, "kv_cache_dtype", None) == "int8_per_token_head" and hasattr(
+            impl, "warmup_int8_kv_prefill"
         ):
             if input_block_tables is None:
                 logger.info_once(
@@ -498,15 +498,27 @@ def warmup_mixed_batch_kernels(model_runner: GPUModelRunner) -> None:
                 ),
                 None,
             )
-            if group_id is not None and layer.kv_cache.numel():
-                impl.warmup_int8_kv_prefill(
-                    layer.kv_cache,
-                    input_block_tables[group_id],
-                )
-                warmed.append("int8 kv prefill")
-    if warmed:
+            if group_id is None or not layer.kv_cache.numel():
+                continue
+            kv_cache = layer.kv_cache
+            block_table = input_block_tables[group_id]
+            key = (
+                tuple(kv_cache.shape[1:]),
+                kv_cache.stride(),
+                kv_cache.dtype,
+                impl.num_kv_heads,
+                impl.head_size,
+                block_table.stride(),
+            )
+            if key not in int8_kv_keys:
+                impl.warmup_int8_kv_prefill(kv_cache, block_table)
+                int8_kv_keys.add(key)
+    if short_conv_keys or int8_kv_keys:
         logger.info(
-            "Warmed up mixed-batch kernel specialisations: %s.", ", ".join(warmed)
+            "Warmed up mixed-batch kernel specialisations: short conv (%d layer "
+            "variants), int8 kv prefill (%d layer variants).",
+            len(short_conv_keys),
+            len(int8_kv_keys),
         )
 
 

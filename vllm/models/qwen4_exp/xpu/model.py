@@ -724,6 +724,22 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             conv_state = conv_state.transpose(-1, -2)
         return conv_state[..., -(self.hist + self.num_spec_tokens) :]
 
+    def short_conv_warmup_key(self) -> tuple | None:
+        """What the short-conv kernels specialise on for this layer: the conv
+        state's channels, window and strides, dtype, dilation and spec length.
+        None while the state is unbound or without spec decoding."""
+        if self.num_spec_tokens == 0 or self.kv_cache[0].numel() == 0:
+            return None
+        conv_state = self._short_conv_state()
+        return (
+            tuple(conv_state.shape[1:]),
+            conv_state.stride(),
+            self.model_config.dtype,
+            self.dil,
+            self.kern,
+            self.num_spec_tokens,
+        )
+
     def warmup_short_conv(self) -> bool:
         """Compile the short-conv launches of mixed spec + prefill batches
         (kernel warm-up calls this once the conv state is bound)."""
