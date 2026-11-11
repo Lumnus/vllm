@@ -13,6 +13,13 @@ import torch
 from vllm.utils import platform_utils
 
 
+@pytest.fixture(autouse=True)
+def fresh_cache():
+    platform_utils.xpu_device_facts.cache_clear()
+    yield
+    platform_utils.xpu_device_facts.cache_clear()
+
+
 def test_reads_directly_once_initialized(monkeypatch):
     props = types.SimpleNamespace(name="Device A", local_mem_size=131072)
     monkeypatch.setattr(platform_utils, "xpu_is_initialized", lambda: True)
@@ -62,17 +69,40 @@ def test_child_script_reads_the_named_properties(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize(
-    "error",
+    ("error", "raised"),
     [
-        subprocess.TimeoutExpired(cmd="python", timeout=1),
-        subprocess.CalledProcessError(returncode=1, cmd="python"),
+        (
+            subprocess.TimeoutExpired(cmd="python", timeout=1, stderr="x" * 5000),
+            TimeoutError,
+        ),
+        (
+            subprocess.CalledProcessError(1, "python", stderr="device lost"),
+            RuntimeError,
+        ),
+        (FileNotFoundError("no interpreter"), OSError),
     ],
 )
-def test_child_failure_raises(monkeypatch, error):
+def test_child_failure_raises_with_a_bounded_stderr_tail(monkeypatch, error, raised):
     def run(argv, **kwargs):
         raise error
 
     monkeypatch.setattr(platform_utils, "xpu_is_initialized", lambda: False)
     monkeypatch.setattr(subprocess, "run", run)
-    with pytest.raises(type(error)):
+    with pytest.raises(raised) as info:
         platform_utils.xpu_get_device_properties(0, ("name",))
+    assert len(str(info.value)) < platform_utils._XPU_PROPERTIES_STDERR_TAIL + 200
+    if isinstance(error, subprocess.CalledProcessError):
+        assert "device lost" in str(info.value)
+
+
+def test_device_facts_are_read_once_per_process(monkeypatch):
+    calls = []
+
+    def properties(device, names, init_xpu=False):
+        calls.append((device, tuple(names)))
+        return ("Device A", 32 << 30, 131072)
+
+    monkeypatch.setattr(platform_utils, "xpu_get_device_properties", properties)
+    assert platform_utils.xpu_device_facts(0) == ("Device A", 32 << 30, 131072)
+    assert platform_utils.xpu_device_facts(0)[2] == 131072
+    assert calls == [(0, ("name", "total_memory", "local_mem_size"))]

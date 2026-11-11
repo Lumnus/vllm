@@ -21,7 +21,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import (
     cuda_get_device_properties,
-    xpu_get_device_properties,
+    xpu_device_facts,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,9 +227,7 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
             # XPU runtime in every process that imports this module. The block
             # sizes are chosen at import, so the read cannot wait for first use.
             try:
-                (max_shared_memory,) = xpu_get_device_properties(
-                    tensor_idx, ("local_mem_size",)
-                )
+                max_shared_memory = xpu_device_facts(tensor_idx)[2]
             except Exception:
                 # Cached with the result, so this is logged once per query.
                 logger.warning(
