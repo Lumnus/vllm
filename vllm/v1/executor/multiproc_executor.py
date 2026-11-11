@@ -712,6 +712,23 @@ class UnreadyWorkerProcHandle:
 
 
 @dataclass
+def _select_worker_device_early(vllm_config: VllmConfig, local_rank: int) -> None:
+    """Make the worker's own device current as its first accelerator call.
+
+    Only where the device follows from ``local_rank`` alone (XPU, one data
+    parallel rank, no physical id remap); ``init_device`` still selects and
+    checks the device as before.
+    """
+    parallel_config = vllm_config.parallel_config
+    if (
+        not current_platform.is_xpu()
+        or parallel_config.data_parallel_size > 1
+        or parallel_config.assigned_physical_gpu_ids is not None
+    ):
+        return
+    current_platform.set_device(torch.device("xpu", local_rank))
+
+
 class WorkerProcHandle:
     proc: BaseProcess
     rank: int
@@ -1016,6 +1033,12 @@ class WorkerProc:
         # Either SIGTERM or SIGINT will terminate the worker
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
+
+        # Select this worker's device before anything touches the accelerator.
+        # The first touch sets up per-process runtime state on the current
+        # device, and before init_device that is device 0 for every worker:
+        # each peer would leave its own share of it on device 0's memory.
+        _select_worker_device_early(kwargs["vllm_config"], kwargs.get("local_rank", 0))
 
         # Publish the logical-to-physical mapping early so topology helpers
         # work before init_device (needed by set_worker_net_device below).
