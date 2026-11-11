@@ -163,8 +163,9 @@ def test_layer_quantizes_and_runs(default_vllm_config, monkeypatch):
     w = torch.randn(n, k, dtype=torch.bfloat16) * 0.05
     layer = torch.nn.Module()
     method = Int8PerChannelOnlineLinearMethod()
-    method.create_weights(layer, k, [n // 2, n // 2], k, n, torch.bfloat16,
-                          weight_loader=None)
+    method.create_weights(
+        layer, k, [n // 2, n // 2], k, n, torch.bfloat16, weight_loader=None
+    )
     assert chosen == dict(
         is_channelwise=True,
         is_static_input_scheme=False,
