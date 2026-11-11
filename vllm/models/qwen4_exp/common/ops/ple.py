@@ -281,7 +281,22 @@ def ple_gate(
 
 
 # Dilated short convolution
-@triton.jit(do_not_specialize=["num_reqs", "bs_iters", "has_token_map"])
+# A mixed batch passes per-request index slices that start `num_decodes`
+# entries into their buffers. They are read element by element, so the
+# kernels do not specialise on their alignment.
+_INDEX_POINTERS = [
+    "state_idx_ptr",
+    "qsl_ptr",
+    "num_acc_ptr",
+    "has_init_ptr",
+    "token_idx_ptr",
+]
+
+
+@triton.jit(
+    do_not_specialize=["num_reqs", "bs_iters", "has_token_map"],
+    do_not_specialize_on_alignment=_INDEX_POINTERS,
+)
 def _ple_conv_kernel(
     x_ptr,
     state_ptr,
@@ -454,7 +469,9 @@ def _ple_conv_kernel(
 
 
 # Prefill and spec write back separately so every token reads the old state.
-@triton.jit(do_not_specialize=["has_token_map"])
+@triton.jit(
+    do_not_specialize=["has_token_map"], do_not_specialize_on_alignment=_INDEX_POINTERS
+)
 def _ple_conv_writeback_kernel(
     x_ptr,
     state_ptr,
@@ -667,12 +684,16 @@ def warmup_token_mapped_ple_conv(
     spec_query_len: int,
     dtype: torch.dtype,
 ) -> None:
-    """Compile the launches of a batch that mixes a spec decode with a prefill.
+    """Compile the launches of a batch that mixes a spec decode with prefills
+    or plain decodes.
 
-    Such a batch addresses its tokens through int64 token maps and a contiguous
-    prefill state index, a specialisation that no warm-up step reaches. Every
-    launch here names the null state slot, so no conv state is read or written;
-    outputs land in scratch tensors.
+    Such a batch addresses its tokens through int64 token maps, a
+    specialisation that no warm-up step reaches: the spec launch, the prefill
+    launch and the plain-decode launch (with and without per-request initial
+    states). Index pointers are not specialised on alignment, so one launch
+    per mode covers every split of the batch. Every launch here names the null
+    state slot, so no conv state is read or written; outputs land in scratch
+    tensors.
     """
     device = conv_state.device
     channels = conv_state.shape[1]
@@ -718,3 +739,17 @@ def warmup_token_mapped_ple_conv(
         ),
         **conv,
     )
+    for has_initial_states in (
+        None,
+        torch.zeros(1, dtype=torch.bool, device=device),
+    ):
+        ple_conv(
+            inputs,
+            residual,
+            state_indices=null_slot(),
+            outer_residual=outer_residual,
+            mode="decode",
+            has_initial_states=has_initial_states,
+            token_indices=torch.zeros(1, dtype=torch.int64, device=device),
+            **conv,
+        )

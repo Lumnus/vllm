@@ -211,8 +211,10 @@ def _num_compiled(fn) -> int:
 @torch.inference_mode()
 def test_short_conv_warmup_covers_mixed_spec_prefill_batches() -> None:
     """After warmup_token_mapped_ple_conv(), a batch with a spec decode beside a
-    prefill (int64 token maps, as the GDN metadata builds them) compiles nothing
-    new."""
+    plain decode and a prefill compiles nothing new. The batch is split as
+    Qwen4ExpPLE.short_conv splits it: int64 token maps from the GDN metadata,
+    and decode / prefill index slices that start one entry in, so not 16-byte
+    aligned."""
     kernels = (ple_ops._ple_conv_kernel, ple_ops._ple_conv_writeback_kernel)
     if not all(hasattr(k, "device_caches") for k in kernels):
         pytest.skip("this Triton has no per-device kernel cache")
@@ -234,9 +236,14 @@ def test_short_conv_warmup_covers_mixed_spec_prefill_batches() -> None:
     )
     before = [_num_compiled(k) for k in kernels]
 
-    num_prefill = 5
-    num_tokens = spec_query_len + num_prefill
+    num_decode, num_prefill = 1, 5
+    num_non_spec = num_decode + num_prefill
+    num_tokens = spec_query_len + num_non_spec
     order = torch.randperm(num_tokens, device="xpu")
+    non_spec_token_indices, spec_token_indices = (
+        order[:num_non_spec],
+        order[num_non_spec:],
+    )
     inputs = torch.randn(num_tokens, channels, dtype=dtype, device="xpu")
     residual = torch.zeros_like(inputs)
     outer_residual = torch.zeros_like(inputs)
@@ -254,18 +261,33 @@ def test_short_conv_warmup_covers_mixed_spec_prefill_batches() -> None:
         query_start_loc=int32(0, spec_query_len),
         num_accepted_tokens=int32(3),
         spec_query_len=spec_query_len,
-        token_indices=order[:spec_query_len].clone(),
+        token_indices=spec_token_indices,
+        **conv,
+    )
+    state_d, state_p = torch.split(int32(3, 2), [num_decode, 1])
+    tokens_d, tokens_p = torch.split(non_spec_token_indices, [num_decode, num_prefill])
+    has_init_d, has_init_p = torch.split(
+        torch.ones(2, dtype=torch.bool, device="xpu"), [num_decode, 1]
+    )
+    ple_ops.ple_conv(
+        inputs,
+        residual,
+        state_indices=state_d,
+        outer_residual=outer_residual,
+        mode="decode",
+        has_initial_states=has_init_d,
+        token_indices=tokens_d,
         **conv,
     )
     ple_ops.ple_conv(
         inputs,
         residual,
-        state_indices=int32(2),
+        state_indices=state_p,
         outer_residual=outer_residual,
         mode="prefill",
         query_start_loc=int32(0, num_prefill),
-        has_initial_states=torch.ones(1, dtype=torch.bool, device="xpu"),
-        token_indices=order[spec_query_len:].clone(),
+        has_initial_states=has_init_p,
+        token_indices=tokens_p,
         **conv,
     )
     torch.xpu.synchronize()

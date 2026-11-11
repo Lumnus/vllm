@@ -26,6 +26,43 @@ def test_dequant_kernel_ignores_group_slice_alignment():
     assert _alignment_free(ops._dequant_blocks_kernel, ["bt_ptr", "sl_ptr"])
 
 
+def test_short_conv_kernels_ignore_index_slice_alignment():
+    """A mixed batch splits its state and token indices at the decode count;
+    the slices' alignment must not select another compiled variant."""
+    from vllm.models.qwen4_exp.common.ops import ple
+
+    names = ["state_idx_ptr", "qsl_ptr", "num_acc_ptr", "has_init_ptr"]
+    names.append("token_idx_ptr")
+    assert _alignment_free(ple._ple_conv_kernel, names)
+    assert _alignment_free(ple._ple_conv_writeback_kernel, names)
+
+
+def test_short_conv_warmup_covers_every_mapped_mode(monkeypatch):
+    """The hook launches the spec, prefill and plain-decode modes with int64
+    token maps, the decode one with and without initial states."""
+    from vllm.models.qwen4_exp.common.ops import ple
+
+    seen = []
+
+    def record(*args, mode, token_indices=None, has_initial_states=None, **kw):
+        seen.append((mode, token_indices.dtype, has_initial_states is not None))
+
+    monkeypatch.setattr(ple, "ple_conv", record)
+    ple.warmup_token_mapped_ple_conv(
+        torch.zeros(4, 16, 16),
+        torch.zeros(16, 4),
+        dilation=3,
+        spec_query_len=8,
+        dtype=torch.float32,
+    )
+    assert seen == [
+        ("spec", torch.int64, False),
+        ("prefill", torch.int64, True),
+        ("decode", torch.int64, False),
+        ("decode", torch.int64, True),
+    ]
+
+
 def _runner(static_forward_context, groups, block_tables):
     return SimpleNamespace(
         compilation_config=SimpleNamespace(
