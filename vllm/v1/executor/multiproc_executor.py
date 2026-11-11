@@ -711,7 +711,6 @@ class UnreadyWorkerProcHandle:
     death_writer: Connection | None = None
 
 
-@dataclass
 def _select_worker_device_early(vllm_config: VllmConfig, local_rank: int) -> None:
     """Make the worker's own device current as its first accelerator call.
 
@@ -729,6 +728,7 @@ def _select_worker_device_early(vllm_config: VllmConfig, local_rank: int) -> Non
     current_platform.set_device(torch.device("xpu", local_rank))
 
 
+@dataclass
 class WorkerProcHandle:
     proc: BaseProcess
     rank: int
