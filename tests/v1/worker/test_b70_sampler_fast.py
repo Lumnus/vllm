@@ -23,8 +23,10 @@ import torch  # noqa: E402
 from vllm.triton_utils import tl, tldevice  # noqa: E402
 
 # libdevice.log1p has no interpreter lowering (the stock _resample_kernel and this
-# module both call it); stand in log(1 + x) so both run, identically, on CPU.
-tldevice.log1p = lambda x: tl.log(1.0 + x)
+# module both call it); stand in log(1 + x) so both run, identically, on CPU. Only
+# under the interpreter: a compiled kernel cannot reference a Python function.
+if os.environ["TRITON_INTERPRET"] == "1":
+    tldevice.log1p = lambda x: tl.log(1.0 + x)
 
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch  # noqa: E402
 from vllm.v1.worker.gpu.sample import b70_sampler_fast as sm  # noqa: E402

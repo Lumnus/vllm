@@ -245,24 +245,29 @@ def test_dequant_warmup_covers_serving_strides():
     num_blocks = sum(-(-L // block_size) for L in seq_lens) + 4
     _, views = _make_cache(num_blocks, nkv, block_size, HEAD_SIZE, True)
     key_cache, value_cache, k_scale, v_scale = views
-    # Block-table rows as wide as serving's (not a multiple of 16 blocks).
+    # Block-table rows as wide as serving's (not a multiple of 16 blocks). Each
+    # prefill below is its own batch, so its group starts at row 0 of the table,
+    # as forward_prefill's first group does.
     width = 37
-    block_table = torch.zeros(len(seq_lens), width, dtype=torch.int32, device=DEVICE)
+
+    def block_table() -> torch.Tensor:
+        return torch.zeros(1, width, dtype=torch.int32, device=DEVICE)
+
     nb = prefill_scratch_tokens(width * block_size, block_size) // block_size
     ks = torch.empty((nb, block_size, nkv, HEAD_SIZE), dtype=dtype, device=DEVICE)
     vs = torch.empty_like(ks)
     int8_kv_ops.warmup_dequant_blocks(
-        key_cache, value_cache, k_scale, v_scale, block_table, ks, vs
+        key_cache, value_cache, k_scale, v_scale, block_table(), ks, vs
     )
     before = _num_compiled(kernel)
-    for i, seq_len in enumerate(seq_lens):
+    for seq_len in seq_lens:
         stride_blocks = -(-seq_len // block_size)
         int8_kv_ops.dequant_blocks(
             key_cache,
             value_cache,
             k_scale,
             v_scale,
-            block_table[i : i + 1],
+            block_table(),
             torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
             ks,
             vs,
