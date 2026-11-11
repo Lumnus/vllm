@@ -20,18 +20,24 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kInt4Static,
     kInt4Static32,
+    kInt8DynamicTokenSym,
     kMxfp4Dynamic,
     kMxfp4Static,
     kMxfp8Dynamic,
     kMxfp8Static,
 )
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 if current_platform.is_xpu():
     from vllm_xpu_kernels.fused_moe_interface import XpuFusedMoe
 
 
 class XPUExperts(mk.FusedMoEExpertsModular):
+    # Extra keyword arguments for every XpuFusedMoe.apply call.
+    impl_apply_kwargs: dict = {}
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -166,6 +172,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             a1q_scale=a1q_scale,
+            **self.impl_apply_kwargs,
         )
 
 
@@ -286,6 +293,58 @@ class XPUExpertsWNA16(XPUExperts):
             (kInt4Static, None),
             (kInt4Static32, None),
         )
+
+
+def xpu_w4a8_moe_available() -> bool:
+    """Whether vllm-xpu-kernels has the W4A8 grouped GEMM."""
+    return current_platform.is_xpu() and hasattr(
+        torch.ops._xpu_C, "cutlass_grouped_gemm_w4a8"
+    )
+
+
+class XPUExpertsW4A8Int(XPUExpertsWNA16):
+    """INT4 symmetric g128 experts with dynamic per-token INT8 activations.
+
+    Same weights and layout as `XPUExpertsWNA16`. vllm-xpu-kernels quantizes the
+    tokens to int8 once before each grouped GEMM and runs the Xe2 s8 x s4 DPAS
+    grouped GEMM on the int4 weights as stored (`XpuFusedMoe.apply(w4a8=True)`).
+    Selected with `quantization_config.moe.activation: int8_per_token`. A layer
+    the W4A8 GEMM cannot take (activation other than SiLU, a clamp, N or K not
+    a multiple of 64) keeps the W4A16 path, with a warning.
+    """
+
+    impl_apply_kwargs = {"w4a8": True}
+
+    @staticmethod
+    def _supports_current_device() -> bool:
+        return xpu_w4a8_moe_available()
+
+    @staticmethod
+    def _supports_quant_scheme(
+        weight_key: QuantKey | None,
+        activation_key: QuantKey | None,
+    ) -> bool:
+        return activation_key == kInt8DynamicTokenSym and (
+            XPUExpertsWNA16._supports_quant_scheme(weight_key, None)
+        )
+
+    def apply(self, *args, **kwargs):
+        super().apply(*args, **kwargs)
+        if getattr(self, "_w4a8_reported", False) or self.fused_moe_impl is None:
+            return
+        self._w4a8_reported = True
+        # The kernels record on the first call why a layer cannot run W4A8
+        # (None: it ran W4A8).
+        reason = getattr(self.fused_moe_impl, "_w4a8_why", None)
+        if reason is None:
+            logger.info_once(
+                "XPU MoE W4A8: int4 g128 experts with dynamic per-token int8 "
+                "activations (s8 x s4 grouped GEMM)."
+            )
+        else:
+            logger.warning_once(
+                "XPU MoE W4A8 requested, but %s: this layer keeps W4A16.", reason
+            )
 
 
 class XPUExpertsMxFp4(XPUExperts):
