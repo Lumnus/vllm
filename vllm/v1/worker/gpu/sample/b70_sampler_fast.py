@@ -37,6 +37,9 @@ above KMAX, grammar bitmasks, block/synthetic/adaptive verification, watermarkin
 fp64 Gumbel, drafters without cached candidates.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import numpy as np
 import torch
 
@@ -51,12 +54,26 @@ KMAX = 32  # largest top-k handled; above this the stock path runs
 BLOCK = 4096  # vocab tile per program of kernel A (the stock XPU tile)
 _BIG = 2147483647
 _logged: set[str] = set()
+_suspended = False
 
 
 def enabled() -> bool:
     from vllm.platforms import current_platform
 
-    return current_platform.is_xpu()
+    return current_platform.is_xpu() and not _suspended
+
+
+@contextmanager
+def suspended() -> Iterator[None]:
+    """Run the stock sampling path while inside, so kernel warm-up can compile
+    the stock kernels this path falls back on."""
+    global _suspended
+    previous = _suspended
+    _suspended = True
+    try:
+        yield
+    finally:
+        _suspended = previous
 
 
 def _log_once(tag: str, msg: str) -> None:

@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
+from vllm.v1.attention.ops import xpu_int8_per_token_head as int8_kv_ops
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
@@ -226,3 +227,46 @@ def test_fa_int8_prefill_groups_through_small_scratch():
     )
     ref = _reference(q, deq_k, deq_v, q_lens, seq_lens, HEAD_SIZE**-0.5)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+
+
+def _num_compiled(fn) -> int:
+    return sum(len(c[0]) for c in fn.device_caches.values())
+
+
+@torch.inference_mode()
+def test_dequant_warmup_covers_serving_strides():
+    """After warmup_dequant_blocks(), prefills whose longest sequence spans one
+    block, a few blocks or a multiple of 16 blocks compile nothing new."""
+    kernel = int8_kv_ops._dequant_blocks_kernel
+    if not hasattr(kernel, "device_caches"):
+        pytest.skip("this Triton has no per-device kernel cache")
+    nkv, block_size, dtype = 2, 64, torch.bfloat16
+    seq_lens = [block_size - 3, 3 * block_size + 1, 32 * block_size - 5]
+    num_blocks = sum(-(-L // block_size) for L in seq_lens) + 4
+    _, views = _make_cache(num_blocks, nkv, block_size, HEAD_SIZE, True)
+    key_cache, value_cache, k_scale, v_scale = views
+    # Block-table rows as wide as serving's (not a multiple of 16 blocks).
+    width = 37
+    block_table = torch.zeros(len(seq_lens), width, dtype=torch.int32, device=DEVICE)
+    nb = prefill_scratch_tokens(width * block_size, block_size) // block_size
+    ks = torch.empty((nb, block_size, nkv, HEAD_SIZE), dtype=dtype, device=DEVICE)
+    vs = torch.empty_like(ks)
+    int8_kv_ops.warmup_dequant_blocks(
+        key_cache, value_cache, k_scale, v_scale, block_table, ks, vs
+    )
+    before = _num_compiled(kernel)
+    for i, seq_len in enumerate(seq_lens):
+        stride_blocks = -(-seq_len // block_size)
+        int8_kv_ops.dequant_blocks(
+            key_cache,
+            value_cache,
+            k_scale,
+            v_scale,
+            block_table[i : i + 1],
+            torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
+            ks,
+            vs,
+            stride_blocks,
+        )
+    torch.accelerator.synchronize()
+    assert _num_compiled(kernel) == before

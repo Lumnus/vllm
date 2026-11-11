@@ -119,7 +119,12 @@ from vllm.v1.attention.backends.short_conv_attn import (
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
-from ..common.ops.ple import ple_conv, ple_gate, ple_ngram_ids
+from ..common.ops.ple import (
+    ple_conv,
+    ple_gate,
+    ple_ngram_ids,
+    warmup_token_mapped_ple_conv,
+)
 
 # nvidia.qsa imports nvidia.model, which imports nvidia.qsa: load the model first.
 from ..nvidia.model import (
@@ -712,6 +717,28 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             (num_tokens, self.n_heads * self.head_dim), dtype=dtype
         )
 
+    def _short_conv_state(self) -> torch.Tensor:
+        """The conv history as ``[slot, channel, window]``."""
+        conv_state = self.kv_cache[0]
+        if not is_conv_state_dim_first():
+            conv_state = conv_state.transpose(-1, -2)
+        return conv_state[..., -(self.hist + self.num_spec_tokens) :]
+
+    def warmup_short_conv(self) -> bool:
+        """Compile the short-conv launches of mixed spec + prefill batches
+        (kernel warm-up calls this once the conv state is bound)."""
+        if self.num_spec_tokens == 0 or self.kv_cache[0].numel() == 0:
+            return False
+        dtype = self.model_config.dtype
+        warmup_token_mapped_ple_conv(
+            self._short_conv_state(),
+            self.conv1d.weight.squeeze(1).to(dtype),
+            dilation=self.dil,
+            spec_query_len=self.num_spec_tokens + 1,
+            dtype=dtype,
+        )
+        return True
+
     def short_conv(
         self,
         inputs: torch.Tensor,
@@ -729,11 +756,7 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             residual.add_(outer_residual)
             return
         assert isinstance(metadata, PleShortConvAttentionMetadata)
-        conv_state = self.kv_cache[0]
-        # Canonicalize both cache layouts to [slot, channel, window].
-        if not is_conv_state_dim_first():
-            conv_state = conv_state.transpose(-1, -2)
-        conv_state = conv_state[..., -(self.hist + self.num_spec_tokens) :]
+        conv_state = self._short_conv_state()
         conv_weights = self.conv1d.weight.squeeze(1).to(inputs.dtype)
 
         n = metadata.num_actual_tokens

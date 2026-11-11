@@ -508,6 +508,46 @@ def test_warmup_runs():
     sm.warmup(torch.device("cpu"), 2048, 7, 16)
 
 
+def test_suspended_runs_the_stock_path(monkeypatch):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+    assert sm.enabled()
+    with sm.suspended():
+        assert not sm.enabled()
+        with sm.suspended():
+            assert not sm.enabled()
+        assert not sm.enabled()
+    assert sm.enabled()
+
+
+def test_kernel_warmup_runs_greedy_batches_on_the_stock_verify(monkeypatch):
+    """With the fast path on, kernel warm-up runs the greedy batches once more
+    with it suspended, so the stock rejection kernels compile for model-dtype
+    logits too."""
+    from types import SimpleNamespace
+
+    from vllm.platforms import current_platform
+    from vllm.v1.worker.gpu import warmup
+
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
+    passes = []
+
+    def fake_warmup_kernels(runner, execute_model, sample_tokens, greedy=False):
+        passes.append((greedy, sm.enabled()))
+
+    monkeypatch.setattr(warmup, "_warmup_kernels", fake_warmup_kernels)
+    runner = SimpleNamespace(
+        adaptive_verification=None,
+        rejection_sampler=None,
+        speculative_config=object(),
+        speculator=None,
+    )
+    warmup.warmup_kernels(runner, None, None)
+    assert passes == [(False, True), (True, True), (True, False)]
+    assert sm.enabled()
+
+
 def _num_compiled(fn) -> int:
     return sum(len(c[0]) for c in fn.device_caches.values())
 

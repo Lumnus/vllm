@@ -1250,6 +1250,26 @@ class FlashAttentionImpl(AttentionImpl):
             self._int8_kv_views = (key, views)
         return self._int8_kv_views[1]
 
+    def warmup_int8_kv_prefill(
+        self, kv_cache: torch.Tensor, block_table: torch.Tensor
+    ) -> None:
+        """Compile the prefill dequantization for the scratch strides serving
+        takes (kernel warm-up calls this with the layer's KV cache and its KV
+        cache group's block table)."""
+        from vllm.v1.attention.ops import xpu_int8_per_token_head as int8_kv
+
+        key_cache, value_cache, k_scale, v_scale = self._int8_kv_split_views(kv_cache)
+        key_scratch, value_scratch = self._int8_kv_prefill_scratch(key_cache.shape[1])
+        int8_kv.warmup_dequant_blocks(
+            key_cache,
+            value_cache,
+            k_scale,
+            v_scale,
+            block_table,
+            key_scratch,
+            value_scratch,
+        )
+
     def _forward_int8_per_token_head(
         self,
         query: torch.Tensor,

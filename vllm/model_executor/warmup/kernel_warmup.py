@@ -261,6 +261,7 @@ def _rocm_aiter_gemm_warmup(worker: "Worker") -> None:
 
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.model_executor.warmup.step5_dsa_warmup import step5_dsa_warmup
+    from vllm.v1.worker.gpu.warmup import warmup_mixed_batch_kernels
 
     enable_jit_warmup = worker.vllm_config.kernel_config.enable_jit_warmup
     if enable_jit_warmup:
@@ -281,6 +282,7 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
 
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
     qwen_vl_triton_warmup(worker.model_runner)
+    warmup_mixed_batch_kernels(worker.model_runner)
     replayssm_lifecycle_warmup(worker.model_runner)
 
     compilation_config = worker.vllm_config.compilation_config

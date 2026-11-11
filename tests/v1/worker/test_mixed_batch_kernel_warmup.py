@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Kernel warm-up reaches the layer hooks for mixed-batch specialisations."""
+
+from types import SimpleNamespace
+
+import torch
+
+from vllm.v1.worker.gpu import warmup
+
+
+def _runner(static_forward_context, groups, block_tables):
+    return SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            static_forward_context=static_forward_context
+        ),
+        kv_cache_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(layer_names=names) for names in groups]
+        ),
+        block_tables=SimpleNamespace(input_block_tables=block_tables),
+    )
+
+
+def _int8_attention(calls, name, numel=6):
+    def warmup_int8_kv_prefill(kv_cache, block_table):
+        calls.append((name, tuple(kv_cache.shape), tuple(block_table.shape)))
+
+    return SimpleNamespace(
+        impl=SimpleNamespace(
+            kv_cache_dtype="int8_per_token_head",
+            warmup_int8_kv_prefill=warmup_int8_kv_prefill,
+        ),
+        kv_cache=torch.zeros(numel),
+    )
+
+
+def test_hooks_run_once_with_the_layers_block_table():
+    calls: list = []
+
+    def warmup_short_conv():
+        calls.append("short conv")
+        return True
+
+    context = {
+        "model.layers.1.ple": SimpleNamespace(warmup_short_conv=warmup_short_conv),
+        "model.layers.3.attn": _int8_attention(calls, "layer 3"),
+        "model.layers.7.attn": _int8_attention(calls, "layer 7"),
+        "model.layers.0.attn": SimpleNamespace(
+            impl=SimpleNamespace(kv_cache_dtype="auto"), kv_cache=torch.zeros(6)
+        ),
+    }
+    runner = _runner(
+        context,
+        [["model.layers.1.ple"], ["model.layers.3.attn", "model.layers.7.attn"]],
+        [torch.zeros(4, 1, dtype=torch.int32), torch.zeros(4, 37, dtype=torch.int32)],
+    )
+    warmup.warmup_mixed_batch_kernels(runner)
+    assert calls == ["short conv", ("layer 3", (6,), (4, 37))]
+
+
+def test_unbound_or_ungrouped_layers_are_skipped():
+    calls: list = []
+    context = {
+        "a": _int8_attention(calls, "unbound", numel=0),
+        "b": _int8_attention(calls, "ungrouped"),
+        "c": SimpleNamespace(warmup_short_conv=lambda: False),
+    }
+    runner = _runner(context, [["a"]], [torch.zeros(4, 37, dtype=torch.int32)])
+    warmup.warmup_mixed_batch_kernels(runner)
+    assert calls == []

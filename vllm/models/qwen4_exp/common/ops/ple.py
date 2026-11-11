@@ -657,3 +657,64 @@ def ple_conv(
             NULL_STATE_ID=NULL_BLOCK_ID,
             num_warps=num_warps,
         )
+
+
+def warmup_token_mapped_ple_conv(
+    conv_state: torch.Tensor,
+    conv_weights: torch.Tensor,
+    *,
+    dilation: int,
+    spec_query_len: int,
+    dtype: torch.dtype,
+) -> None:
+    """Compile the launches of a batch that mixes a spec decode with a prefill.
+
+    Such a batch addresses its tokens through int64 token maps and a contiguous
+    prefill state index, a specialisation that no warm-up step reaches. Every
+    launch here names the null state slot, so no conv state is read or written;
+    outputs land in scratch tensors.
+    """
+    device = conv_state.device
+    channels = conv_state.shape[1]
+    num_prefill_tokens = 2
+    inputs = torch.zeros(
+        spec_query_len + num_prefill_tokens, channels, dtype=dtype, device=device
+    )
+    residual = torch.zeros_like(inputs)
+    outer_residual = torch.zeros_like(inputs)
+    conv = dict(conv_state=conv_state, conv_weights=conv_weights, dilation=dilation)
+
+    def null_slot() -> torch.Tensor:
+        return torch.full((1,), NULL_BLOCK_ID, dtype=torch.int32, device=device)
+
+    def query_start_loc(num_tokens: int) -> torch.Tensor:
+        return torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+
+    ple_conv(
+        inputs,
+        residual,
+        state_indices=null_slot(),
+        outer_residual=outer_residual,
+        mode="spec",
+        query_start_loc=query_start_loc(spec_query_len),
+        num_accepted_tokens=torch.ones(1, dtype=torch.int32, device=device),
+        spec_query_len=spec_query_len,
+        token_indices=torch.arange(spec_query_len, dtype=torch.int64, device=device),
+        **conv,
+    )
+    ple_conv(
+        inputs,
+        residual,
+        state_indices=null_slot(),
+        outer_residual=outer_residual,
+        mode="prefill",
+        query_start_loc=query_start_loc(num_prefill_tokens),
+        has_initial_states=torch.zeros(1, dtype=torch.bool, device=device),
+        token_indices=torch.arange(
+            spec_query_len,
+            spec_query_len + num_prefill_tokens,
+            dtype=torch.int64,
+            device=device,
+        ),
+        **conv,
+    )

@@ -427,6 +427,22 @@ def warmup_kernels(
             _warmup_kernels(
                 model_runner, worker_execute_model, worker_sample_tokens, greedy=True
             )
+            from vllm.v1.worker.gpu.sample import b70_sampler_fast
+
+            if b70_sampler_fast.enabled():
+                # The top-k-first verify takes the greedy batches above. The
+                # stock rejection kernels it falls back on (logprobs, top-k
+                # off, ...) see model-dtype logits in serving as well.
+                logger.info(
+                    "Warming up the stock rejection sampler on model-dtype logits."
+                )
+                with b70_sampler_fast.suspended():
+                    _warmup_kernels(
+                        model_runner,
+                        worker_execute_model,
+                        worker_sample_tokens,
+                        greedy=True,
+                    )
     finally:
         model_runner.adaptive_verification = adaptive_verification
         if adaptive_sampling:
@@ -439,6 +455,49 @@ def warmup_kernels(
     )
     if acceptance_estimator is not None:
         acceptance_estimator.warmup()
+
+
+def warmup_mixed_batch_kernels(model_runner: GPUModelRunner) -> None:
+    """Compile kernel specialisations that only real mixed batches reach: the
+    short convolution of a spec decode beside a prefill (int64 token maps), and
+    the INT8 KV prefill dequantization at multi-block scratch strides. Needs
+    the KV cache bound."""
+    warmed: list[str] = []
+    static_forward_context = model_runner.compilation_config.static_forward_context
+    for layer_name, layer in static_forward_context.items():
+        warmup_short_conv = getattr(layer, "warmup_short_conv", None)
+        if (
+            warmup_short_conv is not None
+            and "short conv" not in warmed
+            and warmup_short_conv()
+        ):
+            warmed.append("short conv")
+        impl = getattr(layer, "impl", None)
+        if (
+            getattr(impl, "kv_cache_dtype", None) == "int8_per_token_head"
+            and hasattr(impl, "warmup_int8_kv_prefill")
+            and "int8 kv prefill" not in warmed
+        ):
+            group_id = next(
+                (
+                    i
+                    for i, group in enumerate(
+                        model_runner.kv_cache_config.kv_cache_groups
+                    )
+                    if layer_name in group.layer_names
+                ),
+                None,
+            )
+            if group_id is not None and layer.kv_cache.numel():
+                impl.warmup_int8_kv_prefill(
+                    layer.kv_cache,
+                    model_runner.block_tables.input_block_tables[group_id],
+                )
+                warmed.append("int8 kv prefill")
+    if warmed:
+        logger.info(
+            "Warmed up mixed-batch kernel specialisations: %s.", ", ".join(warmed)
+        )
 
 
 def _warmup_kernels(

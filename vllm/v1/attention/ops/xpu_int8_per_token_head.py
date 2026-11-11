@@ -354,6 +354,36 @@ def dequant_blocks(
     )
 
 
+def warmup_dequant_blocks(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    block_table: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+) -> None:
+    """Compile `_dequant_blocks_kernel` for every scratch stride class serving
+    takes. Triton specialises the integer `stride_blocks` (a group's longest
+    sequence, in blocks) on == 1 and on divisibility by 16; a warm-up prefill
+    of short prompts reaches only the first. Zero sequence lengths make every
+    program return at once, so nothing is read or written."""
+    seq_lens = torch.zeros(1, dtype=torch.int32, device=key_cache.device)
+    for stride_blocks in (1, 2, 16):
+        if stride_blocks <= key_out.shape[0]:
+            dequant_blocks(
+                key_cache,
+                value_cache,
+                k_scale,
+                v_scale,
+                block_table[:1],
+                seq_lens,
+                key_out,
+                value_out,
+                stride_blocks,
+            )
+
+
 def prefill_scratch_tokens(max_model_len: int, block_size: int) -> int:
     """Tokens of one layer's K (or V) prefill scratch: a `max_model_len`
     sequence in blocks of `block_size` or of any smaller kernel block

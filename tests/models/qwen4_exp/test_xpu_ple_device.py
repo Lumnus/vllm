@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.models.qwen4_exp.common.ops import ple as ple_ops
 from vllm.models.qwen4_exp.common.ops.ple import ple_ngram_ids
 from vllm.models.qwen4_exp.xpu.ple_int8 import read_table_header
 from vllm.models.qwen4_exp.xpu.ple_rows import (
@@ -201,3 +202,71 @@ def test_gather_matches_the_host_in_graph_replay(table, tokens: int) -> None:
         bad += not np.array_equal(out.cpu().numpy(), _expected(slabs, host))
     print(f"replay: {ITERATIONS} rounds of {tokens} tokens")
     assert bad == 0
+
+
+def _num_compiled(fn) -> int:
+    return sum(len(c[0]) for c in fn.device_caches.values())
+
+
+@torch.inference_mode()
+def test_short_conv_warmup_covers_mixed_spec_prefill_batches() -> None:
+    """After warmup_token_mapped_ple_conv(), a batch with a spec decode beside a
+    prefill (int64 token maps, as the GDN metadata builds them) compiles nothing
+    new."""
+    kernels = (ple_ops._ple_conv_kernel, ple_ops._ple_conv_writeback_kernel)
+    if not all(hasattr(k, "device_caches") for k in kernels):
+        pytest.skip("this Triton has no per-device kernel cache")
+    channels, kernel_size, dilation, num_spec = 1024, 4, 3, 7
+    spec_query_len = num_spec + 1
+    window = (kernel_size - 1) * dilation + num_spec
+    dtype = torch.bfloat16
+    # [slot, channel, window] over a [slot, window, channel] cache, as served.
+    conv_state = torch.zeros(8, window, channels, dtype=dtype, device="xpu").transpose(
+        1, 2
+    )
+    weights = torch.randn(channels, kernel_size, dtype=dtype, device="xpu")
+    ple_ops.warmup_token_mapped_ple_conv(
+        conv_state,
+        weights,
+        dilation=dilation,
+        spec_query_len=spec_query_len,
+        dtype=dtype,
+    )
+    before = [_num_compiled(k) for k in kernels]
+
+    num_prefill = 5
+    num_tokens = spec_query_len + num_prefill
+    order = torch.randperm(num_tokens, device="xpu")
+    inputs = torch.randn(num_tokens, channels, dtype=dtype, device="xpu")
+    residual = torch.zeros_like(inputs)
+    outer_residual = torch.zeros_like(inputs)
+    conv = dict(conv_state=conv_state, conv_weights=weights, dilation=dilation)
+
+    def int32(*values: int) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.int32, device="xpu")
+
+    ple_ops.ple_conv(
+        inputs,
+        residual,
+        state_indices=int32(1),
+        outer_residual=outer_residual,
+        mode="spec",
+        query_start_loc=int32(0, spec_query_len),
+        num_accepted_tokens=int32(3),
+        spec_query_len=spec_query_len,
+        token_indices=order[:spec_query_len].clone(),
+        **conv,
+    )
+    ple_ops.ple_conv(
+        inputs,
+        residual,
+        state_indices=int32(2),
+        outer_residual=outer_residual,
+        mode="prefill",
+        query_start_loc=int32(0, num_prefill),
+        has_initial_states=torch.ones(1, dtype=torch.bool, device="xpu"),
+        token_indices=order[spec_query_len:].clone(),
+        **conv,
+    )
+    torch.xpu.synchronize()
+    assert [_num_compiled(k) for k in kernels] == before
