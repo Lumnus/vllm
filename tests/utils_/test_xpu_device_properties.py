@@ -15,9 +15,9 @@ from vllm.utils import platform_utils
 
 @pytest.fixture(autouse=True)
 def fresh_cache():
-    platform_utils.xpu_device_facts.cache_clear()
+    platform_utils._xpu_device_facts.clear()
     yield
-    platform_utils.xpu_device_facts.cache_clear()
+    platform_utils._xpu_device_facts.clear()
 
 
 def test_reads_directly_once_initialized(monkeypatch):
@@ -73,11 +73,11 @@ def test_child_script_reads_the_named_properties(monkeypatch, capsys):
     [
         (
             subprocess.TimeoutExpired(cmd="python", timeout=1, stderr="x" * 5000),
-            TimeoutError,
+            platform_utils.XPUPropertiesChildError,
         ),
         (
             subprocess.CalledProcessError(1, "python", stderr="device lost"),
-            RuntimeError,
+            platform_utils.XPUPropertiesChildError,
         ),
         (FileNotFoundError("no interpreter"), OSError),
     ],
@@ -93,6 +93,36 @@ def test_child_failure_raises_with_a_bounded_stderr_tail(monkeypatch, error, rai
     assert len(str(info.value)) < platform_utils._XPU_PROPERTIES_STDERR_TAIL + 200
     if isinstance(error, subprocess.CalledProcessError):
         assert "device lost" in str(info.value)
+
+
+def test_a_child_timeout_is_not_an_oserror():
+    # The built-in TimeoutError is an OSError; callers tell "the child did not
+    # answer" from "no child could be started" by exception type.
+    assert not issubclass(platform_utils.XPUPropertiesChildError, OSError)
+
+
+def test_a_failed_read_is_remembered(monkeypatch):
+    calls = []
+
+    def properties(device, names, init_xpu=False):
+        calls.append(device)
+        raise platform_utils.XPUPropertiesChildError("no answer")
+
+    monkeypatch.setattr(platform_utils, "xpu_is_initialized", lambda: False)
+    monkeypatch.setattr(platform_utils, "xpu_get_device_properties", properties)
+    for _ in range(3):
+        with pytest.raises(platform_utils.XPUPropertiesChildError, match="no answer"):
+            platform_utils.xpu_device_facts(0)
+    assert calls == [0]
+
+    # Once XPU is initialized here the read is direct, so it is tried again.
+    monkeypatch.setattr(platform_utils, "xpu_is_initialized", lambda: True)
+    monkeypatch.setattr(
+        platform_utils,
+        "xpu_get_device_properties",
+        lambda device, names, init_xpu=False: ("Device A", 1, 131072),
+    )
+    assert platform_utils.xpu_device_facts(0) == ("Device A", 1, 131072)
 
 
 def test_device_facts_are_read_once_per_process(monkeypatch):

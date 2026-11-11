@@ -48,18 +48,42 @@ def test_initializes_in_process_only_when_no_child_can_start(monkeypatch):
     assert calls == [(("name", "total_memory"), True)]
 
 
-@pytest.mark.parametrize("error", [TimeoutError("no answer"), RuntimeError("failed")])
-def test_does_not_initialize_in_process_after_a_failed_child(monkeypatch, error):
+def test_does_not_initialize_in_process_after_a_failed_child(monkeypatch):
+    from vllm.utils.platform_utils import XPUPropertiesChildError
+
     def facts(device):
-        raise error
+        raise XPUPropertiesChildError("no answer in 120 s")
 
     def fail(*args, **kwargs):
         raise AssertionError("the XPU runtime must not be initialized")
 
     monkeypatch.setattr(xpu_platform, "xpu_device_facts", facts)
     monkeypatch.setattr(xpu_platform, "xpu_get_device_properties", fail)
-    with pytest.raises(type(error)):
+    with pytest.raises(XPUPropertiesChildError):
         xpu_platform.XPUPlatform.get_device_total_memory()
+
+
+def test_a_real_child_timeout_does_not_reach_the_in_process_path(monkeypatch):
+    """End to end through the helper: subprocess times out, nothing initializes."""
+    import subprocess
+
+    from vllm.utils import platform_utils
+
+    def run(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs["timeout"])
+
+    def fail(*args, **kwargs):
+        raise AssertionError("the XPU runtime must not be initialized")
+
+    platform_utils._xpu_device_facts.clear()
+    monkeypatch.setattr(platform_utils, "xpu_is_initialized", lambda: False)
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(torch.xpu, "get_device_properties", fail)
+    try:
+        with pytest.raises(platform_utils.XPUPropertiesChildError):
+            xpu_platform.XPUPlatform.get_device_name()
+    finally:
+        platform_utils._xpu_device_facts.clear()
 
 
 def test_linear_attention_import_does_not_query_triton(monkeypatch):
@@ -103,8 +127,13 @@ def test_linear_attention_import_does_not_query_triton(monkeypatch):
         def no_answer(device):
             raise RuntimeError("no child")
 
+        warned = []
         monkeypatch.setattr(utils, "xpu_device_facts", no_answer)
+        monkeypatch.setattr(
+            utils.logger, "warning", lambda *args, **kwargs: warned.append(args[0])
+        )
         assert utils.check_shared_mem("ada") is False
+        assert len(warned) == 1 and "small autotune block sizes" in warned[0]
     finally:
         monkeypatch.undo()
         importlib.reload(utils)

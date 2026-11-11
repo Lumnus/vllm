@@ -15,7 +15,11 @@ import vllm_xpu_kernels._xpu_C  # noqa
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.utils.platform_utils import xpu_device_facts, xpu_get_device_properties
+from vllm.utils.platform_utils import (
+    XPUPropertiesChildError,
+    xpu_device_facts,
+    xpu_get_device_properties,
+)
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interface import DeviceCapability, Platform, PlatformEnum
@@ -117,7 +121,16 @@ def _device_name_and_memory(device_id: int) -> tuple[str, int]:
     """
     try:
         name, total_memory, _ = xpu_device_facts(device_id)
+    except XPUPropertiesChildError:
+        logger.warning(
+            "The child process reading the properties of XPU device %d did "
+            "not answer; not initializing the XPU runtime in this process.",
+            device_id,
+            exc_info=True,
+        )
+        raise
     except OSError:
+        # Only "no child could be started" ends here; a timeout does not.
         logger.warning(
             "Could not start a child process to read the properties of XPU "
             "device %d; initializing the XPU runtime in this process to read "
@@ -128,14 +141,6 @@ def _device_name_and_memory(device_id: int) -> tuple[str, int]:
         name, total_memory = xpu_get_device_properties(
             device_id, ("name", "total_memory"), init_xpu=True
         )
-    except Exception:
-        logger.warning(
-            "The child process reading the properties of XPU device %d did "
-            "not answer; not initializing the XPU runtime in this process.",
-            device_id,
-            exc_info=True,
-        )
-        raise
     return name, total_memory
 
 
