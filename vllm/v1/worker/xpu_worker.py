@@ -159,6 +159,7 @@ class XPUWorker(Worker):
                 current_platform.logical_device_id_to_visible_device_id(self.local_rank)
             )
             self.device = torch.device(f"xpu:{visible_device_index}")
+            current_platform.set_device(self.device)
             torch.accelerator.set_device_index(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
             torch.accelerator.empty_cache()

@@ -19,7 +19,10 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import triton
-from vllm.utils.platform_utils import cuda_get_device_properties
+from vllm.utils.platform_utils import (
+    cuda_get_device_properties,
+    xpu_get_device_properties,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +137,10 @@ def _check_platform() -> Literal["nvidia", "amd", "intel", "musa"]:
         return "nvidia"
     if current_platform.is_rocm():
         return "amd"
+    # On XPU the Triton query initializes the XPU runtime in every process
+    # that imports this module, the API server and the engine core included.
+    if current_platform.is_xpu():
+        return "intel"
     device = get_available_device()
     mapping = {
         "cuda": "nvidia",
@@ -147,14 +154,23 @@ def _check_platform() -> Literal["nvidia", "amd", "intel", "musa"]:
 # For AMD GPUs, the triton backend is 'hip', while for Nvidia GPUs, the triton backend is 'cuda'.
 # However, the torch backend is 'cuda' for both Nvidia and AMD GPUs.
 # Therefore, we need to check the triton backend to determine the actual GPU vendor.
-device = "cuda" if current_platform.is_cuda_alike() else get_available_device()
+if current_platform.is_cuda_alike():
+    device = "cuda"
+elif current_platform.is_xpu():
+    device = "xpu"
+else:
+    device = get_available_device()
 device_torch_lib = getattr(torch, device, None)
 device_platform = _check_platform()
 
 is_amd = device_platform == "amd"
 is_intel = device_platform == "intel"
 is_nvidia = device_platform == "nvidia"
-is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in torch.xpu.get_device_name(0)
+is_intel_alchemist = is_intel and "Intel(R) Arc(TM) A" in (
+    current_platform.get_device_name(0)
+    if current_platform.is_xpu()
+    else torch.xpu.get_device_name(0)
+)
 is_nvidia_hopper = is_nvidia and (
     "NVIDIA H" in current_platform.get_device_name(0)
     or current_platform.get_device_capability(0).major >= 9
@@ -206,6 +222,23 @@ def check_shared_mem(arch: str = "none", tensor_idx: int = 0) -> bool:
             (max_shared_memory,) = cuda_get_device_properties(
                 tensor_idx, ("shared_memory_per_block",)
             )
+        elif is_intel:
+            # Triton's device query needs a stream, so it would initialize the
+            # XPU runtime in every process that imports this module. The block
+            # sizes are chosen at import, so the read cannot wait for first use.
+            try:
+                (max_shared_memory,) = xpu_get_device_properties(
+                    tensor_idx, ("local_mem_size",)
+                )
+            except Exception:
+                # Cached with the result, so this is logged once per query.
+                logger.warning(
+                    "Could not read the shared local memory size of XPU "
+                    "device %d; using the small autotune block sizes.",
+                    tensor_idx,
+                    exc_info=True,
+                )
+                return False
         else:
             max_shared_memory = get_all_max_shared_mem()[tensor_idx]
         return max_shared_memory >= Backend.get_shared_memory(arch)

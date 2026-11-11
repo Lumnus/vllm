@@ -203,8 +203,8 @@ class UsageMessage:
         if current_platform.is_xpu():
             self.xpu_runtime = torch.version.xpu
             self.gpu_count = torch.xpu.device_count()
-            self.gpu_type = torch.xpu.get_device_name(0)
-            self.gpu_memory_per_device = torch.xpu.get_device_properties(0).total_memory
+            self.gpu_type = current_platform.get_device_name(0)
+            self.gpu_memory_per_device = current_platform.get_device_total_memory(0)
         if current_platform.is_tpu():  # noqa: SIM102
             if not self._report_tpu_inference_usage():
                 logger.exception("Failed to collect TPU information")
