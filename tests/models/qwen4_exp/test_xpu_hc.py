@@ -492,3 +492,34 @@ def test_fake_impls_match_the_real_shapes(monkeypatch) -> None:
         assert mixed.shape == (TOKENS, N_EMBD)
         assert injection.shape == (TOKENS, HC)
         assert hc_module._hc_combine_fake(x, block, inject, HC).shape == x.shape
+
+
+def test_hc_route_report_names_the_first_failing_term(monkeypatch) -> None:
+    from vllm.models.qwen4_exp.xpu import hc_gemm
+
+    lines: list[str] = []
+    monkeypatch.setattr(hc_gemm, "_reported", set())
+    for level in ("info", "warning"):
+        monkeypatch.setattr(
+            hc_gemm.logger, level, lambda msg, *args: lines.append(msg % args)
+        )
+    x = torch.zeros(8, hc_gemm._HC_INNER, dtype=torch.bfloat16)
+    down = torch.zeros(336, hc_gemm._HC_INNER, dtype=torch.bfloat16)
+    assert hc_gemm._parallel_route_miss(x, down) is None
+    assert hc_gemm._parallel_route_miss(x.float(), down).startswith("dtype")
+    assert hc_gemm._parallel_route_miss(x[:, ::2], down[:, ::2]).startswith("stride")
+    assert hc_gemm._parallel_route_miss(torch.zeros(64, 8), down) == "rows"
+    lora = torch.zeros(8, 320, dtype=torch.bfloat16)
+    up = torch.zeros(*hc_gemm._UP_SHAPE, dtype=torch.bfloat16)
+    assert hc_gemm._native_up_miss(lora, up) == "device cpu"
+    assert hc_gemm._native_up_miss(torch.zeros(9, 320), up) == "rows"
+
+    for _ in range(3):
+        hc_gemm.report_route("down", x, down, True)
+        hc_gemm.report_route("up", lora, up, False)
+        hc_gemm.report_route("up", torch.zeros(64, 320), up, False)
+    assert lines == [
+        "HC down: batch-invariant route taken (first at 8 rows).",
+        "HC up: stock GEMM at 8 rows instead of the batch-invariant route: device cpu.",
+        "HC up: 64 rows is outside the batch-invariant range; stock GEMM.",
+    ]
