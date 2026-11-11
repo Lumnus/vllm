@@ -106,10 +106,11 @@ def backend_to_kernel_cls(
         return [TritonWNA16Experts]
     elif backend == WNA16MoEBackend.XPU:
         from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
+            XPUExpertsW4A8Int,
             XPUExpertsWNA16,
         )
 
-        return [XPUExpertsWNA16]
+        return [XPUExpertsWNA16, XPUExpertsW4A8Int]
     elif backend == WNA16MoEBackend.CPU:
         from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
             CPUExpertsInt4,
@@ -328,8 +329,15 @@ def select_wna16_moe_backend(
         A tuple of (`WNA16MoEBackend`, experts class or `None`).
 
     """
-    # WNA16 MoE always runs BF16 activations.
-    oracle = WNA16MoEKernelOracle(config, weight_key, None)
+    # WNA16 MoE runs BF16 activations unless the user asks for quantized ones
+    # (`quantization_config.moe.activation`), which only a W4A8 kernel takes.
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.config.quantization import user_activation_override
+
+    activation_key = user_activation_override("moe", get_current_vllm_config_or_none())[
+        0
+    ]
+    oracle = WNA16MoEKernelOracle(config, weight_key, activation_key)
 
     # Handle explicit moe_backend from user.
     runner_backend = config.moe_backend
@@ -368,7 +376,8 @@ def select_wna16_moe_backend(
             return backend, kernel_cls
 
     raise NotImplementedError(
-        "No WNA16 MoE backend supports the deployment configuration."
+        "No WNA16 MoE backend supports the deployment configuration"
+        + (f" (activation={activation_key})." if activation_key is not None else ".")
     )
 
 
@@ -432,6 +441,7 @@ def make_wna16_moe_kernel(
         Rdna3WNA16Experts,
     )
     from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
+        XPUExpertsW4A8Int,
         XPUExpertsWNA16,
     )
     from vllm.model_executor.layers.fused_moe.experts.zentorch_moe import (
@@ -448,6 +458,7 @@ def make_wna16_moe_kernel(
         TritonWNA16Experts,
         TrtLlmMxint4ExpertsMonolithic,
         XPUExpertsWNA16,
+        XPUExpertsW4A8Int,
         CPUExpertsInt4,
         ZentorchExpertsWNA16,
         Int4EmulationTritonExperts,
