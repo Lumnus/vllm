@@ -21,14 +21,22 @@ class _Rec(nn.Module):
 
 def test_fc_projections_take_the_quant_config(monkeypatch):
     _Rec.built = []
-    for name in ("VocabParallelEmbedding", "HyperConnection", "_WideRMSNorm",
-                 "HyperConnectionRMSNorm", "Qwen4ExpDecoderLayer"):
+    for name in (
+        "VocabParallelEmbedding",
+        "HyperConnection",
+        "_WideRMSNorm",
+        "HyperConnectionRMSNorm",
+        "Qwen4ExpDecoderLayer",
+    ):
         monkeypatch.setattr(mtp_module, name, lambda *a, **k: nn.Identity())
     monkeypatch.setattr(mtp_module, "ReplicatedLinear", _Rec)
     monkeypatch.setattr(mtp_module, "_uses_qsa", lambda config: False)
     quant_config = object()
     config = SimpleNamespace(
-        vocab_size=16, hc_count=4, hidden_size=8, rms_norm_eps=1e-6,
+        vocab_size=16,
+        hc_count=4,
+        hidden_size=8,
+        rms_norm_eps=1e-6,
         mtp_num_hidden_layers=1,
     )
     vllm_config = SimpleNamespace(
