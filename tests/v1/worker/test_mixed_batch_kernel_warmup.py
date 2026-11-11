@@ -112,6 +112,16 @@ def test_hooks_run_once_with_the_layers_block_table():
     assert calls == ["short conv", ("layer 3", (6,), (4, 37))]
 
 
+def test_runner_without_block_tables_skips_the_int8_hook():
+    """A runner other than the V2 one keeps no input_block_tables: the INT8 KV
+    hook is skipped instead of failing the boot."""
+    calls: list = []
+    runner = _runner({"a": _int8_attention(calls, "a")}, [["a"]], [])
+    del runner.block_tables
+    warmup.warmup_mixed_batch_kernels(runner)
+    assert calls == []
+
+
 def test_unbound_or_ungrouped_layers_are_skipped():
     calls: list = []
     context = {

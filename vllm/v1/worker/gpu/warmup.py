@@ -463,6 +463,10 @@ def warmup_mixed_batch_kernels(model_runner: GPUModelRunner) -> None:
     the INT8 KV prefill dequantization at multi-block scratch strides. Needs
     the KV cache bound."""
     warmed: list[str] = []
+    # The INT8 KV hook reads the V2 runner's per-group block tables.
+    input_block_tables = getattr(
+        getattr(model_runner, "block_tables", None), "input_block_tables", None
+    )
     static_forward_context = model_runner.compilation_config.static_forward_context
     for layer_name, layer in static_forward_context.items():
         warmup_short_conv = getattr(layer, "warmup_short_conv", None)
@@ -478,6 +482,12 @@ def warmup_mixed_batch_kernels(model_runner: GPUModelRunner) -> None:
             and hasattr(impl, "warmup_int8_kv_prefill")
             and "int8 kv prefill" not in warmed
         ):
+            if input_block_tables is None:
+                logger.info_once(
+                    "Skipping the INT8 KV prefill warm-up: this model runner has "
+                    "no per-group input block tables."
+                )
+                continue
             group_id = next(
                 (
                     i
@@ -491,7 +501,7 @@ def warmup_mixed_batch_kernels(model_runner: GPUModelRunner) -> None:
             if group_id is not None and layer.kv_cache.numel():
                 impl.warmup_int8_kv_prefill(
                     layer.kv_cache,
-                    model_runner.block_tables.input_block_tables[group_id],
+                    input_block_tables[group_id],
                 )
                 warmed.append("int8 kv prefill")
     if warmed:
