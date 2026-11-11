@@ -363,6 +363,20 @@ class XPUPlatform(Platform):
     @classmethod
     def set_device(cls, device: torch.device) -> None:
         """Set the device for the current platform."""
+        # torch.xpu creates the stream pool of whichever device is current
+        # when it initializes, and set_device() initializes before it selects
+        # the device. Make the device current first, so that a worker does not
+        # keep device memory on device 0 that it never uses.
+        if device.index is not None and not torch.xpu.is_initialized():
+            select = getattr(torch._C, "_xpu_setDevice", None)
+            if select is not None:
+                select(device.index)
+            else:
+                logger.warning_once(
+                    "This torch cannot select an XPU device before it "
+                    "initializes; device 0 will hold a stream pool for every "
+                    "worker."
+                )
         torch.xpu.set_device(device)
 
     @classmethod

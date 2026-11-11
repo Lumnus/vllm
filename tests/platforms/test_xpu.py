@@ -97,3 +97,27 @@ def test_linear_attention_import_does_not_query_triton(monkeypatch):
     finally:
         monkeypatch.undo()
         importlib.reload(utils)
+
+
+def test_set_device_selects_before_runtime_init(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.xpu, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        torch._C, "_xpu_setDevice", lambda i: calls.append(("select", i))
+    )
+    monkeypatch.setattr(torch.xpu, "set_device", lambda d: calls.append(("set", d)))
+    device = torch.device("xpu", 2)
+    xpu_platform.XPUPlatform.set_device(device)
+    assert calls == [("select", 2), ("set", device)]
+
+    calls.clear()
+    monkeypatch.setattr(torch.xpu, "is_initialized", lambda: True)
+    xpu_platform.XPUPlatform.set_device(device)
+    assert calls == [("set", device)]
+
+    # A torch without the selector keeps today's behaviour.
+    calls.clear()
+    monkeypatch.setattr(torch.xpu, "is_initialized", lambda: False)
+    monkeypatch.delattr(torch._C, "_xpu_setDevice")
+    xpu_platform.XPUPlatform.set_device(device)
+    assert calls == [("set", device)]
