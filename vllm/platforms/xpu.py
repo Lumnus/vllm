@@ -392,7 +392,7 @@ class XPUPlatform(Platform):
             try:
                 torch._C._xpu_setDevice(device.index)
             except Exception:
-                logger.warning_once(
+                logger.warning(
                     "Could not select the XPU device before torch.xpu "
                     "initializes; device 0 will hold a stream pool for every "
                     "worker.",
