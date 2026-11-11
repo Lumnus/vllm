@@ -889,7 +889,11 @@ def stage_ple_rows(
         layer.reads_rows_on_host for layer in layers
     ):
         with gpu_sync_allowed():
-            torch.accelerator.synchronize()
+            # The ids and their copy are on the current stream. Waiting for the
+            # whole device would also wait for other streams (an async EPLB
+            # transfer), whose work can depend on peers that are still in
+            # this step.
+            torch.accelerator.current_stream().synchronize()
     for layer in layers:
         layer.stage_rows(input_batch, req_states)
 
