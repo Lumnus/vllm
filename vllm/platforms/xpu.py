@@ -381,15 +381,17 @@ class XPUPlatform(Platform):
         # when it initializes, and set_device() initializes before it selects
         # the device. Make the device current first, so that a worker does not
         # keep device memory on device 0 that it never uses.
+        # TODO(pytorch#<issue>): remove once torch.xpu no longer creates a
+        # stream pool during initialization.
         if device.index is not None and not torch.xpu.is_initialized():
-            select = getattr(torch._C, "_xpu_setDevice", None)
-            if select is not None:
-                select(device.index)
-            else:
+            try:
+                torch._C._xpu_setDevice(device.index)
+            except Exception:
                 logger.warning_once(
-                    "This torch cannot select an XPU device before it "
+                    "Could not select the XPU device before torch.xpu "
                     "initializes; device 0 will hold a stream pool for every "
-                    "worker."
+                    "worker.",
+                    exc_info=True,
                 )
         torch.xpu.set_device(device)
 

@@ -126,9 +126,17 @@ def test_set_device_selects_before_runtime_init(monkeypatch):
     xpu_platform.XPUPlatform.set_device(device)
     assert calls == [("set", device)]
 
-    # A torch without the selector keeps today's behaviour.
+    # A torch whose selector is missing or fails keeps today's behaviour.
     calls.clear()
     monkeypatch.setattr(torch.xpu, "is_initialized", lambda: False)
     monkeypatch.delattr(torch._C, "_xpu_setDevice")
+    xpu_platform.XPUPlatform.set_device(device)
+    assert calls == [("set", device)]
+
+    def broken(index):
+        raise RuntimeError("no such device")
+
+    calls.clear()
+    monkeypatch.setattr(torch._C, "_xpu_setDevice", broken, raising=False)
     xpu_platform.XPUPlatform.set_device(device)
     assert calls == [("set", device)]
