@@ -179,6 +179,13 @@ def _sysman_device_name_and_memory(device_id: int) -> tuple[str, int] | None:
         return None
 
 
+def _log_sysman_fallback() -> None:
+    logger.warning_once(
+        "Level Zero Sysman (pyzes) could not report the device properties; "
+        "initializing the XPU runtime in this process to read them."
+    )
+
+
 class XPUPlatform(Platform):
     _enum = PlatformEnum.XPU
     device_name: str = "xpu"
@@ -439,6 +446,7 @@ class XPUPlatform(Platform):
             props = _sysman_device_name_and_memory(device_id)
             if props is not None:
                 return props[0]
+            _log_sysman_fallback()
         return torch.xpu.get_device_name(device_id)
 
     @classmethod
@@ -456,6 +464,7 @@ class XPUPlatform(Platform):
             props = _sysman_device_name_and_memory(device_id)
             if props is not None:
                 return props[1]
+            _log_sysman_fallback()
         device_props = torch.xpu.get_device_properties(device_id)
         return device_props.total_memory
 
