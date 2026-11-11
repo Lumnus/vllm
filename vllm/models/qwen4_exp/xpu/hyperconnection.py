@@ -118,24 +118,16 @@ def _gate_mix_and_inject(
     if down_scale is not None:
         down = int8_down_gemm(xn, down_weight, down_scale)
         lora = hc_silu(down[:, :lowrank], hc)
-        native_up = batch_invariant and hc_gemm.takes_native_up(lora, up_weight)
-        if batch_invariant:
-            hc_gemm.report_route("up", lora, up_weight, native_up)
-        if native_up:
+        if batch_invariant and hc_gemm.takes_native_up(lora, up_weight):
             block_input = hc_gemm.native_up_mix(lora, up_weight, xn, xn.shape[1] // hc)
         else:
             block_input = hc_gate_mix(xn, F.linear(lora, up_weight), hc)
         return block_input, down[:, lowrank : lowrank + hc]
-    parallel = batch_invariant and hc_gemm.takes_parallel_route(xn, down_weight)
-    if batch_invariant:
-        hc_gemm.report_route("down", xn, down_weight, parallel)
-    if parallel:
+    if batch_invariant and hc_gemm.takes_parallel_route(xn, down_weight):
         # Columns past the down and injection rows are the merged GEMM's padding.
         valid = min(down_weight.shape[0], lowrank + hc)
         down, lora = hc_gemm.parallel_hc_gemm_silu(xn, down_weight, valid, lowrank, hc)
-        native_up = hc_gemm.takes_native_up(lora, up_weight)
-        hc_gemm.report_route("up", lora, up_weight, native_up)
-        if native_up:
+        if hc_gemm.takes_native_up(lora, up_weight):
             block_input = hc_gemm.native_up_mix(lora, up_weight, xn, xn.shape[1] // hc)
         else:
             block_input = hc_gate_mix(xn, F.linear(lora, up_weight), hc)
