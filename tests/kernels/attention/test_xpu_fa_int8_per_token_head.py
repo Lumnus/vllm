@@ -235,8 +235,10 @@ def _num_compiled(fn) -> int:
 
 @torch.inference_mode()
 def test_dequant_warmup_covers_serving_strides():
-    """After warmup_dequant_blocks(), prefills whose longest sequence spans one
-    block, a few blocks or a multiple of 16 blocks compile nothing new."""
+    """After warmup_dequant_blocks(), prefill groups whose longest sequence
+    spans one block, a few blocks or a multiple of 16 blocks compile nothing
+    new, including groups that start at a later row of the batch (unaligned
+    block-table and sequence-length slices, as forward_prefill passes them)."""
     kernel = int8_kv_ops._dequant_blocks_kernel
     if not hasattr(kernel, "device_caches"):
         pytest.skip("this Triton has no per-device kernel cache")
@@ -245,30 +247,27 @@ def test_dequant_warmup_covers_serving_strides():
     num_blocks = sum(-(-L // block_size) for L in seq_lens) + 4
     _, views = _make_cache(num_blocks, nkv, block_size, HEAD_SIZE, True)
     key_cache, value_cache, k_scale, v_scale = views
-    # Block-table rows as wide as serving's (not a multiple of 16 blocks). Each
-    # prefill below is its own batch, so its group starts at row 0 of the table,
-    # as forward_prefill's first group does.
+    # Block-table rows as wide as serving's (not a multiple of 16 blocks): rows
+    # 1 and 2 start 148 and 296 bytes in, neither 16-byte aligned.
     width = 37
-
-    def block_table() -> torch.Tensor:
-        return torch.zeros(1, width, dtype=torch.int32, device=DEVICE)
-
+    block_table = torch.zeros(len(seq_lens), width, dtype=torch.int32, device=DEVICE)
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=DEVICE)
     nb = prefill_scratch_tokens(width * block_size, block_size) // block_size
     ks = torch.empty((nb, block_size, nkv, HEAD_SIZE), dtype=dtype, device=DEVICE)
     vs = torch.empty_like(ks)
     int8_kv_ops.warmup_dequant_blocks(
-        key_cache, value_cache, k_scale, v_scale, block_table(), ks, vs
+        key_cache, value_cache, k_scale, v_scale, block_table, ks, vs
     )
     before = _num_compiled(kernel)
-    for seq_len in seq_lens:
+    for i, seq_len in enumerate(seq_lens):
         stride_blocks = -(-seq_len // block_size)
         int8_kv_ops.dequant_blocks(
             key_cache,
             value_cache,
             k_scale,
             v_scale,
-            block_table(),
-            torch.tensor([seq_len], dtype=torch.int32, device=DEVICE),
+            block_table[i : i + 1],
+            seq_lens_t[i : i + 1],
             ks,
             vs,
             stride_blocks,

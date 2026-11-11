@@ -211,7 +211,10 @@ def plan_prefill_groups(
     return groups
 
 
-@triton.jit
+# Prefill groups after the first pass row slices of the block table and of
+# seq_lens, so their base pointers are not 16-byte aligned; those are scalar
+# loads, and specialising on their alignment would only add compiled variants.
+@triton.jit(do_not_specialize_on_alignment=["bt_ptr", "sl_ptr"])
 def _dequant_blocks_kernel(
     k_ptr,
     v_ptr,
@@ -366,8 +369,10 @@ def warmup_dequant_blocks(
     """Compile `_dequant_blocks_kernel` for every scratch stride class serving
     takes. Triton specialises the integer `stride_blocks` (a group's longest
     sequence, in blocks) on == 1 and on divisibility by 16; a warm-up prefill
-    of short prompts reaches only the first. Zero sequence lengths make every
-    program return at once, so nothing is read or written."""
+    of short prompts reaches only the first. The block-table and sequence-length
+    pointers are not specialised on alignment, so the row slices of later
+    prefill groups need no variants of their own. Zero sequence lengths make
+    every program return at once, so nothing is read or written."""
     seq_lens = torch.zeros(1, dtype=torch.int32, device=key_cache.device)
     for stride_blocks in (1, 2, 16):
         if stride_blocks <= key_out.shape[0]:

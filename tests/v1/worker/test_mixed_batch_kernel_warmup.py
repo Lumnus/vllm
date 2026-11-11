@@ -4,9 +4,26 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm.v1.worker.gpu import warmup
+
+
+def _alignment_free(kernel, names: list[str]) -> bool:
+    """Whether a Triton kernel does not specialise on these pointers' alignment."""
+    params = {p.name: p for p in getattr(kernel, "params", [])}
+    if not params:
+        pytest.skip("Triton kernels are not JIT functions here")
+    return all(params[name].do_not_specialize_on_alignment for name in names)
+
+
+def test_dequant_kernel_ignores_group_slice_alignment():
+    """Later prefill groups pass row slices of the block table and seq_lens;
+    their alignment must not select another compiled variant."""
+    from vllm.v1.attention.ops import xpu_int8_per_token_head as ops
+
+    assert _alignment_free(ops._dequant_blocks_kernel, ["bt_ptr", "sl_ptr"])
 
 
 def _runner(static_forward_context, groups, block_tables):
