@@ -11,6 +11,7 @@ if TYPE_CHECKING:
         FusedMoEQuantConfig,
     )
 
+from vllm.model_executor.kernels.linear import init_int8_linear_kernel
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.fused_moe.oracle.int8 import (
@@ -19,16 +20,136 @@ from vllm.model_executor.layers.fused_moe.oracle.int8 import (
     make_int8_moe_quant_config,
     select_int8_moe_backend,
 )
+from vllm.model_executor.layers.quantization.online.fp8 import (
+    OnlineLinearBase,
+    _is_tp_sharded,
+)
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    QuantKey,
     amax_for_moe_weight_quant,
+    amax_for_tp_weight_quant,
     kInt8DynamicTokenSym,
     kInt8StaticChannelSym,
     weight_amax,
 )
-from vllm.model_executor.utils import replace_parameter
+from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
+
+# Chunk so the fp32 intermediate of the divide stays under ~64 MB.
+_QUANT_CHUNK_ELEMS = 16 * 1024 * 1024
+
+
+def quantize_int8_per_channel(
+    weight: torch.Tensor, amax: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """`[N, K]` float weight and its `[N, 1]` row amax -> (int8 `[N, K]`,
+    fp32 `[N, 1]` scale): symmetric, round to nearest, in [-127, 127]."""
+    vmax = torch.iinfo(torch.int8).max
+    scale = (amax.to(torch.float32) / vmax).clamp_min(torch.finfo(torch.float32).tiny)
+    qweight = torch.empty_like(weight, dtype=torch.int8)
+    chunk_rows = max(1, _QUANT_CHUNK_ELEMS // max(1, weight.shape[-1]))
+    for start in range(0, weight.shape[0], chunk_rows):
+        rows = slice(start, start + chunk_rows)
+        qweight[rows] = (
+            (weight[rows].to(torch.float32) / scale[rows])
+            .round_()
+            .clamp_(-vmax, vmax)
+            .to(torch.int8)
+        )
+    return qweight, scale
+
+
+class Int8PerChannelOnlineLinearMethod(OnlineLinearBase):
+    """Online W8A8 INT8 linear quantization.
+
+    Per-output-channel symmetric weight scale + dynamic per-token symmetric
+    activation scale, on the platform's INT8 scaled-mm kernel. Same layout as
+    llmcompressor's W8A8 INT8 recipe with dynamic activations, so no
+    pre-quantized checkpoint is required.
+    """
+
+    weight_quant_key = kInt8StaticChannelSym
+    activation_quant_key: QuantKey | None = kInt8DynamicTokenSym
+    accepts_activation_override = True
+
+    def __init__(self, activation_quant_key: QuantKey | None = kInt8DynamicTokenSym):
+        super().__init__()
+        self.activation_quant_key = self.resolve_activation_quant_key(
+            activation_quant_key, explicit=True
+        )
+
+    @classmethod
+    def resolve_activation_quant_key(
+        cls, activation_quant_key: QuantKey | None, explicit: bool
+    ) -> QuantKey | None:
+        key = super().resolve_activation_quant_key(activation_quant_key, explicit)
+        if key != kInt8DynamicTokenSym:
+            raise NotImplementedError(
+                f"activation override for online {cls.__name__} supports only "
+                f"{kInt8DynamicTokenSym}, got {key}"
+            )
+        return key
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        super().create_weights(
+            layer,
+            input_size_per_partition,
+            output_partition_sizes,
+            input_size,
+            output_size,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+        self.int8_linear = init_int8_linear_kernel(
+            is_channelwise=True,
+            is_static_input_scheme=False,
+            input_symmetric=True,
+            module_name=self.__class__.__name__,
+            is_fused_module=len(output_partition_sizes) > 1,
+        )
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if is_weights_pre_processed():
+            raise RuntimeError("Online INT8 backend cannot use pre-processed weights")
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+
+        weight = self.get_weight_for_quantization(layer)
+        amax = weight_amax(weight, dim=-1, keepdim=True)
+        amax = amax_for_tp_weight_quant(
+            amax, _is_tp_sharded(layer, reduces_output_dim=False)
+        )
+        qweight, weight_scale = quantize_int8_per_channel(weight, amax)
+
+        replace_parameter(layer, "weight", qweight)
+        replace_parameter(layer, "weight_scale", weight_scale)
+        layer.input_scale = None
+        layer.input_zero_point = None
+        layer.azp_adj = None
+
+        self.int8_linear.process_weights_after_loading(layer)
+        self.release_requantization_source_weights(layer)
+
+        layer._already_called_process_weights_after_loading = True
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.int8_linear.apply_weights(layer, x, bias)
 
 
 class Int8OnlineMoEMethod(OnlineMoEMethodBase):
