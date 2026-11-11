@@ -47,6 +47,10 @@ class TransferMetadata:
     """Expert ids (num_local_experts,) of remote primary experts."""
     recv_dst_rows: np.ndarray
     """Target expert indices (num_local_experts,) in local tensors to send."""
+    buffer_rows: np.ndarray | None = None
+    """Row of the transfer buffer that stages each local row (num_local_experts,),
+    -1 for rows not staged; None when the buffer has a row per local expert and
+    row `i` stages row `i`."""
 
 
 @dataclass
@@ -309,6 +313,31 @@ def _get_migration_row(
     raise RuntimeError(message)
 
 
+def _buffer_rows(
+    staged: np.ndarray,
+    expert_weights_buffers: Sequence[torch.Tensor],
+    layer_idx: int,
+    ep_rank: int,
+) -> np.ndarray | None:
+    """Buffer row for each local row that `staged` marks, when the transfer
+    buffer has fewer rows than there are local experts (a buffer sized for a
+    bounded rearrangement); None when it has a row per local expert."""
+    num_buffer_rows = expert_weights_buffers[0].shape[0]
+    if num_buffer_rows >= staged.shape[0]:
+        return None
+    rows = np.flatnonzero(staged)
+    if rows.shape[0] > num_buffer_rows:
+        raise RuntimeError(
+            f"EPLB: rank {ep_rank} has to stage {rows.shape[0]} experts of MoE "
+            f"layer {layer_idx}, but the transfer buffer holds "
+            f"{num_buffer_rows}; the policy changed more slots than "
+            "max_moves_per_rank."
+        )
+    buffer_rows = np.full(staged.shape[0], -1, dtype=np.int64)
+    buffer_rows[rows] = np.arange(rows.shape[0])
+    return buffer_rows
+
+
 def move_to_buffer(
     num_local_experts: int,
     old_indices: np.ndarray,
@@ -385,6 +414,15 @@ def move_to_buffer(
     recv_primary_mask[dst_rows] = True
 
     eligible_local_buffer_mask = np.logical_and(~is_unchanged, is_received_locally)
+    buffer_rows = _buffer_rows(
+        np.logical_or(eligible_local_buffer_mask, recv_primary_mask),
+        expert_weights_buffers,
+        layer_idx,
+        ep_rank,
+    )
+
+    def staged(row: int) -> int:
+        return row if buffer_rows is None else int(buffer_rows[row])
 
     # 1. Local moves into tmp buffers
     if bool(eligible_local_buffer_mask.any()) and send_count > 0:
@@ -398,7 +436,7 @@ def move_to_buffer(
             if src_local != -1:
                 with device_stream(stream):
                     for w, b in zip(expert_weights, expert_weights_buffers):
-                        b[dst].copy_(w[src_local], non_blocking=True)
+                        b[staged(dst)].copy_(w[src_local], non_blocking=True)
     transfer_metadata = TransferMetadata(
         is_unchanged=is_unchanged,
         is_received_locally=is_received_locally,
@@ -406,10 +444,15 @@ def move_to_buffer(
         recv_count=recv_count,
         recv_expert_ids=recv_expert_ids,
         recv_dst_rows=recv_dst_rows,
+        buffer_rows=buffer_rows,
     )
 
     # Migration batching is disabled by default and must be explicitly enabled.
     if enable_migration_batching:
+        if buffer_rows is not None:
+            raise ValueError(
+                "EPLB migration batching needs a transfer buffer row per local expert."
+            )
         _execute_migration_batches(
             num_local_experts=num_local_experts,
             old_indices=old_indices,
@@ -495,7 +538,7 @@ def move_to_buffer(
             else:
                 src = ranks_to_send[recver_pos - remainder_start]
             communicator.add_recv(
-                [b[dst] for b in expert_weights_buffers],
+                [b[staged(dst)] for b in expert_weights_buffers],
                 src,
                 expert_id=int(expert),
             )
@@ -567,6 +610,8 @@ def move_from_buffer(
         src_rows = np.concatenate([src_rows, prim_dsts_sorted[pos[valid]]])
 
     if dst_rows.size:
+        if transfer_metadata.buffer_rows is not None:
+            src_rows = transfer_metadata.buffer_rows[src_rows]
         copy_rows(
             expert_weights,
             dst_rows.tolist(),
@@ -771,15 +816,21 @@ def rearrange_expert_weights_inplace(
             # Reserve NCCL communication buffers via a dummy all_gather.
             # Backends that pre-allocate their own transfer buffers
             # skip this to avoid the extra memory spike during profiling.
+            # As many rows as the transfer buffer: a bounded rearrangement
+            # never sends more at once.
+            num_rows = min(expert_buffer[0].shape[0], num_local_physical_experts)
             profile_buffer: list[torch.Tensor] = [
-                new_expert_buffer(w) for w in first_layer_weights
+                new_expert_buffer(w)
+                if num_rows == num_local_physical_experts
+                else torch.empty_like(w[:num_rows])
+                for w in first_layer_weights
             ]
             for weight, buffer in zip(expert_weights[0], profile_buffer):
                 dummy_recv_buffer = [buffer for _ in range(ep_size)]
                 torch.distributed.barrier()
                 all_gather(
                     dummy_recv_buffer,
-                    weight if isinstance(weight, torch.Tensor) else buffer,
+                    weight[:num_rows] if isinstance(weight, torch.Tensor) else buffer,
                     group=ep_group,
                 )
         return
