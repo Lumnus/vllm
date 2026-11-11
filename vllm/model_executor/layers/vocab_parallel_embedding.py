@@ -561,7 +561,7 @@ class VocabParallelEmbedding(PluggableLayer):
         if not self.use_fused_embedding:
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
         if self.reduce_results:
-            # B70-V2-AR: output_parallel is this call's fresh lookup (masked in place).
+            # output_parallel is this call's fresh lookup (masked in place).
             output_parallel = (
                 self.parallel_group.all_reduce_owned(output_parallel)
                 if self.parallel_group is not None

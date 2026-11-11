@@ -16,7 +16,7 @@ from vllm.v1.worker.gpu.input_batch import (
     get_num_sampled_and_rejected,
 )
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
-from vllm.v1.worker.gpu.sample import b70_sampler_fast as b70sm
+from vllm.v1.worker.gpu.sample import topk_first_sampler as tfs
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_scores
 from vllm.v1.worker.gpu.sample.output import SamplerOutput, SamplingMaskTensors
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -427,7 +427,7 @@ class RejectionSampler:
         )
         return sampled, num_sampled, logprobs_tensors, sampling_mask_tensors
 
-    def _b70_try_fast(
+    def _try_topk_first(
         self,
         logits: torch.Tensor,
         input_batch: InputBatch,
@@ -436,7 +436,7 @@ class RejectionSampler:
         draft_sampled: torch.Tensor,
         pos: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """B70-SM: top-k-first verification. None means run the stock path."""
+        """Top-k-first: top-k-first verification. None means run the stock path."""
         s = self.sampler
         if (
             draft_logits is None
@@ -458,13 +458,13 @@ class RejectionSampler:
         idx_np = input_batch.idx_mapping_np
         if s.get_logprobs_dims(idx_np) is not None:
             return None
-        kmax = b70sm.batch_params(s.sampling_states, idx_np, logits.shape[1])
+        kmax = tfs.batch_params(s.sampling_states, idx_np, logits.shape[1])
         if kmax is None:
             return None
-        b70sm._log_once(
+        tfs._log_once(
             "reject",
             "rejection sampler: top-k-first verify "
-            f"(kmax={kmax}, KP={b70sm._kp(kmax)}, tile={b70sm.BLOCK}, "
+            f"(kmax={kmax}, KP={tfs._kp(kmax)}, tile={tfs.BLOCK}, "
             f"draft candidates={draft_candidate_ids.shape[-1]}) active",
         )
         processed = s.apply_sampling_params(
@@ -476,9 +476,9 @@ class RejectionSampler:
             draft_sampled,
             input_batch.expanded_local_pos,
             input_batch.seq_lens_cpu_upper_bound.numpy(),
-            b70_fast=True,
+            topk_first=True,
         )
-        return b70sm.fast_reject(
+        return tfs.fast_reject(
             processed,
             draft_logits.values,
             draft_candidate_ids,
@@ -513,8 +513,8 @@ class RejectionSampler:
         )
 
         fast = None
-        if b70sm.enabled():
-            fast = self._b70_try_fast(
+        if tfs.enabled():
+            fast = self._try_topk_first(
                 logits,
                 input_batch,
                 draft_logits,

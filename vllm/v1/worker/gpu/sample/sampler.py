@@ -20,7 +20,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import (
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
-from vllm.v1.worker.gpu.sample import b70_sampler_fast as b70sm
+from vllm.v1.worker.gpu.sample import topk_first_sampler as tfs
 from vllm.v1.worker.gpu.sample.bad_words import BadWordsState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
@@ -92,7 +92,7 @@ class Sampler:
 
             self.cjk_mask = CjkMaskState(vllm_config, max_num_reqs, vocab_size, device)
         self.needs_logits_processing = np.zeros(max_num_reqs, dtype=bool)
-        # B70-SM: requests that need more than temperature / top-k / top-p / min-p
+        # Top-k-first: requests that need more than temperature / top-k / top-p / min-p
         # (bias, penalties, bad words, thinking budget, custom processors).
         self.needs_other_processing = np.zeros(max_num_reqs, dtype=bool)
         # Whether processing may leave -inf in a request's logits (filters,
@@ -248,10 +248,10 @@ class Sampler:
         expanded_local_pos: torch.Tensor,
         seq_lens_upper_bound_np: np.ndarray,
         skip_top_k_top_p: bool = False,
-        b70_fast: bool = False,
+        topk_first: bool = False,
     ) -> torch.Tensor:
-        if b70_fast:
-            # B70-SM: temperature, min-p, top-k and top-p are applied by the
+        if topk_first:
+            # Top-k-first: temperature, min-p, top-k and top-p are applied by the
             # top-k-first kernels; only the other processors run here.
             if not np.any(self.needs_other_processing[idx_mapping_np]):
                 return logits
@@ -279,7 +279,7 @@ class Sampler:
         # or weaken it by scaling.
         self.thinking_budget_state.apply(logits, ctx)
 
-        if b70_fast:
+        if topk_first:
             return logits
 
         # Apply temperature in place.
@@ -298,7 +298,7 @@ class Sampler:
             logits, expanded_idx_mapping, idx_mapping_np
         )
 
-    def _b70_fast_plain_ok(
+    def _topk_first_plain_ok(
         self, logits: torch.Tensor, idx_mapping_np: np.ndarray, return_logprobs: bool
     ) -> bool:
         return (
@@ -322,17 +322,17 @@ class Sampler:
         seq_lens_upper_bound_np: np.ndarray,
         return_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if b70sm.enabled() and self._b70_fast_plain_ok(
+        if tfs.enabled() and self._topk_first_plain_ok(
             logits, idx_mapping_np, return_logprobs
         ):
-            kmax = b70sm.batch_params(
+            kmax = tfs.batch_params(
                 self.sampling_states, idx_mapping_np, logits.shape[-1]
             )
             if kmax is not None:
-                b70sm._log_once(
+                tfs._log_once(
                     "plain",
                     "plain sampler: top-k-first support "
-                    f"(kmax={kmax}, KP={b70sm._kp(kmax)}, tile={b70sm.BLOCK}) active",
+                    f"(kmax={kmax}, KP={tfs._kp(kmax)}, tile={tfs.BLOCK}) active",
                 )
                 fast_logits = self.apply_sampling_params(
                     logits,
@@ -343,9 +343,9 @@ class Sampler:
                     input_ids,
                     expanded_local_pos,
                     seq_lens_upper_bound_np,
-                    b70_fast=True,
+                    topk_first=True,
                 )
-                sampled = b70sm.fast_sample(
+                sampled = tfs.fast_sample(
                     fast_logits,
                     expanded_idx_mapping,
                     self.sampling_states,

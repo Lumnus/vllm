@@ -427,9 +427,9 @@ def warmup_kernels(
             _warmup_kernels(
                 model_runner, worker_execute_model, worker_sample_tokens, greedy=True
             )
-            from vllm.v1.worker.gpu.sample import b70_sampler_fast
+            from vllm.v1.worker.gpu.sample import topk_first_sampler
 
-            if b70_sampler_fast.enabled():
+            if topk_first_sampler.enabled():
                 # The top-k-first verify takes the greedy batches above. The
                 # stock rejection kernels it falls back on (logprobs, top-k
                 # off, ...) see model-dtype logits in serving as well. Two
@@ -438,7 +438,7 @@ def warmup_kernels(
                 logger.info(
                     "Warming up the stock rejection sampler on model-dtype logits."
                 )
-                with b70_sampler_fast.suspended():
+                with topk_first_sampler.suspended():
                     _warmup_kernels(
                         model_runner,
                         worker_execute_model,
@@ -671,11 +671,11 @@ def _warmup_kernels(
         worker_sample_tokens(grammar_output)
 
         # Compile the top-k-first sampler kernels here, not on a request.
-        from vllm.v1.worker.gpu.sample import b70_sampler_fast
+        from vllm.v1.worker.gpu.sample import topk_first_sampler
 
         candidate_sampler = getattr(model_runner.speculator, "candidate_sampler", None)
-        if b70_sampler_fast.enabled() and candidate_sampler is not None:
-            b70_sampler_fast.warmup(
+        if topk_first_sampler.enabled() and candidate_sampler is not None:
+            topk_first_sampler.warmup(
                 model_runner.device,
                 model_runner.vocab_size,
                 candidate_sampler.num_steps,

@@ -76,7 +76,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
         return output
 
     def all_reduce_inplace(self, input_: torch.Tensor) -> torch.Tensor:
-        """B70-V2-AR: the same XCCL all-reduce on ``input_`` itself (no clone).
+        """The same XCCL all-reduce on ``input_`` itself (no clone).
 
         Only for a buffer the caller owns and never reads again unreduced.
         Batch-invariant mode keeps its gather."""

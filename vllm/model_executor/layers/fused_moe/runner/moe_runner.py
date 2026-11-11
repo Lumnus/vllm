@@ -530,7 +530,7 @@ class MoERunner(MoERunnerInterface):
             and not output_is_reduced
         ):
             if states_owned:
-                # B70-V2-AR: ``states`` is this call's fresh shared + routed sum.
+                # ``states`` is this call's fresh shared + routed sum.
                 from vllm.distributed.communication_op import (
                     tensor_model_parallel_all_reduce_owned,
                 )

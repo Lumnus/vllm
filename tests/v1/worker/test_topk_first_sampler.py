@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""B70-SM: CPU tests (TRITON_INTERPRET=1) for the top-k-first sampler.
+"""Top-k-first: CPU tests (TRITON_INTERPRET=1) for the top-k-first sampler.
 
 1. support/probabilities of topk_support vs a float64 sort-based reference, with
    bf16-quantised logits (real ties), mixed temperature / top-k / top-p, greedy and
@@ -29,7 +29,7 @@ if os.environ["TRITON_INTERPRET"] == "1":
     tldevice.log1p = lambda x: tl.log(1.0 + x)
 
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch  # noqa: E402
-from vllm.v1.worker.gpu.sample import b70_sampler_fast as sm  # noqa: E402
+from vllm.v1.worker.gpu.sample import topk_first_sampler as sm  # noqa: E402
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (  # noqa: E402
     rejection_sample,
 )
@@ -419,7 +419,7 @@ def test_first_token_marginal_equals_target_and_acceptance():
 
 
 def test_gate_and_fallbacks_in_rejection_sampler(monkeypatch):
-    """The wiring in RejectionSampler._b70_try_fast: off by default, taken when the
+    """The wiring in RejectionSampler._try_topk_first: off by default, taken when the
     batch is inside the envelope, declined (None -> stock path) outside it."""
     from types import SimpleNamespace
 
@@ -441,7 +441,7 @@ def test_gate_and_fallbacks_in_rejection_sampler(monkeypatch):
             return None if n < 0 else (n, 0)
 
         def apply_sampling_params(self, logits, *a, **kw):
-            assert kw["b70_fast"] is True
+            assert kw["topk_first"] is True
             return logits
 
     rs = object.__new__(RejectionSampler)
@@ -471,7 +471,7 @@ def test_gate_and_fallbacks_in_rejection_sampler(monkeypatch):
     def call(**over):
         args = dict(draft_logits=_cache(draft), draft_candidate_ids=cand)
         args.update(over)
-        return rs._b70_try_fast(
+        return rs._try_topk_first(
             logits,
             ib,
             args["draft_logits"],

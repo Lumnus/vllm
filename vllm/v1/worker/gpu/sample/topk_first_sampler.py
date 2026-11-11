@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""B70-SM: top-k-first temperature sampling and spec-decode verification.
+"""Top-k-first: top-k-first temperature sampling and spec-decode verification.
 
 Active on XPU; every other platform keeps the stock path bit for bit.
 
@@ -20,7 +20,7 @@ kernel and an insert kernel. This module replaces that with three launches:
                           resample, evaluated on the <=KP-token support; the draft
                           side reads its cached candidates (DFlash2 CandidateSampler).
 
-Semantics held against the stock path (see tests/v1/worker/test_b70_sampler_fast.py):
+Semantics held against the stock path (see tests/v1/worker/test_topk_first_sampler.py):
   * top-k keeps exactly k tokens, ties at the k-th value broken to the lower token id
     (stock Qrita: "duplicate_keep_mask", index order);
   * top-p is taken on softmax(top-k masked logits), keep while exclusive cumulative
@@ -79,7 +79,7 @@ def suspended() -> Iterator[None]:
 def _log_once(tag: str, msg: str) -> None:
     if tag not in _logged:
         _logged.add(tag)
-        logger.info("B70-SM: %s", msg)
+        logger.info("Top-k-first sampler: %s", msg)
 
 
 @triton.jit
