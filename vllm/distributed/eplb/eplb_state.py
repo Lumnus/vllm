@@ -55,7 +55,12 @@ from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
 from .eplb_state_file import read_expert_loads, write_expert_loads
 from .eplb_utils import CpuGpuEvent
-from .policy import EPLB_POLICIES, AbstractEplbPolicy, DefaultEplbPolicy
+from .policy import (
+    EPLB_POLICIES,
+    AbstractEplbPolicy,
+    DefaultEplbPolicy,
+    IncrementalEplbPolicy,
+)
 from .rebalance_execute import (
     AsyncEplbLayerResult,
     copy_rows,
@@ -308,6 +313,9 @@ class EplbState:
         Background thread handling async transfers.
         """
         self.async_worker_error: Exception | None = None
+        self.last_rearrange_changed: bool = False
+        """Whether the last synchronous rearrangement changed any expert slot.
+        The same on every EP rank (the placement follows all-reduced loads)."""
         """
         Exception that stopped the async worker thread, if any.
         """
@@ -489,8 +497,11 @@ class EplbState:
         )
         self.expert_rearrangement_step_interval = eplb_step_interval
 
-        policy_type = self.parallel_config.eplb_config.policy
+        eplb_config = self.parallel_config.eplb_config
+        policy_type = eplb_config.policy
         self.policy = EPLB_POLICIES[policy_type]
+        if issubclass(self.policy, IncrementalEplbPolicy):
+            self.policy = self.policy.configured(eplb_config.max_moves_per_rank)
         logger.debug("Selected EPLB policy: %s", policy_type)
 
         # num_ubatches is 0 when DBO is disabled.
@@ -511,10 +522,16 @@ class EplbState:
         assert backend is not None, (
             "EPLB communicator backend must be set by ParallelConfig"
         )
+        num_buffer_rows = self._transfer_buffer_rows(
+            model.expert_weights[0][0].shape[0]
+        )
         expert_buffer = (
             None
             if backend == "symm_mem"
-            else [torch.empty_like(w) for w in model.expert_weights[0]]
+            else [
+                w.new_empty((num_buffer_rows, *w.shape[1:]))
+                for w in model.expert_weights[0]
+            ]
         )
         communicator = create_eplb_communicator(
             group_coordinator=get_eplb_group(),
@@ -587,6 +604,35 @@ class EplbState:
             path,
         )
 
+    def _transfer_buffer_rows(self, num_local_experts: int) -> int:
+        """Rows of the transfer buffer per expert tensor: one per local expert,
+        or, when the policy bounds how many slots of a rank a rearrangement
+        changes (`incremental`), that bound. The bounded size needs a
+        communicator that is handed buffer rows (not one that addresses the
+        buffer by expert row itself) and a fixed set of ranks."""
+        config = self.parallel_config.eplb_config
+        bounded = (
+            issubclass(self.policy, IncrementalEplbPolicy)
+            and config.communicator
+            in ("torch_nccl", "torch_gloo", "torch_xccl", "pynccl")
+            and not config.migration_batching_enabled
+            and not self.parallel_config.enable_elastic_ep
+        )
+        if not bounded:
+            return num_local_experts
+        return min(num_local_experts, config.max_moves_per_rank)
+
+    def _restore_rounds(self) -> int:
+        """Blocking rearrangements the restore may take: a bounded policy
+        reaches the saved placement over several."""
+        if not issubclass(self.policy, IncrementalEplbPolicy):
+            return 1
+        num_local = max(
+            s.model.num_physical_experts // get_ep_group().device_group.size()
+            for s in self.model_states.values()
+        )
+        return 2 * -(-num_local // self.policy.max_moves_per_rank)
+
     def restore_saved_placement(self) -> None:
         """Place the experts by the loads read from `EPLBConfig.state_path`,
         once, before serving. A blocking rearrangement on every EP rank; the
@@ -603,7 +649,12 @@ class EplbState:
         with gpu_sync_allowed():
             restore = bool(pending.item())
         if restore:
-            self.rearrange(use_last_expert_load=True, blocking=True)
+            # Every rank computes the same placement from the same loads, so
+            # every rank stops after the same round.
+            for _ in range(self._restore_rounds()):
+                self.rearrange(use_last_expert_load=True, blocking=True)
+                if not self.last_rearrange_changed:
+                    break
         for model_state in self.model_states.values():
             model_state.has_saved_load = False
 
@@ -993,6 +1044,7 @@ class EplbState:
             )
 
         # Get new expert mappings
+        self.last_rearrange_changed = False
         for eplb_model_state, global_expert_load_window in zip(
             self.model_states.values(), global_expert_load_windows
         ):
@@ -1069,6 +1121,12 @@ class EplbState:
                             proposed_imbalance,
                         )
 
+                if not skip_rearrange and not is_profile:
+                    self.last_rearrange_changed |= bool(
+                        (old_physical_to_logical_map != new_physical_to_logical_map)
+                        .any()
+                        .item()
+                    )
                 if not skip_rearrange:
                     # Update expert weights
                     rearrange_expert_weights_inplace(

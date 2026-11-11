@@ -37,7 +37,7 @@ _NUMACTL_CPUSET_PATTERN = re.compile(r"^\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
 ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
-EPLBPolicyOption = Literal["default"]
+EPLBPolicyOption = Literal["default", "incremental"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 EPLBCommunicatorBackend = Literal[
     "torch_nccl", "torch_gloo", "torch_xccl", "nixl", "pynccl", "symm_mem"
@@ -99,7 +99,22 @@ class EPLBConfig:
     """
 
     policy: EPLBPolicyOption = "default"
-    """The policy type for expert parallel load balancing (EPLB)."""
+    """The policy type for expert parallel load balancing (EPLB):
+    - "default": place every expert from scratch at each rearrangement
+      (balanced packing, after DeepSeek EPLB). Most experts change rank each
+      time.
+    - "incremental": start from the current placement and apply, per MoE
+      layer, the expert swaps (and, with redundant experts, replica
+      re-targets) that lower the most-loaded rank's load the most, at most
+      `max_moves_per_rank` per rank. A rearrangement moves a small, bounded
+      part of the weights, and the transfer buffer holds only that many
+      experts per weight tensor.
+    """
+
+    max_moves_per_rank: int = Field(default=8, gt=0)
+    """With `policy="incremental"`: how many expert slots of one rank a
+    rearrangement may change, per MoE layer. Bounds the bytes each
+    rearrangement moves and the size of the transfer buffer."""
 
     communicator: EPLBCommunicatorBackend | None = None
     """
@@ -132,8 +147,11 @@ class EPLBConfig:
     placement."""
 
     def compile_factors(self) -> CompileFactors:
-        # Where the loads are kept does not change the graph.
-        return get_compile_factors(self, ignored_factors={"state_path"})
+        # Where the loads are kept and how far a rearrangement moves experts
+        # do not change the graph.
+        return get_compile_factors(
+            self, ignored_factors={"state_path", "max_moves_per_rank"}
+        )
 
     @property
     def migration_batching_enabled(self) -> bool:
@@ -142,8 +160,11 @@ class EPLBConfig:
 
     @model_validator(mode="after")
     def _validate_eplb_config(self) -> Self:
-        if self.use_async and self.policy != "default":
-            raise ValueError("Async EPLB is only supported with the default policy.")
+        if self.use_async and self.policy not in ("default", "incremental"):
+            raise ValueError(
+                "Async EPLB is only supported with the default and incremental "
+                "policies."
+            )
         if self.use_async and self.communicator in ("torch_nccl", "pynccl"):
             raise ValueError(
                 f"{self.communicator} communicator is incompatible with "
