@@ -54,6 +54,15 @@ print(json.dumps([getattr(props, name) for name in sys.argv[2:]]))
 _XPU_PROPERTIES_STDERR_TAIL = 2000
 
 
+class XPUPropertiesChildError(RuntimeError):
+    """The child process that reads XPU device properties was started and
+    did not deliver: it timed out or exited with an error.
+
+    Deliberately not an OSError (the built-in TimeoutError is one), so that
+    "the child could not be started" stays a separate case.
+    """
+
+
 def _stderr_tail(stderr: str | bytes | None) -> str:
     if isinstance(stderr, bytes):
         stderr = stderr.decode(errors="replace")
@@ -72,9 +81,9 @@ def xpu_get_device_properties(
     initializes XPU, prints the values and exits, so the memory is held for
     the few seconds the child lives.
 
-    The child has `_XPU_PROPERTIES_TIMEOUT_S` seconds. Raises TimeoutError
-    when it does not answer in time, RuntimeError when it ran and failed
-    (both carry the tail of its stderr), and OSError when it could not be
+    The child has `_XPU_PROPERTIES_TIMEOUT_S` seconds. Raises
+    XPUPropertiesChildError when it does not answer in time or exits with an
+    error (with the tail of its stderr), and OSError when it could not be
     started.
     """
     if init_xpu or xpu_is_initialized():
@@ -90,12 +99,12 @@ def xpu_get_device_properties(
             check=True,
         )
     except subprocess.TimeoutExpired as e:
-        raise TimeoutError(
+        raise XPUPropertiesChildError(
             f"Reading the properties of XPU device {device} in a child process "
             f"took more than {_XPU_PROPERTIES_TIMEOUT_S} s: {_stderr_tail(e.stderr)}"
         ) from e
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(
+        raise XPUPropertiesChildError(
             f"The child process reading the properties of XPU device {device} "
             f"exited with status {e.returncode}: {_stderr_tail(e.stderr)}"
         ) from e
@@ -103,17 +112,32 @@ def xpu_get_device_properties(
     return tuple(json.loads(result.stdout.strip().splitlines()[-1]))
 
 
-@cache
+# Per device: the facts, or the error of the read that failed.
+_xpu_device_facts: dict[int, tuple[str, int, int] | Exception] = {}
+
+
 def xpu_device_facts(device: int) -> tuple[str, int, int]:
     """Name, total memory and shared local memory size of an XPU device.
 
-    Read together and cached, so that a process which has not initialized
-    XPU starts one child process at most, whoever asks first.
+    Read together and remembered, so that a process which has not
+    initialized XPU starts one child process at most, whoever asks first. A
+    failed read is remembered as well: later callers get the same error at
+    once instead of waiting for another child. Once XPU is initialized in
+    the process the read is direct, and a remembered failure is retried.
     """
-    name, total_memory, local_mem_size = xpu_get_device_properties(
-        device, ("name", "total_memory", "local_mem_size")
-    )
-    return name, total_memory, local_mem_size
+    known = _xpu_device_facts.get(device)
+    if known is None or (isinstance(known, Exception) and xpu_is_initialized()):
+        try:
+            name, total_memory, local_mem_size = xpu_get_device_properties(
+                device, ("name", "total_memory", "local_mem_size")
+            )
+            known = (name, total_memory, local_mem_size)
+        except Exception as e:
+            known = e
+        _xpu_device_facts[device] = known
+    if isinstance(known, Exception):
+        raise known
+    return known
 
 
 @cache
