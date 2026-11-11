@@ -100,6 +100,85 @@ def get_mem_info_wrapper(
 torch.accelerator.get_memory_info = get_mem_info_wrapper
 
 
+def _sysman_device_name_and_memory(device_id: int) -> tuple[str, int] | None:
+    """Name and memory size of a visible device, read from Level Zero Sysman.
+
+    Sysman answers without creating a compute context. A process that only
+    needs device facts (the API server, the engine core) can therefore ask
+    without initializing the XPU runtime, which would hold device memory on
+    every visible device for the lifetime of the process. This mirrors what
+    NVML does for the CUDA platform.
+
+    Returns None when Sysman cannot answer; the caller then falls back to
+    `torch.xpu`.
+    """
+    try:
+        from ctypes import byref, c_uint32
+
+        import pyzes
+    except Exception:
+        return None
+
+    ok = pyzes.ZE_RESULT_SUCCESS
+    try:
+        if pyzes.zesInit(0) != ok:
+            return None
+        num_drivers = c_uint32(0)
+        if pyzes.zesDriverGet(byref(num_drivers), None) != ok or not num_drivers.value:
+            return None
+        drivers = (pyzes.zes_driver_handle_t * num_drivers.value)()
+        if pyzes.zesDriverGet(byref(num_drivers), drivers) != ok:
+            return None
+        num_devices = c_uint32(0)
+        if pyzes.zesDeviceGet(drivers[0], byref(num_devices), None) != ok:
+            return None
+        devices = (pyzes.zes_device_handle_t * num_devices.value)()
+        if pyzes.zesDeviceGet(drivers[0], byref(num_devices), devices) != ok:
+            return None
+
+        # Sysman lists every device; apply the same visibility the compute
+        # runtime applies. Other mask forms are left to torch.xpu.
+        mask = os.environ.get(XPUPlatform.device_control_env_var)
+        ordinals = list(range(num_devices.value))
+        if mask:
+            ordinals = [int(entry) for entry in mask.split(",")]
+        device = devices[ordinals[device_id]]
+
+        props = pyzes.zes_device_properties_t()
+        props.stype = pyzes.ZES_STRUCTURE_TYPE_DEVICE_PROPERTIES
+        if pyzes.zesDeviceGetProperties(device, byref(props)) != ok:
+            return None
+        name = props.core.name.decode()
+
+        num_modules = c_uint32(0)
+        if (
+            pyzes.zesDeviceEnumMemoryModules(device, byref(num_modules), None) != ok
+            or not num_modules.value
+        ):
+            return None
+        modules = (pyzes.zes_mem_handle_t * num_modules.value)()
+        if pyzes.zesDeviceEnumMemoryModules(device, byref(num_modules), modules) != ok:
+            return None
+        memory = 0
+        for module in modules:
+            mem_props = pyzes.zes_mem_properties_t()
+            mem_props.stype = pyzes.ZES_STRUCTURE_TYPE_MEM_PROPERTIES
+            if pyzes.zesMemoryGetProperties(module, byref(mem_props)) != ok:
+                return None
+            if mem_props.location != pyzes.ZES_MEM_LOC_DEVICE:
+                continue
+            state = pyzes.zes_mem_state_t()
+            state.stype = pyzes.ZES_STRUCTURE_TYPE_MEM_STATE
+            if pyzes.zesMemoryGetState(module, byref(state)) != ok:
+                return None
+            memory += state.size
+        if not name or not memory:
+            return None
+        return name, memory
+    except Exception:
+        return None
+
+
 class XPUPlatform(Platform):
     _enum = PlatformEnum.XPU
     device_name: str = "xpu"
@@ -355,6 +434,11 @@ class XPUPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
+        # Do not initialize the XPU runtime only to answer this.
+        if not torch.xpu.is_initialized():
+            props = _sysman_device_name_and_memory(device_id)
+            if props is not None:
+                return props[0]
         return torch.xpu.get_device_name(device_id)
 
     @classmethod
@@ -367,6 +451,11 @@ class XPUPlatform(Platform):
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
+        # Do not initialize the XPU runtime only to answer this.
+        if not torch.xpu.is_initialized():
+            props = _sysman_device_name_and_memory(device_id)
+            if props is not None:
+                return props[1]
         device_props = torch.xpu.get_device_properties(device_id)
         return device_props.total_memory
 
