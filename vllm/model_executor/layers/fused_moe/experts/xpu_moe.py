@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import functools
+import inspect
 
 import torch
 
@@ -108,6 +110,21 @@ def sentinel_ids_and_counts(
     return out.view(topk_ids.shape), counts
 
 
+@functools.cache
+def fused_moe_takes_valid_ids() -> bool:
+    """Whether the installed XpuFusedMoe.apply takes ``ids_valid`` and
+    ``rows_per_expert``. Without them the expert-parallel path rewrites the
+    unrouted ids and leaves the padding-row mask to the fused MoE."""
+    params = inspect.signature(XpuFusedMoe.apply).parameters
+    supported = "ids_valid" in params and "rows_per_expert" in params
+    if not supported:
+        logger.info(
+            "vllm-xpu-kernels' XpuFusedMoe.apply takes no ids_valid / "
+            "rows_per_expert: expert-parallel layers keep its padding-row mask."
+        )
+    return supported
+
+
 class XPUExperts(mk.FusedMoEExpertsModular):
     # Extra keyword arguments for every XpuFusedMoe.apply call.
     impl_apply_kwargs: dict = {}
@@ -134,6 +151,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         self.fused_moe_impl: XpuFusedMoe | None = None
         is_xe2_or_xe3 = torch.ops._xpu_C.is_xe2_arch() or torch.ops._xpu_C.is_xe3_arch()
         self._expects_unquantized_inputs = is_xe2_or_xe3
+        self.passes_valid_ids = fused_moe_takes_valid_ids()
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -299,10 +317,13 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             # kernel zeroes rows_per_expert, and with every id valid the fused
             # MoE skips its padding-row mask.
             sentinel = global_num_experts - 1 if self.moe_config.ep_rank == 0 else 0
-            topk_ids, rows_per_expert = sentinel_ids_and_counts(
-                topk_ids, sentinel, impl.num_experts
-            )
-            ep_kwargs = {"ids_valid": True, "rows_per_expert": rows_per_expert}
+            if self.passes_valid_ids:
+                topk_ids, rows_per_expert = sentinel_ids_and_counts(
+                    topk_ids, sentinel, impl.num_experts
+                )
+                ep_kwargs = {"ids_valid": True, "rows_per_expert": rows_per_expert}
+            else:
+                topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
         impl.apply(
             output=output,
             hidden_states=hidden_states,
