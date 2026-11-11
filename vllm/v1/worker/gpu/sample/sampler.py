@@ -95,6 +95,9 @@ class Sampler:
         # B70-SM: requests that need more than temperature / top-k / top-p / min-p
         # (bias, penalties, bad words, thinking budget, custom processors).
         self.needs_other_processing = np.zeros(max_num_reqs, dtype=bool)
+        # Whether processing may leave -inf in a request's logits (filters,
+        # forcing, logits processors) rather than only scale them.
+        self.may_mask_logits = np.zeros(max_num_reqs, dtype=bool)
         self.num_speculative_tokens = num_speculative_tokens
         self.return_sampling_mask = return_sampling_mask
         self.use_flashinfer = (
@@ -110,8 +113,10 @@ class Sampler:
         needs_other = self.thinking_budget_state.add_request(req_idx, sampling_params)
         for processor in self.logits_processors:
             needs_other |= processor.add_request(req_idx, sampling_params)
+        may_mask = self.sampling_states.masks_logits(req_idx) or needs_other
         self.needs_other_processing[req_idx] = needs_other
-        self.needs_logits_processing[req_idx] = needs_processing | needs_other
+        self.needs_logits_processing[req_idx] = needs_processing or may_mask
+        self.may_mask_logits[req_idx] = may_mask
 
         self.logprob_token_ids_state.add_request(req_idx, sampling_params)
         if self.cjk_mask is not None:
