@@ -13,6 +13,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
+from vllm.model_executor.layers.fused_moe.experts import xpu_ep_dispatch
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
@@ -253,12 +254,20 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             # Methods that skip finalize_weight_storage build it on first use.
             self._build_impl(w1, w2, topk_ids.size(-1), activation, expert_map)
         assert self.fused_moe_impl is not None
+        impl = staged_impl(self.fused_moe_impl, hidden_states.size(0), "experts")
         if self.moe_config.ep_size > 1:
             # Avoid topk_ids = -1, remap them to an
             # expert not owned by this rank so they are skipped.
             sentinel = global_num_experts - 1 if self.moe_config.ep_rank == 0 else 0
+            if a1q_scale is None and xpu_ep_dispatch.eligible(
+                impl, hidden_states, output, self.impl_apply_kwargs
+            ):
+                xpu_ep_dispatch.apply(
+                    impl, output, hidden_states, topk_weights, topk_ids, sentinel
+                )
+                return
             topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
-        staged_impl(self.fused_moe_impl, hidden_states.size(0), "experts").apply(
+        impl.apply(
             output=output,
             hidden_states=hidden_states,
             topk_weights=topk_weights,
