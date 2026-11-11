@@ -146,11 +146,13 @@ def ep_ids_contract_for(moe_config: FusedMoEConfig) -> EPIdsContract:
     rewriting the ids itself: rebalancing changes which experts a rank owns,
     and that path was not validated with the op filtering them."""
     contract = fused_moe_ep_contract()
-    parallel_config = getattr(moe_config, "moe_parallel_config", None)
-    if contract is EPIdsContract.OP_HANDLES_IDS and getattr(
-        parallel_config, "enable_eplb", False
+    if (
+        contract is EPIdsContract.OP_HANDLES_IDS
+        and moe_config.moe_parallel_config.enable_eplb
     ):
         contract = EPIdsContract.IDS_VALID
+    if moe_config.ep_size <= 1:
+        return contract
     logger.info_once(
         "XPU MoE expert parallelism: %s.",
         {
@@ -354,8 +356,12 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         ep_kwargs: dict = {}
         if (
             self.moe_config.ep_size > 1
-            and self.ep_contract is not EPIdsContract.OP_HANDLES_IDS
+            and self.ep_contract is EPIdsContract.OP_HANDLES_IDS
         ):
+            # The fused MoE reads topk_ids as a dense array; a router's strided
+            # view must reach it contiguous (a no-op when it already is).
+            topk_ids = topk_ids.contiguous()
+        elif self.moe_config.ep_size > 1:
             # Avoid topk_ids = -1, remap them to an
             # expert not owned by this rank so they are skipped. The same
             # kernel zeroes rows_per_expert, and with every id valid the fused

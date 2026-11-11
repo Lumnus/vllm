@@ -117,7 +117,7 @@ def test_ep_ids_contract(monkeypatch, stub, expected, eplb):
     xpu_moe.fused_moe_ep_contract.cache_clear()
     try:
         moe_config = SimpleNamespace(
-            moe_parallel_config=SimpleNamespace(enable_eplb=eplb)
+            ep_size=4, moe_parallel_config=SimpleNamespace(enable_eplb=eplb)
         )
         contract = xpu_moe.ep_ids_contract_for(moe_config)
     finally:
@@ -163,7 +163,9 @@ def test_expert_parallel_apply(monkeypatch, contract, ep_rank):
     experts.impl_apply_kwargs = {}
     experts.ep_contract = xpu_moe.EPIdsContract[contract]
     experts.moe_config = SimpleNamespace(ep_size=4, ep_rank=ep_rank)
-    ids = torch.tensor([[3, -1], [-1, 7]], dtype=torch.int32)
+    # A strided view, as a router may hand over: the op reads a dense array.
+    ids = torch.tensor([[3, 99, -1, 99], [-1, 99, 7, 99]], dtype=torch.int32)[:, ::2]
+    assert not ids.is_contiguous()
     hidden = torch.zeros(2, 8)
     experts.apply(
         torch.zeros(2, 8),
@@ -183,7 +185,8 @@ def test_expert_parallel_apply(monkeypatch, contract, ep_rank):
         False,
     )
     if contract == "OP_HANDLES_IDS":
-        assert seen["topk_ids"] is ids and not kernel_calls
+        assert seen["topk_ids"].is_contiguous() and not kernel_calls
+        assert torch.equal(seen["topk_ids"], ids)
         assert "ids_valid" not in seen and "rows_per_expert" not in seen
         return
     assert torch.equal(seen["topk_ids"], torch.where(ids < 0, sentinel, ids))
