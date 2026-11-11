@@ -6,6 +6,11 @@ from collections.abc import Sequence
 
 import torch
 
+from vllm import _custom_ops as ops
+from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
+    triton_scaled_mm,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
@@ -15,9 +20,17 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .BlockScaledMMLinearKernel import Fp8BlockScaledMMLinearKernel
-from .ScaledMMLinearKernel import FP8ScaledMMLinearKernel, FP8ScaledMMLinearLayerConfig
+from .ScaledMMLinearKernel import (
+    FP8ScaledMMLinearKernel,
+    FP8ScaledMMLinearLayerConfig,
+    Int8ScaledMMLinearLayerConfig,
+)
+from .triton import TritonInt8ScaledMMLinearKernel
+
+logger = init_logger(__name__)
 
 
 class XPUW8A8FP8LinearKernel(FP8ScaledMMLinearKernel):
@@ -286,3 +299,120 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             Bs.t(),
             torch.Tensor(),
         )
+
+
+# Row counts at or below this keep the Triton kernel: its small-M tiles beat
+# oneDNN there.
+XPU_INT8_ONEDNN_MIN_ROWS = 64
+
+
+def xpu_int8_onednn_gemm_available() -> bool:
+    """Whether the vllm-xpu-kernels build has an `int8_gemm_w8a8` that can write
+    bf16 (an `out_dtype` argument). Older builds return fp16 only."""
+    try:
+        schema = torch.ops._xpu_C.int8_gemm_w8a8.default._schema
+    except (AttributeError, RuntimeError):
+        return False
+    return any(arg.name == "out_dtype" for arg in schema.arguments)
+
+
+def _xpu_int8_scaled_mm_func(
+    qx: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if qx.shape[0] <= XPU_INT8_ONEDNN_MIN_ROWS or output_dtype not in (
+        torch.bfloat16,
+        torch.float16,
+    ):
+        return triton_scaled_mm(
+            qx,
+            weight,
+            scale_a=x_scale,
+            scale_b=weight_scale,
+            out_dtype=output_dtype,
+            bias=bias,
+        )
+    a_scale = x_scale.reshape(1) if x_scale.numel() == 1 else x_scale.reshape(-1, 1)
+    return torch.ops._xpu_C.int8_gemm_w8a8(
+        qx,
+        a_scale,
+        None,
+        weight,
+        weight_scale.reshape(1, -1),
+        None,
+        -1,
+        bias,
+        output_dtype,
+    )
+
+
+def _xpu_int8_scaled_mm_fake(
+    qx: torch.Tensor,
+    weight: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    return torch.empty(
+        (qx.size(0), weight.size(1)), dtype=output_dtype, device=qx.device
+    )
+
+
+# The row split sits inside the op so that torch.compile keeps one graph for
+# every batch size.
+direct_register_custom_op(
+    "xpu_int8_scaled_mm_func",
+    _xpu_int8_scaled_mm_func,
+    fake_impl=_xpu_int8_scaled_mm_fake,
+)
+
+
+class XPUInt8ScaledMMLinearKernel(TritonInt8ScaledMMLinearKernel):
+    """W8A8 INT8 linear on XPU: oneDNN (`_xpu_C.int8_gemm_w8a8`, bf16 out) above
+    `XPU_INT8_ONEDNN_MIN_ROWS` rows, the Triton kernel at or below.
+
+    Selected only when the kernels build provides the op; symmetric activations
+    only, so asymmetric layers stay on the Triton kernel."""
+
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        if not current_platform.is_xpu():
+            return False, "requires XPU."
+        if not xpu_int8_onednn_gemm_available():
+            return (
+                False,
+                "vllm-xpu-kernels has no _xpu_C.int8_gemm_w8a8 with out_dtype.",
+            )
+        return True, None
+
+    @classmethod
+    def can_implement(cls, c: Int8ScaledMMLinearLayerConfig) -> tuple[bool, str | None]:
+        if not c.input_symmetric:
+            return False, "asymmetric activations are not supported."
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Same layout as the Triton kernel: the [N, K] weight as a [K, N] view
+        # (oneDNN NT format), channelwise scales for fused modules.
+        super().process_weights_after_loading(layer)
+        logger.info_once(
+            "XPU INT8 GEMM: oneDNN above %d rows, Triton at or below.",
+            XPU_INT8_ONEDNN_MIN_ROWS,
+        )
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        w_q, w_s, i_s, _, _ = self._get_layer_params(layer)
+        x_q, x_s, _ = ops.scaled_int8_quant(x.contiguous(), i_s, None, symmetric=True)
+        return torch.ops.vllm.xpu_int8_scaled_mm_func(x_q, w_q, x_s, w_s, x.dtype, bias)

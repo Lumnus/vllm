@@ -235,6 +235,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.triton import (
 )
 from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
     XPUFp8BlockScaledMMKernel,
+    XPUInt8ScaledMMLinearKernel,
     XPUW8A8FP8LinearKernel,
     XPUW8A16FP8LinearKernel,
 )
@@ -452,7 +453,7 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
         HummingInt8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [AiterInt8ScaledMMLinearKernel, TritonInt8ScaledMMLinearKernel],
-    PlatformEnum.XPU: [TritonInt8ScaledMMLinearKernel],
+    PlatformEnum.XPU: [XPUInt8ScaledMMLinearKernel, TritonInt8ScaledMMLinearKernel],
 }
 
 # in priority/performance order (when available)
@@ -1394,6 +1395,7 @@ __all__ = [
     "RowWiseTorchFP8ScaledMMLinearKernel",
     "ROCmFP8ScaledMMLinearKernel",
     "TritonInt8ScaledMMLinearKernel",
+    "XPUInt8ScaledMMLinearKernel",
     "ZentorchInt8ScaledMMLinearKernel",
     "ZentorchWNA16LinearKernel",
     "MPLinearKernel",
