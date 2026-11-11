@@ -38,8 +38,9 @@ def on_xpu(monkeypatch):
     monkeypatch.setattr(current_platform, "is_xpu", lambda: True)
     monkeypatch.setattr(current_platform, "is_cpu", lambda: False)
     monkeypatch.setattr(xpu_moe, "xpu_w4a8_moe_available", lambda: True)
-    monkeypatch.setattr(XPUExpertsWNA16, "_supports_current_device", staticmethod(
-        lambda: True))
+    monkeypatch.setattr(
+        XPUExpertsWNA16, "_supports_current_device", staticmethod(lambda: True)
+    )
 
 
 def _select(moe_args):
@@ -52,7 +53,10 @@ def _select(moe_args):
     )
     with set_current_vllm_config(config):
         return int_wna16.select_wna16_moe_backend(
-            moe, kInt4Static, quant_config=None, may_have_zp=False,
+            moe,
+            kInt4Static,
+            quant_config=None,
+            may_have_zp=False,
             may_have_bias=False,
         )
 
@@ -83,8 +87,9 @@ class _FakeImpl:
         self.calls.append(kwargs)
 
 
-@pytest.mark.parametrize(("cls", "w4a8"), [(XPUExpertsWNA16, False),
-                                           (XPUExpertsW4A8Int, True)])
+@pytest.mark.parametrize(
+    ("cls", "w4a8"), [(XPUExpertsWNA16, False), (XPUExpertsW4A8Int, True)]
+)
 def test_apply_passes_w4a8(cls, w4a8):
     experts = object.__new__(cls)
     experts.tiers = None
@@ -92,10 +97,20 @@ def test_apply_passes_w4a8(cls, w4a8):
     experts.moe_config = SimpleNamespace(ep_size=1, ep_rank=0)
     x = torch.zeros(3, 8)
     experts.apply(
-        output=torch.empty_like(x), hidden_states=x, w1=None, w2=None,
-        topk_weights=torch.ones(3, 2), topk_ids=torch.zeros(3, 2, dtype=torch.int32),
-        activation=None, global_num_experts=8, expert_map=None, a1q_scale=None,
-        a2_scale=None, workspace13=None, workspace2=None, expert_tokens_meta=None,
+        output=torch.empty_like(x),
+        hidden_states=x,
+        w1=None,
+        w2=None,
+        topk_weights=torch.ones(3, 2),
+        topk_ids=torch.zeros(3, 2, dtype=torch.int32),
+        activation=None,
+        global_num_experts=8,
+        expert_map=None,
+        a1q_scale=None,
+        a2_scale=None,
+        workspace13=None,
+        workspace2=None,
+        expert_tokens_meta=None,
         apply_router_weight_on_input=False,
     )
     (call,) = experts.fused_moe_impl.calls
