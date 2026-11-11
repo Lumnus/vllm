@@ -3,6 +3,7 @@
 
 import contextlib
 import os
+from functools import cache
 from typing import TYPE_CHECKING
 
 import torch
@@ -14,6 +15,7 @@ import vllm_xpu_kernels._xpu_C  # noqa
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.utils.platform_utils import xpu_get_device_properties
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
 from .interface import DeviceCapability, Platform, PlatformEnum
@@ -98,6 +100,29 @@ def get_mem_info_wrapper(
 
 
 torch.accelerator.get_memory_info = get_mem_info_wrapper
+
+
+@cache
+def _device_name_and_memory(device_id: int) -> tuple[str, int]:
+    """Name and total memory of a device.
+
+    The API server and the engine core ask for these and never compute on a
+    device, so they must not initialize the XPU runtime to get the answer.
+    The values are torch.xpu's own on every path.
+    """
+    names = ("name", "total_memory")
+    try:
+        name, total_memory = xpu_get_device_properties(device_id, names)
+    except Exception:
+        logger.warning(
+            "Could not read the properties of XPU device %d in a child "
+            "process; initializing the XPU runtime in this process to read "
+            "them.",
+            device_id,
+            exc_info=True,
+        )
+        name, total_memory = xpu_get_device_properties(device_id, names, init_xpu=True)
+    return name, total_memory
 
 
 class XPUPlatform(Platform):
@@ -355,7 +380,7 @@ class XPUPlatform(Platform):
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
-        return torch.xpu.get_device_name(device_id)
+        return _device_name_and_memory(device_id)[0]
 
     @classmethod
     def get_punica_wrapper(cls) -> str:
@@ -367,8 +392,7 @@ class XPUPlatform(Platform):
 
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
-        device_props = torch.xpu.get_device_properties(device_id)
-        return device_props.total_memory
+        return _device_name_and_memory(device_id)[1]
 
     @classmethod
     def inference_mode(cls):
