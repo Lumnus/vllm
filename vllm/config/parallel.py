@@ -126,8 +126,9 @@ class EPLBConfig:
     - "pynccl": Use PyNccl send/recv
     - "symm_mem": Push expert rows over CUDA symmetric memory; needs all EP
       ranks in one NVLink domain (MNNVL across nodes)
-    - None: Auto-select backend ("torch_xccl" on XPU, prefers "nixl" 
-      on CUDA, falls back to "torch_gloo")
+    - None: Auto-select backend ("torch_xccl" on XPU for synchronous
+      EPLB and "torch_gloo" for async EPLB, prefers "nixl" on CUDA, falls
+      back to "torch_gloo")
     """
 
     enable_migration_batching: bool = False
@@ -197,12 +198,20 @@ class EPLBConfig:
                 "Async EPLB is only supported with the default and incremental "
                 "policies."
             )
-        if self.use_async and self.communicator in ("torch_nccl", "pynccl"):
+        if self.use_async and self.communicator in (
+            "torch_nccl",
+            "pynccl",
+            "torch_xccl",
+        ):
+            # The async worker's device P2P would run on its own stream next to
+            # the forward's collectives on another communicator; NCCL and
+            # oneCCL do not order the two, and a rank can wait on one while
+            # its peers wait on the other.
             raise ValueError(
                 f"{self.communicator} communicator is incompatible with "
-                "async EPLB due to NCCL multi-stream conflicts. Use "
-                "'torch_gloo' or 'nixl' instead, or leave communicator "
-                "unset for automatic selection."
+                "async EPLB due to multi-stream conflicts between device "
+                "communicators. Use 'torch_gloo' or 'nixl' instead, or leave "
+                "communicator unset for automatic selection."
             )
         if self.decode_token_weight == 0 and self.prefill_token_weight == 0:
             raise ValueError(
@@ -1282,8 +1291,13 @@ class ParallelConfig:
             from vllm.distributed.nixl_utils import is_nixl_available
 
             if current_platform.is_xpu():
-                # On XPU, use the device-native XCCL P2P backend.
-                self.eplb_config.communicator = "torch_xccl"
+                # On XPU, the device-native XCCL P2P backend, except for async
+                # EPLB: its transfers run on a second stream, where device P2P
+                # can deadlock against the forward's collectives (as NCCL's
+                # does), so they go through gloo with host staging.
+                self.eplb_config.communicator = (
+                    "torch_gloo" if self.eplb_config.use_async else "torch_xccl"
+                )
             elif is_nixl_available():
                 self.eplb_config.communicator = "nixl"
             elif self.enable_elastic_ep:
