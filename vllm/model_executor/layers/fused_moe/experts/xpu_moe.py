@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import enum
 import functools
 import inspect
 
@@ -110,19 +111,59 @@ def sentinel_ids_and_counts(
     return out.view(topk_ids.shape), counts
 
 
+class EPIdsContract(enum.Enum):
+    """Who handles the routed ids a rank does not own, per vllm-xpu-kernels."""
+
+    # XpuFusedMoe.apply skips negative, out-of-range and unowned ids and clears
+    # its own rows_per_expert: the layer passes the routed ids as they are.
+    OP_HANDLES_IDS = "op"
+    # apply takes ids_valid / rows_per_expert: the layer maps unrouted ids to
+    # an unowned sentinel and zeroes the counts in one kernel.
+    IDS_VALID = "ids_valid"
+    # Neither: the layer maps unrouted ids with torch.where and the fused MoE
+    # keeps its padding-row mask.
+    PADDING_MASK = "padding_mask"
+
+
+# Class attributes XpuFusedMoe sets when apply() itself handles unowned ids
+# and clears rows_per_expert. Both are needed for EPIdsContract.OP_HANDLES_IDS.
+FUSED_MOE_OP_MARKERS = ("HANDLES_UNOWNED_IDS", "CLEARS_ROWS_PER_EXPERT")
+
+
 @functools.cache
-def fused_moe_takes_valid_ids() -> bool:
-    """Whether the installed XpuFusedMoe.apply takes ``ids_valid`` and
-    ``rows_per_expert``. Without them the expert-parallel path rewrites the
-    unrouted ids and leaves the padding-row mask to the fused MoE."""
+def fused_moe_ep_contract() -> EPIdsContract:
+    """What the installed XpuFusedMoe does with the routed ids, read once."""
+    if all(getattr(XpuFusedMoe, name, False) for name in FUSED_MOE_OP_MARKERS):
+        return EPIdsContract.OP_HANDLES_IDS
     params = inspect.signature(XpuFusedMoe.apply).parameters
-    supported = "ids_valid" in params and "rows_per_expert" in params
-    if not supported:
-        logger.info(
-            "vllm-xpu-kernels' XpuFusedMoe.apply takes no ids_valid / "
-            "rows_per_expert: expert-parallel layers keep its padding-row mask."
-        )
-    return supported
+    if "ids_valid" in params and "rows_per_expert" in params:
+        return EPIdsContract.IDS_VALID
+    return EPIdsContract.PADDING_MASK
+
+
+def ep_ids_contract_for(moe_config: FusedMoEConfig) -> EPIdsContract:
+    """The contract an expert-parallel layer uses. With EPLB the layer keeps
+    rewriting the ids itself: rebalancing changes which experts a rank owns,
+    and that path was not validated with the op filtering them."""
+    contract = fused_moe_ep_contract()
+    parallel_config = getattr(moe_config, "moe_parallel_config", None)
+    if contract is EPIdsContract.OP_HANDLES_IDS and getattr(
+        parallel_config, "enable_eplb", False
+    ):
+        contract = EPIdsContract.IDS_VALID
+    logger.info_once(
+        "XPU MoE expert parallelism: %s.",
+        {
+            EPIdsContract.OP_HANDLES_IDS: "the fused MoE filters unowned ids and "
+            "clears its expert counts; the routed ids are passed as they are",
+            EPIdsContract.IDS_VALID: "unrouted ids are mapped to an unowned "
+            "sentinel and the expert counts zeroed in one kernel (ids_valid)",
+            EPIdsContract.PADDING_MASK: "vllm-xpu-kernels' XpuFusedMoe.apply takes "
+            "no ids_valid / rows_per_expert; the fused MoE keeps its padding-row "
+            "mask",
+        }[contract],
+    )
+    return contract
 
 
 class XPUExperts(mk.FusedMoEExpertsModular):
@@ -151,7 +192,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         self.fused_moe_impl: XpuFusedMoe | None = None
         is_xe2_or_xe3 = torch.ops._xpu_C.is_xe2_arch() or torch.ops._xpu_C.is_xe3_arch()
         self._expects_unquantized_inputs = is_xe2_or_xe3
-        self.passes_valid_ids = fused_moe_takes_valid_ids()
+        self.ep_contract = ep_ids_contract_for(moe_config)
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -311,13 +352,16 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         assert self.fused_moe_impl is not None
         impl = staged_impl(self.fused_moe_impl, hidden_states.size(0), "experts")
         ep_kwargs: dict = {}
-        if self.moe_config.ep_size > 1:
+        if (
+            self.moe_config.ep_size > 1
+            and self.ep_contract is not EPIdsContract.OP_HANDLES_IDS
+        ):
             # Avoid topk_ids = -1, remap them to an
             # expert not owned by this rank so they are skipped. The same
             # kernel zeroes rows_per_expert, and with every id valid the fused
             # MoE skips its padding-row mask.
             sentinel = global_num_experts - 1 if self.moe_config.ep_rank == 0 else 0
-            if self.passes_valid_ids:
+            if self.ep_contract is EPIdsContract.IDS_VALID:
                 topk_ids, rows_per_expert = sentinel_ids_and_counts(
                     topk_ids, sentinel, impl.num_experts
                 )

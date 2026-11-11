@@ -69,48 +69,80 @@ def test_sentinel_ids_and_counts(num_tokens, top_k, num_local_experts, sentinel)
     assert int(counts.abs().sum()) == 0
 
 
-@pytest.mark.parametrize("supported", [True, False])
-def test_detects_valid_ids_support(monkeypatch, supported):
+class _FusedMoeIdsValid:
+    def apply(
+        self,
+        output,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        a1q_scale=None,
+        ids_valid=False,
+        rows_per_expert=None,
+    ):
+        pass
+
+
+class _FusedMoeOpHandlesIds(_FusedMoeIdsValid):
+    HANDLES_UNOWNED_IDS = True
+    CLEARS_ROWS_PER_EXPERT = True
+
+
+class _FusedMoeOneMarker(_FusedMoeIdsValid):
+    HANDLES_UNOWNED_IDS = True
+
+
+class _FusedMoePlain:
+    def apply(self, output, hidden_states, topk_weights, topk_ids, a1q_scale=None):
+        pass
+
+
+@pytest.mark.parametrize(
+    "stub, expected",
+    [
+        (_FusedMoeOpHandlesIds, "OP_HANDLES_IDS"),
+        (_FusedMoeOneMarker, "IDS_VALID"),
+        (_FusedMoeIdsValid, "IDS_VALID"),
+        (_FusedMoePlain, "PADDING_MASK"),
+    ],
+)
+@pytest.mark.parametrize("eplb", [False, True])
+def test_ep_ids_contract(monkeypatch, stub, expected, eplb):
+    """Both kernels markers: the op handles the ids; one marker or only the
+    ids_valid parameters: ids_valid; neither: the padding-row mask. EPLB keeps
+    the layer rewriting the ids itself."""
     from vllm.model_executor.layers.fused_moe.experts import xpu_moe
 
-    class FusedMoeWith:
-        def apply(
-            self,
-            output,
-            hidden_states,
-            topk_weights,
-            topk_ids,
-            a1q_scale=None,
-            ids_valid=False,
-            rows_per_expert=None,
-        ):
-            pass
-
-    class FusedMoeWithout:
-        def apply(self, output, hidden_states, topk_weights, topk_ids, a1q_scale=None):
-            pass
-
-    stub = FusedMoeWith if supported else FusedMoeWithout
     monkeypatch.setattr(xpu_moe, "XpuFusedMoe", stub, raising=False)
-    xpu_moe.fused_moe_takes_valid_ids.cache_clear()
+    xpu_moe.fused_moe_ep_contract.cache_clear()
     try:
-        assert xpu_moe.fused_moe_takes_valid_ids() is supported
+        moe_config = SimpleNamespace(
+            moe_parallel_config=SimpleNamespace(enable_eplb=eplb)
+        )
+        contract = xpu_moe.ep_ids_contract_for(moe_config)
     finally:
-        xpu_moe.fused_moe_takes_valid_ids.cache_clear()
+        xpu_moe.fused_moe_ep_contract.cache_clear()
+    if eplb and expected == "OP_HANDLES_IDS":
+        expected = "IDS_VALID"
+    assert contract is xpu_moe.EPIdsContract[expected]
 
 
-@pytest.mark.parametrize("passes_valid_ids", [True, False])
+@pytest.mark.parametrize("contract", ["OP_HANDLES_IDS", "IDS_VALID", "PADDING_MASK"])
 @pytest.mark.parametrize("ep_rank", [0, 2])
-def test_expert_parallel_apply(monkeypatch, passes_valid_ids, ep_rank):
-    """With the kernels' support: sentinel-mapped ids, ids_valid=True and a
-    zeroed int32 rows_per_expert. Without it: the same ids through
-    torch.where and neither argument, so the fused MoE keeps its mask."""
+def test_expert_parallel_apply(monkeypatch, contract, ep_rank):
+    """OP_HANDLES_IDS: the routed ids as they are, no sentinel kernel, neither
+    argument. IDS_VALID: sentinel-mapped ids from the one kernel,
+    ids_valid=True and a zeroed int32 rows_per_expert. PADDING_MASK: the same
+    ids through torch.where and neither argument, so the fused MoE keeps its
+    mask."""
     from vllm.model_executor.layers.fused_moe.experts import xpu_moe
 
     num_global, num_local = 256, 64
     sentinel = num_global - 1 if ep_rank == 0 else 0
+    kernel_calls = []
 
     def reference_sentinel(topk_ids, sentinel_, num_local_experts):
+        kernel_calls.append(1)
         assert sentinel_ == sentinel and num_local_experts == num_local
         counts = torch.zeros(num_local_experts, dtype=torch.int32)
         return torch.where(topk_ids < 0, sentinel_, topk_ids), counts
@@ -129,7 +161,7 @@ def test_expert_parallel_apply(monkeypatch, passes_valid_ids, ep_rank):
     experts.tiers = None
     experts.fused_moe_impl = Impl()
     experts.impl_apply_kwargs = {}
-    experts.passes_valid_ids = passes_valid_ids
+    experts.ep_contract = xpu_moe.EPIdsContract[contract]
     experts.moe_config = SimpleNamespace(ep_size=4, ep_rank=ep_rank)
     ids = torch.tensor([[3, -1], [-1, 7]], dtype=torch.int32)
     hidden = torch.zeros(2, 8)
@@ -150,10 +182,16 @@ def test_expert_parallel_apply(monkeypatch, passes_valid_ids, ep_rank):
         None,
         False,
     )
+    if contract == "OP_HANDLES_IDS":
+        assert seen["topk_ids"] is ids and not kernel_calls
+        assert "ids_valid" not in seen and "rows_per_expert" not in seen
+        return
     assert torch.equal(seen["topk_ids"], torch.where(ids < 0, sentinel, ids))
-    if passes_valid_ids:
+    if contract == "IDS_VALID":
+        assert kernel_calls == [1]
         assert seen["ids_valid"] is True
         assert seen["rows_per_expert"].dtype == torch.int32
         assert not seen["rows_per_expert"].any()
     else:
+        assert not kernel_calls
         assert "ids_valid" not in seen and "rows_per_expert" not in seen
