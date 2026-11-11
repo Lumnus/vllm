@@ -2,14 +2,53 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The XPU expert-parallel sentinel kernel: ids as ``torch.where`` maps them,
 and a zeroed ``rows_per_expert``; and the expert-parallel call into the fused
-MoE with and without the kernels' ``ids_valid`` / ``rows_per_expert``."""
+MoE with and without the kernels' ``ids_valid`` / ``rows_per_expert``.
 
+The kernel runs on a card, and on CPU under the Triton interpreter (in a
+subprocess, so the interpreter setting stays out of this session)."""
+
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm.platforms import current_platform
+
+_INTERPRETED_CHECK = """
+import torch
+from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
+    sentinel_ids_and_counts,
+)
+
+g = torch.Generator().manual_seed(0)
+for num_tokens, top_k, num_local_experts, sentinel in (
+    (1, 1, 4, 0),
+    (7, 8, 64, 255),
+    (300, 8, 300, 0),
+):
+    ids = torch.randint(-1, 256, (num_tokens, top_k), dtype=torch.int32, generator=g)
+    out, counts = sentinel_ids_and_counts(ids, sentinel, num_local_experts)
+    assert torch.equal(out, torch.where(ids < 0, sentinel, ids)), (num_tokens, top_k)
+    assert out.shape == ids.shape and out.dtype == ids.dtype
+    assert counts.dtype == torch.int32 and counts.shape == (num_local_experts,)
+    assert not counts.any()
+print("SENTINEL-OK")
+"""
+
+
+def test_sentinel_ids_and_counts_interpreted():
+    env = dict(os.environ, TRITON_INTERPRET="1", CUDA_VISIBLE_DEVICES="")
+    run = subprocess.run(
+        [sys.executable, "-c", _INTERPRETED_CHECK],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert run.returncode == 0 and "SENTINEL-OK" in run.stdout, run.stderr[-3000:]
 
 
 @pytest.mark.skipif(not current_platform.is_xpu(), reason="XPU only")
