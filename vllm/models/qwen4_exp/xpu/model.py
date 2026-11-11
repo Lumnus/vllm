@@ -979,10 +979,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         # Hyper-connections replace the per-layer RMSNorm + residual add.
         self.attn_hyper_connection = HyperConnection(
-            config, has_inject=True, prefix=f"{prefix}.attn_hyper_connection"
+            config,
+            has_inject=True,
+            prefix=f"{prefix}.attn_hyper_connection",
+            quant_config=quant_config,
         )
         self.mlp_hyper_connection = HyperConnection(
-            config, has_inject=True, prefix=f"{prefix}.mlp_hyper_connection"
+            config,
+            has_inject=True,
+            prefix=f"{prefix}.mlp_hyper_connection",
+            quant_config=quant_config,
         )
 
         if self.layer_type == "linear_attention":
