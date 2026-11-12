@@ -4,7 +4,7 @@
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
@@ -27,6 +27,9 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
 
@@ -240,9 +243,12 @@ class KVCacheManager:
         """Grow the block pool to num_blocks blocks, the device memory behind
         them being in place. Requests running keep their blocks; the new ones
         are free for the next allocation."""
-        config = self.kv_cache_config
-        assert num_blocks > config.num_blocks
+        assert num_blocks > self.kv_cache_config.num_blocks
         self.coordinator.grow(num_blocks)
+        self._set_num_blocks(num_blocks)
+
+    def _set_num_blocks(self, num_blocks: int) -> None:
+        config = self.kv_cache_config
         # Tensor sizes follow the block count, as when sizing shrinks it.
         config.kv_cache_tensors = [
             tensor
@@ -252,6 +258,42 @@ class KVCacheManager:
         ]
         config.num_blocks = num_blocks
         self.watermark_blocks = int(self.watermark * num_blocks)
+
+    def min_num_blocks(self, vllm_config: "VllmConfig") -> int:
+        """The fewest blocks the pool may be shrunk to: one request of
+        max_model_len tokens must still fit beside the null block and the
+        watermark, as the startup sizing requires
+        (`get_max_concurrency_for_kv_cache_config`, `shrink_kv_cache_configs`).
+        """
+        blocks_per_request = 0
+        for group in self.kv_cache_config.kv_cache_groups:
+            if group.host_resident:
+                continue
+            spec = group.kv_cache_spec
+            blocks_per_request += cdiv(
+                spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
+            )
+        num_blocks = 1 + blocks_per_request
+        while num_blocks - 1 - int(self.watermark * num_blocks) < blocks_per_request:
+            num_blocks += 1
+        return num_blocks
+
+    def begin_shrink(self, num_blocks: int) -> None:
+        """Fence the blocks from num_blocks on (`BlockPool.begin_shrink`).
+        Admission sees the smaller pool at once: the watermark follows it."""
+        self.block_pool.begin_shrink(num_blocks)
+        self.watermark_blocks = int(self.watermark * num_blocks)
+
+    def finish_shrink(self) -> None:
+        """Cut the pool to the fenced size once drained."""
+        retire_from = self.block_pool.retire_from
+        assert retire_from is not None
+        self.block_pool.finish_shrink()
+        self._set_num_blocks(retire_from)
+
+    def abort_shrink(self) -> None:
+        self.block_pool.abort_shrink()
+        self.watermark_blocks = int(self.watermark * self.kv_cache_config.num_blocks)
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
