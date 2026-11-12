@@ -37,6 +37,7 @@ from vllm.v1.attention.ops.vit_attn_wrappers import (
     vit_flash_attn_wrapper,
     vit_flashinfer_wrapper,
     vit_torch_sdpa_wrapper,
+    vit_torch_sdpa_wrapper_on_host,
     vit_triton_attn_wrapper,
 )
 
@@ -527,10 +528,14 @@ class MMEncoderAttention(CustomOp):
         key: torch.Tensor,
         value: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
+        on_host: bool = False,
     ) -> torch.Tensor:
         """Input shape:
         (batch_size x seq_len x hidden_size) or
         (batch_size x seq_len x num_heads x head_size)
+
+        `on_host` is for tensors in host memory in an engine whose platform
+        is an accelerator: the registered op has no host kernel there.
         """
         bsz, q_len = query.size()[:2]
         kv_len = key.size(1)
@@ -538,7 +543,8 @@ class MMEncoderAttention(CustomOp):
 
         query, key, value = self.view_qkv_to_4d(query, key, value, bsz, q_len, kv_len)
 
-        output = vit_torch_sdpa_wrapper(
+        sdpa = vit_torch_sdpa_wrapper_on_host if on_host else vit_torch_sdpa_wrapper
+        output = sdpa(
             q=query,
             k=key,
             v=value,
@@ -812,7 +818,7 @@ class MMEncoderAttention(CustomOp):
         sequence_lengths: torch.Tensor
         | None = None,  # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
-        return self._forward_sdpa(query, key, value, cu_seqlens)
+        return self._forward_sdpa(query, key, value, cu_seqlens, on_host=True)
 
     def forward_xpu(
         self,

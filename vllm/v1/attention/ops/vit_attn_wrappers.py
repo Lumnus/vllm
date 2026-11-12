@@ -333,6 +333,26 @@ def vit_torch_sdpa_wrapper(
     )
 
 
+def vit_torch_sdpa_wrapper_on_host(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float | None = None,
+    cu_seqlens: torch.Tensor | None = None,
+    enable_gqa: bool = False,
+) -> torch.Tensor:
+    """`vit_torch_sdpa_wrapper` for tensors in host memory.
+
+    The op is registered for the dispatch key of the engine's platform, so a
+    host tensor has no kernel behind it when that platform is an accelerator.
+    The op is only a boundary for graph compilation: called eagerly, the
+    function it wraps gives the same result without the dispatcher.
+    """
+    if torch.compiler.is_compiling():
+        return vit_torch_sdpa_wrapper(q, k, v, scale, cu_seqlens, enable_gqa=enable_gqa)
+    return torch_sdpa_wrapper(q, k, v, scale, cu_seqlens, enable_gqa=enable_gqa)
+
+
 def flashinfer_wrapper(
     q: torch.Tensor,
     k: torch.Tensor,
