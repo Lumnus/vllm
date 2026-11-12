@@ -16,6 +16,32 @@ from .xpu_store_harness import FAST, LAYERS, E, Env, expert_in_store, pool_rows,
 pytestmark = pytest.mark.skip_global_cleanup
 
 
+def test_a_unit_computed_on_the_host_is_the_unit_the_first_load_writes(
+    monkeypatch, tmp_path
+):
+    """For a build outside the engine: one expert's checkpoint tensors through
+    ``kernel_layout_unit`` are, byte for byte, the unit the tiers wrote for
+    that expert, whether its slot was in a fast row or in a host row."""
+    from vllm.model_executor.layers.fused_moe import xpu_expert_tiers as xt
+
+    from .xpu_store_harness import checkpoint, raw_gptq
+
+    env = run(monkeypatch, tmp_path, store=True)
+    for layer in range(LAYERS):
+        for slot in range(E):
+            want = expert_in_store(env, layer, slot)
+            got = xt.kernel_layout_unit(
+                **raw_gptq(checkpoint(layer, slot)), scales_dtype=torch.bfloat16
+            )
+            assert list(got) == list(want)  # the unit's tensor order
+            for key in want:
+                assert torch.equal(
+                    got[key].reshape(-1).view(torch.uint8),
+                    want[key].reshape(-1).view(torch.uint8),
+                ), (layer, slot, key)
+    tstore.reset_sessions()
+
+
 def test_build_then_fill_give_the_host_rows_the_checkpoint_path_gives(
     monkeypatch, tmp_path
 ):
