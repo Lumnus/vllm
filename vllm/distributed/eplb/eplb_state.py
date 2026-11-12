@@ -54,6 +54,7 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
 from .eplb_state_file import read_expert_loads, write_expert_loads
+from .eplb_trace import ExpertLoadTracer
 from .eplb_utils import CpuGpuEvent
 from .expert_weights import (
     fast_slot_count,
@@ -308,6 +309,20 @@ class EplbState:
         ] = deque()
         """Balancedness stats whose copies to the host are in flight, oldest
         first."""
+        self._trace: ExpertLoadTracer | None = None
+        """Writer of the routed expert load over time, when
+        `EPLBConfig.trace_path` is set."""
+        eplb_config = parallel_config.eplb_config
+        if eplb_config.trace_path is not None:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                else 0
+            )
+            self._trace = ExpertLoadTracer(
+                eplb_config.trace_path, eplb_config.trace_interval, rank
+            )
         self.is_async: bool = False
         """
         The flag indicates whether the EPLB is running in async mode.
@@ -868,6 +883,8 @@ class EplbState:
         # Update the expert load sliding window
         if not is_dummy:
             should_record = self._should_record_current_step(log_stats=log_stats)
+            if self._trace is not None:
+                self._trace.accumulate(list(self.model_states.values()))
             for eplb_model_state in self.model_states.values():
                 if should_record:
                     eplb_model_state.expert_load_window[
@@ -882,6 +899,9 @@ class EplbState:
                 self.expert_load_window_step += 1
                 if self.expert_load_window_step >= self.expert_load_window_size:
                     self.expert_load_window_step = 0
+
+            if self._trace is not None:
+                self._trace.end_step(list(self.model_states.values()))
 
         # Step the expert rearrangement step
         # Note that even if this is a dummy step, we still increment the
@@ -947,6 +967,8 @@ class EplbState:
         1) The next rearrangement step, so the sliding window is ready.
         2) The next balancedness logging step, when log_stats is enabled.
         """
+        if self._trace is not None:
+            return True  # the trace follows every step
         steps_remaining = (
             self.expert_rearrangement_step_interval - self.expert_rearrangement_step
         )
