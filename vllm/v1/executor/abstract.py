@@ -189,6 +189,22 @@ class Executor(ABC):
         assert len(set(results)) == 1, f"Workers disagree on the size: {results}"
         return results[0]
 
+    def kv_cache_shrink_plan(self, num_blocks: int) -> list[dict]:
+        """Every worker's answer to what a shrink to num_blocks would release
+        (`GPUWorker.kv_cache_shrink_plan`); changes nothing."""
+        return self.collective_rpc("kv_cache_shrink_plan", args=(num_blocks,))
+
+    def shrink_kv_cache(self, num_blocks: int) -> list[int]:
+        """Release the blocks from num_blocks on, on every worker; the bytes
+        each released. Raises if any worker could not finish."""
+        from vllm import envs
+
+        return self.collective_rpc(
+            "shrink_kv_cache",
+            args=(num_blocks,),
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+        )
+
     def register_failure_callback(self, callback: FailureCallback):  # noqa: B027
         """Register a function to be called if the executor enters a permanent
         failed state.

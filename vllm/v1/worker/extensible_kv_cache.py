@@ -137,6 +137,9 @@ class ExtensibleKVCache:
         # Mapped bytes of other holders of VMM memory on this device (e.g.
         # weights moved out of torch's allocator), which the cap leaves out.
         self.external_mapped_bytes: list[Callable[[], int]] = []
+        # The block count a shrink goes to, set while it is being carried out
+        # on this rank. Left set by a failure, for the next resize to finish.
+        self.unfinished_shrink: int | None = None
         # Set while a grow is being taken into use: the block counts it goes
         # from and to and the torch cap before it. Left set by a failure, for
         # the next resize to finish.
@@ -341,6 +344,32 @@ class ExtensibleKVCache:
             self.physical_bytes / (1 << 30),
         )
         return released
+
+    def truncate_to(self, num_blocks: int) -> None:
+        """Commit only the first num_blocks blocks, keeping everything mapped:
+        the first half of a shrink, so that views can be rebuilt over the
+        smaller prefix before the memory above it goes (`release_tail`)."""
+        if not self.min_committed_blocks <= num_blocks <= self.num_committed_blocks:
+            raise ValueError(
+                f"Cannot shrink the KV cache from {self.num_committed_blocks} to "
+                f"{num_blocks} blocks (minimum {self.min_committed_blocks})."
+            )
+        self.buffer.truncate_segments_(
+            [num_blocks * stride for stride in self.segment_strides]
+        )
+        self.num_committed_blocks = num_blocks
+
+    def release_tail(self) -> int:
+        """Give back the physical objects wholly above the committed prefix
+        of every segment; returns the bytes released. Repeating it after a
+        failure releases what the failed call left."""
+        return self.buffer.shrink_segments_(
+            [self.num_committed_blocks * stride for stride in self.segment_strides]
+        )
+
+    @property
+    def num_physical_chunks(self) -> int:
+        return self.buffer.num_physical_chunks
 
     def committed_views(
         self,
@@ -1195,6 +1224,11 @@ def grow_kv_cache(
         kv_cache.anchor_torch_memory_budget()
     error: Exception | None = None
     try:
+        if kv_cache.unfinished_shrink is not None:
+            raise RuntimeError(
+                f"A shrink of the KV cache to {kv_cache.unfinished_shrink} blocks "
+                "is unfinished on this rank; it must be finished before a grow."
+            )
         if kv_cache.unfinished_grow is not None:
             start, end, torch_memory_limit = kv_cache.unfinished_grow
             logger.warning(
@@ -1248,6 +1282,215 @@ def grow_kv_cache(
         return old
     _finish_grow(runner, old, num_blocks, kv_cache.torch_memory_limit)
     return num_blocks
+
+
+def forget_block_ids_from(runner: "GPUModelRunner", num_blocks: int) -> None:
+    """Make every persistent table on this rank's runner that can hold a block
+    id stop naming blocks at or above num_blocks, before they are unmapped.
+
+    A kernel may load table entries past the blocks a row attends, and after
+    an unmap an entry naming an unmapped block faults instead of reading
+    garbage. Tables that are rewritten on every step for the rows it uses
+    (the attention metadata builders' state indices, which pad with the null
+    block) and tables of addresses rather than ids (the block zeroer's) need
+    nothing; the rest is rewritten here:
+
+    - the per-request block tables and the forward block tables, and the
+      slot mappings (`BlockTables.forget_block_ids_from`);
+    - each attention group's kernel block table and kernel slot mapping, the
+      draft model's groups included (`AttentionGroup.forget_block_ids_from`);
+    - a speculator's own slot buffers, where it has any;
+    - the context-parallel local block tables, where present.
+    """
+    block_tables = getattr(runner, "block_tables", None)
+    if block_tables is not None:
+        block_tables.forget_block_ids_from(num_blocks)
+    speculator = getattr(runner, "speculator", None)
+    for groups in getattr(runner, "attn_groups", []) + getattr(
+        speculator, "attn_groups", []
+    ):
+        for group in groups:
+            group.forget_block_ids_from(num_blocks)
+    if speculator is not None and hasattr(speculator, "forget_block_ids_from"):
+        speculator.forget_block_ids_from(num_blocks)
+    pcp_manager = getattr(runner, "pcp_manager", None)
+    for table in getattr(pcp_manager, "_local_block_tables", None) or ():
+        table.masked_fill_(table >= num_blocks, 0)
+
+
+def _check_resizable(runner: "GPUModelRunner", what: str) -> None:
+    """Refusals that are the same on every rank, before any collective."""
+    if runner.vllm_config.attention_config.hisparse_config is not None:
+        raise NotImplementedError(f"{what} the KV cache does not support HiSparse.")
+    if not runner.cache_config.get_resolved_kv_cache_layout().is_block_compact:
+        raise NotImplementedError(
+            f"{what} the KV cache needs a block-compact KV cache layout."
+        )
+    if (
+        has_kv_transfer_group()
+        and not get_kv_transfer_group().supports_kv_cache_resize()
+    ):
+        raise NotImplementedError(
+            f"The KV connector {type(get_kv_transfer_group()).__name__} does not "
+            "support resizing the KV cache."
+        )
+
+
+def kv_cache_shrink_plan(runner: "GPUModelRunner", num_blocks: int) -> dict:
+    """What a shrink to num_blocks would give back on this rank, without
+    changing anything: the bytes (`releasable_bytes`, whole release chunks
+    only), the release chunk size (None when the cache was committed in one
+    object per segment, which releases next to nothing), and the counts."""
+    kv_cache = runner.extensible_kv_cache
+    assert kv_cache is not None
+    committed = kv_cache.num_committed_blocks
+    releasable = (
+        kv_cache._releasable_bytes(num_blocks)
+        if kv_cache.min_committed_blocks <= num_blocks <= committed
+        else 0
+    )
+    return {
+        "num_committed_blocks": committed,
+        "min_committed_blocks": kv_cache.min_committed_blocks,
+        "releasable_bytes": releasable,
+        "release_chunk_bytes": kv_cache.buffer.max_chunk_bytes,
+        "physical_bytes": kv_cache.physical_bytes,
+    }
+
+
+def _finish_shrink(runner: "GPUModelRunner", num_blocks: int) -> int:
+    """Carry out a shrink to num_blocks on this rank, once every rank agreed
+    and the scheduler holds no block at or above it. Returns the bytes
+    released.
+
+    In order: wait for the device; rewrite every persistent table that may
+    still name a block at or above num_blocks; commit only num_blocks
+    (memory still mapped) and rebuild the views over them; let the KV
+    connector follow (the offloading connector submits and waits for its
+    stores of those blocks); wait for the device again; release the whole
+    chunks above; set the torch cap from the budget. `unfinished_shrink`
+    stays set until the end, and every step can run again: the next resize
+    repeats a failed one before anything else.
+    """
+    kv_cache = runner.extensible_kv_cache
+    assert kv_cache is not None
+    kv_cache.unfinished_shrink = num_blocks
+    start = runner.kv_cache_config.num_blocks
+    chunks_before = kv_cache.num_physical_chunks
+    limit_before = kv_cache.torch_memory_limit
+    # Kernels of earlier steps may still read the tail.
+    torch.accelerator.synchronize()
+    forget_block_ids_from(runner, num_blocks)
+    if kv_cache.num_committed_blocks > num_blocks:
+        kv_cache.truncate_to(num_blocks)
+    if runner.kv_cache_config.num_blocks != num_blocks:
+        runner.kv_cache_config.num_blocks = num_blocks
+        try:
+            rebind_committed_views(runner)
+        except Exception:
+            # The runner keeps the views it had, still over mapped memory.
+            runner.kv_cache_config.num_blocks = start
+            raise
+    if has_kv_transfer_group():
+        get_kv_transfer_group().resize_kv_caches(runner.kv_caches_by_layer, num_blocks)
+    # The connector's transfers run on their own streams.
+    torch.accelerator.synchronize()
+    released = kv_cache.release_tail()
+    limit = kv_cache.refresh_torch_memory_limit()
+    kv_cache.unfinished_shrink = None
+    logger.info(
+        "Shrank KV cache from %d to %d blocks: released %s GiB in %d chunks "
+        "(%s GiB mapped now); torch cap %s GiB before, %s GiB after.",
+        start,
+        num_blocks,
+        format_gib(released),
+        chunks_before - kv_cache.num_physical_chunks,
+        format_gib(kv_cache.physical_bytes),
+        "no" if limit_before is None else format_gib(limit_before),
+        "no" if limit is None else format_gib(limit),
+    )
+    return released
+
+
+def shrink_kv_cache(
+    runner: "GPUModelRunner",
+    num_blocks: int,
+    *,
+    reduce_min: Callable[[int], int],
+) -> int:
+    """Give the KV cache's blocks from num_blocks on back to the device, on
+    every rank, while serving. Returns the bytes this rank released.
+
+    The caller (the engine core) runs this only once the scheduler has
+    fenced and drained those blocks, between two steps. Every rank calls
+    reduce_min exactly twice, whatever happens on it. The first agreement
+    is that every rank can go ahead: a rank that cannot (an unfinished grow
+    it fails to finish, a count out of range) votes no and raises after it,
+    and no rank changes anything. After it there is no way back: every rank
+    carries the shrink out (`_finish_shrink`), and the second agreement
+    tells all of them whether every rank finished. A rank that did not
+    keeps `unfinished_shrink`; the call raises on every rank, and repeating
+    it (the engine core does) finishes the shrink where it is unfinished
+    and changes nothing where it is done.
+    """
+    kv_cache = runner.extensible_kv_cache
+    assert kv_cache is not None
+    _check_resizable(runner, "Shrinking")
+    error: Exception | None = None
+    try:
+        if kv_cache.unfinished_grow is not None:
+            start, end, torch_memory_limit = kv_cache.unfinished_grow
+            logger.warning(
+                "Finishing the grow of the KV cache from %d to %d blocks before "
+                "shrinking it.",
+                start,
+                end,
+            )
+            _finish_grow(runner, start, end, torch_memory_limit, recovering=True)
+        if kv_cache.torch_memory_budget is None:
+            kv_cache.anchor_torch_memory_budget()
+        if (
+            not kv_cache.min_committed_blocks
+            <= num_blocks
+            <= (kv_cache.num_committed_blocks)
+        ):
+            raise ValueError(
+                f"Cannot shrink the KV cache from {kv_cache.num_committed_blocks} "
+                f"to {num_blocks} blocks."
+            )
+        ready = 1
+    except Exception as e:
+        logger.exception("This rank cannot shrink the KV cache; no rank shrinks.")
+        error = e
+        ready = 0
+    ready = reduce_min(ready)
+    released = 0
+    done = 1
+    if ready:
+        try:
+            released = _finish_shrink(runner, num_blocks)
+        except Exception as e:
+            logger.exception(
+                "Shrinking the KV cache to %d blocks failed on this rank; the "
+                "next resize finishes it.",
+                num_blocks,
+            )
+            error = e
+            done = 0
+    done = reduce_min(done)
+    if error is not None:
+        raise error
+    if not ready:
+        raise RuntimeError(
+            "Another rank could not take part in shrinking the KV cache; no rank "
+            "shrank."
+        )
+    if not done:
+        raise RuntimeError(
+            f"Shrinking the KV cache to {num_blocks} blocks is unfinished on "
+            "another rank; repeating the call finishes it."
+        )
+    return released
 
 
 # A layerwise weight update holds a layer's checkpoint-format copy while weight

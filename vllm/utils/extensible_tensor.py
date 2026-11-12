@@ -577,6 +577,13 @@ class ExtensibleTensor:
         self._committed = list(sizes)
         return sum(self._buffer.release_range(start, end) for start, end in ranges)
 
+    def truncate_segments_(self, sizes: Sequence[int]) -> None:
+        """Shrink each segment's committed prefix to `sizes[i]` bytes without
+        releasing anything: views built afterwards stop at the new sizes,
+        while the memory above stays mapped until `shrink_segments_`."""
+        self._shrunk_ranges(sizes)
+        self._committed = list(sizes)
+
     def release_physical(self) -> None:
         """Drop all physical pages but keep the reservation and its views."""
         self._buffer.release_physical()
