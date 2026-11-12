@@ -155,9 +155,7 @@ class _VirtualBuffer:
         self._mapped_granules.update(range(first, last))
         recorded.extend(range(first, last))
 
-    def _undo_call(
-        self, objects_before: int, recorded: list[int]
-    ) -> Exception | None:
+    def _undo_call(self, objects_before: int, recorded: list[int]) -> Exception | None:
         """Unmap and release the objects a failed `ensure_committed_range`
         created and forget the granules it recorded. Objects that cannot be
         released stay in the books, with their granules, so a later call can

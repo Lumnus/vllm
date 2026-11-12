@@ -1519,7 +1519,11 @@ def test_a_failed_grant_undoes_a_three_chunk_run(fake_xpu, monkeypatch):
         ops = fake_xpu.ops
         buffer = et._buffer
         buffer.ensure_committed_range(0, 2 * GRANULE)  # an earlier call
-        before = (ops.physical_bytes, list(buffer._handles), set(buffer._mapped_granules))
+        before = (
+            ops.physical_bytes,
+            list(buffer._handles),
+            set(buffer._mapped_granules),
+        )
         assert before[0] == 2 * GRANULE
 
         grant = _fail_grants(fake_xpu, monkeypatch, {1})
