@@ -46,6 +46,7 @@ from vllm.config import (
     EncoderCacheManagerConfig,
     EngramConfig,
     EPLBConfig,
+    ExpertStoreConfig,
     FaultToleranceConfig,
     KernelConfig,
     KVEventsConfig,
@@ -788,6 +789,7 @@ class EngineArgs:
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
     attention_config: AttentionConfig = get_field(VllmConfig, "attention_config")
     engram_config: EngramConfig | None = VllmConfig.engram_config
+    expert_store_config: ExpertStoreConfig | None = VllmConfig.expert_store_config
     mamba_config: MambaConfig = get_field(VllmConfig, "mamba_config")
     kernel_config: KernelConfig = get_field(VllmConfig, "kernel_config")
     enable_flashinfer_autotune: bool = get_field(
@@ -911,6 +913,8 @@ class EngineArgs:
             self.aux_output_config.enable_return_routed_experts = True
         if isinstance(self.engram_config, dict):
             self.engram_config = EngramConfig(**self.engram_config)
+        if isinstance(self.expert_store_config, dict):
+            self.expert_store_config = ExpertStoreConfig(**self.expert_store_config)
         if isinstance(self.mamba_config, dict):
             self.mamba_config = MambaConfig(**self.mamba_config)
         if isinstance(self.kernel_config, dict):
@@ -1960,6 +1964,9 @@ class EngineArgs:
             "--attention-config", "-ac", **vllm_kwargs["attention_config"]
         )
         vllm_group.add_argument("--engram-config", **vllm_kwargs["engram_config"])
+        vllm_group.add_argument(
+            "--expert-store-config", **vllm_kwargs["expert_store_config"]
+        )
         vllm_group.add_argument("--reasoning-config", **vllm_kwargs["reasoning_config"])
         vllm_group.add_argument("--kernel-config", **vllm_kwargs["kernel_config"])
         vllm_group.add_argument(
@@ -2974,6 +2981,7 @@ class EngineArgs:
             attention_config=attention_config,
             aux_output_config=self.aux_output_config,
             engram_config=self.engram_config,
+            expert_store_config=self.expert_store_config,
             mamba_config=mamba_config,
             kernel_config=kernel_config,
             lora_config=lora_config,
