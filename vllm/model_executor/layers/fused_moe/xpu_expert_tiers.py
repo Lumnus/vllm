@@ -497,7 +497,40 @@ class ExpertTiers:
             return
         if binding.session.mode == "build":
             self._write_units()
+        else:
+            self._check_store_against_this_boot()
         binding.session.layer_done(self.layer_name)
+
+    def _check_store_against_this_boot(self) -> None:
+        """Fill mode: the fast rows were just laid out by this tree and these
+        kernels from the checkpoint. A few of them must equal the store's
+        units for the same experts, or the store was built from another
+        checkpoint or under another kernel layout, and the host rows it
+        filled would not match the fast rows."""
+        from vllm.model_executor.offloader.expert_store import StoreMismatchError
+
+        binding = self.store_binding
+        assert binding is not None and self._impls is not None
+        store = binding.session.store
+        fast = self._impls[0]
+        for slot in sorted({0, self.num_fast // 2, self.num_fast - 1}):
+            if self.slot_global[slot] >= binding.num_logical:
+                continue  # a replica
+            logical = int(binding.initial_logical[slot])
+            with store.get((binding.store_layer, logical)) as entry:
+                unit = entry.tensors()
+                for impl_field, key in _TIER_FIELDS:
+                    row = _u8(getattr(fast, impl_field))[slot].cpu()
+                    want = unit[key].reshape(-1).view(torch.uint8)
+                    if not torch.equal(row, want):
+                        raise StoreMismatchError(
+                            f"{self.layer_name}: the expert store's unit of "
+                            f"expert {logical} ({key}) differs from the row "
+                            "this start built from the checkpoint: the store "
+                            "was built from another checkpoint or by kernels "
+                            "with another weight layout. Start once with "
+                            "--expert-store-config build set to 'rebuild'"
+                        )
 
     def impls(
         self,
@@ -864,6 +897,22 @@ def slot_tensor_bytes(
     }
 
 
+def _layout_fingerprint() -> str:
+    """What the kernels' int4 transform does to every byte value. It is part
+    of the store's identity: a kernels build whose transform differs sees
+    another identity, whatever its version string says. A change of the row
+    layout that this probe cannot see is caught at load, when a store that
+    fills the host tier is compared with the rows this boot laid out
+    (``ExpertTiers._check_store_against_this_boot``)."""
+    import hashlib
+
+    from vllm_xpu_kernels.fused_moe_interface import implement_zp
+
+    probe = implement_zp(torch.arange(256, dtype=torch.uint8))
+    raw = probe.contiguous().view(torch.uint8).numpy().tobytes()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
 def _ep_barrier() -> None:
     if not torch.distributed.is_initialized():
         return
@@ -909,7 +958,9 @@ def _store_binding(
             moe_quant_params["params_dtype"],
         ),
     )
-    identity = store_identity(schema, checkpoint_identity(vllm_config.model_config))
+    identity = store_identity(
+        schema, checkpoint_identity(vllm_config.model_config), _layout_fingerprint()
+    )
     session = get_session(
         (identity, tuple(store_config.dirs)),
         lambda: StoreSession(

@@ -169,6 +169,63 @@ def test_the_staging_pool_is_pinned_only_when_asked(monkeypatch, tmp_path):
     tstore.reset_sessions()
 
 
+def _other_kernels(monkeypatch, tmp_path, zp_xor: int, layout_xor: int) -> Env:
+    """An environment whose kernels differ from the harness's: ``zp_xor`` is
+    what ``implement_zp`` does, ``layout_xor`` what the experts' constructor
+    does to the fast rows (the harness uses 0x88 for both)."""
+    import sys
+    import types
+
+    from vllm.model_executor.layers.fused_moe import xpu_expert_tiers as xt
+
+    from .xpu_store_harness import FakeXpuFusedMoe
+
+    class Kernel(FakeXpuFusedMoe):
+        def __init__(self, w13, w13_scales, w13_bias, w2, w2_scales, w2_bias, **kw):
+            if not hasattr(w13, "xpu_fused_moe"):
+                for w in (w13, w2):
+                    w.data = (w.data ^ layout_xor).view(torch.int8).clone()
+                w13.xpu_fused_moe = True
+            super().__init__(w13, w13_scales, w13_bias, w2, w2_scales, w2_bias, **kw)
+
+    env = Env(monkeypatch, tmp_path, True)
+    monkeypatch.setattr(xt, "_xpu_fused_moe", lambda: Kernel)
+    fake = types.ModuleType("vllm_xpu_kernels.fused_moe_interface")
+    fake.implement_zp = lambda packed: packed ^ zp_xor  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "vllm_xpu_kernels.fused_moe_interface", fake)
+    return env
+
+
+def test_a_store_built_under_another_weight_transform_is_not_filled_from(
+    monkeypatch, tmp_path
+):
+    """The identity carries a fingerprint of the kernels' transform: a
+    kernels build that changes it does not see the old store as its own."""
+    run(monkeypatch, tmp_path, store=True)
+    tstore.reset_sessions()
+    env = _other_kernels(monkeypatch, tmp_path, zp_xor=0x44, layout_xor=0x44)
+    with pytest.raises(ValueError, match="another checkpoint or kernel layout"):
+        env.construct()
+    tstore.reset_sessions()
+
+
+def test_a_fill_is_checked_against_the_rows_this_start_built(monkeypatch, tmp_path):
+    """A layout change the fingerprint cannot see (the experts' constructor
+    lays the rows out differently): the store opens for fill, and the first
+    layer's fast rows do not match its units."""
+    from vllm.model_executor.offloader.expert_store import StoreMismatchError
+
+    run(monkeypatch, tmp_path, store=True)
+    tstore.reset_sessions()
+    env = _other_kernels(monkeypatch, tmp_path, zp_xor=0x88, layout_xor=0x44)
+    env.construct()
+    assert env.tiers[0].store_binding.session.mode == "fill"
+    env.load()
+    with pytest.raises(StoreMismatchError, match="another weight layout"):
+        env.process()
+    tstore.reset_sessions()
+
+
 def _flip_unit(env, layer: int, logical: int) -> None:
     store = env.tiers[layer].store_binding.session.store
     stripe, offset, _ = store.layout.locate(layer, logical)
