@@ -317,6 +317,8 @@ class ExpertTiers:
             None if store is None else np.array(store.initial_logical, dtype=np.int64)
         )
         self.move_log: list[dict[str, float]] = []
+        # Slots whose row or expert changed since the last scrub.
+        self._touched: set[int] = set()
 
     @property
     def num_slow(self) -> int:
@@ -742,6 +744,8 @@ class ExpertTiers:
             on_pool_rows_changed=lambda: self.on_rows_written([]),
         )
         self.slot_logical = move.plan.new_logical.copy()
+        plan = move.plan
+        self._touched.update(plan.changed, plan.demoted, plan.to_fast)
         move.stats["commit_ms"] = (time.perf_counter() - t0) * 1e3
         self.move_log.append(move.stats)
 
@@ -856,6 +860,7 @@ class ExpertTiers:
         ops.compute_write(self.fast_map, fast_np)
         ops.compute_write(self.slow_map, slow_np)
         self.slot_logical = logical.copy()
+        self._touched.update(range(self.num_local))
         self.on_rows_written([])
         self.move_log.append(
             {
@@ -863,6 +868,93 @@ class ExpertTiers:
                 "units": float(len(logical)),
             }
         )
+
+    @property
+    def scrub_every(self) -> int:
+        """The debug setting: scrub after every Nth rearrangement (0: off)."""
+        binding = self.store_binding
+        return 0 if binding is None else int(binding.session.config.scrub_every)
+
+    def scrub(self, phys2log: np.ndarray | None = None, full: bool = True) -> dict:
+        """Compare what the kernels of this layer read with the expert store.
+
+        For each slot checked, the bytes of the row that serves it, read the
+        way the kernels read them (a fast row back from the device, a pool
+        row through the device view, not from the pinned tensor), must be the
+        store's unit of the expert the slot holds. The two maps on the device
+        must equal the placement, and with ``phys2log`` (EPLB's map of the
+        layer) the experts must be the ones EPLB routes to these slots.
+        ``full`` checks every slot, otherwise the slots moves touched since
+        the last scrub.
+
+        Blocking (device reads). Safe on a serving engine between two steps,
+        on the thread that enqueues the forward: it reads mapped rows only,
+        which nothing writes, and waits for the commits queued before it.
+        Returns ``slots``, ``mismatches``, ``maps_equal``, ``placement_equal``
+        and ``first`` (the first problem as text, or None).
+        """
+        from vllm.model_executor.offloader.expert_tier_map import FAST, POOL
+
+        binding, placement, _ = self._require_store()
+        assert self._impls is not None and self.slot_logical is not None
+        assert self.fast_map is not None and self.slow_map is not None
+        store = binding.session.store
+        fast = self._impls[0]
+        problems: list[str] = []
+        want_fast, want_slow = placement.maps(self.slot_global, self.num_global)
+        maps_equal = bool(
+            np.array_equal(self.fast_map.cpu().numpy(), want_fast)
+            and np.array_equal(self.slow_map.cpu().numpy(), want_slow)
+        )
+        if not maps_equal:
+            problems.append(
+                f"{self.layer_name}: the tier maps on the device differ from "
+                "the placement"
+            )
+        placement_equal = True
+        if phys2log is not None:
+            routed = np.asarray(phys2log)[np.array(self.slot_global)]
+            placement_equal = bool(np.array_equal(routed, self.slot_logical))
+            if not placement_equal:
+                slot = int(np.flatnonzero(routed != self.slot_logical)[0])
+                problems.append(
+                    f"{self.layer_name}: slot {slot} holds expert "
+                    f"{int(self.slot_logical[slot])}, EPLB routes expert "
+                    f"{int(routed[slot])} to it"
+                )
+        slots = range(self.num_local) if full else sorted(self._touched)
+        whole: dict[tuple[int, str], torch.Tensor] = {}
+        if full:  # one device read per tensor instead of one per row
+            for impl_field, key in _TIER_FIELDS:
+                whole[(FAST, key)] = _u8(getattr(fast, impl_field)).cpu()
+                whole[(POOL, key)] = _u8(self.slow_views[key]).cpu()
+        mismatches = 0
+        for slot in slots:
+            tier, row = int(placement.tier[slot]), int(placement.row[slot])
+            tensors = {}
+            for impl_field, key in _TIER_FIELDS:
+                if full:
+                    tensors[key] = whole[(tier, key)][row]
+                elif tier == FAST:
+                    tensors[key] = _u8(getattr(fast, impl_field))[row].cpu()
+                else:
+                    tensors[key] = _u8(self.slow_views[key])[row].cpu()
+            logical = int(self.slot_logical[slot])
+            if not store.holds_unit((binding.store_layer, logical), tensors):
+                mismatches += 1
+                problems.append(
+                    f"{self.layer_name}: slot {slot} (expert {logical}, "
+                    f"{'fast' if tier == FAST else 'pool'} row {row}) does not "
+                    "hold the store's unit"
+                )
+        self._touched.clear()
+        return {
+            "slots": len(slots),
+            "mismatches": mismatches,
+            "maps_equal": maps_equal,
+            "placement_equal": placement_equal,
+            "first": problems[0] if problems else None,
+        }
 
     def swap(self, promote: int, demote: int) -> "PreparedMove":
         """Put the pool slot ``promote`` in a fast row and the fast slot

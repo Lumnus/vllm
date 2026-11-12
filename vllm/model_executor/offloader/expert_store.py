@@ -1168,6 +1168,9 @@ class ExpertStore:
         self._into_logged: set[str] = set()
         self._into_executor: ThreadPoolExecutor | None = None
         self._io_threads = io_threads
+        # Where the unit digest table is, for holds_unit (set by open()).
+        self._checksum_source: tuple[str, Any] | None = None
+        self._digests: np.ndarray | None = None
         # statistics
         self._hits = self._misses = self._joins = self._reads = 0
         self._bytes_read = self._evictions = self._errors = 0
@@ -1297,6 +1300,7 @@ class ExpertStore:
                 preadv,
             )
             store._integrity = checker
+            store._checksum_source = (str(ordered[0]), first.get("unit_checksums"))
             store.set_read_mode(read_mode)
             return store
         except BaseException:
@@ -1487,6 +1491,48 @@ class ExpertStore:
                 "(the data on the drive differs from what was written)"
             )
 
+    def holds_unit(
+        self, key: Key, tensors: Mapping[str, Any], threads: int = 4
+    ) -> bool:
+        """Whether ``tensors`` (name -> host buffer, as for :meth:`read_into`)
+        hold the unit ``key`` as it was written.
+
+        For checking memory that was filled from the store some time ago (a
+        row read back from a device, say). With unit digests in the store and
+        no gaps between the unit's tensors this reads nothing from the drive:
+        the buffers' digest is compared with the recorded one. Otherwise the
+        unit is read through the pool and compared byte by byte.
+        """
+        key = (int(key[0]), int(key[1]))
+        _, _, unit_bytes = self.layout.locate(*key)
+        group = self.layout.group_of(key[0])
+        views = self._dest_views(group, tensors)
+        table = self._unit_digests()
+        if table is not None and self._gapless(group):
+            index = self.layout.unit_index(*key)
+            parts: list[Any] = [*views, bytes(unit_bytes - group.payload_bytes)]
+            got = _integrity.unit_digest_parts(parts, index, threads)
+            return got == int(table[index])
+        with self.get(key) as entry:
+            raw = entry.raw
+            return all(
+                np.array_equal(view, raw[place.offset : place.offset + place.nbytes])
+                for place, view in zip(group.tensors, views)
+            )
+
+    def _unit_digests(self) -> np.ndarray | None:
+        """The store's digest table, or None for a store written without."""
+        if self._integrity is not None:
+            return self._integrity.table
+        if self._digests is None and self._checksum_source is not None:
+            directory, info = self._checksum_source
+            if info:
+                try:
+                    self._digests = _integrity.load_table(directory, info)
+                except ValueError as exc:
+                    raise StoreCorruptError(f"unit checksum table: {exc}") from exc
+        return self._digests
+
     @staticmethod
     def _dest_views(group: _GroupLayout, dests: Mapping[str, Any]) -> list[np.ndarray]:
         views = []
@@ -1562,11 +1608,10 @@ class ExpertStore:
                     continue
                 error = f"short read ({got} < {need} B)"
             except OSError as exc:
-                refused = exc.errno == errno.EFAULT or (
-                    exc.errno == errno.EINVAL and direct
-                )
+                code = exc.errno or 0
+                refused = code == errno.EFAULT or (code == errno.EINVAL and direct)
                 if refused and auto:
-                    raise _ReadFallback(exc.errno) from exc
+                    raise _ReadFallback(code) from exc
                 error = f"errno {exc.errno} ({exc.strerror})"
             if attempt >= len(RETRY_BACKOFF_S):
                 raise ExpertStoreError(

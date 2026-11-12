@@ -268,6 +268,11 @@ class EplbModelState:
     abandoned_rearrangements: int = 0
     """Rearrangements the ranks agreed to stop because a mover could not
     prepare a layer."""
+    completed_rearrangements: int = 0
+    """Async rearrangements whose last layer was committed."""
+    load_scrubbed: bool = False
+    """The movers' scrub after load has been offered (it runs only with the
+    layers' debug setting on)."""
 
 
 class EplbState:
@@ -910,6 +915,12 @@ class EplbState:
 
         """
         ep_group = get_ep_group().device_group
+        for eplb_model_state in self.model_states.values():
+            if not eplb_model_state.load_scrubbed:
+                # The first step after load (a dummy run before serving): with
+                # the layers' debug setting on, check every slot once.
+                eplb_model_state.load_scrubbed = True
+                _scrub_movers(eplb_model_state, ep_group.rank(), full=True, when="load")
         if is_dummy:
             # Do not record load metrics for dummy steps
             for eplb_model_state in self.model_states.values():
@@ -1427,6 +1438,28 @@ class EplbState:
                     model_key,
                 )
 
+    def scrub_expert_store(self, full: bool = True) -> list[dict]:
+        """Run the movers' scrub now, whatever their debug setting says: for
+        each model whose layers place their own experts, compare what this
+        rank's kernels read with the experts' home, the device's tier maps
+        with the placement and the placement with EPLB's map. One INFO line
+        per model with the counts, an ERROR line naming the first mismatch.
+
+        Call on the thread that enqueues the forward, between two steps (it
+        blocks on device reads and waits for the commits queued before it).
+        It reads mapped rows only, so a rearrangement being prepared in the
+        background does not disturb it. Returns one summary per such model.
+        """
+        ep_rank = get_ep_group().device_group.rank()
+        summaries = []
+        for model_state in self.model_states.values():
+            summary = _scrub_movers(
+                model_state, ep_rank, full=full, when="on request", force=True
+            )
+            if summary is not None:
+                summaries.append(summary)
+        return summaries
+
     def _consume_async_result(self, model_state: EplbModelState, ep_rank: int) -> None:
         """The step hook's part of an async rearrangement, for one model: once
         every rank has the pending layer's result, commit it, or, if any
@@ -1834,6 +1867,63 @@ def _commit_eplb_maps(
     dst.copy_(src, non_blocking=True)
 
 
+def _scrub_movers(
+    model_state: EplbModelState,
+    ep_rank: int,
+    *,
+    full: bool,
+    when: str,
+    force: bool = False,
+) -> dict | None:
+    """The movers' scrub over every layer of a model whose layers place their
+    own experts (None for other models, and unless `force`, when the layers'
+    debug setting is off). Blocking; the thread that enqueues the forward."""
+    movers = model_state.movers
+    if not movers or movers[0] is None:
+        return None
+    if not force and not movers[0].scrub_every:
+        return None
+    started = time.perf_counter()
+    with gpu_sync_allowed():
+        phys2log = model_state.physical_to_logical_map.cpu().numpy()
+        reports = []
+        for layer, mover in enumerate(movers):
+            assert mover is not None
+            reports.append(mover.scrub(phys2log[layer], full))
+    summary = {
+        "model": model_state.model_name,
+        "layers": len(reports),
+        "slots": sum(r["slots"] for r in reports),
+        "mismatches": sum(r["mismatches"] for r in reports),
+        "maps_differ": sum(not r["maps_equal"] for r in reports),
+        "placement_differs": sum(not r["placement_equal"] for r in reports),
+        "first": next((r["first"] for r in reports if r["first"]), None),
+        "seconds": time.perf_counter() - started,
+    }
+    logger.info(
+        "Expert store scrub (EP rank %d, %s, %s): %d slots of %d layers read "
+        "back and compared with the store, %d mismatches; tier maps differ "
+        "from the placement on %d layers, the placement from EPLB's map on "
+        "%d; %.2f s.",
+        ep_rank,
+        when,
+        "every slot" if full else "slots moved since the last scrub",
+        summary["slots"],
+        summary["layers"],
+        summary["mismatches"],
+        summary["maps_differ"],
+        summary["placement_differs"],
+        summary["seconds"],
+    )
+    if summary["first"]:
+        logger.error(
+            "Expert store scrub (EP rank %d): first mismatch: %s",
+            ep_rank,
+            summary["first"],
+        )
+    return summary
+
+
 def _abandon_layer(
     model_state: EplbModelState,
     ep_rank: int,
@@ -1924,6 +2014,11 @@ def _move_to_workspace(
                 model_state.model.num_moe_layers,
             )
             stats.clear()
+        model_state.completed_rearrangements += 1
+        if model_state.movers is not None and model_state.movers[0] is not None:
+            every = model_state.movers[0].scrub_every
+            if every and model_state.completed_rearrangements % every == 0:
+                _scrub_movers(model_state, ep_rank, full=False, when="rearrangement")
 
     # Reset pending_result before unblocking the async worker
     model_state.pending_result = None
