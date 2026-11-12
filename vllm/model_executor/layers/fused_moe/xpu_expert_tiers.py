@@ -915,7 +915,7 @@ def _store_binding(
             rank=int(moe_config.ep_rank),
             num_ranks=int(moe_config.ep_size),
             barrier=_ep_barrier,
-            pin=is_pin_memory_available(),
+            pin=store_config.pool_pinned and is_pin_memory_available(),
         ),
     )
     session.register(layer_name)

@@ -193,8 +193,8 @@ class StoreSession:
             self._start_stats_thread()
             logger.info(
                 "Expert store opened (%s): %d units of %d B, %.2f GiB in %d "
-                "stripe(s) %s, staging pool %d slots (%.2f GiB), read mode %s, "
-                "%.2f s.",
+                "stripe(s) %s, staging pool %d slots (%.2f GiB, %s), read mode "
+                "%s, %.2f s.",
                 self.mode,
                 layout.total_units,
                 layout.slot_bytes,
@@ -203,6 +203,7 @@ class StoreSession:
                 cfg.dirs,
                 self._store.num_slots,
                 self._store.num_slots * slot_bytes / 2**30,
+                "pinned" if self._store.pinned else "not pinned",
                 cfg.read_mode,
                 time.perf_counter() - t0,
             )

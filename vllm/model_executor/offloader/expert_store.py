@@ -1869,6 +1869,14 @@ class ExpertStore:
             self._mode = _NEXT_MODE[mode]
             reason = f"{errno.errorcode.get(code, code)}_{mode}"
             self._fallbacks[reason] = self._fallbacks.get(reason, 0) + 1
+            new = self._mode
+        logger.warning(
+            "Expert store: a %s read into a staging slot was refused (%s); "
+            "reading slots %s from now on.",
+            mode,
+            errno.errorcode.get(code, code),
+            new,
+        )
 
     def _fill(
         self,

@@ -35,6 +35,13 @@ class ExpertStoreConfig:
     (units read ahead of use, and the copy source of reads that cannot land in
     a row directly)."""
 
+    pool_pinned: bool = False
+    """Pin the staging slots. Off by default: direct reads then land in
+    ordinary page-aligned memory, which every drive and accelerator takes,
+    and a row is filled from a slot by a host copy. On: a slot can be the
+    source of an asynchronous copy to the device, and reads into it follow
+    ``read_mode`` like reads into rows."""
+
     io_threads: int = Field(default=16, ge=1)
     """Reader threads per rank."""
 
@@ -119,6 +126,7 @@ class ExpertStoreConfig:
             {
                 "dirs",
                 "pool_gib",
+                "pool_pinned",
                 "io_threads",
                 "direct",
                 "read_mode",
