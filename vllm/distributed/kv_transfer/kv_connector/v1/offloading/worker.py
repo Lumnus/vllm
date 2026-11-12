@@ -67,6 +67,8 @@ class OffloadingConnectorWorker:
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
+        # Store jobs submitted and not yet reported finished.
+        self._inflight_store_jobs: set[int] = set()
 
     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
         self._kv_caches = kv_caches
@@ -78,12 +80,25 @@ class OffloadingConnectorWorker:
     def resize_kv_caches(
         self, kv_caches: dict[str, torch.Tensor], num_blocks: int
     ) -> None:
-        """Follow a KV cache whose committed block count grew to num_blocks.
+        """Follow a KV cache whose committed block count changed to num_blocks.
 
         The views keep their storage's base address, so transfers already
-        submitted and the pointer arithmetic for new block ids stay valid; only
+        submitted and the pointer arithmetic for block ids stay valid; only
         the extent of the views the transfers resolve against changes.
+
+        Before a shrink the blocks above num_blocks are still mapped and are
+        about to go. Stores are deferred to the next step and run on their
+        own streams, and nothing makes a store of a block wait for the block
+        to be unmapped: the stores not yet submitted are submitted now
+        (against the old views, which still cover their blocks), and every
+        store in flight is waited for. Their completion is reported as usual.
+        Loads into those blocks cannot be in flight: their requests hold the
+        blocks, and the scheduler drained them.
         """
+        if num_blocks < self.kv_cache_config.num_blocks and self.worker is not None:
+            self._submit_deferred_stores()
+            if self._inflight_store_jobs:
+                self.worker.wait(set(self._inflight_store_jobs))
         self.kv_cache_config = copy.copy(self.kv_cache_config)
         self.kv_cache_config.num_blocks = num_blocks
         self._kv_caches = self._canonical_kv_caches(kv_caches)
@@ -251,24 +266,24 @@ class OffloadingConnectorWorker:
                     )
 
         # Submit deferred stores from previous step (and jobs_to_flush above).
-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
-            assert isinstance(src_spec, GPULoadStoreSpec)
-            device_ptrs = resolve_device_pointers(src_spec, self._kv_caches)
-            success = self.worker.submit_store(job_id, device_ptrs, dst_spec)
-            assert success
-        self._unsubmitted_store_jobs.clear()
+        self._submit_deferred_stores()
 
         if kv_connector_metadata.jobs_to_flush:
             self.worker.wait(kv_connector_metadata.jobs_to_flush)
 
-    def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
+    def _submit_deferred_stores(self) -> None:
         assert self.worker is not None
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             assert isinstance(src_spec, GPULoadStoreSpec)
             device_ptrs = resolve_device_pointers(src_spec, self._kv_caches)
             success = self.worker.submit_store(job_id, device_ptrs, dst_spec)
             assert success
+            self._inflight_store_jobs.add(job_id)
         self._unsubmitted_store_jobs.clear()
+
+    def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
+        assert self.worker is not None
+        self._submit_deferred_stores()
 
         sync_job_ids: set[int] = set()
         for job_id, entry in metadata.load_jobs.items():
@@ -317,6 +332,7 @@ class OffloadingConnectorWorker:
         for transfer_result in self.worker.get_finished():
             job_id = transfer_result.job_id
             is_load = job_id in self._load_jobs
+            self._inflight_store_jobs.discard(job_id)
             if not transfer_result.success:
                 self._connector_worker_meta.mark_completed(job_id, success=False)
                 req_id = self._load_jobs.pop(job_id, None)
@@ -363,6 +379,7 @@ class OffloadingConnectorWorker:
 
     def shutdown(self) -> None:
         self._unsubmitted_store_jobs.clear()
+        self._inflight_store_jobs.clear()
         self._load_jobs.clear()
         self._failed_recving.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
