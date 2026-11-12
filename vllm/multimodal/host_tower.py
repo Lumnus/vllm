@@ -26,9 +26,9 @@ import enum
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import nullcontext, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -348,8 +348,32 @@ def _use_host_forward(module: nn.Module) -> None:
             submodule._forward_method = submodule.forward_cpu
 
 
+@contextmanager
+def own_module_caches() -> Iterator[None]:
+    """Construct modules without the process's shared module caches.
+
+    `get_rope` hands out one rotary embedding per set of arguments for the
+    whole process. In a worker whose model was built with a tower left out,
+    that tower's rotary embedding was constructed on the meta device and
+    cached: a later build of the same tower would get it back, with a
+    `cos_sin_cache` that has no data. A tower built here gets its own.
+    """
+    from vllm.model_executor.layers import rotary_embedding
+
+    shared = rotary_embedding._ROPE_DICT
+    rotary_embedding._ROPE_DICT = {}
+    try:
+        yield
+    finally:
+        rotary_embedding._ROPE_DICT = shared
+
+
 def build_host_tower_module(
-    twin_config: "VllmConfig", *, host_forward: bool = True, whole: bool = True
+    twin_config: "VllmConfig",
+    *,
+    host_forward: bool = True,
+    whole: bool = True,
+    device: torch.device | str = "cpu",
 ) -> nn.Module:
     """Build the module of a host tower, without weights.
 
@@ -358,9 +382,11 @@ def build_host_tower_module(
     memory, and nothing else, and its `embed_multimodal` is what encodes.
 
     A worker building the accelerator copy of a tower passes
-    `host_forward=False` (its custom ops keep the accelerator's kernels) and,
-    for tensor-parallel shards, `whole=False` (the worker's own groups cut
-    it).
+    `host_forward=False` (its custom ops keep the accelerator's kernels),
+    its `device` (or the meta device, to measure it) and, for
+    tensor-parallel shards, `whole=False` (the worker's own groups cut it).
+    The module never shares cached submodules with the process
+    (`own_module_caches`).
 
     Raises:
         ValueError: The model cannot keep this tower on the host.
@@ -387,8 +413,9 @@ def build_host_tower_module(
 
     with (
         set_default_torch_dtype(model_config.dtype),
-        torch.device("cpu"),
+        torch.device(device),
         single_rank_model_parallel() if whole else nullcontext(),
+        own_module_caches(),
     ):
         module = initialize_model(vllm_config=twin_config, model_config=model_config)
 

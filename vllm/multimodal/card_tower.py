@@ -9,28 +9,31 @@ every worker builds its own copy and puts it in that place; when the engine
 core sends the tower back, every worker takes it out again. `CardTower` is
 that copy on one worker, in four steps, each an RPC from the engine core:
 
-* `stage()` builds the tower module in host memory and starts reading its
-  weights on a side thread. The worker keeps serving meanwhile.
-* `commit()` loads the weights into the module, moves it to the accelerator
-  and puts it in the model. The engine core calls it after the KV cache gave
-  up the memory, and routes requests to the workers' tower only after every
-  rank's commit succeeded.
+* `stage()` measures the copy (a build on the meta device: no memory),
+  lists the checkpoint tensors it loads, and warms them into the page cache
+  on a side thread. It holds no copy of the weights: host memory stays as it
+  was, apart from the page cache, which the kernel gives back on demand.
+* `commit()` builds the tower on the accelerator, streams its tensors from
+  the checkpoint one at a time into it, and puts it in the model. The engine
+  core calls it after the KV cache gave up the memory, and routes requests to
+  the workers' tower only after every rank's commit succeeded.
 * `release()` takes the tower out of the model and drops it.
-* `discard()` drops a staged copy that will not be committed.
+* `discard()` forgets a staging that will not be committed.
 
 None of the steps is a collective, so a failure on one rank never leaves
-another waiting; each step can be repeated.
+another waiting; each can be repeated, and `release` and `discard` never
+raise on a half-built copy.
 
 Building and loading run on the worker's main thread: they swap process
 globals (the current config, and for a whole replica the model-parallel
-groups) that a forward on another thread would see. Only the reading of the
-checkpoint's bytes runs on the side thread.
+groups) that a forward on another thread would see. Only the page-cache warm
+up runs on the side thread.
 """
 
 import gc
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, nullcontext
 from typing import TYPE_CHECKING, Any
 
@@ -45,13 +48,28 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-TensorReader = Callable[[], dict[str, torch.Tensor]]
+TensorStream = Callable[[], Iterator[tuple[str, torch.Tensor]]]
 
 
 def module_bytes(module: nn.Module) -> int:
     return sum(p.numel() * p.element_size() for p in module.parameters()) + sum(
         b.numel() * b.element_size() for b in module.buffers()
     )
+
+
+def meta_tensors(module: nn.Module) -> list[str]:
+    """Parameters and buffers of `module` without data (on the meta device)."""
+    found = [
+        f"parameter {name} {tuple(p.shape)}"
+        for name, p in module.named_parameters()
+        if p.is_meta
+    ]
+    found += [
+        f"buffer {name} {tuple(b.shape)}"
+        for name, b in module.named_buffers()
+        if b.is_meta
+    ]
+    return found
 
 
 def tower_paths(model: nn.Module, tower_name: str) -> list[str]:
@@ -71,6 +89,13 @@ def _set_submodule(root: nn.Module, path: str, module: nn.Module) -> None:
     setattr(parent, name, module)
 
 
+def _get(module: nn.Module, path: str) -> nn.Module | None:
+    try:
+        return module.get_submodule(path)
+    except AttributeError:
+        return None
+
+
 class CardTower:
     """One worker's accelerator copy of one tower.
 
@@ -78,11 +103,15 @@ class CardTower:
         name: The tower's name (`vision_tower`, ...).
         model: The worker's model, with placeholders where the tower goes.
         device: The worker's accelerator.
-        build: Builds the tower module in host memory, without weights. It
-            holds the tower under the same attribute paths as `model`.
-        read: Reads the tower's checkpoint tensors; called on a side thread.
-        load: Loads `read`'s tensors into the built module and finishes it
-            (post-processing); called on the main thread.
+        build: `build(device)` builds the tower module on `device` (the
+            meta device to measure it), without weights. It holds the tower
+            under the same attribute paths as `model`.
+        tensors: Lists the checkpoint tensors of the tower and how many bytes
+            each takes in host memory while it is loaded; called once, on the
+            main thread, with the module built on the meta device.
+        stream: `stream()` yields the tower's checkpoint tensors one at a time.
+        load: `load(module, tensor_iterator)` loads them into the module and
+            finishes it (post-processing); called on the main thread.
         build_context: Entered around `build` and `load` (the model-parallel
             groups a whole replica is built with).
 
@@ -94,26 +123,31 @@ class CardTower:
         *,
         model: nn.Module,
         device: torch.device,
-        build: Callable[[], nn.Module],
-        read: TensorReader,
-        load: Callable[[nn.Module, dict[str, torch.Tensor]], None],
+        build: Callable[[torch.device], nn.Module],
+        tensors: Callable[[nn.Module], dict[str, int]],
+        stream: Callable[[], Iterator[tuple[str, torch.Tensor]]],
+        load: Callable[[nn.Module, Iterator[tuple[str, torch.Tensor]]], None],
         build_context: Callable[[], AbstractContextManager[Any]] = nullcontext,
     ) -> None:
         self.name = name
         self._model = model
         self._device = device
         self._build = build
-        self._read = read
+        self._list_tensors = tensors
+        self._stream = stream
         self._load = load
         self._build_context = build_context
 
-        self._module: nn.Module | None = None
-        self._reader: threading.Thread | None = None
-        self._tensors: dict[str, torch.Tensor] | None = None
-        self._read_error: BaseException | None = None
+        # The staging: what the copy needs, and the page-cache warm up.
+        self._staged: dict[str, int] | None = None
+        self._warmer: threading.Thread | None = None
+        self._warm_error: BaseException | None = None
+        self._warm_done = False
         self._token: object | None = None
         self._staged_at = 0.0
-        # Placeholders taken out of the model, by path, while the copy is in.
+
+        # The copy in the model, and the placeholders it took the place of.
+        self._module: nn.Module | None = None
         self._placeholders: dict[str, nn.Module] = {}
 
     @property
@@ -122,116 +156,134 @@ class CardTower:
 
     @property
     def staged(self) -> bool:
-        return self._module is not None and not self.on_card
+        return self._staged is not None and not self.on_card
 
     # ------------------------------------------------------------------
     # Steps
     # ------------------------------------------------------------------
 
     def stage(self) -> dict[str, Any]:
-        """Build the module in host memory and start reading its weights.
-        Returns the bytes the copy will take on the accelerator."""
+        """Measure the copy and start warming its tensors. Returns the bytes
+        the copy takes on the accelerator, and the most host memory the
+        commit holds at once (one tensor)."""
         if self.on_card:
             assert self._module is not None
-            return {"bytes": module_bytes(self._module), "on_card": True}
-        if self._module is None:
-            paths = tower_paths(self._model, self.name)
-            if not paths:
+            nbytes = module_bytes(self._module)
+            return {"bytes": nbytes, "host_bytes": 0, "on_card": True}
+        if self._staged is None:
+            if not tower_paths(self._model, self.name):
                 raise ValueError(
                     f"The model holds no place for tower {self.name!r}: it was "
                     "built with the tower, or without its modalities."
                 )
             start = time.perf_counter()
             with self._build_context():
-                module = self._build()
-            missing = [p for p in paths if _get(module, p) is None]
-            if missing:
-                raise ValueError(
-                    f"The built tower {self.name!r} has nothing at {missing}."
-                )
-            self._module = module
-            self._tensors = None
-            self._read_error = None
+                shape = self._build(torch.device("meta"))
+            tensors = self._list_tensors(shape)
+            self._staged = {
+                "bytes": module_bytes(shape),
+                "host_bytes": max(tensors.values(), default=0),
+                "num_tensors": len(tensors),
+            }
+            del shape
+            self._warm_error = None
+            self._warm_done = False
             self._staged_at = time.perf_counter()
-            # A read left over from a discarded staging cannot write into
-            # this one.
             token = object()
             self._token = token
-            self._reader = threading.Thread(
-                target=self._read_tensors,
+            self._warmer = threading.Thread(
+                target=self._warm,
                 args=(token,),
-                name=f"card-tower-{self.name}-read",
+                name=f"card-tower-{self.name}-warm",
                 daemon=True,
             )
-            self._reader.start()
+            self._warmer.start()
             logger.info(
-                "Tower %s: staging a copy for the accelerator (%s GiB, built in "
-                "%.2f s); reading its weights.",
+                "Tower %s: staging a copy for the accelerator (%s GiB in %d "
+                "checkpoint tensors, measured in %.2f s); warming its tensors.",
                 self.name,
-                format_gib(module_bytes(module)),
+                format_gib(self._staged["bytes"]),
+                len(tensors),
                 self._staged_at - start,
             )
-        return {"bytes": module_bytes(self._module), "on_card": False}
+        return {
+            "bytes": self._staged["bytes"],
+            "host_bytes": self._staged["host_bytes"],
+            "on_card": False,
+        }
 
-    def _read_tensors(self, token: object) -> None:
+    def _warm(self, token: object) -> None:
         try:
-            tensors = self._read()
+            for _, tensor in self._stream():
+                del tensor
+                if token is not self._token:
+                    return
         except BaseException as e:  # noqa: BLE001 - reported by poll/commit
             if token is self._token:
-                self._read_error = e
+                self._warm_error = e
             return
         if token is self._token:
-            self._tensors = tensors
+            self._warm_done = True
 
     def poll(self) -> dict[str, Any]:
-        """Whether the staged weights are read (or failed to be)."""
+        """Whether the staged tensors are warm (or failed to be read)."""
         if self.on_card:
             return {"staged": True, "error": None}
-        if self._module is None:
+        if self._staged is None:
             return {"staged": False, "error": "nothing is staged"}
-        error = None if self._read_error is None else repr(self._read_error)
-        return {"staged": self._tensors is not None and error is None, "error": error}
+        error = None if self._warm_error is None else repr(self._warm_error)
+        return {"staged": self._warm_done and error is None, "error": error}
 
     def commit(self, wait_s: float | None = None) -> dict[str, Any]:
-        """Load, move to the accelerator and put the copy in the model.
-        Waits for the read (at most wait_s). On any failure the model is left
-        as it was and the staged copy is dropped."""
+        """Build the copy on the accelerator, stream its weights into it and
+        put it in the model. Waits for the warm up (at most wait_s; a cold
+        read is slower, not wrong). On any failure the model is left as it was
+        and the copy is dropped."""
         if self.on_card:
             assert self._module is not None
             return {"bytes": module_bytes(self._module), "seconds": 0.0}
-        module = self._module
-        if module is None:
+        if self._staged is None:
             raise RuntimeError(f"Tower {self.name!r}: nothing is staged.")
+        if self._warm_error is not None:
+            error = self._warm_error
+            self.discard()
+            raise RuntimeError(
+                f"Tower {self.name!r}: reading its weights failed: {error!r}"
+            ) from error
+        if self._warmer is not None:
+            self._warmer.join(wait_s)
         start = time.perf_counter()
         try:
-            if self._reader is not None:
-                self._reader.join(wait_s)
-                if self._reader.is_alive():
-                    raise TimeoutError(
-                        f"Tower {self.name!r}: its weights were not read in {wait_s} s."
-                    )
-            if self._read_error is not None:
-                raise RuntimeError(
-                    f"Tower {self.name!r}: reading its weights failed: "
-                    f"{self._read_error!r}"
-                ) from self._read_error
-            tensors = self._tensors
-            assert tensors is not None
             with self._build_context():
-                self._load(module, tensors)
-            self._tensors = None
-            module.to(self._device)
+                module = self._build(self._device)
+                self._module = module
+                self._load(module, self._stream())
             paths = tower_paths(self._model, self.name)
-            for path in paths:
+            copies = {path: _get(module, path) for path in paths}
+            missing = [path for path, copy in copies.items() if copy is None]
+            if missing:
+                raise ValueError(f"The built tower has nothing at {missing}.")
+            empty = [
+                f"{path}: {what}"
+                for path, copy in copies.items()
+                for what in meta_tensors(assert_module(copy))
+            ]
+            if empty:
+                raise ValueError(
+                    f"Tower {self.name!r}: {len(empty)} tensors of the copy hold "
+                    f"no data, e.g. {empty[:4]}."
+                )
+            for path, copy in copies.items():
                 placeholder = self._model.get_submodule(path)
-                copy = _get(module, path)
-                assert copy is not None
-                _set_submodule(self._model, path, copy)
+                _set_submodule(self._model, path, assert_module(copy))
                 self._placeholders[path] = placeholder
         except BaseException:
             self._put_placeholders_back()
+            self._module = None
             self.discard()
             raise
+        self._staged = None
+        self._token = None  # a warm up still running stops
         nbytes = module_bytes(module)
         seconds = time.perf_counter() - start
         logger.info(
@@ -246,10 +298,14 @@ class CardTower:
         return {"bytes": nbytes, "seconds": seconds}
 
     def release(self) -> dict[str, Any]:
-        """Take the copy out of the model and drop it. Repeatable."""
+        """Take the copy out of the model and drop it. Repeatable; never
+        raises on a half-built copy."""
         was_on_card = self.on_card
-        nbytes = module_bytes(self._module) if self._module is not None else 0
+        nbytes = 0
+        if was_on_card and self._module is not None:
+            nbytes = module_bytes(self._module)
         self._put_placeholders_back()
+        self._module = None
         self.discard()
         if was_on_card:
             logger.info(
@@ -258,17 +314,19 @@ class CardTower:
                 self._device,
                 format_gib(nbytes),
             )
-        return {"bytes": nbytes if was_on_card else 0}
+        return {"bytes": nbytes}
 
     def discard(self) -> None:
-        """Drop a staged copy (a read in flight finishes and is dropped)."""
+        """Forget a staging (a warm up in flight stops at its next tensor).
+        Never raises."""
         if self.on_card:
             return
-        self._module = None
-        self._tensors = None
-        self._reader = None
-        self._read_error = None
+        self._staged = None
+        self._warmer = None
+        self._warm_error = None
+        self._warm_done = False
         self._token = None
+        self._module = None
         gc.collect()
 
     def _put_placeholders_back(self) -> None:
@@ -277,11 +335,9 @@ class CardTower:
             del self._placeholders[path]
 
 
-def _get(module: nn.Module, path: str) -> nn.Module | None:
-    try:
-        return module.get_submodule(path)
-    except AttributeError:
-        return None
+def assert_module(module: nn.Module | None) -> nn.Module:
+    assert module is not None
+    return module
 
 
 # ----------------------------------------------------------------------
@@ -289,59 +345,105 @@ def _get(module: nn.Module, path: str) -> nn.Module | None:
 # ----------------------------------------------------------------------
 
 
-def checkpoint_tower_reader(
-    twin_config: "VllmConfig", model: nn.Module, paths: list[str]
-) -> TensorReader:
-    """A reader of exactly the checkpoint tensors that load into the tower at
-    `paths` of `model` (after the model's own name mapping), from the
-    safetensors shards. Nothing else is read.
+class CheckpointTowerTensors:
+    """The checkpoint tensors that load into the tower at `paths` (after the
+    model's own name mapping), read from the safetensors shards one at a
+    time. Nothing else is read.
 
-    The shard list is resolved here, on the caller's thread; the returned
-    callable only reads files."""
-    from safetensors import safe_open
+    `index(module)` resolves the shards and the tensor names on the main
+    thread; `stream()` only reads files and may run on any thread."""
 
-    from vllm.model_executor.model_loader import get_model_loader
-    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+    def __init__(self, twin_config: "VllmConfig", paths: list[str]) -> None:
+        self._config = twin_config
+        self._prefixes = tuple(f"{path}." for path in paths)
+        self._paths = list(paths)
+        # file -> names, in file order.
+        self._files: dict[str, list[str]] = {}
 
-    model_config = twin_config.model_config
-    loader = get_model_loader(twin_config.load_config)
-    if not isinstance(loader, DefaultModelLoader):
-        raise ValueError(
-            f"A tower can only be brought to the accelerator from a checkpoint "
-            f"read by the default loader, not {type(loader).__name__}."
+    def index(self, module: nn.Module) -> dict[str, int]:
+        from safetensors import safe_open
+
+        from vllm.model_executor.model_loader import get_model_loader
+        from vllm.model_executor.model_loader.default_loader import (
+            DefaultModelLoader,
         )
-    _, files, use_safetensors, _ = loader._prepare_weights(
-        model_config.model,
-        None,
-        model_config.revision,
-        fall_back_to_pt=False,
-        allow_patterns_overrides=getattr(model, "allow_patterns_overrides", None),
-    )
-    if not use_safetensors:
-        raise ValueError("A tower is brought to the accelerator from safetensors only.")
-    mapper = getattr(model, "hf_to_vllm_mapper", None)
-    prefixes = tuple(f"{path}." for path in paths)
 
-    def wanted(name: str) -> bool:
-        mapped = mapper.map_name(name) if mapper is not None else name
-        return mapped is not None and mapped.startswith(prefixes)
+        model_config = self._config.model_config
+        loader = get_model_loader(self._config.load_config)
+        if not isinstance(loader, DefaultModelLoader):
+            raise ValueError(
+                "A tower can only be brought to the accelerator from a "
+                f"checkpoint read by the default loader, not "
+                f"{type(loader).__name__}."
+            )
+        _, files, use_safetensors, _ = loader._prepare_weights(
+            model_config.model,
+            None,
+            model_config.revision,
+            fall_back_to_pt=False,
+            allow_patterns_overrides=getattr(module, "allow_patterns_overrides", None),
+        )
+        if not use_safetensors:
+            raise ValueError(
+                "A tower is brought to the accelerator from safetensors only."
+            )
+        mapper = getattr(module, "hf_to_vllm_mapper", None)
 
-    def read() -> dict[str, torch.Tensor]:
-        tensors: dict[str, torch.Tensor] = {}
+        sizes: dict[str, int] = {}
+        self._files = {}
         for file in files:
             with safe_open(file, framework="pt") as f:
                 for name in f.keys():  # noqa: SIM118
-                    if wanted(name):
-                        tensors[name] = f.get_tensor(name)
-        if not tensors:
-            raise ValueError(f"No checkpoint tensor loads into {list(paths)}.")
-        return tensors
+                    mapped = mapper.map_name(name) if mapper is not None else name
+                    if mapped is None or not mapped.startswith(self._prefixes):
+                        continue
+                    piece = f.get_slice(name)
+                    numel = 1
+                    for dim in piece.get_shape():
+                        numel *= dim
+                    sizes[name] = numel * _dtype_bytes(piece.get_dtype())
+                    self._files.setdefault(file, []).append(name)
+        if not sizes:
+            raise ValueError(f"No checkpoint tensor loads into {self._paths}.")
+        return sizes
 
-    return read
+    def stream(self) -> Iterator[tuple[str, torch.Tensor]]:
+        from safetensors import safe_open
+
+        for file, names in self._files.items():
+            with safe_open(file, framework="pt") as f:
+                for name in names:
+                    yield name, f.get_tensor(name)
+
+
+_SAFETENSORS_DTYPE_BYTES = {
+    "F64": 8,
+    "I64": 8,
+    "U64": 8,
+    "F32": 4,
+    "I32": 4,
+    "U32": 4,
+    "F16": 2,
+    "BF16": 2,
+    "I16": 2,
+    "U16": 2,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "I8": 1,
+    "U8": 1,
+    "BOOL": 1,
+}
+
+
+def _dtype_bytes(dtype: str) -> int:
+    return _SAFETENSORS_DTYPE_BYTES.get(dtype, 4)
 
 
 def load_tower_tensors(
-    module: nn.Module, tensors: dict[str, torch.Tensor], twin_config: "VllmConfig"
+    module: nn.Module,
+    tensors: Iterator[tuple[str, torch.Tensor]],
+    twin_config: "VllmConfig",
+    device: torch.device,
 ) -> None:
     """Load checkpoint tensors into a built tower module the way the model
     loader would, and refuse a module left with parameters it did not get."""
@@ -354,7 +456,7 @@ def load_tower_tensors(
         set_current_vllm_config(twin_config),
         set_default_torch_dtype(model_config.dtype),
     ):
-        loaded = module.load_weights(iter(tensors.items()))  # type: ignore[operator]
+        loaded = module.load_weights(tensors)  # type: ignore[operator]
         if loaded is not None:
             missing = {n for n, _ in module.named_parameters()} - set(loaded)
             if missing:
@@ -362,7 +464,7 @@ def load_tower_tensors(
                     f"{len(missing)} tower parameters got no checkpoint tensor, "
                     f"e.g. {sorted(missing)[:3]}."
                 )
-        process_weights_after_loading(module, model_config, torch.device("cpu"))
+        process_weights_after_loading(module, model_config, device)
     module.eval()
 
 
@@ -383,24 +485,19 @@ def make_card_tower(
     options = mm_config.mm_encoder_host_towers[name]
     whole = options.card_layout == "replicated"
     twin_config = make_host_tower_config(vllm_config, name, options, for_card=True)
-    paths = tower_paths(model, name)
-    reader_holder: list[TensorReader] = []
-
-    def build() -> nn.Module:
-        module = build_host_tower_module(twin_config, host_forward=False, whole=False)
-        reader_holder[:] = [checkpoint_tower_reader(twin_config, module, paths)]
-        return module
-
-    def read() -> dict[str, torch.Tensor]:
-        return reader_holder[0]()
+    tensors = CheckpointTowerTensors(twin_config, tower_paths(model, name))
 
     return CardTower(
         name,
         model=model,
         device=device,
-        build=build,
-        read=read,
-        load=lambda module, tensors: load_tower_tensors(module, tensors, twin_config),
+        # The build context supplies the one-rank groups of a whole replica.
+        build=lambda where: build_host_tower_module(
+            twin_config, host_forward=False, whole=False, device=where
+        ),
+        tensors=tensors.index,
+        stream=tensors.stream,
+        load=lambda module, it: load_tower_tensors(module, it, twin_config, device),
         # A whole replica is built and loaded with one-rank groups; shards are
         # cut by the worker's own groups.
         build_context=single_rank_model_parallel if whole else nullcontext,
