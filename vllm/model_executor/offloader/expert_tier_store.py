@@ -127,6 +127,7 @@ class StoreSession:
         self.built: set[str] = set()
         self._writer: ExpertStoreWriter | None = None
         self._store: ExpertStore | None = None
+        self._stats_stop: threading.Event | None = None
         self._lock = threading.RLock()
         self._t_start = time.perf_counter()
         self.build_seconds = 0.0
@@ -189,6 +190,7 @@ class StoreSession:
                 read_mode=cfg.read_mode,
             )
             layout = self._store.layout
+            self._start_stats_thread()
             logger.info(
                 "Expert store opened (%s): %d units of %d B, %.2f GiB in %d "
                 "stripe(s) %s, staging pool %d slots (%.2f GiB), read mode %s, "
@@ -206,6 +208,34 @@ class StoreSession:
             )
             return self._store
 
+    def _start_stats_thread(self) -> None:
+        interval = self.config.stats_interval_s
+        if interval <= 0 or self._stats_stop is not None:
+            return
+        stop = self._stats_stop = threading.Event()
+        store = self._store
+
+        def loop() -> None:
+            while not stop.wait(interval):
+                st = store.stats()  # type: ignore[union-attr]
+                logger.info(
+                    "Expert store (rank %d): %d reads (%d scatter, %d staged), "
+                    "%.0f MiB, read p50 %.2f ms p95 %.2f ms, staging hits %d "
+                    "misses %d evictions %d.",
+                    self.rank,
+                    st["reads"],
+                    st["reads_scatter"],
+                    st["reads_staged"],
+                    st["bytes_read"] / 2**20,
+                    st["read_ms"]["p50"],
+                    st["read_ms"]["p95"],
+                    st["hits"],
+                    st["misses"],
+                    st["evictions"],
+                )
+
+        threading.Thread(target=loop, name="expert-store-stats", daemon=True).start()
+
     # -- writing ----------------------------------------------------------
 
     def _ensure_writer(self) -> ExpertStoreWriter:
@@ -213,26 +243,23 @@ class StoreSession:
             return self._writer
         cfg = self.config
         writer_id = f"rank{self.rank}"
-        if self._wipe:
-            # One rank clears the old store, then the others join the new one.
-            if self.rank == 0:
-                self._writer = ExpertStoreWriter(
-                    cfg.dirs, self.schema, self.identity,
-                    writer_id=writer_id, rebuild=True,
-                )  # fmt: skip
-            self._barrier()
-            if self._writer is None:
-                self._writer = ExpertStoreWriter(
-                    cfg.dirs, self.schema, self.identity, writer_id=writer_id
-                )
-        else:
+        # Rank 0 opens first, clearing an old store when asked to; the others
+        # join the new one. Every rank passes the barrier, whatever it found
+        # in the manifests.
+        if self.rank == 0:
+            self._writer = ExpertStoreWriter(
+                cfg.dirs, self.schema, self.identity,
+                writer_id=writer_id, rebuild=self._wipe,
+            )  # fmt: skip
+        self._barrier()
+        if self._writer is None:
             self._writer = ExpertStoreWriter(
                 cfg.dirs, self.schema, self.identity, writer_id=writer_id
             )
         logger.info(
-            "Expert store: building %s for %s (%d layers x %d experts, "
-            "%d unit bytes) in %s.",
-            "anew" if self._wipe else "or resuming",
+            "Expert store: building (%s; found %s) %d layers x %d experts, "
+            "%d B per unit, in %s.",
+            "from scratch" if self._wipe else "starting or resuming",
             self.status,
             self.schema.layers,
             self.schema.experts_per_layer,
@@ -296,6 +323,9 @@ class StoreSession:
 
     def close(self) -> None:
         with self._lock:
+            if self._stats_stop is not None:
+                self._stats_stop.set()
+                self._stats_stop = None
             if self._store is not None:
                 self._store.close()
                 self._store = None

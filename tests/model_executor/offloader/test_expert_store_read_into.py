@@ -277,3 +277,30 @@ def test_status_reads_the_manifests_only(tmp_path):
     w.finalize()
     assert ExpertStore.status(dirs, IDENT) == "complete"
     assert ExpertStore.status(dirs, "other") == "mismatch"
+
+
+class _Log:
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+
+    def info(self, msg, *args, **kwargs) -> None:
+        self.lines.append(msg % args if args else msg)
+
+    warning = info
+
+
+def test_each_read_path_says_so_once(tmp_path, monkeypatch):
+    from vllm.model_executor.offloader import expert_store
+
+    log = _Log()
+    monkeypatch.setattr(expert_store, "logger", log)
+    sch = schema()
+    dirs = build(tmp_path, sch)
+    with open_store(dirs, sch) as s:
+        for e in range(3):
+            s.read_into((0, e), dests(sch))
+        assert [x for x in log.lines if "scatter" in x].__len__() == 1
+        assert not [x for x in log.lines if "(staged)" in x]
+        s.read_into((0, 4), dests(sch, offset=64))
+        s.read_into((0, 5), dests(sch, offset=64))
+        assert len([x for x in log.lines if "(staged)" in x]) == 1

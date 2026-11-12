@@ -29,7 +29,7 @@ import numpy as np
 import regex as re
 import torch
 
-from vllm.distributed.eplb.expert_weights import TieredExpertWeight
+from vllm.distributed.eplb.expert_weights import StoreBackedWeight, TieredExpertWeight
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -432,7 +432,7 @@ class ExpertTiers:
                 TorchStreamOps,
             )
 
-            self.ops = TorchStreamOps(device)
+            self.ops = TorchStreamOps.shared(device)
             self.placement = TierPlacement(
                 self.num_local,
                 self.num_fast,
@@ -554,7 +554,7 @@ class ExpertTiers:
         """The tensors the two impls read, as EPLB's per-slot rows."""
         assert self._impls is not None, "the impls are built at weight processing"
         fast, slow = self._impls
-        weights = []
+        weights: list[TieredExpertWeight] = []
         for impl_field, _ in _TIER_FIELDS:
             parts = [getattr(impl, impl_field) for impl in (fast, slow)]
             # The spare rows beyond the host tier's slots are not EPLB's.
@@ -562,7 +562,11 @@ class ExpertTiers:
             parts = [p.view(p.shape[0], -1) for p in parts]
             if parts[0].dtype != parts[1].dtype:  # packed int4: int8 vs uint8
                 parts = [p.view(torch.uint8) for p in parts]
-            weights.append(TieredExpertWeight(parts, self.on_rows_written))
+            if self.store_binding is not None:
+                # placed by this object, through the expert store
+                weights.append(StoreBackedWeight(parts, self.on_rows_written, self))
+            else:
+                weights.append(TieredExpertWeight(parts, self.on_rows_written))
         return weights
 
     # -- moving slots between tiers while serving --------------------------
@@ -657,6 +661,116 @@ class ExpertTiers:
         move.stats = {"units": float(len(plan.reads))}
         self.commit_move(move)
         return move
+
+    # -- EPLB's ExpertMover ---------------------------------------------------
+
+    def _local_view(
+        self, phys2log: np.ndarray, logical_load: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """(logical expert, load) of each local slot under the placement
+        ``phys2log`` of the layer's physical slots."""
+        assert self.store_binding is not None
+        phys2log = np.asarray(phys2log)
+        slots = np.array(self.slot_global)
+        logical = phys2log[slots].astype(np.int64)
+        if (logical < 0).any():
+            raise NotImplementedError(
+                "empty expert slots (elastic EP) are not supported"
+            )
+        counts = np.bincount(
+            phys2log[phys2log >= 0], minlength=self.store_binding.num_logical
+        )
+        load = np.asarray(logical_load, dtype=np.float64)
+        return logical, load[logical] / np.maximum(counts[logical], 1)
+
+    def prepare(
+        self,
+        old_phys2log: np.ndarray,
+        new_phys2log: np.ndarray,
+        logical_load: np.ndarray,
+        hysteresis: float,
+    ) -> "PreparedMove":
+        old_logical, _ = self._local_view(old_phys2log, logical_load)
+        new_logical, slot_load = self._local_view(new_phys2log, logical_load)
+        assert self.slot_logical is not None
+        if not np.array_equal(old_logical, self.slot_logical):
+            raise RuntimeError(
+                f"{self.layer_name}: EPLB's placement and the tiers' disagree "
+                f"({old_logical.tolist()} vs {self.slot_logical.tolist()})"
+            )
+        return self.prepare_move(new_logical, slot_load, hysteresis)
+
+    def commit(self, prepared: "PreparedMove") -> None:
+        self.commit_move(prepared)
+
+    def discard(self, prepared: "PreparedMove") -> None:
+        """A prepared move that will not be committed: its pool rows were only
+        written, never mapped, so they are free at once."""
+        _, placement, _ = self._require_store()
+        placement.pool.give_back_unused(prepared.pool_dest.values())
+
+    @staticmethod
+    def prepared_stats(prepared: "PreparedMove") -> dict[str, float]:
+        return {
+            k: prepared.stats[k]
+            for k in ("units", "bytes", "prepare_ms")
+            if k in prepared.stats
+        }
+
+    def fill_to(
+        self, phys2log: np.ndarray, logical_load: np.ndarray, hysteresis: float
+    ) -> None:
+        """Before serving: take the placement ``phys2log`` and read every slot
+        from the store into the row it serves from. The hottest slots get the
+        fast rows (copied through the spare pool rows), the rest get pool rows
+        in slot order. Nothing reads the rows yet, so no ordering is needed."""
+        import time as _time
+
+        from vllm.model_executor.offloader.expert_tier_map import FAST, POOL
+
+        binding, placement, ops = self._require_store()
+        spare_rows = list(range(self.num_slow, self.num_pool_rows))
+        assert spare_rows, "filling the fast rows stages them through spare rows"
+        logical, load = self._local_view(phys2log, logical_load)
+        is_fast = np.zeros(self.num_local, dtype=bool)
+        is_fast[np.argsort(-load, kind="stable")[: self.num_fast]] = True
+        if np.array_equal(logical, self.slot_logical) and np.array_equal(
+            is_fast, placement.is_fast()
+        ):
+            return  # the rows already hold this placement
+        tier = np.where(is_fast, FAST, POOL).astype(np.int8)
+        row = np.zeros(self.num_local, dtype=np.int32)
+        row[is_fast] = np.arange(self.num_fast)
+        row[~is_fast] = np.arange(self.num_slow)
+        start = _time.perf_counter()
+        pool_slots = np.flatnonzero(~is_fast).tolist()
+        self._fill_rows(
+            {s: int(logical[s]) for s in pool_slots},
+            {s: int(row[s]) for s in pool_slots},
+        )
+        fast_slots = np.flatnonzero(is_fast).tolist()
+        for i in range(0, len(fast_slots), len(spare_rows)):
+            chunk = fast_slots[i : i + len(spare_rows)]
+            staging = {s: spare_rows[j] for j, s in enumerate(chunk)}
+            self._fill_rows({s: int(logical[s]) for s in chunk}, staging)
+            for s in chunk:
+                self._copy_rows(s, staging[s], int(row[s]))
+            done = ops.record_side()
+            while not ops.done(done):
+                _time.sleep(0.0005)
+        placement.reset_to(tier, row)
+        fast_np, slow_np = placement.maps(self.slot_global, self.num_global)
+        assert self.fast_map is not None and self.slow_map is not None
+        ops.compute_write(self.fast_map, fast_np)
+        ops.compute_write(self.slow_map, slow_np)
+        self.slot_logical = logical.copy()
+        self.on_rows_written([])
+        self.move_log.append(
+            {
+                "fill_ms": (_time.perf_counter() - start) * 1e3,
+                "units": float(len(logical)),
+            }
+        )
 
     def swap(self, promote: int, demote: int) -> "PreparedMove":
         """Put the pool slot ``promote`` in a fast row and the fast slot

@@ -1059,6 +1059,7 @@ class ExpertStore:
         # A scatter read lands in caller memory straight from the drive; it
         # is switched off for good the first time the drive refuses one.
         self._scatter_ok = read_mode != "staged"
+        self._modes_logged: set[str] = set()
         self._into_executor: ThreadPoolExecutor | None = None
         self._io_threads = io_threads
         self._reads_scatter = self._reads_staged = self._scatter_fallbacks = 0
@@ -1281,11 +1282,25 @@ class ExpertStore:
                 with self._lock:
                     self._reads_scatter += 1
                     self._into_bytes += group.payload_bytes
+                    first_use = "scatter" not in self._modes_logged
+                    self._modes_logged.add("scatter")
+                if first_use:
+                    logger.info(
+                        "Expert store: units are read straight into the caller's "
+                        "rows (scatter: one preadv, an iovec per tensor)."
+                    )
                 return "scatter"
         self._staged_read(key, group, views)
         with self._lock:
             self._reads_staged += 1
             self._into_bytes += group.payload_bytes
+            first_use = "staged" not in self._modes_logged
+            self._modes_logged.add("staged")
+        if first_use:
+            logger.info(
+                "Expert store: units are read into pool slots and copied into the "
+                "caller's rows (staged)."
+            )
         return "staged"
 
     def read_into_async(self, key: Key, dests: Mapping[str, Any]) -> Future:
