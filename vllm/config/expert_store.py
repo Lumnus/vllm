@@ -68,6 +68,15 @@ class ExpertStoreConfig:
     verify: bool = False
     """Hash every stripe against its checksum at open (a full read)."""
 
+    check_every: int = Field(default=8, ge=0)
+    """Check units against their recorded digests as they are read: 1 every
+    read, N every Nth read (the default samples one read in eight), 0 never.
+    A unit that fails is never mapped: the read raises and the move that
+    asked for it is abandoned."""
+
+    check_threads: int = Field(default=2, ge=0)
+    """Hashing threads of one unit check (0: as many as the library likes)."""
+
     spare_rows: int | None = Field(default=None, ge=0)
     """Host rows per layer beyond the host tier's slots, for experts being
     read while the old ones still serve. None: EPLB's ``max_moves_per_rank``,
@@ -133,6 +142,8 @@ class ExpertStoreConfig:
                 "decay_interval",
                 "build",
                 "verify",
+                "check_every",
+                "check_threads",
                 "stats_interval_s",
             },
         )
