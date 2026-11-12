@@ -9,6 +9,7 @@ every call on an unknown handle or an out-of-range device raises.
 """
 
 import ctypes
+import importlib.util
 import mmap
 import sys
 import types
@@ -319,8 +320,11 @@ def test_committable_blocks_on_xpu_keep_the_margin(fake_xpu, monkeypatch):
     kv_cache = ExtensibleKVCache(config, torch.device("xpu", 0), KVCacheLayout.LBNHC)
     try:
         bytes_per_block = NUM_LAYERS * spec.page_size_bytes
-        floor = extensible_kv_cache.KV_CACHE_MARGIN_FLOOR_BYTES
-        assert floor == 1 << 30
+        # Pin the margin so the expectation does not depend on the platform
+        # the module was imported under.
+        floor = 1 << 30
+        monkeypatch.setattr(extensible_kv_cache, "KV_CACHE_MARGIN_FLOOR_BYTES", floor)
+        monkeypatch.setattr(extensible_kv_cache, "KV_CACHE_MARGIN_FRACTION", 0.75)
         free = floor + 120 * bytes_per_block
         monkeypatch.setattr(
             extensible_kv_cache,
@@ -333,6 +337,103 @@ def test_committable_blocks_on_xpu_keep_the_margin(fake_xpu, monkeypatch):
         assert kv_cache.committable_blocks() == 20
     finally:
         kv_cache.free()
+
+
+def _import_with_platform(monkeypatch, *, rocm: bool, xpu: bool):
+    """A fresh copy of the sizing module, imported as `current_platform` says."""
+    import vllm.platforms
+
+    monkeypatch.setattr(
+        vllm.platforms,
+        "current_platform",
+        SimpleNamespace(is_rocm=lambda: rocm, is_xpu=lambda: xpu),
+    )
+    spec = importlib.util.spec_from_file_location(
+        "_extensible_kv_cache_probe", extensible_kv_cache.__file__
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# platform: (margin floor in GiB, margin fraction)
+PLATFORM_MARGINS = {
+    "cuda": (1, 0.75),
+    "rocm": (3, 0.75),
+    "xpu": (0, 0.0),
+}
+
+
+@pytest.mark.parametrize("platform", list(PLATFORM_MARGINS))
+def test_margin_constants_follow_the_platform(monkeypatch, platform):
+    module = _import_with_platform(
+        monkeypatch, rocm=platform == "rocm", xpu=platform == "xpu"
+    )
+    floor_gib, fraction = PLATFORM_MARGINS[platform]
+    assert floor_gib << 30 == module.KV_CACHE_MARGIN_FLOOR_BYTES
+    assert fraction == module.KV_CACHE_MARGIN_FRACTION
+    # The keyword defaults of the sizing function are bound to the same values.
+    defaults = module.measure_kv_cache_bytes.__kwdefaults__
+    assert defaults["margin_floor_bytes"] == floor_gib << 30
+    assert defaults["margin_fraction"] == fraction
+    # Not platform dependent for XPU: the non-torch reserve and the warmup share.
+    reserve_bytes = (2 if platform == "rocm" else 1) << 29
+    assert reserve_bytes == module.KV_CACHE_NON_TORCH_RESERVE_BYTES
+    assert module.KV_CACHE_WARMUP_RESERVE_FRACTION == 0.1
+
+
+@pytest.mark.parametrize("platform", list(PLATFORM_MARGINS))
+def test_measure_kv_cache_bytes_at_the_card_log_numbers(monkeypatch, platform):
+    """Rank 1 of a TP4 hybrid-MoE boot on four Arc Pro B70 cards: 2.96 GiB
+    free, 4.3 GiB committed, 1.11 GiB transient peak, 28.18 GiB requested,
+    28.64 GiB free at init."""
+    module = _import_with_platform(
+        monkeypatch, rocm=platform == "rocm", xpu=platform == "xpu"
+    )
+    gib = 1 << 30
+    free, committed, transient = int(2.96 * gib), int(4.3 * gib), int(1.11 * gib)
+    requested, init_free = int(28.18 * gib), int(28.64 * gib)
+    result = module.measure_kv_cache_bytes(
+        init_free_memory=init_free,
+        free_memory=free,
+        committed_bytes=committed,
+        requested_memory=requested,
+        transient_peak_bytes=transient,
+    )
+    # available = min(requested - non_kv_used, free + committed - margin)
+    #             - transient_peak, margin = max(floor, fraction * transient).
+    floor_gib, fraction = PLATFORM_MARGINS[platform]
+    non_kv_used = init_free - free - committed
+    margin = max(floor_gib << 30, int(transient * fraction))
+    expected = min(requested - non_kv_used, free + committed - margin) - transient
+    assert result == expected
+    # The device headroom binds on CUDA and ROCm (5.14 GiB in the card log for
+    # CUDA's margin); the budget binds on XPU, where no margin is held back.
+    if platform == "xpu":
+        assert result == requested - non_kv_used - transient
+    else:
+        assert result == free + committed - margin - transient
+
+
+def test_xpu_margin_gives_the_larger_cache(monkeypatch):
+    gib = 1 << 30
+    kwargs = dict(
+        init_free_memory=int(28.64 * gib),
+        free_memory=int(2.96 * gib),
+        committed_bytes=int(4.3 * gib),
+        requested_memory=int(28.18 * gib),
+        transient_peak_bytes=int(1.11 * gib),
+    )
+    sizes = {
+        name: _import_with_platform(
+            monkeypatch, rocm=name == "rocm", xpu=name == "xpu"
+        ).measure_kv_cache_bytes(**kwargs)
+        for name in PLATFORM_MARGINS
+    }
+    assert sizes["xpu"] > sizes["cuda"] > sizes["rocm"]
+    # The transient peak is still kept free in full on XPU.
+    assert sizes["xpu"] <= int(28.18 * gib) - kwargs["transient_peak_bytes"]
 
 
 @pytest.mark.parametrize("requested", [None, True, False])
