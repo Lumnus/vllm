@@ -44,6 +44,7 @@ from .diffusion import DiffusionConfig
 from .ec_manager_config import EncoderCacheManagerConfig
 from .ec_transfer import ECTransferConfig
 from .engram import EngramConfig, model_has_engram_layers
+from .expert_store import ExpertStoreConfig
 from .kernel import KernelConfig
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVCacheAccess, KVTransferConfig, hisparse_host_pool_gib
@@ -403,6 +404,8 @@ class VllmConfig:
     """Execution auxiliary output configuration."""
     engram_config: EngramConfig | None = None
     """N-gram embedding storage and sharding settings."""
+    expert_store_config: ExpertStoreConfig | None = None
+    """Experts on NVMe behind the per-expert CPU offload tiers."""
     mamba_config: MambaConfig = Field(default_factory=MambaConfig)
     """Mamba configuration."""
     kernel_config: KernelConfig = Field(default_factory=KernelConfig)
@@ -516,6 +519,7 @@ class VllmConfig:
             "offload": get_factors(self.offload_config),
             "attention": get_factors(self.attention_config),
             "engram": get_factors(self.engram_config),
+            "expert_store": get_factors(self.expert_store_config),
             "lora": get_factors(self.lora_config),
             "speculative": get_factors(self.speculative_config),
             "structured_outputs": get_factors(self.structured_outputs_config),
@@ -1488,6 +1492,10 @@ class VllmConfig:
         self.try_verify_and_update_config()
         self._reject_mismatched_float_kv_cache()
         self._resolve_and_verify_engram_config()
+        if self.expert_store_config is not None:
+            self.expert_store_config.verify_parallel_config(
+                self.parallel_config, self.offload_config
+            )
 
         self._check_supports_watermarking()
         # Models may have supplied their own DCP defaults above; anything still
