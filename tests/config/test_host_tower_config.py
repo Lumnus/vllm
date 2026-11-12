@@ -2,12 +2,17 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """`--mm-encoder-host-towers`: its formats, what it derives, what it refuses."""
 
+import copy
+import pickle
+from types import SimpleNamespace
+
 import pytest
 
 from vllm.config import CompilationConfig, ModelConfig, VllmConfig
 from vllm.config.ec_transfer import ECTransferConfig
 from vllm.config.multimodal import HostTowerOptions, MultiModalConfig
-from vllm.config.utils import hash_config
+from vllm.config.speculative import SpeculativeConfig
+from vllm.config.utils import hash_config, replace
 from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 
@@ -142,3 +147,107 @@ def test_language_model_only_has_no_tower_to_host():
 def test_deployments_that_cannot_host_a_tower_are_refused(kwargs, match):
     with pytest.raises(ValueError, match=match):
         _vllm_config({"vision_tower": 4}, **kwargs)
+
+
+# A config is built more than once on its way to a running engine: a worker
+# rebuilds it through `replace` (the draft model of speculative decoding, for
+# one), which runs every resolution and validation again on the values the
+# first run left behind.
+
+
+def _rebuilt_as_a_worker_does(config: VllmConfig) -> VllmConfig:
+    return replace(config, cache_config=replace(config.cache_config))
+
+
+def _draft_overrides_applied(config: VllmConfig) -> VllmConfig:
+    spec = SimpleNamespace(
+        moe_backend=None, attention_backend=None, kv_cache_dtype="auto"
+    )
+    return SpeculativeConfig.apply_draft_overrides(spec, config)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "rebuild", [_rebuilt_as_a_worker_does, _draft_overrides_applied]
+)
+def test_a_rebuilt_config_keeps_the_connector_the_engine_derived(rebuild):
+    config = _vllm_config({"vision_tower": {"cache_gb": 0.5}})
+    derived = config.ec_transfer_config
+    assert derived is not None
+
+    rebuilt = rebuild(config)
+
+    assert rebuilt.ec_transfer_config is not None
+    assert rebuilt.ec_transfer_config.ec_connector == "ECHostTowerConnector"
+    assert rebuilt.ec_transfer_config.ec_role == "ec_consumer"
+    assert rebuilt.ec_transfer_config.ec_connector_extra_config == {
+        "ec_cpu_bytes": 1 << 29
+    }
+    # The same connector instance identity, not a second derivation.
+    assert rebuilt.ec_transfer_config.engine_id == derived.engine_id
+
+
+def test_rebuilding_again_and_again_changes_nothing():
+    config = _vllm_config({"vision_tower": 4})
+    derived = config.ec_transfer_config
+    assert derived is not None
+
+    for _ in range(3):
+        config = _rebuilt_as_a_worker_does(config)
+
+    assert config.ec_transfer_config is not None
+    assert config.ec_transfer_config.engine_id == derived.engine_id
+    assert config.ec_transfer_config.ec_connector_extra_config == (
+        derived.ec_connector_extra_config
+    )
+
+
+@pytest.mark.parametrize("copier", [copy.copy, copy.deepcopy])
+def test_copies_and_pickles_keep_the_connector(copier):
+    config = _vllm_config({"vision_tower": 4})
+    for clone in (copier(config), pickle.loads(pickle.dumps(config))):
+        assert clone.ec_transfer_config is not None
+        assert clone.ec_transfer_config.ec_connector == "ECHostTowerConnector"
+        assert _rebuilt_as_a_worker_does(clone).ec_transfer_config is not None
+
+
+@pytest.mark.parametrize(
+    "connector",
+    [
+        ECTransferConfig(ec_connector="ECExampleConnector", ec_role="ec_consumer"),
+        # The connector's own name is no proof that the engine derived it.
+        ECTransferConfig(ec_connector="ECHostTowerConnector", ec_role="ec_consumer"),
+    ],
+)
+def test_a_connector_of_the_user_is_refused_with_the_same_message(connector):
+    with pytest.raises(
+        ValueError, match="cannot be combined with --ec-transfer-config"
+    ):
+        _vllm_config({"vision_tower": 4}, ec_transfer_config=connector)
+
+
+def test_a_connector_of_the_user_is_refused_after_a_rebuild_too():
+    config = _vllm_config()
+    config.ec_transfer_config = ECTransferConfig(
+        ec_connector="ECHostTowerConnector", ec_role="ec_consumer"
+    )
+    config.model_config.get_multimodal_config().mm_encoder_host_towers = {
+        "vision_tower": HostTowerOptions(threads=4)
+    }
+    with pytest.raises(
+        ValueError, match="cannot be combined with --ec-transfer-config"
+    ):
+        _rebuilt_as_a_worker_does(config)
+
+
+def test_the_derived_connector_cannot_be_asked_for_on_the_command_line():
+    with pytest.raises(ValueError):
+        ECTransferConfig(
+            ec_connector="ECHostTowerConnector",
+            ec_role="ec_consumer",
+            host_tower_derived=True,  # type: ignore[call-arg]
+        )
+
+
+def test_a_rebuild_without_host_towers_still_has_no_connector():
+    config = _rebuilt_as_a_worker_does(_vllm_config())
+    assert config.ec_transfer_config is None

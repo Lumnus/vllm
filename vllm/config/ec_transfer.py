@@ -54,6 +54,12 @@ class ECTransferConfig:
     """The Python module path to dynamically load the EC connector from.
     Only supported in V1."""
 
+    host_tower_derived: bool = field(default=False, init=False)
+    """Set on the config that `--mm-encoder-host-towers` derives for its own
+    connector, so that building the engine config again (a worker rebuilds it
+    through `replace`) tells that connector from one given by the user. It is
+    not an argument: it cannot be passed in."""
+
     mm_encoder_output_widths: dict[str, int] = field(default_factory=dict, init=False)
     """Per-token width of the encoder output for each modality, measured by EC
     producers at startup. It can exceed the LM embedding width (e.g. DeepStack).
