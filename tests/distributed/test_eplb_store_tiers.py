@@ -173,8 +173,17 @@ def test_store_backed_layers_have_no_expert_buffer_and_no_tier_order(
     assert model_state.expert_buffer == []
     assert model_state.movers is not None and model_state.fast_slots is None
     assert any("expert store mover" in line for line in log.lines)
-    # EPLB addresses the host tier by its slots, not by the spare rows
-    assert model.expert_weights[0][0].tier_sizes == (FAST, E - FAST)
+    # EPLB sees the host tier by its slots, not by the spare rows
+    weight = model.expert_weights[0][0]
+    assert weight.tier_sizes == (FAST, E - FAST) and len(weight) == E
+    # ... and cannot reach a row by slot: which row serves a slot is the
+    # mover's state, so a by-slot access would touch another expert
+    with pytest.raises(RuntimeError, match="not addressable by slot"):
+        weight[0]
+    with pytest.raises(RuntimeError, match="not addressable by slot"):
+        weight.rows_written([E - 1])
+    with pytest.raises(RuntimeError, match="not addressable by slot"):
+        weight.view(torch.uint8).tier_of(0)
     # a synchronous rearrangement is refused, a profile rearrangement is free
     with pytest.raises(NotImplementedError, match="asynchronously"):
         state.rearrange(blocking=True)
