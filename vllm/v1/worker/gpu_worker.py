@@ -1069,6 +1069,36 @@ class Worker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_blocks
         return released
 
+    # The accelerator copies of encoder towers with residency "dynamic"
+    # (vllm/multimodal/card_tower.py); the engine core calls these in order.
+    def _card_tower(self, name: str):
+        towers = self.__dict__.setdefault("_card_towers", {})
+        tower = towers.get(name)
+        if tower is None:
+            from vllm.multimodal.card_tower import make_card_tower
+
+            device = getattr(self.model_runner, "device", None) or self.device
+            tower = make_card_tower(
+                self.vllm_config, name, self.model_runner.get_model(), device
+            )
+            towers[name] = tower
+        return tower
+
+    def tower_residency_stage(self, name: str) -> dict:
+        return self._card_tower(name).stage()
+
+    def tower_residency_poll(self, name: str) -> dict:
+        return self._card_tower(name).poll()
+
+    def tower_residency_commit(self, name: str, wait_s: float | None = None) -> dict:
+        return self._card_tower(name).commit(wait_s)
+
+    def tower_residency_release(self, name: str) -> dict:
+        return self._card_tower(name).release()
+
+    def tower_residency_discard(self, name: str) -> None:
+        self._card_tower(name).discard()
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         # Warmup forwards record expert load like real ones.
