@@ -39,7 +39,10 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from vllm.logger import init_logger
 from vllm.model_executor.offloader import expert_store_integrity as _integrity
+
+logger = init_logger(__name__)
 
 FORMAT = "expert-store/v1"
 PAGE = 4096
@@ -56,6 +59,10 @@ CHUNK_BYTES = 1 << 30
 # Retry backoff for a failed or short read, seconds (then raise).
 RETRY_BACKOFF_S = (0.001, 0.010, 0.100)
 DEFAULT_TENSOR_ALIGN = 64
+# Bytes the file offset, buffer addresses and sizes of a direct read into
+# caller memory must be a multiple of (the logical block size of the common
+# drives); a read that does not meet it goes through a bounce buffer.
+DIRECT_ALIGN = 512
 
 _ITEMSIZE = {
     "float64": 8,
@@ -1151,6 +1158,16 @@ class ExpertStore:
         self._tls = threading.local()
         self._reads_bounce = 0
         self._fallbacks: dict[str, int] = {}
+        # Reads into caller memory (read_into) keep a read mode of their own:
+        # the caller's rows and the pool's slots may be different kinds of
+        # memory (pinned or not), and the kernel may refuse one and not the
+        # other.
+        self._into_mode = "direct"
+        self._into_counts = {"direct": 0, "buffered": 0, "bounce": 0}
+        self._into_bytes = 0
+        self._into_logged: set[str] = set()
+        self._into_executor: ThreadPoolExecutor | None = None
+        self._io_threads = io_threads
         # statistics
         self._hits = self._misses = self._joins = self._reads = 0
         self._bytes_read = self._evictions = self._errors = 0
@@ -1303,6 +1320,273 @@ class ExpertStore:
             for future in [pool.submit(check, d) for d in ordered]:
                 future.result()
 
+    @staticmethod
+    def status(dirs: Sequence[str], identity: str) -> str:
+        """What ``open`` would find, from the manifests alone (no pool, no
+        stripe read): ``"complete"`` (opens with this identity), ``"mismatch"``
+        (complete, another identity), ``"incomplete"`` (started, not
+        finalized) or ``"absent"`` (a directory without a manifest)."""
+        manifests = [_read_manifest(os.fspath(d)) for d in dirs]
+        if not manifests or manifests[0] is None:
+            return "absent"
+        first = manifests[0]
+        if not first.get("complete"):
+            return "incomplete"
+        if first.get("identity") != identity:
+            return "mismatch"
+        if any(m is None or not m.get("complete") for m in manifests):
+            return "incomplete"
+        return "complete"
+
+    # -- reads into caller memory -----------------------------------------
+
+    def read_into(self, key: Key, dests: Mapping[str, Any]) -> str:
+        """Read one unit's tensors into caller-owned host memory.
+
+        ``dests`` maps each tensor name of the unit to a writable,
+        C-contiguous buffer of exactly that tensor's bytes (a numpy array, or
+        a torch CPU tensor of any dtype). Blocks until the bytes are there and
+        returns how they came:
+
+        * ``"direct"``: one ``preadv`` with an iovec per tensor, O_DIRECT,
+          straight from the drive into the buffers (no copy, nothing in the
+          pool);
+        * ``"buffered"``: the same read on a descriptor without O_DIRECT;
+        * ``"bounce"``: a direct read of the whole unit into an ordinary
+          page-aligned buffer of the calling thread, then one host copy per
+          tensor.
+
+        The store's read mode applies (see :meth:`open`). In ``auto`` the
+        first read is direct; if the kernel refuses the buffers (EFAULT, as
+        for pinned accelerator memory) reads into caller memory move to
+        buffered and, if that is refused too, to bounce; a drive that refuses
+        the buffers' alignment (EINVAL) moves them to bounce. What worked is
+        kept, apart from the pool's own mode: the caller's memory and the
+        pool's slots may be of different kinds. A read whose buffers are not
+        ``DIRECT_ALIGN``-aligned, or whose unit has gaps between its tensors,
+        takes the bounce path for that read only.
+
+        With unit checks on (``check_every``), a sampled read is checked
+        against its digest before the call returns; a unit that fails raises
+        :class:`StoreCorruptError` (the buffers then hold the bad bytes).
+        """
+        key = (int(key[0]), int(key[1]))
+        stripe_no, offset, unit_bytes = self.layout.locate(*key)
+        group = self.layout.group_of(key[0])
+        views = self._dest_views(group, dests)
+        stripe = self._stripes[stripe_no]
+        start = time.perf_counter()
+        while True:
+            mode = self._into_mode
+            try:
+                used = self._read_into_once(
+                    key, stripe, offset, unit_bytes, group, views, mode
+                )
+                break
+            except _ReadFallback as fb:
+                self._demote_into(mode, fb.code)
+        latency = time.perf_counter() - start
+        with self._lock:
+            self._latencies.append(latency)
+            self._latency_max = max(self._latency_max, latency)
+            self._reads += 1
+            self._bytes_read += group.payload_bytes
+            self._into_bytes += group.payload_bytes
+            self._into_counts[used] += 1
+            if used == "buffered":
+                self._reads_buffered += 1
+            else:
+                self._reads_direct += 1
+            if used == "bounce":
+                self._reads_bounce += 1
+            first_use = used not in self._into_logged
+            self._into_logged.add(used)
+        if first_use:
+            if used == "bounce":
+                logger.info(
+                    "Expert store: units are read into a bounce buffer and "
+                    "copied into the caller's rows (bounce)."
+                )
+            else:
+                logger.info(
+                    "Expert store: units are read straight into the caller's "
+                    "rows (%s: one preadv, an iovec per tensor).",
+                    used,
+                )
+        return used
+
+    def read_into_async(self, key: Key, dests: Mapping[str, Any]) -> Future:
+        """:meth:`read_into` on a thread of a pool of its own (not the pool's
+        I/O threads); the future's result is the read path taken."""
+        with self._lock:
+            if self._closed:
+                raise StoreClosedError("store is closed")
+            if self._into_executor is None:
+                self._into_executor = ThreadPoolExecutor(
+                    self._io_threads, thread_name_prefix="expert-into"
+                )
+            executor = self._into_executor
+        return executor.submit(self.read_into, key, dests)
+
+    def _read_into_once(
+        self,
+        key: Key,
+        stripe: "_Stripe",
+        offset: int,
+        unit_bytes: int,
+        group: _GroupLayout,
+        views: list[np.ndarray],
+        mode: str,
+    ) -> str:
+        if mode != "bounce" and self._gapless(group):
+            want_direct = mode == "direct" and stripe.direct
+            if not want_direct or self._direct_fits(offset, views):
+                direct = self._fill_views(
+                    stripe, offset, group.payload_bytes, views, want_direct, mode
+                )
+                self._check_parts(key, views, unit_bytes - group.payload_bytes)
+                return "direct" if direct else "buffered"
+        # The whole padded unit into this thread's ordinary buffer (direct
+        # where the stripe takes it), then a copy per tensor.
+        bounce = self._bounce_buffer(unit_bytes)
+        self._fill(stripe, offset, bounce, True, "bounce")
+        if self._integrity is not None:
+            self._check_unit(key, bounce)
+        for place, view in zip(group.tensors, views):
+            np.copyto(view, bounce[place.offset : place.offset + place.nbytes])
+        return "bounce"
+
+    def _demote_into(self, mode: str, code: int) -> None:
+        """Move reads into caller memory to the next mode after a refusal."""
+        with self._lock:
+            if self._into_mode != mode:
+                return  # another thread already moved on
+            self._into_mode = "bounce" if code == errno.EINVAL else _NEXT_MODE[mode]
+            reason = f"{errno.errorcode.get(code, code)}_{mode}_into"
+            self._fallbacks[reason] = self._fallbacks.get(reason, 0) + 1
+            new = self._into_mode
+        logger.warning(
+            "Expert store: a %s read into the caller's rows was refused (%s); "
+            "reading them %s from now on.",
+            mode,
+            errno.errorcode.get(code, code),
+            new,
+        )
+
+    def _check_parts(self, key: Key, views: list[np.ndarray], padding: int) -> None:
+        """Check a unit read as its tensors (no gaps) against its digest."""
+        checker = self._integrity
+        if checker is None or not checker.due():
+            return
+        index = self.layout.unit_index(*key)
+        parts: list[Any] = [*views, bytes(padding)]
+        if checker.check_parts(index, parts) is not None:
+            raise StoreCorruptError(
+                f"unit {key} does not match its recorded checksum "
+                "(the data on the drive differs from what was written)"
+            )
+
+    @staticmethod
+    def _dest_views(group: _GroupLayout, dests: Mapping[str, Any]) -> list[np.ndarray]:
+        views = []
+        for place in group.tensors:
+            if place.name not in dests:
+                raise ValueError(f"no destination for tensor {place.name!r}")
+            dest = dests[place.name]
+            if not isinstance(dest, np.ndarray):  # a torch CPU tensor
+                import torch
+
+                if dest.dtype != torch.uint8:
+                    dest = dest.view(torch.uint8)
+                dest = dest.numpy()
+            if not (dest.flags.c_contiguous and dest.flags.writeable):
+                raise ValueError(f"destination of {place.name!r} is not writable")
+            dest = dest.reshape(-1).view(np.uint8)
+            if dest.nbytes != place.nbytes:
+                raise ValueError(
+                    f"destination of {place.name!r} is {dest.nbytes} B, the "
+                    f"tensor is {place.nbytes} B"
+                )
+            views.append(dest)
+        extra = set(dests) - {p.name for p in group.tensors}
+        if extra:
+            raise ValueError(f"unknown tensors {sorted(extra)}")
+        return views
+
+    @staticmethod
+    def _gapless(group: _GroupLayout) -> bool:
+        """Whether the unit's tensors follow each other without padding."""
+        end = 0
+        for place in group.tensors:
+            if place.offset != end:
+                return False
+            end += place.nbytes
+        return True
+
+    @staticmethod
+    def _direct_fits(offset: int, views: list[np.ndarray]) -> bool:
+        return offset % DIRECT_ALIGN == 0 and all(
+            v.ctypes.data % DIRECT_ALIGN == 0 and v.nbytes % DIRECT_ALIGN == 0
+            for v in views
+        )
+
+    def _fill_views(
+        self,
+        stripe: "_Stripe",
+        offset: int,
+        need: int,
+        views: list[np.ndarray],
+        want_direct: bool,
+        mode: str,
+    ) -> bool:
+        """Fill ``views`` in order from the stripe; True if O_DIRECT was used."""
+        iovecs = [memoryview(v) for v in views]
+        got = 0
+        attempt = 0
+        direct = False
+        auto = self._forced is None
+        while got < need:
+            if want_direct and stripe.direct:
+                fd, direct = stripe.fd, True
+            else:
+                fd, direct = stripe.buffered_fd(), False
+            error = ""
+            try:
+                count = self._preadv(fd, iovecs, offset + got)
+                if direct and got + count < need:
+                    count -= count % DIRECT_ALIGN  # resume on a block boundary
+                if count > 0:
+                    got += count
+                    iovecs = self._advance(views, got)
+                    continue
+                error = f"short read ({got} < {need} B)"
+            except OSError as exc:
+                refused = exc.errno == errno.EFAULT or (
+                    exc.errno == errno.EINVAL and direct
+                )
+                if refused and auto:
+                    raise _ReadFallback(exc.errno) from exc
+                error = f"errno {exc.errno} ({exc.strerror})"
+            if attempt >= len(RETRY_BACKOFF_S):
+                raise ExpertStoreError(
+                    f"read failed at {offset + got} of {stripe.path}: {error}"
+                )
+            time.sleep(RETRY_BACKOFF_S[attempt])
+            attempt += 1
+        return direct
+
+    @staticmethod
+    def _advance(views: list[np.ndarray], consumed: int) -> list[memoryview]:
+        """The iovecs for what is left after ``consumed`` bytes."""
+        out = []
+        for v in views:
+            if consumed >= v.nbytes:
+                consumed -= v.nbytes
+                continue
+            out.append(memoryview(v)[consumed:])
+            consumed = 0
+        return out
+
     # -- requests ----------------------------------------------------------
 
     def request(self, keys: Iterable[Key], lease: bool = False) -> list[Future]:
@@ -1385,6 +1669,7 @@ class ExpertStore:
         with self._lock:
             self._forced = None if mode == "auto" else mode
             self._mode = "direct" if mode == "auto" else mode
+            self._into_mode = self._mode
 
     def _check_unit(self, key: Key, data: np.ndarray) -> None:
         """Check a unit just read against its digest (I/O thread, no lock)."""
@@ -1689,6 +1974,9 @@ class ExpertStore:
                 "read_mode": self._mode,
                 "reads_bounce": self._reads_bounce,
                 "read_fallbacks": dict(self._fallbacks),
+                "into_read_mode": self._into_mode,
+                "into_reads": dict(self._into_counts),
+                "into_bytes": self._into_bytes,
                 "checked": self._integrity.checked if self._integrity else 0,
                 "check_failures": self._integrity.failed if self._integrity else 0,
             }
@@ -1708,6 +1996,8 @@ class ExpertStore:
             if self._closed:
                 return
             self._closed = True
+        if self._into_executor is not None:
+            self._into_executor.shutdown(wait=True, cancel_futures=True)
         self._executor.shutdown(wait=True, cancel_futures=True)
         with self._lock:
             error = StoreClosedError("store was closed")
