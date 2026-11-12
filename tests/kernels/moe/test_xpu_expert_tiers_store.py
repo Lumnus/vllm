@@ -226,6 +226,22 @@ def test_a_fill_is_checked_against_the_rows_this_start_built(monkeypatch, tmp_pa
     tstore.reset_sessions()
 
 
+def test_a_device_view_that_is_a_copy_is_refused_at_load(monkeypatch, tmp_path):
+    """Store reads land in the pinned tensors; the kernels read the views. If
+    the view op copies (memory it does not take as pinned), the load fails
+    instead of serving rows the store never reaches."""
+    env = Env(monkeypatch, tmp_path, True)
+    monkeypatch.setattr(
+        "vllm.utils.torch_utils.get_accelerator_view_from_cpu_tensor",
+        lambda t: t.clone(),
+    )
+    env.construct()
+    env.load()
+    with pytest.raises(RuntimeError, match="is a copy"):
+        env.process()
+    tstore.reset_sessions()
+
+
 def _flip_unit(env, layer: int, logical: int) -> None:
     store = env.tiers[layer].store_binding.session.store
     stripe, offset, _ = store.layout.locate(layer, logical)
