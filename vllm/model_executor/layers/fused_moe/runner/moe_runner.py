@@ -664,6 +664,11 @@ class MoERunner(MoERunnerInterface):
                 hidden_states, topk_weights, topk_ids
             )
         elif self.routed_experts.quant_method.is_monolithic:
+            if self.router.residency_mask_active:
+                raise NotImplementedError(
+                    "The EPLB residency mask is applied by the router before "
+                    "top-k; a monolithic MoE kernel routes by itself"
+                )
             # Monolithic kernels: pass router_logits to routed_experts
             router_logits = self.router.prepare_monolithic_logits(router_logits)
             fused_out = self.routed_experts.forward_monolithic(
