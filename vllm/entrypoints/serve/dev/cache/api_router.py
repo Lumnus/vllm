@@ -44,6 +44,32 @@ async def reset_prefix_cache(
     return JSONResponse(content={"success": bool(success)})
 
 
+@router.post("/resize_kv_cache")
+async def resize_kv_cache(
+    raw_request: Request,
+    num_blocks: int = Query(gt=0),
+):
+    """Grow the extensible KV cache toward `num_blocks` blocks while serving.
+
+    The engine commits what the memory on every card fits, up to `num_blocks`
+    and the reserved capacity, and never fewer blocks than it has. Returns
+    `{"num_blocks": int}`, the count in force afterwards; a request at or below
+    the current size changes nothing.
+
+    Example:
+       POST /resize_kv_cache?num_blocks=9000
+
+    """
+    logger.info("Resizing the KV cache toward %d blocks...", num_blocks)
+    try:
+        committed = await engine_client(raw_request).resize_kv_cache(num_blocks)
+    except Exception as e:  # noqa: BLE001
+        # The engine core reports a failed call as a plain Exception.
+        logger.warning("Resizing the KV cache failed: %s", e)
+        return JSONResponse(content={"error": str(e)}, status_code=400)
+    return JSONResponse(content={"num_blocks": committed})
+
+
 @router.post("/reset_mm_cache")
 async def reset_mm_cache(raw_request: Request):
     """Reset the multi-modal cache. Note that we currently do not check if the

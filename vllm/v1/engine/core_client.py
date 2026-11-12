@@ -328,6 +328,9 @@ class EngineCoreClient(ABC):
     async def reset_encoder_cache_async(self) -> None:
         raise NotImplementedError
 
+    async def resize_kv_cache_async(self, target_num_blocks: int) -> int:
+        raise NotImplementedError
+
     async def sleep_async(
         self, level: int = 1, mode: PauseMode = "abort", reset_connector: bool = True
     ) -> None:
@@ -1427,6 +1430,9 @@ class AsyncMPClient(MPClient):
 
     async def reset_encoder_cache_async(self) -> None:
         await self.call_utility_async("reset_encoder_cache")
+
+    async def resize_kv_cache_async(self, target_num_blocks: int) -> int:
+        return await self.call_utility_async("resize_kv_cache", target_num_blocks)
 
     async def sleep_async(
         self, level: int = 1, mode: PauseMode = "abort", reset_connector: bool = True

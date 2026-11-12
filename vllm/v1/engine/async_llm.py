@@ -1214,6 +1214,9 @@ class AsyncLLM(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
+    async def resize_kv_cache(self, target_num_blocks: int) -> int:
+        return await self.engine_core.resize_kv_cache_async(target_num_blocks)
+
     async def sleep(
         self, level: int = 1, mode: PauseMode = "abort", reset_connector: bool = True
     ) -> None:

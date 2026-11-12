@@ -199,6 +199,13 @@ class EngineClient(ABC):
         """Reset the prefix cache and optionally any configured connector cache."""
         ...
 
+    async def resize_kv_cache(self, target_num_blocks: int) -> int:
+        """Grow the extensible KV cache toward target_num_blocks while serving.
+
+        Returns the block count in force afterwards.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     async def sleep(
         self, level: int = 1, mode: "PauseMode" = "abort", reset_connector: bool = True
