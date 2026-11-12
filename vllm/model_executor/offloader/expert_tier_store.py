@@ -30,9 +30,10 @@ from vllm.model_executor.offloader.expert_store import (
 
 logger = init_logger(__name__)
 
-# Changes whenever the bytes of a unit would change for the same checkpoint
-# (the layout transform of the kernels, the order of the tensors).
-LAYOUT_VERSION = "expert-tiers-int4-sm4/1"
+# Changes whenever this module changes what a unit holds for the same
+# checkpoint (the order of the tensors, what is stored). What the kernels do
+# to the weights is not kept by hand: see ``store_identity``'s ``transform``.
+LAYOUT_VERSION = "expert-tiers-int4/2"
 
 _SUFFIXES = (".safetensors", ".json", ".bin", ".pt", ".model")
 
@@ -68,10 +69,14 @@ def build_schema(
     return StoreSchema.uniform(num_layers, num_experts, specs)
 
 
-def store_identity(schema: StoreSchema, checkpoint: str) -> str:
-    """The identity string of a store: checkpoint, layout version, schema."""
+def store_identity(schema: StoreSchema, checkpoint: str, transform: str = "") -> str:
+    """The identity string of a store: checkpoint, layout version, schema,
+    and ``transform``, a fingerprint of what the kernels' weight transform
+    does (taken by running it, so a kernels build that changes it changes
+    the identity without anyone keeping a version by hand)."""
     body = {
         "layout": LAYOUT_VERSION,
+        "transform": transform,
         "checkpoint": checkpoint,
         "layers": schema.layers,
         "experts": schema.experts_per_layer,
