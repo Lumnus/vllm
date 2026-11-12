@@ -1190,15 +1190,13 @@ def _sized_with_reserve(ranks: GrowFixture, transient: int) -> ExtensibleKVCache
     return cache
 
 
-def test_serving_measurement_does_not_count_twice_what_torch_took(
-    grow_ranks, monkeypatch
-):
-    """Memory torch reserved since the sizing came out of the transient
-    reserve: the count that fits is the one the sizing found, not that less
-    what torch took. One line reports the numbers."""
+def test_serving_measurement_counts_torch_cache_as_reclaimable(grow_ranks, monkeypatch):
+    """Torch's cache that is reserved and not allocated is room a grow may
+    take, as long as torch keeps the startup reserve above its allocation.
+    One line reports every term."""
     ranks = grow_ranks([40])
     transient, taken = 64 * MIB, 24 * MIB
-    _sized_with_reserve(ranks, transient)
+    cache = _sized_with_reserve(ranks, transient)
     ranks.torch_reserved += taken
     ranks.torch_stats = {
         "allocated_bytes.all.current": 510 * MIB,
@@ -1211,23 +1209,30 @@ def test_serving_measurement_does_not_count_twice_what_torch_took(
         "info",
         lambda message, *args: lines.append(message % args),
     )
+    # Free: 40 blocks' worth plus 40 MiB; reclaimable 26 MiB; keep 64 MiB.
+    expected = cache.blocks_within(cache.physical_bytes_for(40) + 2 * MIB)
+    assert expected >= 40
 
-    assert ranks.grow(0, 50) == 40
+    assert ranks.grow(0, 50) == min(50, expected)
 
     measured = [line for line in lines if "resize measurement" in line]
     assert len(measured) == 1
-    assert "40 blocks fit" in measured[0]
-    assert "0.02 taken by torch since" in measured[0]
+    assert "(0.03 reclaimable)" in measured[0]
+    assert "keep 0.06 GiB above the allocation" in measured[0]
+    assert f"{expected} blocks fit" in measured[0]
 
 
 def test_serving_measurement_keeps_free_the_peak_serving_has_shown(grow_ranks):
-    """An allocation peak above the startup reserve raises the reserve."""
+    """A peak above the allocation larger than the startup reserve raises
+    the room torch keeps."""
     ranks = grow_ranks([40])
     transient, above = 64 * MIB, 8 * MIB
     cache = _sized_with_reserve(ranks, transient)
     ranks.torch_stats["allocated_bytes.all.peak"] = 500 * MIB + transient + above
-    expected = cache.blocks_within(cache.physical_bytes_for(40) - above)
-    assert 8 < expected < 40
+    # Free 40 blocks' worth + 64 MiB, reclaimable 12 MiB, keep 72 MiB.
+    expected = cache.blocks_within(cache.physical_bytes_for(40) + 4 * MIB)
+    without_peak = cache.blocks_within(cache.physical_bytes_for(40) + 12 * MIB)
+    assert expected < without_peak
 
     assert ranks.grow(0, 50) == expected
 
@@ -1238,9 +1243,121 @@ def test_serving_measurement_counts_memory_taken_outside_torch(grow_ranks):
     cache = _sized_with_reserve(ranks, 64 * MIB)
     elsewhere = 8 * MIB
     ranks.free_memory[0] -= elsewhere
-    expected = cache.blocks_within(cache.physical_bytes_for(40) - elsewhere)
+    expected = cache.blocks_within(cache.physical_bytes_for(40) + 12 * MIB - elsewhere)
 
     assert ranks.grow(0, 50) == expected
+
+
+GIB = 1 << 30
+
+
+def _card_room(**overrides):
+    """The terms of the measurement on four B70 at 5,993 blocks after a load
+    (allocated 19.5 GiB, reserved 22.34, peak 20.52, startup reserve 1.11,
+    cap 21.54 over 5.14 GiB mapped), with the device's free memory as given."""
+    terms = dict(
+        free_memory=0,
+        mapped_bytes=int(5.14 * GIB),
+        torch_allocated=int(19.5 * GIB),
+        torch_reserved=int(22.34 * GIB),
+        torch_peak=int(20.52 * GIB),
+        startup_reserve=int(1.11 * GIB),
+        torch_budget=int((21.54 + 5.14) * GIB),
+    )
+    terms.update(overrides)
+    return extensible_kv_cache.serving_kv_room(**terms)
+
+
+def test_serving_room_at_the_card_numbers():
+    """With nothing free on the device the room is in torch's cache: none
+    until it is emptied; afterwards the cap, not the device, binds."""
+    bytes_per_block = 6.14 * GIB / 7158
+    before = _card_room()
+    assert before.reclaimable == pytest.approx(2.84 * GIB, rel=1e-3)
+    assert before.keep == pytest.approx(1.11 * GIB, rel=1e-3)
+    assert before.room == 0
+    # Emptying the cache returned 1.76 GiB on the card that bound before the
+    # fix pass (its 6,744 = 5.14 + 1.76 - 1.11 GiB); 1.08 GiB stays cached.
+    after = _card_room(
+        free_memory=int(1.76 * GIB), torch_reserved=int((19.5 + 1.08) * GIB)
+    )
+    assert after.device_room == pytest.approx(1.73 * GIB, rel=1e-3)
+    assert after.cap_room == pytest.approx(0.93 * GIB, rel=1e-3)
+    assert after.room == after.cap_room
+    assert 5993 + int(after.room // bytes_per_block) == pytest.approx(7077, abs=2)
+
+
+def test_serving_room_refuses_when_torch_holds_its_reservation():
+    room = _card_room(torch_allocated=int(22.2 * GIB))
+    assert room.room == 0
+    # And no cap: the device alone decides, still nothing.
+    assert _card_room(torch_allocated=int(22.2 * GIB), torch_budget=None).room == 0
+
+
+def test_serving_measurement_empties_torch_cache_only_when_the_grow_needs_it(
+    grow_ranks, monkeypatch
+):
+    ranks = grow_ranks([40])
+    cache = _sized_with_reserve(ranks, 64 * MIB)
+    empties: list[int] = []
+    # Torch caches 100 MiB it does not use; emptying gives it to the device.
+    # Blocks are 3 MiB: free memory then covers 20 blocks beyond the 8.
+    ranks.torch_reserved += 100 * MIB
+    ranks.free_memory[0] -= 100 * MIB
+
+    def empty_cache() -> None:
+        empties.append(1)
+        ranks.torch_reserved -= 100 * MIB
+        ranks.free_memory[0] += 100 * MIB
+
+    monkeypatch.setattr(torch.accelerator, "empty_cache", empty_cache)
+
+    # A grow the free memory covers leaves the cache alone.
+    assert ranks.grow(0, 12) == 12
+    assert empties == []
+    # One that needs more empties it once, then measures again.
+    assert ranks.grow(0, 40) == 40
+    assert empties == [1]
+    assert cache.num_committed_blocks == 40
+
+
+def test_serving_measurement_refuses_when_torch_has_nothing_to_give(grow_ranks):
+    ranks = grow_ranks([40])
+    cache = _sized_with_reserve(ranks, 64 * MIB)
+    # Torch took the whole startup reserve and more, and allocated it all.
+    ranks.free_memory[0] = 0
+    ranks.torch_reserved = 600 * MIB
+    ranks.torch_stats = {
+        "allocated_bytes.all.current": 600 * MIB,
+        "allocated_bytes.all.peak": 600 * MIB,
+    }
+    assert ranks.grow(0, 40) == 8
+    assert cache.num_committed_blocks == 8
+
+
+def test_grow_cap_follows_from_the_budget_and_stops_the_grow(grow_ranks, monkeypatch):
+    """The cap after a grow is the budget less what the KV cache maps; a grow
+    that would put it below the allocation plus the reserve stops short."""
+    ranks = grow_ranks([40])
+    cache = _sized_with_reserve(ranks, 0)
+    total = 32 << 30
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda device=None: (total, total)
+    )
+    monkeypatch.setattr(
+        torch.xpu, "set_per_process_memory_fraction", lambda fraction, device=None: None
+    )
+    # Torch holds 500 MiB; the budget leaves it room up to 20 blocks.
+    cap = 500 * MIB + cache.physical_bytes_for(20) - cache.physical_bytes
+    cache.set_torch_memory_limit(cap)
+    assert cache.torch_memory_budget is None
+    cache.anchor_torch_memory_budget()
+    budget = cache.torch_memory_budget
+    assert budget == cap + cache.physical_bytes
+
+    assert ranks.grow(0, 40) == 20
+    assert cache.torch_memory_limit == budget - cache.physical_bytes
+    assert cache.torch_memory_limit == 500 * MIB
 
 
 def test_sizing_baseline_records_what_torch_holds(fake_xpu, monkeypatch):

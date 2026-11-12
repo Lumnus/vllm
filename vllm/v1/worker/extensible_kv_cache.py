@@ -131,6 +131,12 @@ class ExtensibleKVCache:
         # Bytes torch's caching allocator may reserve, set once the cache is
         # sized; None leaves it unlimited.
         self.torch_memory_limit: int | None = None
+        # What torch's cap and the KV cache's mapped bytes add up to; None
+        # while torch is not capped. See `set_torch_memory_limit`.
+        self.torch_memory_budget: int | None = None
+        # Mapped bytes of other holders of VMM memory on this device (e.g.
+        # weights moved out of torch's allocator), which the cap leaves out.
+        self.external_mapped_bytes: list[Callable[[], int]] = []
         # Set while a grow is being taken into use: the block counts it goes
         # from and to and the torch cap before it. Left set by a failure, for
         # the next resize to finish.
@@ -480,12 +486,39 @@ class ExtensibleKVCache:
     def set_torch_memory_limit(self, num_bytes: int | None) -> None:
         """Cap what torch's caching allocator reserves on this device, or lift
         the cap (None). At the cap it releases cached segments before growing,
-        rather than taking memory other allocations need."""
+        rather than taking memory other allocations need.
+
+        A resize recomputes the cap from a budget torch shares with the KV
+        cache (`anchor_torch_memory_budget`, `refresh_torch_memory_limit`)
+        instead of moving it by deltas; setting the cap here drops the budget
+        until it is anchored again.
+        """
+        self.torch_memory_budget = None
+        self._apply_torch_memory_limit(num_bytes)
+
+    def anchor_torch_memory_budget(self) -> None:
+        """Take the current cap plus the bytes the cache maps now as the
+        budget torch and the cache share (`torch_memory_budget`), for a cap
+        computed for the size the cache has now."""
+        if self.torch_memory_limit is not None:
+            self.torch_memory_budget = self.torch_memory_limit + self.physical_bytes
+
+    def refresh_torch_memory_limit(self) -> int | None:
+        """Set the cap from the budget: what the KV cache does not map, less
+        what other holders of VMM memory registered here map. Returns it."""
+        if self.torch_memory_budget is None:
+            return self.torch_memory_limit
+        external = sum(mapped() for mapped in self.external_mapped_bytes)
+        limit = max(self.torch_memory_budget - self.physical_bytes - external, 0)
+        self._apply_torch_memory_limit(limit)
+        return limit
+
+    def _apply_torch_memory_limit(self, num_bytes: int | None) -> None:
         self.torch_memory_limit = num_bytes
-        total = torch.accelerator.get_memory_info(self.buffer.device)[1]
+        device = self.buffer.device
+        total = _allocator_total_memory(device)
         fraction = 1.0 if num_bytes is None else min(num_bytes / total, 1.0)
         # torch.accelerator has no per-process memory fraction.
-        device = self.buffer.device
         torch.get_device_module(device).set_per_process_memory_fraction(
             fraction, device
         )
@@ -496,6 +529,22 @@ class ExtensibleKVCache:
             self.set_torch_memory_limit(None)
         self.buffer.free()
         self.num_committed_blocks = 0
+
+
+def _allocator_total_memory(device: torch.device) -> int:
+    """The device total the cap is turned into a memory fraction against."""
+    return torch.accelerator.get_memory_info(device)[1]
+
+
+def _device_properties_total_memory(device: torch.device) -> int | None:
+    """The device properties' total, which a caching allocator may multiply
+    the fraction by instead of the total above; None where not available.
+    Only logged, so that a card shows whether the two differ."""
+    try:
+        properties = torch.get_device_module(device).get_device_properties(device)
+        return int(properties.total_memory)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def registers_kv_cache_memory(vllm_config: "VllmConfig") -> bool:
@@ -706,6 +755,8 @@ def extend_kv_cache(
         kv_cache.physical_bytes / (1 << 30),
     )
     rebind_committed_views(runner)
+    # The cap measured for this size holds from now on; resizes recompute it.
+    kv_cache.anchor_torch_memory_budget()
     runner.kv_connector = get_kv_connector(
         runner.vllm_config, runner.kv_caches_by_layer
     )
@@ -863,6 +914,68 @@ def measure_kv_cache_blocks(
     return num_blocks
 
 
+class ServingKVRoom(NamedTuple):
+    """What a grow may take while serving, term by term (bytes)."""
+
+    # Room torch must keep above its current allocation: the larger of the
+    # startup transient reserve and the highest allocation serving has shown
+    # above the current one.
+    keep: int
+    # Torch's cache that is reserved and not allocated: reclaimable.
+    reclaimable: int
+    # Device-side: free memory, less what of `keep` the reclaimable cache
+    # does not cover. The KV can only map memory the device has free.
+    device_room: int
+    # Cap-side: the torch budget less the KV's mapped bytes, the allocation
+    # and `keep`, i.e. how far the cap may come down. None without a cap.
+    cap_room: int | None
+
+    @property
+    def room(self) -> int:
+        rooms = [self.device_room]
+        if self.cap_room is not None:
+            rooms.append(self.cap_room)
+        return max(min(rooms), 0)
+
+
+def serving_kv_room(
+    *,
+    free_memory: int,
+    mapped_bytes: int,
+    torch_allocated: int,
+    torch_reserved: int,
+    torch_peak: int,
+    startup_reserve: int,
+    torch_budget: int | None,
+) -> ServingKVRoom:
+    """Bytes the KV cache may add while serving.
+
+    After the grow, free device memory plus torch's reclaimable cache must
+    still cover `keep` (torch can serve its next peak from either), and the
+    torch cap, recomputed from the budget, must stay at or above the
+    allocation plus `keep`.
+    """
+    keep = max(startup_reserve, torch_peak - torch_allocated, 0)
+    reclaimable = max(torch_reserved - torch_allocated, 0)
+    device_room = max(free_memory - max(keep - reclaimable, 0), 0)
+    cap_room = (
+        None
+        if torch_budget is None
+        else torch_budget - mapped_bytes - torch_allocated - keep
+    )
+    return ServingKVRoom(keep, reclaimable, device_room, cap_room)
+
+
+def _torch_memory_now(device: torch.device) -> tuple[int, int, int]:
+    """Torch's allocated, peak allocated (since the sizing) and reserved."""
+    stats = torch.accelerator.memory_stats(device)
+    return (
+        stats.get("allocated_bytes.all.current", 0),
+        stats.get("allocated_bytes.all.peak", 0),
+        torch.accelerator.memory_reserved(device),
+    )
+
+
 def _measure_kv_cache_serving(
     kv_cache: ExtensibleKVCache,
     vllm_config: "VllmConfig",
@@ -870,70 +983,107 @@ def _measure_kv_cache_serving(
     *,
     init_free_memory: int,
     requested_memory: int,
+    target_num_blocks: int | None = None,
 ) -> int:
-    """Blocks the memory free now fits, measured while serving.
+    """Blocks the KV cache may hold now, measured while serving.
 
-    The sizing after warmup keeps reserved_headroom_bytes free for what torch
-    allocates afterwards. Torch has since taken part of that (what it reserves
-    beyond its reservation at sizing), so only the rest is kept free here:
-    the startup rule applied again would count that part twice, as memory that
-    is no longer free and inside the reserve. The reserve is the larger of the
-    startup one and the highest allocation seen since, above the level at
-    sizing. With nothing else taken from the device since sizing, the result
-    is what the startup sizing gave. Nothing is collected or released: memory
-    torch caches counts as taken. Without a sizing baseline the whole startup
-    reserve is kept free. Logs the numbers, one line per rank.
+    Torch's cache that is reserved and not allocated counts as reclaimable,
+    not as taken: `serving_kv_room` gives the bytes a grow may add. When the
+    grow toward target_num_blocks needs more than the device has free and
+    torch caches memory, the cache is emptied first and the measurement
+    taken again, since only whole free segments come back (what stays cached
+    is fragmentation torch keeps). The request's memory budget
+    (`measure_kv_cache_bytes`, as at startup, with the reclaimable cache
+    counted free) and the multimodal reservation bound the result too.
+    Logs every term, one line per rank. The cap is lowered afterwards, from
+    the budget, by whoever commits (`refresh_torch_memory_limit`).
     """
-    free_memory = current_platform.free_device_memory(device)
-    stats = torch.accelerator.memory_stats(device)
-    allocated = stats.get("allocated_bytes.all.current", 0)
-    peak = stats.get("allocated_bytes.all.peak", 0)
-    reserved = torch.accelerator.memory_reserved(device)
+    mapped = kv_cache.physical_bytes
     startup_reserve = kv_cache.reserved_headroom_bytes
-    reserve = startup_reserve
-    taken = 0
-    if (
-        kv_cache.torch_reserved_at_sizing is not None
-        and kv_cache.torch_allocated_at_sizing is not None
-    ):
-        reserve = max(reserve, peak - kv_cache.torch_allocated_at_sizing)
-        taken = max(reserved - kv_cache.torch_reserved_at_sizing, 0)
-    available = measure_kv_cache_bytes(
-        init_free_memory=init_free_memory,
+    budget = kv_cache.torch_memory_budget
+    free_memory = current_platform.free_device_memory(device)
+    allocated, peak, reserved = _torch_memory_now(device)
+    room = serving_kv_room(
         free_memory=free_memory,
-        committed_bytes=kv_cache.physical_bytes,
+        mapped_bytes=mapped,
+        torch_allocated=allocated,
+        torch_reserved=reserved,
+        torch_peak=peak,
+        startup_reserve=startup_reserve,
+        torch_budget=budget,
+    )
+    trimmed = False
+    if target_num_blocks is not None and room.reclaimable > 0:
+        needed = kv_cache.physical_bytes_for(target_num_blocks) - mapped
+        # What emptying the cache could make room for at best.
+        potential = free_memory + room.reclaimable - room.keep
+        if room.cap_room is not None:
+            potential = min(potential, room.cap_room)
+        if needed > free_memory and potential > room.room:
+            # Give torch's cached segments back to the device before mapping.
+            torch.accelerator.empty_cache()
+            trimmed = True
+            free_memory = current_platform.free_device_memory(device)
+            allocated, peak, reserved = _torch_memory_now(device)
+            room = serving_kv_room(
+                free_memory=free_memory,
+                mapped_bytes=mapped,
+                torch_allocated=allocated,
+                torch_reserved=reserved,
+                torch_peak=peak,
+                startup_reserve=startup_reserve,
+                torch_budget=budget,
+            )
+    requested = measure_kv_cache_bytes(
+        init_free_memory=init_free_memory,
+        free_memory=free_memory + room.reclaimable,
+        committed_bytes=mapped,
         requested_memory=requested_memory,
-        transient_peak_bytes=max(reserve - taken, 0),
-        margin_peak_bytes=reserve,
+        transient_peak_bytes=room.keep,
     )
     try:
-        kv_cache_bytes = reserve_mm_ipc_gpu_memory(
-            available,
+        requested = reserve_mm_ipc_gpu_memory(
+            requested,
             vllm_config.model_config.multimodal_config,
             getattr(vllm_config.parallel_config, "_api_process_count", 1),
         )
     except ValueError:
         # Nothing left after the multimodal reservation.
-        kv_cache_bytes = 0
-    fits = kv_cache.blocks_within(kv_cache_bytes)
+        requested = 0
+    kv_cache_bytes = min(requested, mapped + room.room)
+    fits = max(kv_cache.blocks_within(kv_cache_bytes), kv_cache.num_committed_blocks)
     limit = kv_cache.torch_memory_limit
+    properties_total = _device_properties_total_memory(device)
+    try:
+        info_total: int | None = _allocator_total_memory(device)
+    except Exception:  # noqa: BLE001
+        info_total = None
     logger.info(
-        "KV cache resize measurement: %s GiB free, %s GiB mapped for the KV "
-        "cache, %d blocks committed (%s GiB), transient reserve %s GiB (%s at "
-        "startup, %s taken by torch since), %d blocks fit; torch allocated %s "
-        "GiB, reserved %s GiB, peak %s GiB, cap %s GiB.",
+        "KV cache resize measurement: %s GiB free%s, %s GiB mapped for the KV "
+        "cache, %d blocks committed; torch allocated %s GiB, reserved %s GiB "
+        "(%s reclaimable), peak %s GiB, cap %s GiB of budget %s GiB; keep %s "
+        "GiB above the allocation (%s at startup, %s by the peak); room %s GiB "
+        "on the device, %s under the cap, %s by the request; %d blocks fit. "
+        "Cap fraction total %s GiB, device properties total %s GiB.",
         format_gib(free_memory),
-        format_gib(kv_cache.physical_bytes),
+        " after emptying torch's cache" if trimmed else "",
+        format_gib(mapped),
         kv_cache.num_committed_blocks,
-        format_gib(kv_cache.num_committed_blocks * kv_cache.bytes_per_block),
-        format_gib(reserve),
-        format_gib(startup_reserve),
-        format_gib(taken),
-        fits,
         format_gib(allocated),
         format_gib(reserved),
+        format_gib(room.reclaimable),
         format_gib(peak),
         "no" if limit is None else format_gib(limit),
+        "no" if budget is None else format_gib(budget),
+        format_gib(room.keep),
+        format_gib(startup_reserve),
+        format_gib(max(peak - allocated, 0)),
+        format_gib(room.device_room),
+        "no limit" if room.cap_room is None else format_gib(room.cap_room),
+        format_gib(max(requested - mapped, 0)),
+        fits,
+        "unknown" if info_total is None else format_gib(info_total),
+        "unknown" if properties_total is None else format_gib(properties_total),
     )
     return fits
 
@@ -948,8 +1098,9 @@ def _finish_grow(
 ) -> None:
     """Take a grow from start to num_blocks blocks into use on this rank, once
     every rank has the memory mapped: commit and zero the new blocks, rebuild
-    the views, tell the KV connector, and lower the cap on torch from
-    torch_memory_limit, the cap before the grow.
+    the views, tell the KV connector, and lower the cap on torch to what
+    the budget leaves (torch_memory_limit, the cap before the grow, is kept
+    in `unfinished_grow` for the record only).
 
     `unfinished_grow` stays set until the last step is done. A failure here
     cannot be undone on the other ranks, so it is repaired instead: the next
@@ -975,19 +1126,11 @@ def _finish_grow(
         raise
     if has_kv_transfer_group():
         get_kv_transfer_group().resize_kv_caches(runner.kv_caches_by_layer, num_blocks)
-    # Torch must not grow into what the cache now holds.
-    if torch_memory_limit is not None:
-        torch_memory_limit = max(
-            torch_memory_limit
-            - (
-                kv_cache.physical_bytes_for(num_blocks)
-                - kv_cache.physical_bytes_for(start)
-            ),
-            0,
-        )
-        kv_cache.set_torch_memory_limit(torch_memory_limit)
-        if torch.accelerator.memory_reserved(runner.device) > torch_memory_limit:
-            torch.accelerator.empty_cache()
+    # Torch must not grow into what the cache now holds: the cap follows
+    # from the budget and what is mapped now, so a repeat is harmless.
+    limit = kv_cache.refresh_torch_memory_limit()
+    if limit is not None and torch.accelerator.memory_reserved(runner.device) > limit:
+        torch.accelerator.empty_cache()
     # The new blocks are zeroed on the current stream; finish before any step
     # can address them.
     torch.accelerator.synchronize()
@@ -1047,6 +1190,9 @@ def grow_kv_cache(
             f"The KV connector {type(get_kv_transfer_group()).__name__} does not "
             "support resizing the KV cache."
         )
+    if kv_cache.torch_memory_budget is None:
+        # A cap set without a budget holds for the size mapped now.
+        kv_cache.anchor_torch_memory_budget()
     error: Exception | None = None
     try:
         if kv_cache.unfinished_grow is not None:
@@ -1064,6 +1210,7 @@ def grow_kv_cache(
             runner.device,
             init_free_memory=init_free_memory,
             requested_memory=requested_memory,
+            target_num_blocks=min(target_num_blocks, kv_cache.capacity_blocks),
         )
         vote = min(target_num_blocks, fits, kv_cache.capacity_blocks)
     except Exception as e:
@@ -1135,6 +1282,7 @@ def kv_cache_lent_for_weight_update(
     # Weight processing allocates through torch, beyond the cap sized for
     # serving.
     torch_memory_limit = kv_cache.torch_memory_limit
+    torch_memory_budget = getattr(kv_cache, "torch_memory_budget", None)
     if torch_memory_limit is not None:
         kv_cache.set_torch_memory_limit(None)
     try:
@@ -1148,6 +1296,8 @@ def kv_cache_lent_for_weight_update(
                 get_kv_transfer_group().restore_kv_caches()
         if torch_memory_limit is not None:
             kv_cache.set_torch_memory_limit(torch_memory_limit)
+            if torch_memory_budget is not None:
+                kv_cache.torch_memory_budget = torch_memory_budget
 
 
 def _release_for_weight_update(
