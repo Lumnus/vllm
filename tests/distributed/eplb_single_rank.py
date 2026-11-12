@@ -44,6 +44,9 @@ class _Event:
     def record(self, *args) -> None:
         pass
 
+    def wait(self, *args) -> None:
+        pass
+
     def synchronize(self) -> None:
         pass
 
