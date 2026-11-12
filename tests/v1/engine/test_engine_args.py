@@ -270,6 +270,22 @@ def test_extensible_kv_cache_initial_blocks_from_cli():
         CacheConfig(extensible_kv_cache_initial_blocks=0)
 
 
+def test_kv_cache_release_chunk_mib_from_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    assert EngineArgs.from_cli_args(args=args).kv_cache_release_chunk_mib is None
+
+    args = parser.parse_args(["--kv-cache-release-chunk-mib", "32"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.kv_cache_release_chunk_mib == 32
+
+    cache_config = CacheConfig(kv_cache_release_chunk_mib=32)
+    assert cache_config.kv_cache_release_chunk_mib == 32
+    with pytest.raises(ValueError):
+        CacheConfig(kv_cache_release_chunk_mib=0)
+
+
 # Off CUDA and XPU the platform check trips first, before the behavior under test.
 requires_vmm_device = pytest.mark.skipif(
     not (torch.cuda.is_available() or torch.xpu.is_available()),

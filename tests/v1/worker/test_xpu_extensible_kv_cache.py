@@ -1023,6 +1023,37 @@ def test_failed_access_grant_leaves_nothing_mapped(fake_xpu, monkeypatch):
         et.free()
 
 
+# Chunked commit and tail release.
+
+POISON = 0xA5
+
+
+def _objects(et: ExtensibleTensor) -> list[tuple[int, int]]:
+    """(offset, size) of every mapped physical object, in granules."""
+    return sorted(
+        (offset // GRANULE, size // GRANULE) for _, offset, size in et._buffer._handles
+    )
+
+
+def test_chunked_commit_maps_objects_of_the_chunk_size(fake_xpu):
+    """A run is split into objects of at most the chunk size, on a grid
+    counted from the segment start whatever sizes the commits come in; a chunk
+    size that is not a granule multiple rounds up."""
+    et = ExtensibleTensor(16 * GRANULE, device="xpu:0", max_chunk_bytes=2 * GRANULE - 1)
+    try:
+        assert et.max_chunk_bytes == 2 * GRANULE
+        et.resize_per_segment_(3 * GRANULE, zero_new=True)
+        assert _objects(et) == [(0, 2), (2, 1)]
+        et.resize_per_segment_(7 * GRANULE, zero_new=True)
+        # The partial chunk [2, 3) is not extended; the new run starts there.
+        assert _objects(et) == [(0, 2), (2, 1), (3, 1), (4, 2), (6, 1)]
+        assert fake_xpu.ops.calls.count("create") == 5
+        assert fake_xpu.ops.calls.count("map") == 5
+        assert et.physical_bytes == fake_xpu.ops.physical_bytes == 7 * GRANULE
+    finally:
+        et.free()
+
+
 def _grow_each(ranks: GrowFixture, target: int) -> list[object]:
     """Every rank's result of one grow, an exception where the rank raised."""
     group = MinGroup(len(ranks.runners))
@@ -1234,6 +1265,512 @@ def test_sizing_baseline_records_what_torch_holds(fake_xpu, monkeypatch):
         kv_cache.free()
 
 
+def test_chunk_grid_follows_the_segment_start(fake_xpu):
+    """Each segment's chunks are counted from its own start, so a segment that
+    begins mid-chunk of the reservation still has whole chunks of its own."""
+    capacities = [3 * GRANULE, 4 * GRANULE]
+    et = ExtensibleTensor(
+        7 * GRANULE,
+        device="xpu:0",
+        segment_capacities=capacities,
+        max_chunk_bytes=2 * GRANULE,
+    )
+    try:
+        et.resize_segments_([3 * GRANULE, 4 * GRANULE], zero_new=True)
+        assert _objects(et) == [(0, 2), (2, 1), (3, 2), (5, 2)]
+    finally:
+        et.free()
+
+
+def test_no_chunk_size_keeps_one_object_per_run(fake_xpu):
+    et = ExtensibleTensor(16 * GRANULE, device="xpu:0")
+    try:
+        assert et.max_chunk_bytes is None
+        et.resize_per_segment_(3 * GRANULE, zero_new=True)
+        et.resize_per_segment_(7 * GRANULE, zero_new=True)
+        assert _objects(et) == [(0, 3), (3, 4)]
+        assert fake_xpu.ops.calls.count("create") == 2
+        assert et.num_physical_chunks == 2
+    finally:
+        et.free()
+
+
+def test_whole_runs_override_the_chunk_size(fake_xpu):
+    et = ExtensibleTensor(16 * GRANULE, device="xpu:0", max_chunk_bytes=2 * GRANULE)
+    try:
+        et.resize_segments_([7 * GRANULE], zero_new=True, whole_runs=True)
+        assert _objects(et) == [(0, 7)]
+    finally:
+        et.free()
+
+
+@pytest.mark.parametrize("chunk", [0, -GRANULE])
+def test_chunk_size_must_be_positive(fake_xpu, chunk):
+    with pytest.raises(ValueError, match="max_chunk_bytes"):
+        ExtensibleTensor(4 * GRANULE, device="xpu:0", max_chunk_bytes=chunk)
+    assert not fake_xpu.ops._reservations
+
+
+def test_shrink_releases_the_whole_chunks_above_the_new_size(fake_xpu):
+    """Bytes below the new size keep their contents; the objects above it are
+    unmapped whole (the fake poisons their pages) and released; a chunk that
+    straddles the new size stays."""
+    et = ExtensibleTensor(16 * GRANULE, device="xpu:0", max_chunk_bytes=2 * GRANULE)
+    try:
+        base = et.base_ptr
+        et.resize_per_segment_(12 * GRANULE, zero_new=True)
+        full = et.full_view()
+        full[: 12 * GRANULE].fill_(11)
+        ops = fake_xpu.ops
+        calls = len(ops.calls)
+
+        # 5 granules: chunk [4, 6) straddles, [6, 12) goes: three objects.
+        assert et.shrink_segments_([5 * GRANULE]) == 6 * GRANULE
+        assert ops.calls[calls:] == ["unmap", "release"] * 3
+        assert ops.physical_bytes == et.physical_bytes == 6 * GRANULE
+        assert et.num_bytes == 5 * GRANULE
+        assert et.base_ptr == base
+        assert et.segment_view(0).numel() == 5 * GRANULE
+        assert torch.all(et.segment_view(0) == 11)
+        assert torch.all(full[6 * GRANULE : 12 * GRANULE] == POISON)
+        assert _objects(et) == [(0, 2), (2, 2), (4, 2)]
+
+        # The same shrink again changes nothing.
+        calls = len(ops.calls)
+        assert et.shrink_segments_([5 * GRANULE]) == 0
+        assert ops.calls[calls:] == []
+    finally:
+        et.free()
+    assert ops.physical_bytes == 0
+
+
+def test_shrink_to_a_chunk_boundary_releases_exactly_the_chunks_above(fake_xpu):
+    et = ExtensibleTensor(16 * GRANULE, device="xpu:0", max_chunk_bytes=2 * GRANULE)
+    try:
+        et.resize_per_segment_(12 * GRANULE, zero_new=True)
+        before = fake_xpu.ops.physical_bytes
+        released = et.shrink_segments_([4 * GRANULE])
+        assert released == 8 * GRANULE
+        assert before - fake_xpu.ops.physical_bytes == released
+        assert et.physical_bytes == 4 * GRANULE
+        assert et.releasable_bytes([2 * GRANULE]) == 2 * GRANULE
+        assert et.shrink_segments_([0]) == 4 * GRANULE
+        assert fake_xpu.ops.physical_bytes == 0
+    finally:
+        et.free()
+
+
+def test_grow_after_shrink_maps_fresh_zeroed_chunks(fake_xpu):
+    """Everything above the old committed size reads as zero after a regrow,
+    whether its pages were released and mapped afresh or kept in a straddling
+    chunk; the bytes below are untouched."""
+    et = ExtensibleTensor(16 * GRANULE, device="xpu:0", max_chunk_bytes=2 * GRANULE)
+    try:
+        et.resize_per_segment_(12 * GRANULE, zero_new=True)
+        et.full_view()[: 12 * GRANULE].fill_(11)
+        et.shrink_segments_([5 * GRANULE])
+        creates = fake_xpu.ops.calls.count("create")
+
+        # Granule 5 is still mapped, in the straddling chunk, holding 11s.
+        et.resize_per_segment_(6 * GRANULE, zero_new=True)
+        assert fake_xpu.ops.calls.count("create") == creates
+        view = et.segment_view(0)
+        assert torch.all(view[: 5 * GRANULE] == 11)
+        assert torch.count_nonzero(view[5 * GRANULE :]) == 0
+
+        et.resize_per_segment_(12 * GRANULE, zero_new=True)
+        assert fake_xpu.ops.calls.count("create") == creates + 3
+        assert et.physical_bytes == fake_xpu.ops.physical_bytes == 12 * GRANULE
+        view = et.segment_view(0)
+        assert torch.all(view[: 5 * GRANULE] == 11)
+        assert torch.count_nonzero(view[5 * GRANULE :]) == 0
+    finally:
+        et.free()
+
+
+def test_shrink_keeps_a_granule_shared_with_the_next_segment(fake_xpu):
+    """Segments need not start on a granule. A chunk holding the end of one
+    segment and the start of the next is not wholly inside either's tail."""
+    half = GRANULE // 2
+    capacities = [3 * GRANULE + half, 3 * GRANULE]
+    et = ExtensibleTensor(
+        sum(capacities),
+        device="xpu:0",
+        segment_capacities=capacities,
+        max_chunk_bytes=GRANULE,
+    )
+    try:
+        et.resize_segments_(list(capacities), zero_new=True)
+        full = et.full_view()
+        full.fill_(2)
+        # The first segment gives back everything above its first granule: the
+        # granule it shares with the second segment (granule 3) stays.
+        released = et.shrink_segments_([GRANULE, capacities[1]])
+        assert released == 2 * GRANULE
+        assert _objects(et)[:2] == [(0, 1), (3, 1)]
+        second = et.segment_view(1)
+        assert second.numel() == capacities[1]
+        assert torch.all(second == 2)
+    finally:
+        et.free()
+
+
+def test_shrink_rejects_a_bad_size(fake_xpu):
+    et = ExtensibleTensor(
+        8 * GRANULE, device="xpu:0", num_segments=2, max_chunk_bytes=GRANULE
+    )
+    try:
+        et.resize_per_segment_(2 * GRANULE, zero_new=True)
+        before = (fake_xpu.ops.physical_bytes, et.bytes_per_segment)
+        for sizes in ([GRANULE], [3 * GRANULE, GRANULE], [GRANULE, -1]):
+            with pytest.raises(ValueError):
+                et.shrink_segments_(sizes)
+            with pytest.raises(ValueError):
+                et.releasable_bytes(sizes)
+        assert (fake_xpu.ops.physical_bytes, et.bytes_per_segment) == before
+    finally:
+        et.free()
+
+
+def test_release_range_takes_any_range_and_a_recommit_fills_the_hole(fake_xpu):
+    """The generic primitive: objects wholly inside a range go, whatever else
+    is mapped on both sides; a partial object at either end stays."""
+    et = ExtensibleTensor(8 * GRANULE, device="xpu:0", max_chunk_bytes=GRANULE)
+    try:
+        buffer = et._buffer
+        buffer.ensure_committed_range(0, 8 * GRANULE)
+        full = et.full_view()
+        full.fill_(3)
+        # [2.5, 5.5) granules wholly contains the objects at granules 3 and 4.
+        start, end = 2 * GRANULE + GRANULE // 2, 5 * GRANULE + GRANULE // 2
+        assert buffer.releasable_bytes(start, end) == 2 * GRANULE
+        assert buffer.release_range(start, end) == 2 * GRANULE
+        assert buffer.committed_bytes == 6 * GRANULE
+        assert torch.all(full[: 3 * GRANULE] == 3)
+        assert torch.all(full[5 * GRANULE :] == 3)
+        assert torch.all(full[3 * GRANULE : 5 * GRANULE] == POISON)
+        assert buffer.release_range(start, end) == 0
+
+        buffer.ensure_committed_range(2 * GRANULE, 6 * GRANULE)
+        assert buffer.committed_bytes == 8 * GRANULE
+        assert torch.all(full[3 * GRANULE : 5 * GRANULE] == 0)
+        assert torch.all(full[: 3 * GRANULE] == 3)
+        with pytest.raises(ValueError):
+            buffer.release_range(5, 4)
+    finally:
+        et.free()
+
+
+def test_a_failed_chunk_undoes_the_whole_run(fake_xpu, monkeypatch):
+    """A commit that fails on its third chunk unmaps and releases the two it
+    mapped and records nothing, so the retry maps the whole run afresh."""
+    et = ExtensibleTensor(16 * GRANULE, device="xpu:0", max_chunk_bytes=2 * GRANULE)
+    try:
+        ops = fake_xpu.ops
+        real_create = ops.vmm_create
+        creates = []
+
+        def failing_create(size, device_index):
+            creates.append(size)
+            if len(creates) in (3, 4):  # the retry after empty_cache fails too
+                raise RuntimeError("UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY")
+            return real_create(size, device_index)
+
+        monkeypatch.setattr(ops, "vmm_create", failing_create)
+        monkeypatch.setattr(
+            torch.accelerator, "empty_cache", lambda: None, raising=False
+        )
+        with pytest.raises(RuntimeError, match="OUT_OF_DEVICE_MEMORY"):
+            et.back_segments_([12 * GRANULE])
+        assert et._buffer._mapped_granules == set()
+        assert et._buffer._handles == []
+        assert ops.physical_bytes == 0
+        assert ops.calls.count("set_access") == 0
+        assert et.bytes_per_segment == 0
+
+        monkeypatch.setattr(ops, "vmm_create", real_create)
+        et.resize_per_segment_(12 * GRANULE, zero_new=True)
+        assert _objects(et) == [(0, 2), (2, 2), (4, 2), (6, 2), (8, 2), (10, 2)]
+    finally:
+        et.free()
+
+
+def _fail_grants(fake_xpu, monkeypatch, which):
+    """Make the access grants numbered `which` (from 1) raise."""
+    grant = fake_xpu.driver.set_access
+    count = [0]
+
+    def set_access(ptr: int, size: int, device_index: int) -> None:
+        count[0] += 1
+        if count[0] in which:
+            raise RuntimeError("UR_RESULT_ERROR_UNKNOWN")
+        grant(ptr, size, device_index)
+
+    monkeypatch.setattr(fake_xpu.driver, "set_access", set_access)
+    return grant
+
+
+def test_a_failed_grant_undoes_a_three_chunk_run(fake_xpu, monkeypatch):
+    """A run of three chunks whose access grant fails: nothing is recorded,
+    the physical bytes are back to what they were before the call, objects of
+    earlier calls are untouched, and a retry maps three fresh chunks."""
+    et = ExtensibleTensor(16 * GRANULE, device="xpu:0", max_chunk_bytes=2 * GRANULE)
+    try:
+        ops = fake_xpu.ops
+        buffer = et._buffer
+        buffer.ensure_committed_range(0, 2 * GRANULE)  # an earlier call
+        before = (ops.physical_bytes, list(buffer._handles), set(buffer._mapped_granules))
+        assert before[0] == 2 * GRANULE
+
+        grant = _fail_grants(fake_xpu, monkeypatch, {1})
+        with pytest.raises(RuntimeError, match="UNKNOWN"):
+            buffer.ensure_committed_range(2 * GRANULE, 8 * GRANULE)
+        assert (
+            ops.physical_bytes,
+            list(buffer._handles),
+            set(buffer._mapped_granules),
+        ) == before
+
+        monkeypatch.setattr(fake_xpu.driver, "set_access", grant)
+        creates = ops.calls.count("create")
+        buffer.ensure_committed_range(2 * GRANULE, 8 * GRANULE)
+        assert ops.calls.count("create") == creates + 3
+        assert ops.physical_bytes == 8 * GRANULE
+        assert len(buffer._handles) == 4
+    finally:
+        et.free()
+
+
+def test_a_failed_second_run_undoes_the_first_run_of_the_call(fake_xpu, monkeypatch):
+    """The undo covers everything one call created, not only the failing run:
+    a call over two unmapped runs whose second grant fails leaves neither."""
+    et = ExtensibleTensor(16 * GRANULE, device="xpu:0", max_chunk_bytes=2 * GRANULE)
+    try:
+        ops = fake_xpu.ops
+        buffer = et._buffer
+        buffer.ensure_committed_range(4 * GRANULE, 6 * GRANULE)  # a mapped hole
+        _fail_grants(fake_xpu, monkeypatch, {2})  # the grants of run 1 and run 2
+        with pytest.raises(RuntimeError, match="UNKNOWN"):
+            buffer.ensure_committed_range(0, 10 * GRANULE)
+        assert buffer._mapped_granules == {4, 5}
+        assert len(buffer._handles) == 1
+        assert ops.physical_bytes == 2 * GRANULE
+    finally:
+        et.free()
+
+
+def test_a_failed_undo_keeps_what_it_could_not_release(fake_xpu, monkeypatch):
+    """If the undo itself fails on an object, that object stays in the books
+    (handle and granules) so a later call can reuse or release it, and the
+    original error is raised with the undo failure chained."""
+    et = ExtensibleTensor(16 * GRANULE, device="xpu:0", max_chunk_bytes=2 * GRANULE)
+    try:
+        ops = fake_xpu.ops
+        buffer = et._buffer
+        grant = _fail_grants(fake_xpu, monkeypatch, {1})
+        real_unmap = ops.vmm_unmap
+        unmaps = []
+
+        def failing_unmap(ptr, size):
+            unmaps.append(ptr)
+            if len(unmaps) == 2:
+                raise RuntimeError("unmap refused")
+            real_unmap(ptr, size)
+
+        monkeypatch.setattr(ops, "vmm_unmap", failing_unmap)
+        with pytest.raises(RuntimeError, match="UNKNOWN") as raised:
+            buffer.ensure_committed_range(0, 6 * GRANULE)
+        assert isinstance(raised.value.__cause__, RuntimeError)
+        assert "unmap refused" in str(raised.value.__cause__)
+        # Three objects were created; the second one to be undone (the middle
+        # one, undone newest first) is the one left behind.
+        assert len(buffer._handles) == 1
+        assert ops.physical_bytes == 2 * GRANULE
+        _, offset, size = buffer._handles[0]
+        assert buffer._mapped_granules == set(
+            range(offset // GRANULE, (offset + size) // GRANULE)
+        )
+
+        monkeypatch.setattr(ops, "vmm_unmap", real_unmap)
+        monkeypatch.setattr(fake_xpu.driver, "set_access", grant)
+        assert buffer.release_range(0, 16 * GRANULE) == 2 * GRANULE
+        assert ops.physical_bytes == 0
+    finally:
+        et.free()
+
+
+def test_a_failed_release_keeps_the_books_straight(fake_xpu, monkeypatch):
+    """If an unmap fails part-way, the objects already released are gone from
+    the books and the rest stay mapped; the committed size is the new one."""
+    et = ExtensibleTensor(16 * GRANULE, device="xpu:0", max_chunk_bytes=2 * GRANULE)
+    try:
+        et.resize_per_segment_(12 * GRANULE, zero_new=True)
+        ops = fake_xpu.ops
+        real_unmap = ops.vmm_unmap
+        unmaps = []
+
+        def failing_unmap(ptr, size):
+            unmaps.append(ptr)
+            if len(unmaps) == 2:
+                raise RuntimeError("unmap refused")
+            real_unmap(ptr, size)
+
+        monkeypatch.setattr(ops, "vmm_unmap", failing_unmap)
+        with pytest.raises(RuntimeError, match="unmap refused"):
+            et.shrink_segments_([4 * GRANULE])
+        assert et.num_bytes == 4 * GRANULE
+        assert et.physical_bytes == ops.physical_bytes
+        assert len(et._buffer._handles) == 5
+        monkeypatch.setattr(ops, "vmm_unmap", real_unmap)
+        # Repeating the shrink finishes it.
+        assert et.shrink_segments_([4 * GRANULE]) == 6 * GRANULE
+        assert et.physical_bytes == ops.physical_bytes == 4 * GRANULE
+    finally:
+        et.free()
+
+
+def _chunked_kv_cache(layout, chunk_blocks=8):
+    config, spec = _kv_cache_config(layout)
+    kv_cache = ExtensibleKVCache(
+        config,
+        torch.device("xpu", 0),
+        layout,
+        release_chunk_bytes=chunk_blocks * spec.page_size_bytes,
+    )
+    return config, spec, kv_cache
+
+
+def test_kv_cache_commits_in_release_chunks(fake_xpu):
+    _, _, kv_cache = _chunked_kv_cache(KVCacheLayout.LBNHC)
+    try:
+        kv_cache.allocate(kv_cache.size)
+        kv_cache.commit(48)
+        # 48 MiB per layer is 24 granules in chunks of four, the first one
+        # shortened by the null block's granule.
+        per_segment = _objects(kv_cache.buffer)
+        assert len(per_segment) == NUM_LAYERS * 7
+        assert fake_xpu.ops.physical_bytes == kv_cache.physical_bytes
+        assert kv_cache.physical_bytes == kv_cache.physical_bytes_for(48)
+    finally:
+        kv_cache.free()
+
+
+def test_kv_cache_defragment_still_gives_one_object_per_segment(fake_xpu):
+    _, _, kv_cache = _chunked_kv_cache(KVCacheLayout.LBNHC)
+    try:
+        kv_cache.allocate(kv_cache.size)
+        kv_cache.commit(48)
+        assert not all(kv_cache.buffer.segments_backed_by_one_chunk([48 * MIB] * 3))
+        kv_cache.commit(48, defragment=True)
+        assert kv_cache.buffer.num_physical_chunks == NUM_LAYERS
+        assert all(kv_cache.buffer.segments_backed_by_one_chunk([48 * MIB] * 3))
+        # Later growth is chunked again.
+        kv_cache.commit(64)
+        assert kv_cache.buffer.num_physical_chunks > NUM_LAYERS + 1
+    finally:
+        kv_cache.free()
+
+
+@pytest.mark.parametrize("layout", [KVCacheLayout.LBNHC, KVCacheLayout.BLNHC])
+def test_kv_cache_shrinks_to_a_smaller_prefix(fake_xpu, layout):
+    """`shrink_to` keeps the contents of the kept blocks, gives back whole
+    chunks of the tail (poisoned in the fake), and a regrow reads as zero."""
+    _, _, kv_cache = _chunked_kv_cache(layout)
+    try:
+        view = kv_cache.allocate(kv_cache.size)
+        base = view.data_ptr()
+        kv_cache.commit(48)
+        full = kv_cache.buffer.full_view()
+        segments = list(zip(kv_cache.segment_offsets, kv_cache.segment_strides))
+        for index, (offset, stride) in enumerate(segments):
+            full[offset : offset + 48 * stride].fill_(index + 1)
+        before = fake_xpu.ops.physical_bytes
+
+        released = kv_cache.shrink_to(16)
+        assert kv_cache.num_committed_blocks == 16
+        assert released > 0
+        assert before - fake_xpu.ops.physical_bytes == released
+        assert kv_cache.physical_bytes == fake_xpu.ops.physical_bytes
+        for index, (offset, stride) in enumerate(segments):
+            assert torch.all(full[offset : offset + 16 * stride] == index + 1)
+            assert torch.all(
+                full[offset + 40 * stride : offset + 48 * stride] == POISON
+            )
+        assert kv_cache.buffer.full_view().data_ptr() == base
+
+        kv_cache.commit(48)
+        assert kv_cache.num_committed_blocks == 48
+        for index, (offset, stride) in enumerate(segments):
+            assert torch.all(full[offset : offset + 16 * stride] == index + 1)
+            assert (
+                torch.count_nonzero(full[offset + 16 * stride : offset + 48 * stride])
+                == 0
+            )
+        assert kv_cache.physical_bytes == kv_cache.physical_bytes_for(48)
+    finally:
+        kv_cache.free()
+
+
+def test_kv_cache_keeps_the_straddling_chunk_when_shrinking(fake_xpu):
+    _, _, kv_cache = _chunked_kv_cache(KVCacheLayout.LBNHC)
+    try:
+        kv_cache.allocate(kv_cache.size)
+        kv_cache.commit(48)
+        kv_cache.shrink_to(10)
+        # 10 MiB per layer is five granules; the chunk of granules [4, 8)
+        # holds the new size and stays, so more than five granules remain.
+        assert kv_cache.physical_bytes > kv_cache.physical_bytes_for(10)
+        assert kv_cache.physical_bytes == kv_cache.physical_bytes_for(16)
+        assert fake_xpu.ops.physical_bytes == kv_cache.physical_bytes
+    finally:
+        kv_cache.free()
+
+
+def test_kv_cache_blocks_releasable(fake_xpu):
+    _, spec, kv_cache = _chunked_kv_cache(KVCacheLayout.LBNHC)
+    try:
+        kv_cache.allocate(kv_cache.size)
+        kv_cache.commit(48)
+        chunk = 8 * spec.page_size_bytes * NUM_LAYERS
+        assert kv_cache.blocks_releasable(0) == 0
+        assert kv_cache.blocks_releasable(1) == 8
+        assert kv_cache.blocks_releasable(chunk) == 8
+        assert kv_cache.blocks_releasable(chunk + 1) == 16
+        assert kv_cache.blocks_releasable(1 << 40) is None
+        for need in (1, chunk, 3 * chunk + 1, 5 * chunk):
+            k = kv_cache.blocks_releasable(need)
+            assert k is not None
+            assert kv_cache._releasable_bytes(48 - k) >= need
+            assert kv_cache._releasable_bytes(48 - k + 1) < need
+        # What it predicts is what shrinking then frees.
+        k = kv_cache.blocks_releasable(2 * chunk)
+        before = fake_xpu.ops.physical_bytes
+        assert kv_cache.shrink_to(48 - k) == before - fake_xpu.ops.physical_bytes
+        assert before - fake_xpu.ops.physical_bytes >= 2 * chunk
+    finally:
+        kv_cache.free()
+
+
+def test_kv_cache_without_a_chunk_size_releases_little(fake_xpu):
+    """Today's commit maps one object per run, so a tail inside it cannot be
+    given back: only a shrink to (almost) nothing frees an object."""
+    config, _ = _kv_cache_config(KVCacheLayout.LBNHC)
+    kv_cache = ExtensibleKVCache(config, torch.device("xpu", 0), KVCacheLayout.LBNHC)
+    try:
+        kv_cache.allocate(kv_cache.size)
+        kv_cache.commit(48)
+        assert kv_cache.blocks_releasable(1) == 46
+        before = fake_xpu.ops.physical_bytes
+        assert kv_cache.shrink_to(16) == 0
+        assert fake_xpu.ops.physical_bytes == before
+        assert kv_cache.num_committed_blocks == 16
+        # The committed prefix is smaller; its pages are still there.
+        kv_cache.commit(32)
+        assert kv_cache.num_committed_blocks == 32
+    finally:
+        kv_cache.free()
+
+
 @pytest.mark.parametrize(
     ("initial_blocks", "expected"), [(12, 24), (24, 24), (30, 30), (60, 40)]
 )
@@ -1295,3 +1832,86 @@ def test_startup_cap_keeps_the_blocks_warmup_committed(
     finally:
         for _, kv_cache in caches:
             kv_cache.free()
+
+
+@pytest.mark.parametrize(
+    ("layout", "minimum"), [(KVCacheLayout.LBNHC, 1), (KVCacheLayout.BLNHC, 2)]
+)
+def test_kv_cache_shrink_bounds(fake_xpu, layout, minimum):
+    _, _, kv_cache = _chunked_kv_cache(layout)
+    try:
+        kv_cache.allocate(kv_cache.size)
+        kv_cache.commit(16)
+        assert kv_cache.min_committed_blocks == minimum
+        for bad in (minimum - 1, 17):
+            with pytest.raises(ValueError, match="Cannot shrink"):
+                kv_cache.shrink_to(bad)
+        assert kv_cache.shrink_to(16) == 0
+        kv_cache.shrink_to(minimum)
+        assert kv_cache.num_committed_blocks == minimum
+    finally:
+        kv_cache.free()
+
+
+def test_grow_after_shrink_on_the_kv_cache_reuses_back_and_commit(fake_xpu):
+    """`back` then `commit` (the grow path) work on a shrunk, chunked cache:
+    the memory is mapped by `back` and nothing more by `commit`."""
+    _, _, kv_cache = _chunked_kv_cache(KVCacheLayout.LBNHC)
+    try:
+        kv_cache.allocate(kv_cache.size)
+        kv_cache.commit(48)
+        kv_cache.shrink_to(16)
+        kv_cache.back(40)
+        assert kv_cache.num_committed_blocks == 16
+        creates = fake_xpu.ops.calls.count("create")
+        kv_cache.commit(40)
+        assert fake_xpu.ops.calls.count("create") == creates
+        assert kv_cache.num_committed_blocks == 40
+    finally:
+        kv_cache.free()
+
+
+def test_release_chunk_setting(fake_xpu):
+    from vllm.config import CacheConfig
+    from vllm.engine.arg_utils import EngineArgs
+
+    assert CacheConfig().kv_cache_release_chunk_mib is None
+    assert CacheConfig(kv_cache_release_chunk_mib=32).kv_cache_release_chunk_mib == 32
+    with pytest.raises(ValueError):
+        CacheConfig(kv_cache_release_chunk_mib=0)
+    assert EngineArgs().kv_cache_release_chunk_mib is None
+
+
+@pytest.mark.parametrize(
+    ("enabled", "chunk", "refused"),
+    [(True, 32, False), (False, 32, True), (False, None, False), (True, None, False)],
+)
+def test_release_chunk_needs_the_extensible_kv_cache(enabled, chunk, refused):
+    from vllm.config.vllm import VllmConfig
+
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            enable_extensible_kv_cache=enabled, kv_cache_release_chunk_mib=chunk
+        )
+    )
+    if refused:
+        with pytest.raises(ValueError, match="kv_cache_release_chunk_mib"):
+            VllmConfig._validate_kv_cache_release_chunk(config)
+    else:
+        VllmConfig._validate_kv_cache_release_chunk(config)
+
+
+@pytest.mark.parametrize(
+    ("chunk_mib", "registers", "expected"),
+    [(None, False, None), (32, False, 32 << 20), (32, True, None), (None, True, None)],
+)
+def test_release_chunk_bytes_follows_the_setting_and_the_connector(
+    chunk_mib, registers, expected
+):
+    """The setting becomes bytes, except where a connector registers the cache
+    for RDMA and needs one allocation per segment."""
+    vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(kv_cache_release_chunk_mib=chunk_mib),
+        kv_transfer_config=SimpleNamespace(registers_kv_cache_memory=lambda: registers),
+    )
+    assert extensible_kv_cache.release_chunk_bytes(vllm_config) == expected
