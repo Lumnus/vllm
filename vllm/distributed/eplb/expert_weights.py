@@ -130,6 +130,18 @@ class ExpertMover(Protocol):
     def prepared_stats(self, prepared: Any) -> dict[str, float]:
         """Units and bytes read and milliseconds spent, for the logs."""
 
+    @property
+    def scrub_every(self) -> int:
+        """A debugging aid of the layer: check it after every Nth
+        rearrangement (and once after load); 0 for never."""
+
+    def scrub(self, phys2log: np.ndarray | None = None, full: bool = True) -> dict:
+        """Compare what the layer's kernels read with the experts' home and
+        the device's maps with the placement (and with ``phys2log``, EPLB's
+        map of the layer). The thread that enqueues the forward, between two
+        steps; blocking. Keys: ``slots``, ``mismatches``, ``maps_equal``,
+        ``placement_equal``, ``first``."""
+
 
 class StoreBackedWeight(TieredExpertWeight):
     """A tiered expert tensor of a layer whose slots are placed by an

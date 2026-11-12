@@ -91,6 +91,14 @@ class ExpertStoreConfig:
     stats_interval_s: float = Field(default=0.0, ge=0)
     """Seconds between store log lines per rank; 0 for none."""
 
+    scrub_every: int = Field(default=0, ge=0)
+    """Debugging aid, off at 0. N: once after load (every slot) and after
+    every Nth rearrangement (the slots moved since the last scrub), each rank
+    reads the rows its kernels read back from the device and through the
+    device views and compares them with the store, and the tier maps on the
+    device with the placement; one log line with the counts, an error line
+    naming the first mismatch. The step that scrubs waits for it."""
+
     @model_validator(mode="after")
     def _check_dirs(self) -> "ExpertStoreConfig":
         if len(set(self.dirs)) != len(self.dirs):
@@ -155,6 +163,7 @@ class ExpertStoreConfig:
                 "decay_interval",
                 "build",
                 "verify",
+                "scrub_every",
                 "check_every",
                 "check_threads",
                 "read_timeout_s",

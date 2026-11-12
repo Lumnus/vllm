@@ -423,6 +423,88 @@ def test_a_rank_gives_its_rows_back_when_a_peer_could_not_prepare(
     tstore.reset_sessions()
 
 
+def test_scrub_compares_what_the_kernels_read_with_the_store(monkeypatch, tmp_path):
+    env, model, state, model_state, log = _build(monkeypatch, tmp_path, spare=4)
+    (summary,) = state.scrub_expert_store()  # on request, whatever the setting
+    assert summary["slots"] == LAYERS * E and summary["layers"] == LAYERS
+    assert summary["mismatches"] == 0 and summary["first"] is None
+    assert summary["maps_differ"] == 0 and summary["placement_differs"] == 0
+    assert any(
+        x.startswith("Expert store scrub (EP rank 0, on request, every slot)")
+        for x in log.lines
+    )
+    # after a rearrangement every slot still holds its unit
+    _window(model_state, [[1, 1, 1, 0, 2, 40, 50, 60]] * LAYERS)
+    _run_async_cycle(state, model_state)
+    assert state.scrub_expert_store()[0]["mismatches"] == 0
+    tiers = env.tiers[0]
+    fast, _ = tiers._impls
+    placement = tiers.placement
+    assert placement.tier[5] == 0 and placement.tier[0] == 1  # 5 up, 0 down
+
+    # a wrong byte in a fast row
+    cell = fast.w2[int(placement.row[5])].view(torch.uint8).view(-1)
+    cell[3] ^= 1
+    bad = state.scrub_expert_store()[0]
+    assert bad["mismatches"] == 1
+    assert "slot 5 (expert 5, fast row" in bad["first"]
+    assert any("first mismatch" in x and "slot 5" in x for x in log.lines)
+    cell[3] ^= 1
+    # a wrong byte where the kernels read a pool row: through the view
+    cell = tiers.slow_views["w13_scales"][int(placement.row[0])]
+    cell = cell.view(torch.uint8).view(-1)
+    cell[0] ^= 1
+    bad = state.scrub_expert_store()[0]
+    assert bad["mismatches"] == 1 and "slot 0 (expert 0, pool row" in bad["first"]
+    cell[0] ^= 1
+    # a tier map on the device that is not the placement's
+    g = tiers.slot_global[5]
+    row = int(tiers.fast_map[g])
+    tiers.fast_map[g] = -1
+    bad = state.scrub_expert_store()[0]
+    assert bad["maps_differ"] == 1 and "tier maps on the device" in bad["first"]
+    tiers.fast_map[g] = row
+    # EPLB routing another expert to a slot than the one its row holds
+    model_state.physical_to_logical_map[0, 2] = 3
+    bad = state.scrub_expert_store()[0]
+    assert bad["placement_differs"] == 1 and "EPLB routes expert 3" in bad["first"]
+    model_state.physical_to_logical_map[0, 2] = 2
+    clean = state.scrub_expert_store()[0]
+    assert clean["mismatches"] == 0 and clean["first"] is None
+    tstore.reset_sessions()
+
+
+def test_scrub_every_checks_after_load_and_after_each_rearrangement(
+    monkeypatch, tmp_path
+):
+    env, model, state, model_state, log = _build(monkeypatch, tmp_path, spare=4)
+
+    def scrubs(kind):
+        head = f"Expert store scrub (EP rank 0, {kind}"
+        return [x for x in log.lines if x.startswith(head)]
+
+    # off by default: a step and a rearrangement scrub nothing
+    state.step(is_dummy=True, is_profile=True)
+    _window(model_state, [[1, 1, 1, 0, 2, 40, 50, 60]] * LAYERS)
+    _run_async_cycle(state, model_state)
+    assert not [x for x in log.lines if x.startswith("Expert store scrub")]
+    # on: the first step after load checks every slot, once
+    env.store_cfg.scrub_every = 1
+    model_state.load_scrubbed = False
+    state.step(is_dummy=True, is_profile=True)
+    state.step(is_dummy=True, is_profile=True)
+    assert len(scrubs("load, every slot")) == 1
+    assert f"{LAYERS * E} slots of {LAYERS} layers" in scrubs("load")[0]
+    assert ", 0 mismatches" in scrubs("load")[0]
+    # ... and each rearrangement checks the slots it moved
+    _window(model_state, [[60, 50, 40, 0, 2, 1, 1, 1]] * LAYERS)
+    _run_async_cycle(state, model_state)
+    (line,) = scrubs("rearrangement, slots moved since the last scrub")
+    moved = int(line.split("): ")[1].split(" slots")[0])
+    assert 0 < moved < LAYERS * E and ", 0 mismatches" in line
+    tstore.reset_sessions()
+
+
 def test_a_prepared_move_that_is_dropped_gives_its_rows_back(monkeypatch, tmp_path):
     env, model, state, model_state, log = _build(monkeypatch, tmp_path, spare=3)
     tiers = env.tiers[0]
