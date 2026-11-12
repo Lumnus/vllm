@@ -981,3 +981,31 @@ def test_initial_blocks_needs_the_extensible_kv_cache(enabled, initial_blocks, r
             VllmConfig._validate_extensible_kv_cache_initial_blocks(config)
     else:
         VllmConfig._validate_extensible_kv_cache_initial_blocks(config)
+
+
+def test_failed_access_grant_leaves_nothing_mapped(fake_xpu, monkeypatch):
+    """A chunk whose access grant fails is unmapped and released again, so a
+    later commit of the same range maps it afresh instead of over it."""
+    et = ExtensibleTensor(4 * GRANULE, device="xpu:0", num_segments=2)
+    try:
+        grant = fake_xpu.driver.set_access
+        grants: list[int] = []
+
+        def set_access(ptr: int, size: int, device_index: int) -> None:
+            grants.append(size)
+            if len(grants) == 1:
+                raise RuntimeError("UR_RESULT_ERROR_UNKNOWN")
+            grant(ptr, size, device_index)
+
+        monkeypatch.setattr(fake_xpu.driver, "set_access", set_access)
+        with pytest.raises(RuntimeError, match="UNKNOWN"):
+            et.back_segments_([GRANULE] * 2)
+        assert fake_xpu.ops.physical_bytes == 0
+        assert et.num_physical_chunks == 0
+
+        et.resize_segments_([GRANULE] * 2, zero_new=True)
+        assert fake_xpu.ops.physical_bytes == 2 * GRANULE
+        assert et.num_physical_chunks == 2
+        assert torch.count_nonzero(et.segment_view(0)) == 0
+    finally:
+        et.free()

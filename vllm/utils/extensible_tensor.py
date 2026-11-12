@@ -78,13 +78,23 @@ class _VirtualBuffer:
             if unmapped and run_start is None:
                 run_start = g
             elif not unmapped and run_start is not None:
-                self._map_chunk_at(
-                    run_start * self.granularity, (g - run_start) * self.granularity
-                )
+                offset = run_start * self.granularity
+                size = (g - run_start) * self.granularity
+                self._map_chunk_at(offset, size)
                 # Grant before recording the run as mapped: a failure in a
                 # later run must not leave these granules mapped but
                 # inaccessible, since later commits would skip them.
-                self._grant_access(*self._run_bounds(run_start, g))
+                try:
+                    self._grant_access(*self._run_bounds(run_start, g))
+                except Exception:
+                    # The run is not recorded as mapped, so a later commit
+                    # maps it again: take this chunk out first.
+                    handle, _, _ = self._handles.pop()
+                    with suppress(Exception):
+                        self._driver.unmap(self.base_ptr + offset, size)
+                    with suppress(Exception):
+                        self._driver.release(handle)
+                    raise
                 self._mapped_granules.update(range(run_start, g))
                 run_start = None
 
