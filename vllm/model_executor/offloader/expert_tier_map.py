@@ -81,6 +81,17 @@ class TorchStreamOps:
     """:class:`StreamOps` on the accelerator's compute stream and one side
     stream; call from the thread that enqueues the forward."""
 
+    _shared: "dict[str, TorchStreamOps]" = {}
+
+    @classmethod
+    def shared(cls, device: Any) -> "TorchStreamOps":
+        """One instance (one side stream) per device: the commits of all layers
+        run on the same thread, one after the other."""
+        key = str(device)
+        if key not in cls._shared:
+            cls._shared[key] = cls(device)
+        return cls._shared[key]
+
     def __init__(self, device: Any):
         import torch
 
@@ -321,6 +332,20 @@ class TierPlacement:
         # at load, one per demoted slot when a slot is demoted alone.
         self.fast_free: list[int] = []
 
+    def reset_to(self, tier: np.ndarray, row: np.ndarray) -> None:
+        """Take a placement as it is (before serving: no kernel reads the
+        rows, so nothing is quarantined)."""
+        self.tier = np.asarray(tier, dtype=np.int8).copy()
+        self.row = np.asarray(row, dtype=np.int32).copy()
+        self.fast_free = []
+        used = set(self.row[self.tier == POOL].tolist())
+        self.pool = RowAllocator(
+            self.num_pool_rows,
+            [r for r in range(self.num_pool_rows) if r not in used],
+            self.pool._done,
+        )
+        self.check()
+
     # -- inspection -------------------------------------------------------
 
     def is_fast(self) -> np.ndarray:
@@ -508,6 +533,13 @@ class TierPlacement:
         go to quarantine until E3.
         """
         plan = move.plan
+        if (
+            not move.pool_dest
+            and not move.fast_dest
+            and np.array_equal(move.end_tier, self.tier)
+            and np.array_equal(move.end_row, self.row)
+        ):
+            return  # nothing moves on this rank
         if move.fast_dest:
             drained = ops.record_compute()
             ops.side_wait(drained)
