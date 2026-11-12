@@ -400,6 +400,13 @@ class CacheConfig:
     connectors declare this by overriding
     `KVConnectorBase_V1.kv_cache_access`."""
 
+    extensible_kv_cache_initial_blocks: int | None = Field(default=None, gt=0)
+    """Most KV cache blocks to commit at startup with the extensible KV cache,
+    when the measured memory fits more. The rest of the reserved address range
+    stays uncommitted, and a running engine can commit it later (see the
+    `/resize_kv_cache` dev endpoint). If unspecified, startup commits what the
+    measurement allows. Requires the extensible KV cache."""
+
     kv_offloading_size: float | None = None
     """Size of the KV cache offloading buffer in GiB. When TP > 1, this is
     the total buffer size summed across all TP ranks. By default, this is set
@@ -452,6 +459,7 @@ class CacheConfig:
             "swa_bounded_replay",
             # Runtime memory allocation strategy, not graph structure.
             "enable_extensible_kv_cache",
+            "extensible_kv_cache_initial_blocks",
         }
 
         return get_compile_factors(self, ignored_factors)

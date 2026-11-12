@@ -621,6 +621,9 @@ class EngineArgs:
     gpu_memory_utilization: float | None = CacheConfig.gpu_memory_utilization
     kv_cache_memory_bytes: int | None = CacheConfig.kv_cache_memory_bytes
     enable_extensible_kv_cache: bool | None = CacheConfig.enable_extensible_kv_cache
+    extensible_kv_cache_initial_blocks: int | None = (
+        CacheConfig.extensible_kv_cache_initial_blocks
+    )
     max_num_batched_tokens: int | None = None
     max_num_scheduled_tokens: int | None = None
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
@@ -1428,6 +1431,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--enable-extensible-kv-cache",
             **cache_kwargs["enable_extensible_kv_cache"],
+        )
+        cache_group.add_argument(
+            "--extensible-kv-cache-initial-blocks",
+            **cache_kwargs["extensible_kv_cache_initial_blocks"],
         )
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
         cache_group.add_argument(
@@ -2377,6 +2384,7 @@ class EngineArgs:
             gpu_memory_utilization=self.gpu_memory_utilization,
             kv_cache_memory_bytes=self.kv_cache_memory_bytes,
             enable_extensible_kv_cache=self.enable_extensible_kv_cache,  # type: ignore[arg-type]
+            extensible_kv_cache_initial_blocks=self.extensible_kv_cache_initial_blocks,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,

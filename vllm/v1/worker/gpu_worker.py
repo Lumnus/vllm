@@ -1241,6 +1241,7 @@ class Worker(WorkerBase):
                     self.device,
                     init_free_memory=self.init_free_memory,
                     requested_memory=int(self.requested_memory),
+                    initial_blocks=self.cache_config.extensible_kv_cache_initial_blocks,
                 )
             )
 

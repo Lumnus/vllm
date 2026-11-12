@@ -2007,6 +2007,7 @@ class VllmConfig:
         self._disable_cudagraphs_for_stock_torch_compile()
         self._validate_model_runner()
         self._resolve_extensible_kv_cache()
+        self._validate_extensible_kv_cache_initial_blocks()
         self._validate_eplb_world()
 
         self._validate_profiler_config()
@@ -3313,6 +3314,20 @@ class VllmConfig:
                 "No IMEX channel: with the extensible KV cache, KV transfers within "
                 "a host (e.g. NIXL) fall back to TCP. Transfers across hosts use "
                 "RDMA."
+            )
+
+    def _validate_extensible_kv_cache_initial_blocks(self) -> None:
+        """The cap on the blocks committed at startup is a setting of the
+        extensible KV cache, which must have been settled on by now."""
+        cache_config = self.cache_config
+        if (
+            cache_config.extensible_kv_cache_initial_blocks is not None
+            and not cache_config.enable_extensible_kv_cache
+        ):
+            raise ValueError(
+                "extensible_kv_cache_initial_blocks needs the extensible KV cache, "
+                "which is off for this model and platform (or by "
+                "--no-enable-extensible-kv-cache)."
             )
 
     def _validate_adaptive_verification(self) -> None:

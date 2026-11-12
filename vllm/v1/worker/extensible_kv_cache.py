@@ -611,13 +611,15 @@ def measure_kv_cache_blocks(
     *,
     init_free_memory: int,
     requested_memory: int,
+    initial_blocks: int | None = None,
 ) -> int:
     """Size an extensible KV cache from the memory free after warmup.
 
     Keeps free reserved_headroom_bytes, the larger of the profiled peak and
     warmup's allocated (not reserved) transient peak. Torch's cache is emptied
     first: its blocks may not fit the large workspaces the first real steps
-    allocate. Then caps torch's caching allocator to leave
+    allocate. Commits no more than initial_blocks blocks when that is set. Then
+    caps torch's caching allocator to leave
     KV_CACHE_NON_TORCH_RESERVE_BYTES free for allocations outside it.
     """
     torch.accelerator.synchronize()
@@ -638,6 +640,14 @@ def measure_kv_cache_blocks(
         getattr(vllm_config.parallel_config, "_api_process_count", 1),
     )
     num_blocks = kv_cache.blocks_within(kv_cache_bytes)
+    if initial_blocks is not None and initial_blocks < num_blocks:
+        logger.info(
+            "Committing %d KV cache blocks at startup, not the %d the "
+            "measurement allows (extensible_kv_cache_initial_blocks).",
+            initial_blocks,
+            num_blocks,
+        )
+        num_blocks = initial_blocks
     # Torch may grow into what stays free once the cache is extended, less the
     # memory kept for multimodal IPC and for allocations outside torch.
     left_free = (

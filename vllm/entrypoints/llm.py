@@ -122,6 +122,9 @@ class LLM(
             device virtual memory and commit physical pages after warmup, so
             the cache is sized from the memory actually free after CUDA graph
             capture. Defaults to on for CUDA, ROCm and XPU.
+        extensible_kv_cache_initial_blocks: Most KV cache blocks to commit at
+            startup with the extensible KV cache, when the measured memory
+            fits more. The rest of the reserved range can be committed later.
         cpu_offload_gb: The size (GiB) of CPU memory to use for offloading
             the model weights. This virtually increases the GPU memory space
             you can use to hold the model weights, at the cost of CPU-GPU data
@@ -219,6 +222,7 @@ class LLM(
         attention_config: dict[str, Any] | AttentionConfig | None = None,
         kv_cache_memory_bytes: int | None = None,
         enable_extensible_kv_cache: bool | None = None,
+        extensible_kv_cache_initial_blocks: int | None = None,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         quantization_config: dict[str, Any] | QuantizationConfigArgs | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
@@ -317,6 +321,7 @@ class LLM(
             gpu_memory_utilization=gpu_memory_utilization,
             kv_cache_memory_bytes=kv_cache_memory_bytes,
             enable_extensible_kv_cache=enable_extensible_kv_cache,
+            extensible_kv_cache_initial_blocks=extensible_kv_cache_initial_blocks,
             cpu_offload_gb=cpu_offload_gb,
             offload_group_size=offload_group_size,
             offload_num_in_group=offload_num_in_group,
