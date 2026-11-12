@@ -130,6 +130,12 @@ class ECHostTowerConnector(ECConnectorBase):
             return self.connector_scheduler.has_pending_push_work()
         return False
 
+    def host_tower_stats(self) -> dict[str, dict[str, float]]:
+        """Per tower with residency "dynamic": location and counters."""
+        if self.connector_scheduler is not None:
+            return self.connector_scheduler.host_tower_stats()
+        return {}
+
     # Shared.
     def shutdown(self) -> None:
         if self.connector_scheduler is not None:
