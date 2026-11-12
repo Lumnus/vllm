@@ -122,6 +122,10 @@ class ExtensibleKVCache:
         # Bytes torch's caching allocator may reserve, set once the cache is
         # sized; None leaves it unlimited.
         self.torch_memory_limit: int | None = None
+        # Set while a grow is being taken into use: the block counts it goes
+        # from and to and the torch cap before it. Left set by a failure, for
+        # the next resize to finish.
+        self.unfinished_grow: tuple[int, int, int | None] | None = None
         self.buffer = ExtensibleTensor(
             self.size,
             device=device,
@@ -234,6 +238,15 @@ class ExtensibleKVCache:
         self.buffer.back_segments_(
             [num_blocks * stride for stride in self.segment_strides]
         )
+
+    def zero_blocks(self, start: int, end: int) -> None:
+        """Zero the committed blocks from start up to end."""
+        assert 0 <= start <= end <= self.num_committed_blocks
+        if start == end:
+            return
+        full = self.buffer.full_view()
+        for offset, stride in zip(self.segment_offsets, self.segment_strides):
+            full[offset + start * stride : offset + end * stride].zero_()
 
     def committed_views(
         self,
@@ -723,6 +736,69 @@ def measure_kv_cache_blocks(
     return num_blocks
 
 
+def _finish_grow(
+    runner: "GPUModelRunner",
+    start: int,
+    num_blocks: int,
+    torch_memory_limit: int | None,
+    *,
+    recovering: bool = False,
+) -> None:
+    """Take a grow from start to num_blocks blocks into use on this rank, once
+    every rank has the memory mapped: commit and zero the new blocks, rebuild
+    the views, tell the KV connector, and lower the cap on torch from
+    torch_memory_limit, the cap before the grow.
+
+    `unfinished_grow` stays set until the last step is done. A failure here
+    cannot be undone on the other ranks, so it is repaired instead: the next
+    resize runs these steps again (recovering) before anything else. Until
+    then this rank goes on serving the blocks below start, which every step
+    leaves in place and addressable.
+    """
+    kv_cache = runner.extensible_kv_cache
+    assert kv_cache is not None
+    kv_cache.unfinished_grow = (start, num_blocks, torch_memory_limit)
+    kv_cache.commit(num_blocks)
+    if recovering:
+        # The failed attempt may have stopped before zeroing them, and no
+        # request has been given these blocks.
+        kv_cache.zero_blocks(start, num_blocks)
+    bound_blocks = runner.kv_cache_config.num_blocks
+    runner.kv_cache_config.num_blocks = num_blocks
+    try:
+        rebind_committed_views(runner)
+    except Exception:
+        # The runner keeps the views it had; keep their count with them.
+        runner.kv_cache_config.num_blocks = bound_blocks
+        raise
+    if has_kv_transfer_group():
+        get_kv_transfer_group().resize_kv_caches(runner.kv_caches_by_layer, num_blocks)
+    # Torch must not grow into what the cache now holds.
+    if torch_memory_limit is not None:
+        torch_memory_limit = max(
+            torch_memory_limit
+            - (
+                kv_cache.physical_bytes_for(num_blocks)
+                - kv_cache.physical_bytes_for(start)
+            ),
+            0,
+        )
+        kv_cache.set_torch_memory_limit(torch_memory_limit)
+        if torch.accelerator.memory_reserved(runner.device) > torch_memory_limit:
+            torch.accelerator.empty_cache()
+    # The new blocks are zeroed on the current stream; finish before any step
+    # can address them.
+    torch.accelerator.synchronize()
+    kv_cache.unfinished_grow = None
+    logger.info(
+        "Grew KV cache from %d to %d blocks (%.2f GiB to %.2f GiB).",
+        start,
+        num_blocks,
+        kv_cache.physical_bytes_for(start) / (1 << 30),
+        kv_cache.physical_bytes_for(num_blocks) / (1 << 30),
+    )
+
+
 def grow_kv_cache(
     runner: "GPUModelRunner",
     target_num_blocks: int,
@@ -735,11 +811,17 @@ def grow_kv_cache(
 
     Every rank takes part: each measures with the rule of the startup sizing
     and the ranks agree, through reduce_min (the minimum over ranks), on the
-    block count n = the least of the target, what every rank's memory fits and
-    the capacity. Physical memory is mapped on every rank before any commits, so
-    a rank that cannot map leaves all ranks at the current count. Returns the
-    count in force afterwards, never below the current one: a target at or below
-    it changes nothing.
+    block count n = the least of the target, what every rank fits and the
+    capacity. Physical memory is mapped on every rank before any commits, and
+    the ranks agree a second time that it is, so a rank that cannot map leaves
+    all ranks at the current count. Returns the count in force afterwards,
+    never below the current one: a target at or below it changes nothing.
+
+    Every rank calls reduce_min exactly twice, whatever happens on it: a rank
+    that left an agreement out would leave the others waiting in it. A rank
+    that fails before the agreements votes for no growth and raises once both
+    are over. A rank that fails after them keeps `unfinished_grow`, and the
+    next resize finishes that grow first (see `_finish_grow`).
 
     Must run where no step is between its forward and its sampling: blocks
     below the old count are untouched, the new blocks are zeroed, and the views
@@ -762,30 +844,55 @@ def grow_kv_cache(
             f"The KV connector {type(get_kv_transfer_group()).__name__} does not "
             "support resizing the KV cache."
         )
-    old = kv_cache.num_committed_blocks
+    error: Exception | None = None
     try:
-        fits = _measure_kv_cache(
-            kv_cache,
-            vllm_config,
-            runner.device,
-            init_free_memory=init_free_memory,
-            requested_memory=requested_memory,
-        ).num_blocks
-    except ValueError:
-        # Nothing left after the multimodal reservation: this rank fits no more.
-        fits = old
-    num_blocks = reduce_min(min(target_num_blocks, fits, kv_cache.capacity_blocks))
+        if kv_cache.unfinished_grow is not None:
+            start, end, torch_memory_limit = kv_cache.unfinished_grow
+            logger.warning(
+                "Finishing the grow of the KV cache from %d to %d blocks that an "
+                "earlier resize left incomplete.",
+                start,
+                end,
+            )
+            _finish_grow(runner, start, end, torch_memory_limit, recovering=True)
+        try:
+            fits = _measure_kv_cache(
+                kv_cache,
+                vllm_config,
+                runner.device,
+                init_free_memory=init_free_memory,
+                requested_memory=requested_memory,
+            ).num_blocks
+        except ValueError:
+            # Nothing left after the multimodal reservation: this rank fits
+            # no more.
+            fits = kv_cache.num_committed_blocks
+        vote = min(target_num_blocks, fits, kv_cache.capacity_blocks)
+    except Exception as e:
+        logger.exception(
+            "This rank cannot take part in resizing the KV cache; no rank grows."
+        )
+        error = e
+        vote = 0
+    old = kv_cache.num_committed_blocks
+    num_blocks = reduce_min(vote)
+    backed = 1
+    if error is None and num_blocks > old:
+        try:
+            kv_cache.back(num_blocks)
+        except Exception:
+            logger.warning(
+                "Could not map memory for %d KV cache blocks.",
+                num_blocks,
+                exc_info=True,
+            )
+            backed = 0
+    backed = reduce_min(backed)
+    if error is not None:
+        raise error
     if num_blocks <= old:
         return old
-    try:
-        kv_cache.back(num_blocks)
-        backed = 1
-    except RuntimeError:
-        logger.warning(
-            "Could not map memory for %d KV cache blocks.", num_blocks, exc_info=True
-        )
-        backed = 0
-    if not reduce_min(backed):
+    if not backed:
         # Nothing was committed anywhere; mapped granules stay for the next try.
         logger.warning(
             "Not growing the KV cache from %d to %d blocks: memory could not be "
@@ -794,32 +901,7 @@ def grow_kv_cache(
             num_blocks,
         )
         return old
-    old_bytes = kv_cache.physical_bytes_for(old)
-    kv_cache.commit(num_blocks)
-    runner.kv_cache_config.num_blocks = num_blocks
-    rebind_committed_views(runner)
-    if has_kv_transfer_group():
-        get_kv_transfer_group().resize_kv_caches(runner.kv_caches_by_layer, num_blocks)
-    # Torch must not grow into what the cache now holds.
-    torch_memory_limit = kv_cache.torch_memory_limit
-    if torch_memory_limit is not None:
-        torch_memory_limit = max(
-            torch_memory_limit - (kv_cache.physical_bytes_for(num_blocks) - old_bytes),
-            0,
-        )
-        kv_cache.set_torch_memory_limit(torch_memory_limit)
-        if torch.accelerator.memory_reserved(runner.device) > torch_memory_limit:
-            torch.accelerator.empty_cache()
-    # The new blocks are zeroed on the current stream; finish before any step
-    # can address them.
-    torch.accelerator.synchronize()
-    logger.info(
-        "Grew KV cache from %d to %d blocks (%.2f GiB to %.2f GiB).",
-        old,
-        num_blocks,
-        old_bytes / (1 << 30),
-        kv_cache.physical_bytes_for(num_blocks) / (1 << 30),
-    )
+    _finish_grow(runner, old, num_blocks, kv_cache.torch_memory_limit)
     return num_blocks
 
 

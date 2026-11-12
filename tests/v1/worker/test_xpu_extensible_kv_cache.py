@@ -722,7 +722,8 @@ def test_grow_to_the_current_size_or_less_changes_nothing(grow_ranks):
     assert ranks.caches[0].num_committed_blocks == 8
     assert ranks.fake_xpu.ops.calls.count("create") == creates
     assert ranks.rebinds == []
-    assert reduce_calls == [8, 3]  # only the measurement round ran
+    # Both agreements run on every call, so that no rank can leave one out.
+    assert reduce_calls == [8, 1, 3, 1]
 
 
 def test_grow_measures_inside_the_call_and_takes_the_minimum(grow_ranks):
@@ -1009,3 +1010,120 @@ def test_failed_access_grant_leaves_nothing_mapped(fake_xpu, monkeypatch):
         assert torch.count_nonzero(et.segment_view(0)) == 0
     finally:
         et.free()
+
+
+def _grow_each(ranks: GrowFixture, target: int) -> list[object]:
+    """Every rank's result of one grow, an exception where the rank raised."""
+    group = MinGroup(len(ranks.runners))
+    results: list[object] = [None] * len(ranks.runners)
+
+    def run(rank: int) -> None:
+        try:
+            results[rank] = ranks.grow(rank, target, group.reducer(rank))
+        except BaseException as e:  # noqa: BLE001
+            results[rank] = e
+
+    threads = [
+        threading.Thread(target=run, args=(r,)) for r in range(len(ranks.runners))
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+    assert group.rounds == 2
+    return results
+
+
+def test_rank_that_cannot_measure_still_joins_both_agreements(grow_ranks, monkeypatch):
+    """A rank whose measurement raises votes for no growth and raises only
+    after both agreements, so the other ranks are not left waiting in one."""
+    ranks = grow_ranks([40, 40])
+    measured = extensible_kv_cache.current_platform.free_device_memory
+
+    def free_device_memory(device):
+        if device.index == 1:
+            raise RuntimeError("UR_RESULT_ERROR_UNKNOWN")
+        return measured(device)
+
+    monkeypatch.setattr(
+        extensible_kv_cache,
+        "current_platform",
+        SimpleNamespace(free_device_memory=free_device_memory),
+    )
+    creates = ranks.fake_xpu.ops.calls.count("create")
+
+    results = _grow_each(ranks, 24)
+
+    assert results[0] == 8
+    assert isinstance(results[1], RuntimeError)
+    assert [c.num_committed_blocks for c in ranks.caches] == [8, 8]
+    assert ranks.fake_xpu.ops.calls.count("create") == creates
+    assert ranks.rebinds == []
+
+
+def test_grow_that_failed_after_the_agreement_is_finished_by_the_next_resize(
+    grow_ranks, monkeypatch
+):
+    """A rank that fails once every rank agreed and mapped reports the failure
+    and keeps serving its old views; the next resize finishes its grow, zeroing
+    included, before any rank reports the new count."""
+    ranks = grow_ranks([40, 40])
+    rebound: list[tuple[int, int]] = []
+    fail = {1}
+
+    def rebind(runner):
+        rank = runner.device.index
+        if rank in fail:
+            fail.discard(rank)
+            raise RuntimeError("device error while rebinding")
+        rebound.append((rank, runner.kv_cache_config.num_blocks))
+
+    monkeypatch.setattr(extensible_kv_cache, "rebind_committed_views", rebind)
+
+    results = _grow_each(ranks, 24)
+
+    assert results[0] == 24
+    assert isinstance(results[1], RuntimeError)
+    failed = ranks.caches[1]
+    assert failed.unfinished_grow == (8, 24, None)
+    assert ranks.caches[0].unfinished_grow is None
+    # The failed rank still describes the views it serves with.
+    assert ranks.runners[1].kv_cache_config.num_blocks == 8
+    # Whatever the failed attempt left in the new blocks must not survive.
+    full = failed.buffer.full_view()
+    for offset, stride in zip(failed.segment_offsets, failed.segment_strides):
+        full[offset + 8 * stride : offset + 24 * stride].fill_(0xFF)
+    failed.buffer.segment_view(0)[:64].fill_(7)
+
+    assert ranks.grow_all(24) == [24, 24]
+
+    assert rebound == [(0, 24), (1, 24)]
+    assert failed.unfinished_grow is None
+    assert ranks.runners[1].kv_cache_config.num_blocks == 24
+    view = failed.buffer.segment_view(0)
+    assert torch.all(view[:64] == 7)
+    assert torch.count_nonzero(view[8 * ranks.spec.page_size_bytes :]) == 0
+
+
+def test_rank_that_cannot_finish_an_earlier_grow_stops_every_rank(
+    grow_ranks, monkeypatch
+):
+    """While one rank still fails to finish its grow, a resize toward more
+    grows no rank, and that rank raises after the agreements."""
+    ranks = grow_ranks([40, 40])
+
+    def rebind(runner):
+        if runner.device.index == 1:
+            raise RuntimeError("device error while rebinding")
+
+    monkeypatch.setattr(extensible_kv_cache, "rebind_committed_views", rebind)
+    results = _grow_each(ranks, 24)
+    assert results[0] == 24
+    assert isinstance(results[1], RuntimeError)
+
+    results = _grow_each(ranks, 32)
+
+    assert results[0] == 24
+    assert isinstance(results[1], RuntimeError)
+    assert [c.num_committed_blocks for c in ranks.caches] == [24, 24]
+    assert ranks.caches[1].unfinished_grow == (8, 24, None)
