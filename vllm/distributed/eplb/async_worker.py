@@ -76,6 +76,8 @@ def run_rebalance_experts(
         eplb_stats.num_gpus,
     )
     assert new_physical_to_logical_map.device == torch.device("cpu")
+    # The movers of layers that place their own experts take the loads.
+    model_state.plan_load = global_expert_load_window
 
     return new_physical_to_logical_map
 
@@ -171,27 +173,49 @@ def _transfer_cycle(
                 model_state.rebalanced = False
                 break
 
-            transfer_metadata = transfer_layer(
-                old_layer_indices=physical_to_logical_map_cpu[layer_idx],
-                new_layer_indices=new_physical_to_logical_map[layer_idx],
-                expert_weights=model_state.model.expert_weights[layer_idx],
-                expert_weights_buffer=model_state.expert_buffer,
-                communicator=model_state.communicator,
-                ep_group=eplb_group,
-                is_profile=is_profile,
-                stream=stream,
-                layer_idx=layer_idx,
-                enable_migration_batching=(
-                    state.parallel_config.eplb_config.migration_batching_enabled
-                ),
-                migration_batches=(
-                    # This is only the current layer's schedule; it does not
-                    # combine transfers from different layers.
-                    migration_batches_by_layer[layer_idx]
-                    if migration_batches_by_layer is not None
-                    else None
-                ),
+            transfer_metadata = None
+            prepared = None
+            mover = (
+                None if model_state.movers is None else model_state.movers[layer_idx]
             )
+            if mover is not None:
+                # The layer reads what it newly holds from the expert store
+                # (this rank only); nothing crosses ranks.
+                assert model_state.plan_load is not None
+                started = time.perf_counter()
+                prepared = mover.prepare(
+                    physical_to_logical_map_cpu[layer_idx].numpy(),
+                    new_physical_to_logical_map[layer_idx].numpy(),
+                    model_state.plan_load[layer_idx].float().numpy(),
+                    state.parallel_config.eplb_config.tier_hysteresis,
+                )
+                logger.debug(
+                    "EPLB layer %d prepared in %.1f ms",
+                    layer_idx,
+                    (time.perf_counter() - started) * 1e3,
+                )
+            else:
+                transfer_metadata = transfer_layer(
+                    old_layer_indices=physical_to_logical_map_cpu[layer_idx],
+                    new_layer_indices=new_physical_to_logical_map[layer_idx],
+                    expert_weights=model_state.model.expert_weights[layer_idx],
+                    expert_weights_buffer=model_state.expert_buffer,
+                    communicator=model_state.communicator,
+                    ep_group=eplb_group,
+                    is_profile=is_profile,
+                    stream=stream,
+                    layer_idx=layer_idx,
+                    enable_migration_batching=(
+                        state.parallel_config.eplb_config.migration_batching_enabled
+                    ),
+                    migration_batches=(
+                        # This is only the current layer's schedule; it does not
+                        # combine transfers from different layers.
+                        migration_batches_by_layer[layer_idx]
+                        if migration_batches_by_layer is not None
+                        else None
+                    ),
+                )
 
             # Wait until all writes to expert_buffer have finished before making the
             # AsyncEplbLayerResult visible to the main thread.
@@ -207,12 +231,15 @@ def _transfer_cycle(
                 new_physical_to_logical_map=new_physical_to_logical_map[layer_idx],
                 transfer_metadata=transfer_metadata,
                 consumed_event=consumed_event,
+                prepared=prepared,
             )
             # A fault recovery happened during the transfer, so the main
             # thread will never consume this result. Drop it and abandon
             # the rebalance.
             if state.ft_reset_epoch != reset_epoch:
                 model_state.pending_result = None
+                if prepared is not None and mover is not None:
+                    mover.discard(prepared)
                 return
 
             # Block this thread until the main thread and main stream
