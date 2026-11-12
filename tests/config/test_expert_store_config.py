@@ -99,6 +99,10 @@ def test_needs_the_tiers_a_bounded_policy_and_async_eplb():
     elastic.enable_elastic_ep = True
     with pytest.raises(ValueError, match="elastic"):
         config.verify_parallel_config(elastic, _offload())
+    staged = _parallel()
+    staged.pipeline_parallel_size = 2
+    with pytest.raises(ValueError, match="pipeline"):
+        config.verify_parallel_config(staged, _offload())
     with pytest.raises(ValueError, match="spare_rows=2"):
         ExpertStoreConfig(dirs=["/a"], spare_rows=2).verify_parallel_config(
             _parallel(), _offload()

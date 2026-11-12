@@ -108,6 +108,13 @@ class ExpertStoreConfig:
             )
         if parallel_config.enable_elastic_ep:
             raise ValueError("the expert store is not supported with elastic EP")
+        if getattr(parallel_config, "pipeline_parallel_size", 1) > 1:
+            # Each stage is its own group of ranks with half of the layers:
+            # the build's writers and its finalize are agreed within one.
+            raise ValueError(
+                "the expert store is not supported with pipeline parallelism "
+                "(--pipeline-parallel-size > 1)"
+            )
         eplb = parallel_config.eplb_config
         if eplb.policy != "incremental":
             raise ValueError(

@@ -76,16 +76,23 @@ def test_build_then_fill_give_the_host_rows_the_checkpoint_path_gives(
     tstore.reset_sessions()
 
 
-def test_a_store_of_another_checkpoint_is_rebuilt_or_refused(monkeypatch, tmp_path):
-    run(monkeypatch, tmp_path, store=True)
+def test_a_store_of_another_checkpoint_is_refused_unless_rebuild(
+    monkeypatch, tmp_path
+):
+    from vllm.model_executor.offloader.expert_store import ExpertStore
+
+    first = run(monkeypatch, tmp_path, store=True)
+    session = first.tiers[0].store_binding.session
+    dirs, identity = session.config.dirs, session.identity
     tstore.reset_sessions()
-    # same dirs, other checkpoint identity: auto rebuilds
+    # same dirs, other checkpoint identity: auto refuses and deletes nothing
     monkeypatch.setattr(
         tstore, "checkpoint_identity", lambda model_config: "another-checkpoint"
     )
-    env = run(monkeypatch, tmp_path, store=True)
-    assert env.tiers[0].store_binding.session.mode == "build"
-    assert env.tiers[0].store_binding.session.status == "mismatch"
+    env = Env(monkeypatch, tmp_path, True)
+    with pytest.raises(ValueError, match="does not replace it"):
+        env.construct()
+    assert ExpertStore.status(dirs, identity) == "complete"  # still there
     tstore.reset_sessions()
     # build=never refuses a store that does not match
     monkeypatch.setattr(
@@ -101,6 +108,44 @@ def test_a_store_of_another_checkpoint_is_rebuilt_or_refused(monkeypatch, tmp_pa
     )
     env = run(monkeypatch, tmp_path, store=True, build="rebuild")
     assert env.tiers[0].store_binding.session.mode == "build"
+    assert ExpertStore.status(dirs, identity) == "mismatch"  # replaced
+    tstore.reset_sessions()
+
+
+def test_a_model_with_a_dense_decoder_layer_is_refused_before_loading(
+    monkeypatch, tmp_path
+):
+    """Three decoder layers, routed experts in two of them: the loader's first
+    routing call refuses, and nothing is on the drives."""
+    import os
+    from types import SimpleNamespace
+
+    from vllm import config as vllm_config_mod
+
+    from .xpu_store_harness import _GPTQ, HIDDEN, INTER, NAME, _Linear
+
+    env = Env(monkeypatch, tmp_path, True)
+    cfg = vllm_config_mod.get_current_vllm_config()
+    cfg.model_config.hf_text_config.num_hidden_layers = LAYERS + 1
+    moe_config = SimpleNamespace(
+        num_experts=E, num_logical_experts=E, ep_rank=0, ep_size=1
+    )
+    params = {
+        "hidden_size": HIDDEN,
+        "intermediate_size_per_partition": INTER,
+        "params_dtype": torch.bfloat16,
+    }
+    from vllm.model_executor.layers.fused_moe import xpu_expert_tiers as xt
+
+    layers = [
+        xt.maybe_tier(NAME.format(i), moe_config, _Linear(0, 1), _GPTQ(), params)
+        for i in (0, 2)
+    ]
+    assert all(t is not None and t.store_binding is not None for t in layers)
+    with pytest.raises(ValueError, match="every decoder layer"):
+        layers[0].route(None, 0)
+    for d in env.store_cfg.dirs:
+        assert os.listdir(d) == []
     tstore.reset_sessions()
 
 

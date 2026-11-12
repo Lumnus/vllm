@@ -118,11 +118,21 @@ class StoreSession:
                 f"--expert-store-config build=never, but the store in "
                 f"{config.dirs} is {status} for this checkpoint and layout"
             )
+        elif status == "mismatch":
+            # Never replaced on our own: it may be another model's store, or
+            # this model's under another kernel layout, and it is large.
+            raise ValueError(
+                f"the expert store in {config.dirs} was built for another "
+                "checkpoint or kernel layout. build=auto does not replace it: "
+                "give this model directories of its own, or set "
+                "--expert-store-config build to 'rebuild' for one start to "
+                "delete that store and build this one"
+            )
         else:
             self.mode = "build"
-        self._wipe = self.mode == "build" and (
-            config.build == "rebuild" or status in ("complete", "mismatch")
-        )
+        # Only an explicit rebuild deletes what is there.
+        self._wipe = config.build == "rebuild"
+        self._layers_checked = False
         self.registered: set[str] = set()
         self.built: set[str] = set()
         self._writer: ExpertStoreWriter | None = None
@@ -141,6 +151,22 @@ class StoreSession:
 
     def register(self, layer_name: str) -> None:
         self.registered.add(layer_name)
+
+    def check_layers(self) -> None:
+        """Every layer of the schema must have registered (call once the
+        model is constructed, before anything is loaded or written): the
+        store is one rectangle of layers by experts, so a decoder layer
+        without routed experts would leave units nobody writes."""
+        if self._layers_checked:
+            return
+        if len(self.registered) != self.schema.layers:
+            raise ValueError(
+                "the expert store needs routed experts in every decoder layer: "
+                f"{len(self.registered)} of {self.schema.layers} decoder layers "
+                "have them (a model with dense decoder layers is not supported "
+                "yet). Nothing was written; drop --expert-store-config"
+            )
+        self._layers_checked = True
 
     @property
     def slot_bytes(self) -> int:
@@ -246,6 +272,7 @@ class StoreSession:
     def _ensure_writer(self) -> ExpertStoreWriter:
         if self._writer is not None:
             return self._writer
+        self.check_layers()  # on every rank, before the first barrier
         cfg = self.config
         writer_id = f"rank{self.rank}"
         # Rank 0 opens first, clearing an old store when asked to; the others
