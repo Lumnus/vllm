@@ -3055,7 +3055,8 @@ class VllmConfig:
                 flag,
             )
             return
-        if self.ec_transfer_config is not None:
+        derived = self.ec_transfer_config
+        if derived is not None and not derived.host_tower_derived:
             raise ValueError(
                 f"{flag} cannot be combined with --ec-transfer-config: the host "
                 "towers use the encoder cache connector slot of this engine."
@@ -3090,6 +3091,12 @@ class VllmConfig:
                 "adapters are not applied to a host tower."
             )
 
+        if derived is not None:
+            # This config was built from one that already went through here
+            # (the engine hands it to the workers, which rebuild it): the
+            # connector is ours and stays as it is.
+            return
+
         cache_bytes = int(
             sum(o.cache_gb for o in mm_config.mm_encoder_host_towers.values())
             * GiB_bytes
@@ -3100,6 +3107,7 @@ class VllmConfig:
             ec_role="ec_consumer",
             ec_connector_extra_config={"ec_cpu_bytes": cache_bytes},
         )
+        self.ec_transfer_config.host_tower_derived = True
         logger.info_once(
             "Encoder towers kept in host memory: %s.",
             ", ".join(sorted(mm_config.mm_encoder_host_towers)),
