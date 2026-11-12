@@ -7,6 +7,7 @@ This involves the exchange of expert weights between GPUs.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -64,8 +65,9 @@ class AsyncEplbLayerResult:
     New physical→logical mapping for layers_idx, on CPU.
     Shape: (num_physical_experts)
     """
-    transfer_metadata: TransferMetadata
-    """Metadata describing what was received during transfer_layer."""
+    transfer_metadata: TransferMetadata | None
+    """Metadata describing what was received during transfer_layer; None for a
+    layer that places its own experts (`ExpertMover`)."""
     consumed_event: CpuGpuEvent
     """
     Event used to synchronize access to the intermediate buffer. The async worker calls
@@ -73,6 +75,8 @@ class AsyncEplbLayerResult:
     thread calls record() after it finishes transferring weights out of the intermediate
     buffer in _move_to_workspace()
     """
+    prepared: Any = None
+    """What an `ExpertMover` prepared for the layer; committed by the main thread."""
 
 
 def get_ep_ranks_with_experts_batch(

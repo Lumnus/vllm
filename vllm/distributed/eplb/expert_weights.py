@@ -13,6 +13,7 @@ experts of each rank in the first (fast) tier.
 """
 
 from collections.abc import Callable, Iterable, Sequence
+from typing import Any, Protocol
 
 import numpy as np
 import torch
@@ -91,7 +92,74 @@ class TieredExpertWeight:
             self.on_rows_written(slow)
 
 
+class ExpertMover(Protocol):
+    """A layer that places its own experts, instead of EPLB sending them.
+
+    The weights of an expert never change and each has a durable home (the
+    expert store), so a rearrangement is, for the layer, reading what it newly
+    holds from there and then switching which row serves which slot. EPLB keeps
+    the decisions (loads, policy, the replicated maps) and the timing: it calls
+    :meth:`prepare` off the step thread and :meth:`commit` between two steps,
+    in the window where it commits its own maps, on every rank at the same step.
+    """
+
+    def prepare(
+        self,
+        old_phys2log: np.ndarray,
+        new_phys2log: np.ndarray,
+        logical_load: np.ndarray,
+        hysteresis: float,
+    ) -> Any:
+        """Read what this rank's slots newly hold. Any thread; touches no
+        device state. ``*_phys2log``: the logical expert of every physical
+        slot of the layer; ``logical_load``: load per logical expert."""
+
+    def commit(self, prepared: Any) -> None:
+        """Switch to the prepared placement (enqueue its device work). The
+        thread that enqueues the forward, between two steps."""
+
+    def discard(self, prepared: Any) -> None:
+        """Give up a prepared placement that will not be committed."""
+
+    def fill_to(
+        self, phys2log: np.ndarray, logical_load: np.ndarray, hysteresis: float
+    ) -> None:
+        """Put the layer straight into a placement, reading every slot from its
+        home. Only before serving: nothing reads the rows."""
+
+    def prepared_stats(self, prepared: Any) -> dict[str, float]:
+        """Units and bytes read and milliseconds spent, for the logs."""
+
+
+class StoreBackedWeight(TieredExpertWeight):
+    """A tiered expert tensor of a layer whose slots are placed by an
+    :class:`ExpertMover`. EPLB reads shapes and sizes from it as from any
+    tiered tensor; the bytes are moved by ``mover``, never by EPLB."""
+
+    def __init__(
+        self,
+        parts: Sequence[torch.Tensor],
+        on_rows_written: Callable[[list[int]], None] | None,
+        mover: ExpertMover,
+    ):
+        super().__init__(parts, on_rows_written)
+        self.mover = mover
+
+    def view(self, dtype: torch.dtype) -> "StoreBackedWeight":
+        return StoreBackedWeight(
+            [p.view(dtype) for p in self.parts], self.on_rows_written, self.mover
+        )
+
+
 ExpertWeight = torch.Tensor | TieredExpertWeight
+
+
+def expert_mover(weights: Sequence[Any]) -> ExpertMover | None:
+    """The mover of a layer whose experts are placed by the layer itself."""
+    for weight in weights:
+        if isinstance(weight, StoreBackedWeight):
+            return weight.mover
+    return None
 
 
 def new_expert_buffer(weight: ExpertWeight) -> torch.Tensor:
