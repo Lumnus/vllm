@@ -3377,6 +3377,60 @@ class Scheduler(SchedulerInterface):
         self.cache_config.num_gpu_blocks = num_blocks
         update_kv_cache_capacity(self.vllm_config, self.kv_cache_config)
 
+    def min_kv_cache_blocks(self) -> int:
+        return self.kv_cache_manager.min_num_blocks(self.vllm_config)
+
+    def begin_kv_cache_shrink(self, num_blocks: int) -> None:
+        """Stop handing out the blocks from num_blocks on. Requests holding
+        some keep them until they finish (or are preempted); admission sees
+        the smaller pool at once."""
+        floor = self.min_kv_cache_blocks()
+        if num_blocks < floor:
+            raise ValueError(
+                f"Cannot shrink the KV cache to {num_blocks} blocks: one request "
+                f"of max_model_len={self.max_model_len} tokens needs {floor}."
+            )
+        self.kv_cache_manager.begin_shrink(num_blocks)
+
+    def kv_cache_shrink_progress(self) -> tuple[int, int]:
+        """(fenced blocks, fenced blocks still held by requests)."""
+        pool = self.kv_cache_manager.block_pool
+        return pool.num_fenced_blocks, pool.num_retiring_blocks
+
+    def preempt_kv_cache_shrink_holders(self) -> int:
+        """Preempt the running requests that hold fenced blocks, so that the
+        blocks retire; they resume from the prefix cache, the host tier or a
+        recompute. Returns how many were preempted."""
+        pool = self.kv_cache_manager.block_pool
+        retire_from = pool.retire_from
+        if retire_from is None:
+            return 0
+        holders = [
+            request
+            for request in self.running
+            if any(
+                block_id >= retire_from
+                for group in self.kv_cache_manager.get_block_ids(request.request_id)
+                for block_id in group
+            )
+        ]
+        timestamp = time.monotonic()
+        # Newest first, as reset_prefix_cache does, so that they resume in order.
+        for request in reversed(holders):
+            self.running.remove(request)
+            self._preempt_request(request, timestamp, drop_stale_output=True)
+        return len(holders)
+
+    def finish_kv_cache_shrink(self) -> None:
+        """Cut the pool to the fenced size, once no request holds a fenced
+        block and the workers have given the memory back."""
+        self.kv_cache_manager.finish_shrink()
+        self.cache_config.num_gpu_blocks = self.kv_cache_config.num_blocks
+        update_kv_cache_capacity(self.vllm_config, self.kv_cache_config)
+
+    def abort_kv_cache_shrink(self) -> None:
+        self.kv_cache_manager.abort_shrink()
+
     def make_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,

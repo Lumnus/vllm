@@ -172,6 +172,11 @@ class BlockPool:
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
 
+        # A shrink in progress (`begin_shrink`): blocks with ids from
+        # `retire_from` on are handed out no more and retire as they free.
+        self.retire_from: int | None = None
+        self._retired: set[int] = set()
+
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
     ) -> list[KVCacheBlock] | None:
@@ -196,6 +201,10 @@ class BlockPool:
                 block_hash_with_group_id
             )
             if not block:
+                return None
+            if self.retire_from is not None and block.block_id >= self.retire_from:
+                # A request running on a fenced block may still cache it; a
+                # hit would hand it to another request and hold the drain.
                 return None
             cached_blocks.append(block)
         return cached_blocks
@@ -746,7 +755,7 @@ class BlockPool:
             self._reuse_watchers[block.block_id] = on_reuse
             if block.ref_cnt == 0:
                 released.append(block)
-        self.free_block_queue.append_n(released)
+        self.free_block_queue.append_n(self._divert_retiring(released))
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
         """If a block is cached in `cached_block_hash_to_block`, we reset its hash
@@ -831,6 +840,9 @@ class BlockPool:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
                     blocks_to_evict_last.append(block)
 
+        if self.retire_from is not None:
+            blocks_to_evict_first = self._divert_retiring(blocks_to_evict_first)
+            blocks_to_evict_last = self._divert_retiring(blocks_to_evict_last)
         # Blocks to reuse first are prepended to the front of the free queue.
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
@@ -868,7 +880,10 @@ class BlockPool:
             False otherwise.
 
         """
-        num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
+        # Retired blocks (a shrink in progress) are neither free nor used.
+        num_used_blocks = (
+            self.num_gpu_blocks - self.get_num_free_blocks() - len(self._retired)
+        )
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
                 "Failed to reset prefix cache because some "
@@ -910,6 +925,8 @@ class BlockPool:
         cached-block map shares it.
         """
         assert num_gpu_blocks > self.num_gpu_blocks
+        if self.retire_from is not None:
+            raise RuntimeError("Cannot grow the block pool while it is shrinking.")
         new_blocks = [
             KVCacheBlock(idx, pool=self._weak_self)
             for idx in range(self.num_gpu_blocks, num_gpu_blocks)
@@ -917,6 +934,120 @@ class BlockPool:
         self.blocks.extend(new_blocks)
         self.free_block_queue.append_n(new_blocks)
         self.num_gpu_blocks = num_gpu_blocks
+
+    def begin_shrink(self, num_gpu_blocks: int) -> None:
+        """Fence the blocks with ids from num_gpu_blocks on, so that the pool
+        can later be cut down to num_gpu_blocks (`finish_shrink`).
+
+        From now on no fenced block is handed out: the free ones leave the free
+        queue at once, the ones in use leave it as their holders free them, and
+        prefix-cache entries on fenced blocks are dropped (a hit would give a
+        fenced block to a new request). Each fenced block "retires" when it
+        leaves; the shrink is drained (`shrink_drained`) once all have.
+        `abort_shrink` puts the retired blocks back.
+        """
+        if self.retire_from is not None:
+            raise RuntimeError("The block pool is already shrinking.")
+        if not 1 < num_gpu_blocks < self.num_gpu_blocks:
+            raise ValueError(
+                f"Cannot shrink a pool of {self.num_gpu_blocks} blocks to "
+                f"{num_gpu_blocks}."
+            )
+        self.retire_from = num_gpu_blocks
+        for block in self.blocks[num_gpu_blocks:]:
+            if block.ref_cnt == 0:
+                # Free, or an evictable prefix-cache entry.
+                self.free_block_queue.remove(block)
+                self._retire(block)
+            elif block.block_hash is not None:
+                # Held by a request: it keeps its contents, but no new request
+                # finds it through the prefix cache.
+                self._maybe_evict_cached_block(block)
+
+    def _divert_retiring(self, blocks: list[KVCacheBlock]) -> list[KVCacheBlock]:
+        """The blocks that go back to the free queue; fenced ones retire."""
+        retire_from = self.retire_from
+        if retire_from is None:
+            return blocks
+        kept: list[KVCacheBlock] = []
+        for block in blocks:
+            if block.block_id >= retire_from:
+                self._retire(block)
+            else:
+                kept.append(block)
+        return kept
+
+    def _retire(self, block: KVCacheBlock) -> None:
+        assert block.ref_cnt == 0 and not block.is_null
+        if block.block_hash is not None:
+            self._maybe_evict_cached_block(block)
+        if self._reuse_watchers:
+            # Whoever still reads it must stop: it will not hold data again.
+            self._notify_reuse([block])
+        self._retired.add(block.block_id)
+
+    @property
+    def num_retiring_blocks(self) -> int:
+        """Fenced blocks still held by requests (0 when not shrinking)."""
+        if self.retire_from is None:
+            return 0
+        return self.num_gpu_blocks - self.retire_from - len(self._retired)
+
+    @property
+    def num_fenced_blocks(self) -> int:
+        """Blocks a shrink in progress takes out of the pool."""
+        if self.retire_from is None:
+            return 0
+        return self.num_gpu_blocks - self.retire_from
+
+    def shrink_drained(self) -> bool:
+        """Whether every fenced block has retired."""
+        return self.retire_from is not None and self.num_retiring_blocks == 0
+
+    def fenced_block_holders(self) -> set[int]:
+        """Ids of fenced blocks still in use."""
+        if self.retire_from is None:
+            return set()
+        return {
+            block.block_id
+            for block in self.blocks[self.retire_from :]
+            if block.block_id not in self._retired
+        }
+
+    def finish_shrink(self) -> None:
+        """Cut the pool down to the fenced size, once drained (the device
+        memory behind the retired blocks may then be given back)."""
+        if not self.shrink_drained():
+            raise RuntimeError(
+                f"Cannot finish shrinking the block pool: "
+                f"{self.num_retiring_blocks} fenced blocks are still in use."
+            )
+        retire_from = self.retire_from
+        assert retire_from is not None
+        assert all(
+            block.block_hash is None and block.ref_cnt == 0
+            for block in self.blocks[retire_from:]
+        )
+        assert not any(
+            block_id >= retire_from for block_id in self.cached_block_hashes_by_block
+        )
+        # In place: the cached-block map shares the list.
+        del self.blocks[retire_from:]
+        for block_id in [b for b in self._reuse_watchers if b >= retire_from]:
+            del self._reuse_watchers[block_id]
+        self.num_gpu_blocks = retire_from
+        self.retire_from = None
+        self._retired.clear()
+
+    def abort_shrink(self) -> None:
+        """Give the retired blocks back to the free queue and drop the fence.
+        Prefix-cache entries dropped by the fence stay dropped."""
+        if self.retire_from is None:
+            return
+        retired = [self.blocks[block_id] for block_id in sorted(self._retired)]
+        self.retire_from = None
+        self._retired.clear()
+        self.free_block_queue.append_n(retired)
 
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.
@@ -934,8 +1065,9 @@ class BlockPool:
             The KV cache usage (between 0.0 and 1.0).
 
         """
-        # Subtract 1 to account for null block.
-        total_gpu_blocks = self.num_gpu_blocks - 1
+        # Subtract 1 to account for null block. Retired blocks (a shrink in
+        # progress) are out of the pool already.
+        total_gpu_blocks = self.num_gpu_blocks - 1 - len(self._retired)
         if not total_gpu_blocks:
             return 0
         return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)

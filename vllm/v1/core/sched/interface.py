@@ -222,6 +222,31 @@ class SchedulerInterface(ABC):
         the memory behind them is committed on every worker."""
         raise NotImplementedError
 
+    def min_kv_cache_blocks(self) -> int:
+        """The fewest blocks the KV cache may be shrunk to."""
+        raise NotImplementedError
+
+    def begin_kv_cache_shrink(self, num_blocks: int) -> None:
+        """Fence the blocks from num_blocks on: they are handed out no more
+        and retire as the requests holding them free them."""
+        raise NotImplementedError
+
+    def kv_cache_shrink_progress(self) -> tuple[int, int]:
+        """(fenced blocks, fenced blocks still held) of a shrink in progress."""
+        raise NotImplementedError
+
+    def preempt_kv_cache_shrink_holders(self) -> int:
+        """Preempt the running requests holding fenced blocks."""
+        raise NotImplementedError
+
+    def finish_kv_cache_shrink(self) -> None:
+        """Cut the pool to the fenced size once drained."""
+        raise NotImplementedError
+
+    def abort_kv_cache_shrink(self) -> None:
+        """Put the fenced blocks back into use."""
+        raise NotImplementedError
+
     @abstractmethod
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
