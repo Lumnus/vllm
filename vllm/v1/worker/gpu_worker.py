@@ -113,6 +113,7 @@ from vllm.v1.outputs import (
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.extensible_kv_cache import (
     extend_kv_cache,
+    grow_kv_cache,
     kv_cache_lent_for_weight_update,
     measure_kv_cache_blocks,
     pad_kv_cache_segments,
@@ -1021,6 +1022,24 @@ class Worker(WorkerBase):
         """Commit the final size of an extensible KV cache."""
         extend_kv_cache(self.model_runner, self._kv_cache_config, num_blocks)
         self.cache_config.num_gpu_blocks = num_blocks
+
+    def resize_kv_cache(self, target_num_blocks: int) -> int:
+        """Grow an extensible KV cache toward target_num_blocks while serving.
+
+        Returns the block count in force, the same on every rank: the target
+        or the most every rank's memory fits, and never fewer than before.
+        """
+        if getattr(self.model_runner, "extensible_kv_cache", None) is None:
+            raise RuntimeError("The KV cache is not extensible.")
+        num_blocks = grow_kv_cache(
+            self.model_runner,
+            target_num_blocks,
+            init_free_memory=self.init_free_memory,
+            requested_memory=int(self.requested_memory),
+            reduce_min=_min_across_ranks,
+        )
+        self.cache_config.num_gpu_blocks = num_blocks
+        return num_blocks
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:

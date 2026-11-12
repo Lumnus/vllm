@@ -951,6 +951,39 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
+    def resize_kv_cache(self, target_num_blocks: int) -> int:
+        """Grow the KV cache toward target_num_blocks while serving; returns the
+        block count in force afterwards (the target, or less if the workers'
+        memory fits less, and never fewer than before).
+
+        Runs as a utility, so the busy loop calls it between two steps and never
+        while one waits for its output (`_INPUTS_HANDLED_DURING_STEP` leaves
+        utilities queued). Every batch launched so far then has both
+        `execute_model` and `sample_tokens` ahead of this RPC on each worker,
+        and the first step that can use a new block is scheduled after the
+        workers committed it.
+        """
+        vllm_config = self.vllm_config
+        if not vllm_config.cache_config.enable_extensible_kv_cache:
+            raise ValueError("Resizing the KV cache needs the extensible KV cache.")
+        if vllm_config.parallel_config.data_parallel_size > 1:
+            raise NotImplementedError(
+                "Resizing the KV cache is not supported with data parallelism."
+            )
+        if self.model_executor.is_sleeping:
+            raise RuntimeError("Cannot resize the KV cache while asleep.")
+        old_num_blocks = vllm_config.cache_config.num_gpu_blocks
+        num_blocks = self.model_executor.resize_kv_cache(target_num_blocks)
+        if num_blocks > old_num_blocks:
+            self.scheduler.grow_kv_cache(num_blocks)
+            logger.info(
+                "Grew KV cache from %d to %d blocks (%s tokens).",
+                old_num_blocks,
+                num_blocks,
+                f"{vllm_config.cache_config.kv_cache_size_tokens:,}",
+            )
+        return num_blocks
+
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
 

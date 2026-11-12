@@ -5,11 +5,11 @@
 import copy
 import gc
 from bisect import bisect_right
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from itertools import pairwise
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -218,6 +218,21 @@ class ExtensibleKVCache:
             num_blocks,
             self.capacity_blocks,
             self.physical_bytes / (1 << 30),
+        )
+
+    def back(self, num_blocks: int) -> None:
+        """Map physical memory for the first num_blocks blocks without
+        committing them: nothing that reads the committed prefix changes.
+
+        Lets every rank learn that the memory is there before any commits. If
+        this raises, some granules may stay mapped; a later `commit` reuses
+        them.
+        """
+        num_blocks = min(num_blocks, self.capacity_blocks)
+        if num_blocks <= self.num_committed_blocks:
+            return
+        self.buffer.back_segments_(
+            [num_blocks * stride for stride in self.segment_strides]
         )
 
     def committed_views(
@@ -604,24 +619,27 @@ def measure_kv_cache_bytes(
     return max(available, 0)
 
 
-def measure_kv_cache_blocks(
+class _KVCacheMeasurement(NamedTuple):
+    free_memory: int
+    transient_peak: int
+    available: int
+    kv_cache_bytes: int
+    num_blocks: int
+
+
+def _measure_kv_cache(
     kv_cache: ExtensibleKVCache,
     vllm_config: "VllmConfig",
     device: torch.device,
     *,
     init_free_memory: int,
     requested_memory: int,
-    initial_blocks: int | None = None,
-) -> int:
-    """Size an extensible KV cache from the memory free after warmup.
-
-    Keeps free reserved_headroom_bytes, the larger of the profiled peak and
+) -> _KVCacheMeasurement:
+    """Blocks the memory free now fits, by the rule of `measure_kv_cache_bytes`,
+    keeping free reserved_headroom_bytes, the larger of the profiled peak and
     warmup's allocated (not reserved) transient peak. Torch's cache is emptied
     first: its blocks may not fit the large workspaces the first real steps
-    allocate. Commits no more than initial_blocks blocks when that is set. Then
-    caps torch's caching allocator to leave
-    KV_CACHE_NON_TORCH_RESERVE_BYTES free for allocations outside it.
-    """
+    allocate."""
     torch.accelerator.synchronize()
     gc.collect()
     torch.accelerator.empty_cache()
@@ -639,7 +657,39 @@ def measure_kv_cache_blocks(
         vllm_config.model_config.multimodal_config,
         getattr(vllm_config.parallel_config, "_api_process_count", 1),
     )
-    num_blocks = kv_cache.blocks_within(kv_cache_bytes)
+    return _KVCacheMeasurement(
+        free_memory,
+        transient_peak,
+        available,
+        kv_cache_bytes,
+        kv_cache.blocks_within(kv_cache_bytes),
+    )
+
+
+def measure_kv_cache_blocks(
+    kv_cache: ExtensibleKVCache,
+    vllm_config: "VllmConfig",
+    device: torch.device,
+    *,
+    init_free_memory: int,
+    requested_memory: int,
+    initial_blocks: int | None = None,
+) -> int:
+    """Size an extensible KV cache from the memory free after warmup.
+
+    Measures as `_measure_kv_cache` does, and commits no more than
+    initial_blocks blocks when that is set. Then caps torch's caching allocator
+    to leave KV_CACHE_NON_TORCH_RESERVE_BYTES free for allocations outside it.
+    """
+    free_memory, transient_peak, available, kv_cache_bytes, num_blocks = (
+        _measure_kv_cache(
+            kv_cache,
+            vllm_config,
+            device,
+            init_free_memory=init_free_memory,
+            requested_memory=requested_memory,
+        )
+    )
     if initial_blocks is not None and initial_blocks < num_blocks:
         logger.info(
             "Committing %d KV cache blocks at startup, not the %d the "
@@ -669,6 +719,106 @@ def measure_kv_cache_blocks(
         format_gib(num_blocks * kv_cache.bytes_per_block),
         format_gib(requested_memory),
         format_gib(torch_memory_limit),
+    )
+    return num_blocks
+
+
+def grow_kv_cache(
+    runner: "GPUModelRunner",
+    target_num_blocks: int,
+    *,
+    init_free_memory: int,
+    requested_memory: int,
+    reduce_min: Callable[[int], int],
+) -> int:
+    """Commit more of an extensible KV cache's reservation while serving.
+
+    Every rank takes part: each measures with the rule of the startup sizing
+    and the ranks agree, through reduce_min (the minimum over ranks), on the
+    block count n = the least of the target, what every rank's memory fits and
+    the capacity. Physical memory is mapped on every rank before any commits, so
+    a rank that cannot map leaves all ranks at the current count. Returns the
+    count in force afterwards, never below the current one: a target at or below
+    it changes nothing.
+
+    Must run where no step is between its forward and its sampling: blocks
+    below the old count are untouched, the new blocks are zeroed, and the views
+    rebuilt over n blocks keep their addresses, so graphs stay valid.
+    """
+    kv_cache = runner.extensible_kv_cache
+    assert kv_cache is not None
+    vllm_config = runner.vllm_config
+    if vllm_config.attention_config.hisparse_config is not None:
+        raise NotImplementedError("Growing the KV cache does not support HiSparse.")
+    if not runner.cache_config.get_resolved_kv_cache_layout().is_block_compact:
+        raise NotImplementedError(
+            "Growing the KV cache needs a block-compact KV cache layout."
+        )
+    if (
+        has_kv_transfer_group()
+        and not get_kv_transfer_group().supports_kv_cache_resize()
+    ):
+        raise NotImplementedError(
+            f"The KV connector {type(get_kv_transfer_group()).__name__} does not "
+            "support resizing the KV cache."
+        )
+    old = kv_cache.num_committed_blocks
+    try:
+        fits = _measure_kv_cache(
+            kv_cache,
+            vllm_config,
+            runner.device,
+            init_free_memory=init_free_memory,
+            requested_memory=requested_memory,
+        ).num_blocks
+    except ValueError:
+        # Nothing left after the multimodal reservation: this rank fits no more.
+        fits = old
+    num_blocks = reduce_min(min(target_num_blocks, fits, kv_cache.capacity_blocks))
+    if num_blocks <= old:
+        return old
+    try:
+        kv_cache.back(num_blocks)
+        backed = 1
+    except RuntimeError:
+        logger.warning(
+            "Could not map memory for %d KV cache blocks.", num_blocks, exc_info=True
+        )
+        backed = 0
+    if not reduce_min(backed):
+        # Nothing was committed anywhere; mapped granules stay for the next try.
+        logger.warning(
+            "Not growing the KV cache from %d to %d blocks: memory could not be "
+            "mapped on every rank.",
+            old,
+            num_blocks,
+        )
+        return old
+    old_bytes = kv_cache.physical_bytes_for(old)
+    kv_cache.commit(num_blocks)
+    runner.kv_cache_config.num_blocks = num_blocks
+    rebind_committed_views(runner)
+    if has_kv_transfer_group():
+        get_kv_transfer_group().resize_kv_caches(runner.kv_caches_by_layer, num_blocks)
+    # Torch must not grow into what the cache now holds.
+    torch_memory_limit = kv_cache.torch_memory_limit
+    if torch_memory_limit is not None:
+        torch_memory_limit = max(
+            torch_memory_limit - (kv_cache.physical_bytes_for(num_blocks) - old_bytes),
+            0,
+        )
+        kv_cache.set_torch_memory_limit(torch_memory_limit)
+        if torch.accelerator.memory_reserved(runner.device) > torch_memory_limit:
+            torch.accelerator.empty_cache()
+    # The new blocks are zeroed on the current stream; finish before any step
+    # can address them.
+    torch.accelerator.synchronize()
+    logger.info(
+        "Grew KV cache from %d to %d blocks (%.2f GiB to %.2f GiB).",
+        old,
+        num_blocks,
+        old_bytes / (1 << 30),
+        kv_cache.physical_bytes_for(num_blocks) / (1 << 30),
     )
     return num_blocks
 

@@ -173,6 +173,15 @@ class Executor(ABC):
         """Commit the final size of an extensible KV cache on the workers."""
         self.collective_rpc("extend_kv_cache", args=(num_blocks,))
 
+    def resize_kv_cache(self, target_num_blocks: int) -> int:
+        """Grow the extensible KV cache on the workers toward the target; the
+        block count they now all hold."""
+        results: list[int] = self.collective_rpc(
+            "resize_kv_cache", args=(target_num_blocks,)
+        )
+        assert len(set(results)) == 1, f"Workers disagree on the size: {results}"
+        return results[0]
+
     def register_failure_callback(self, callback: FailureCallback):  # noqa: B027
         """Register a function to be called if the executor enters a permanent
         failed state.

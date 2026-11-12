@@ -319,8 +319,9 @@ class ExtensibleTensor:
         """Grow every segment's committed prefix to the same size."""
         self.resize_segments_([bytes_per_segment] * self.num_segments, zero_new)
 
-    def resize_segments_(self, sizes: Sequence[int], zero_new: bool = False) -> None:
-        """Grow each segment's committed prefix; optionally zero the new bytes."""
+    def _grown_ranges(self, sizes: Sequence[int]) -> list[tuple[int, int]]:
+        """Reservation byte ranges that growing each segment's committed prefix
+        to `sizes` adds, after checking `sizes`."""
         if len(sizes) != self.num_segments:
             raise ValueError(f"Expected {self.num_segments} sizes, got {len(sizes)}.")
         for old, new, capacity in zip(self._committed, sizes, self._segment_capacities):
@@ -334,11 +335,27 @@ class ExtensibleTensor:
                     f"Requested {new} bytes per segment exceeds the "
                     f"segment capacity {capacity}."
                 )
-        grown = [
+        return [
             (start + old, start + new)
             for start, old, new in zip(self._segment_offsets, self._committed, sizes)
             if new > old
         ]
+
+    def back_segments_(self, sizes: Sequence[int]) -> None:
+        """Map physical memory behind each segment's first `sizes[i]` bytes
+        without growing the committed prefixes.
+
+        Lets a caller learn whether a resize can be backed, e.g. on every rank
+        of a group, before it commits. A later `resize_segments_` to the same
+        sizes skips the granules mapped here. If this raises, some granules may
+        stay mapped; they hold no committed bytes and later resizes reuse them.
+        """
+        for start, end in self._grown_ranges(sizes):
+            self._buffer.ensure_committed_range(start, end)
+
+    def resize_segments_(self, sizes: Sequence[int], zero_new: bool = False) -> None:
+        """Grow each segment's committed prefix; optionally zero the new bytes."""
+        grown = self._grown_ranges(sizes)
         for start, end in grown:
             self._buffer.ensure_committed_range(start, end)
         self._committed = list(sizes)
