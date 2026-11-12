@@ -28,13 +28,13 @@ import gc
 import pickle
 import weakref
 from collections import deque, namedtuple
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from math import gcd
 from multiprocessing import shared_memory
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 from unittest.mock import patch
 
 import torch
@@ -2521,6 +2521,38 @@ def get_tensor_model_parallel_rank() -> int:
 def get_pipeline_model_parallel_rank() -> int:
     """Return my rank for the pipeline model parallel group."""
     return get_pp_group().rank_in_group
+
+
+class _SingleRankGroup:
+    """What module constructors read from a model-parallel group, for one rank."""
+
+    world_size = 1
+    rank = 0
+    local_rank = 0
+    rank_in_group = 0
+    first_rank = 0
+    last_rank = 0
+    is_first_rank = True
+    is_last_rank = True
+
+
+@contextmanager
+def single_rank_model_parallel() -> Iterator[None]:
+    """Present one-rank tensor and pipeline parallel groups to module
+    constructors.
+
+    For building a module that holds its weights whole, in a process or at a
+    point where the model-parallel groups are not the ones to shard by (an
+    encoder tower kept in host memory). The stand-in groups carry no
+    communicator: only construction-time sizes and ranks are served.
+    """
+    global _TP, _PP
+    saved = (_TP, _PP)
+    _TP = _PP = cast(GroupCoordinator, _SingleRankGroup())
+    try:
+        yield
+    finally:
+        _TP, _PP = saved
 
 
 def get_node_count() -> int:
