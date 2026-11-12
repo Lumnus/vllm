@@ -728,17 +728,21 @@ def async_tensor_h2d(
     """Copy list/numpy array/tensor async from host to device."""
     if dtype is None and out is not None:
         dtype = out.dtype
+    # Pinning only serves the copy to an accelerator: a host destination (a
+    # module kept in host memory) takes the data as it is.
+    to_host = out is None and device is not None and torch.device(device).type == "cpu"
+    pin_memory = PIN_MEMORY and not to_host
     if isinstance(data, np.ndarray):
         data = torch.from_numpy(data)
     if isinstance(data, torch.Tensor):
         t = data
-        if PIN_MEMORY and not t.is_pinned():
+        if pin_memory and not t.is_pinned():
             # Stage in pinned, contiguous buffer to ensure fully async copy.
             t = torch.empty(
                 t.shape, dtype=dtype or t.dtype, device="cpu", pin_memory=True
             ).copy_(t)
     else:
-        t = torch.tensor(data, dtype=dtype, pin_memory=PIN_MEMORY, device="cpu")
+        t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
     assert t.is_cpu
 
     if out is not None:
