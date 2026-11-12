@@ -15,10 +15,19 @@
 The store is either an expert store (``(layer, expert)`` units, see
 ``expert_store``) or a component store (named components, see ``weight_units``);
 the source says which. The step that turns a checkpoint into kernel-layout
-tensors is not here: it is the *source* (:class:`UnitSource`), a small object
-the caller supplies by ``module:callable``. ``--source synthetic`` and
-``--source synthetic-components`` are built in, for tests and for trying the
-tool.
+tensors is the *source* (:class:`UnitSource`), a small object supplied by
+``module:callable``. Built in: ``--source checkpoint`` (a GPTQ / AutoRound
+int4 MoE checkpoint in safetensors, see ``expert_store_ckpt``; the expert store
+of an engine, built before the first boot), and ``synthetic`` and
+``synthetic-components`` for tests and for trying the tool::
+
+    $B build --source checkpoint --model /models/m --engine-quantization inc \\
+        --dirs /nvme0/store /nvme1/store [--part 0/4]
+    $B info --source checkpoint --model /models/m --engine-quantization inc
+
+The tool runs on the CPU only (``card_guard``): run it as
+``python <tree>/vllm/model_executor/offloader/card_guard.py <command> ...`` to
+guard the imports too.
 
 ``build`` is resumable (the writer's records say which units are durable; a
 rerun with the same ``--part`` skips them) and multi-process friendly: with
@@ -171,8 +180,9 @@ def _coerce(text: str) -> Any:
 
 
 def load_source(spec: str, args: Iterable[str] = ()) -> UnitSource:
-    """``synthetic``, ``synthetic-components`` or ``module:callable``; ``args``
-    are ``key=value`` pairs passed to it as keyword arguments."""
+    """``checkpoint``, ``synthetic``, ``synthetic-components`` or
+    ``module:callable``; ``args`` are ``key=value`` pairs passed to it as keyword
+    arguments."""
     kwargs = {}
     for item in args:
         key, _, value = item.partition("=")
@@ -181,10 +191,15 @@ def load_source(spec: str, args: Iterable[str] = ()) -> UnitSource:
         return SyntheticExperts(**kwargs)
     if spec == "synthetic-components":
         return SyntheticComponents(**kwargs)
+    if spec == "checkpoint":
+        from vllm.model_executor.offloader.expert_store_ckpt import CheckpointExperts
+
+        return CheckpointExperts(**kwargs)
     module, _, attr = spec.partition(":")
     if not attr:
         raise ValueError(
-            "--source is 'synthetic', 'synthetic-components' or module:callable"
+            "--source is 'checkpoint', 'synthetic', 'synthetic-components' or "
+            "module:callable"
         )
     factory = getattr(importlib.import_module(module), attr)
     return factory(**kwargs)  # type: ignore[no-any-return]
@@ -279,6 +294,15 @@ def build_from_iter(
     return result
 
 
+def _unit_payload_bytes(source: Any) -> int:
+    """Payload bytes of one unit of an expert source (0 when not known)."""
+    schema = getattr(source, "schema", None)
+    groups = getattr(schema, "groups", None)
+    if not groups:
+        return 0
+    return sum(t.nbytes for t in groups[0].tensors)
+
+
 def parse_part(text: str) -> tuple[int, int]:
     index, _, count = text.partition("/")
     i, n = int(index), int(count or 1)
@@ -298,8 +322,12 @@ def build_source(
     finalize: bool = False,
     checksum: bool = True,
     log: Any = None,
+    expect_identity: str | None = None,
 ) -> BuildResult:
     """Build (or resume) this process's share of a store from ``source``.
+
+    ``expect_identity``: refuse (before touching the directories) unless the
+    source's identity is this string, e.g. the identity an engine reported.
 
     Reads and writes run in ``workers`` threads. The writer id is
     ``part<i>of<n>``, so a rerun resumes the same record. ``finalize`` also
@@ -307,6 +335,11 @@ def build_source(
     :func:`finalize_store` once after all exited).
     """
     index, count = part
+    if expect_identity is not None and source.identity != expect_identity:
+        raise ValueError(
+            f"the source's identity is {source.identity}, expected "
+            f"{expect_identity}: the engine would not accept this store"
+        )
     if finalize and count != 1:
         raise ValueError(
             "--finalize with several parts: run `finalize` once afterwards"
@@ -323,11 +356,31 @@ def build_source(
     result = BuildResult(skipped=len(keys) - len(todo))
     start = time.perf_counter()
     done = 0
+    unit_bytes = _unit_payload_bytes(source)
+    if log:
+        log(
+            f"part {index}/{count}: {len(todo)} units to write, "
+            f"{result.skipped} already done, {max(1, workers)} workers"
+        )
 
     def one(key: Any) -> None:
         write_item(writer, key, source.read(key))
 
+    def progress() -> str:
+        elapsed = max(time.perf_counter() - start, 1e-9)
+        rate = done / elapsed
+        text = f"{done}/{len(todo)} units, {rate:.1f} units/s"
+        if unit_bytes:
+            text += f", {rate * unit_bytes / (1 << 20):.1f} MiB/s"
+        if rate > 0:
+            text += (
+                f", {elapsed:.0f} s elapsed, ~{(len(todo) - done) / rate:.0f} s left"
+            )
+        return text
+
     try:
+        # At most `workers` units are in flight (read, converted, written);
+        # the queue holds only keys.
         with ThreadPoolExecutor(max(1, workers)) as pool:
             futures = [pool.submit(one, k) for k in todo]
             for future in futures:
@@ -336,7 +389,9 @@ def build_source(
                 if flush_every and done % flush_every == 0:
                     writer.flush()
                     if log:
-                        log(f"{done}/{len(todo)} units written")
+                        log(progress())
+        if log and done % max(flush_every, 1):
+            log(progress())
         writer.close()
     except BaseException:
         writer.__exit__(RuntimeError, None, None)
@@ -728,11 +783,50 @@ def main(argv: Sequence[str] | None = None) -> int:
         p.add_argument(
             "--source",
             required=required,
-            help="synthetic | synthetic-components | module:callable",
+            help="checkpoint | synthetic | synthetic-components | module:callable",
         )
         p.add_argument(
             "--arg", action="append", default=[], help="key=value for the source"
         )
+        g = p.add_argument_group("--source checkpoint")
+        g.add_argument("--model", help="the checkpoint directory")
+        g.add_argument(
+            "--engine-quantization",
+            help="the quantization the engine resolves (its log line "
+            "'quantization=...'); part of the store's identity",
+        )
+        g.add_argument(
+            "--engine-model",
+            help="the model string the engine is served with (default --model)",
+        )
+        g.add_argument("--engine-dtype", help="the engine's dtype (default bfloat16)")
+        g.add_argument("--engine-revision", help="the engine's revision (default none)")
+        g.add_argument("--name-format", help="tensor name pattern ({layer} ...)")
+        g.add_argument("--kernels-src", help="directory holding vllm_xpu_kernels")
+        g.add_argument(
+            "--strict-qzeros",
+            action="store_true",
+            help="refuse a checkpoint whose zero points are not symmetric int4",
+        )
+
+    def source_from(args: argparse.Namespace) -> UnitSource:
+        extra = []
+        if args.source == "checkpoint":
+            for flag, field in (
+                ("model", "model"),
+                ("engine_quantization", "engine_quantization"),
+                ("engine_model", "engine_model"),
+                ("engine_dtype", "engine_dtype"),
+                ("engine_revision", "engine_revision"),
+                ("name_format", "name_format"),
+                ("kernels_src", "kernels_src"),
+            ):
+                value = getattr(args, flag, None)
+                if value is not None:
+                    extra.append(f"{field}={json.dumps(value)}")
+            if getattr(args, "strict_qzeros", False):
+                extra.append("strict_qzeros=true")
+        return load_source(args.source, [*extra, *args.arg])
 
     p = sub.add_parser("build", help="write (or resume) units from a source")
     common(p)
@@ -743,6 +837,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--rebuild", action="store_true", help="discard any store here")
     p.add_argument("--finalize", action="store_true", help="publish (single part)")
     p.add_argument("--no-sha256", action="store_true", help="skip the sha256 sidecar")
+    p.add_argument(
+        "--expect-identity",
+        help="refuse unless the source's identity is this (e.g. an engine's)",
+    )
+    p.add_argument(
+        "--torch-threads",
+        type=int,
+        default=1,
+        help="torch intra-op threads per process (the workers are the parallelism)",
+    )
 
     p = sub.add_parser("finalize", help="publish a store whose writers all finished")
     common(p)
@@ -757,8 +861,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--no-sha256", action="store_true")
     p.add_argument("--no-units", action="store_true")
 
-    p = sub.add_parser("info", help="schema, identity, sizes, stripe layout")
-    common(p)
+    p = sub.add_parser(
+        "info",
+        help="schema, identity, sizes, stripe layout of a store (--dirs) and/or "
+        "what a source finds (--source)",
+    )
+    p.add_argument("--dirs", nargs="+", help="one per drive")
+    source_args(p, False)
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser(
@@ -768,9 +877,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     p.add_argument("--force", action="store_true")
 
     args = parser.parse_args(argv)
+    from vllm.model_executor.offloader import card_guard
+
+    card_guard.prepare_env()
+    card_guard.install()
     try:
         if args.cmd == "build":
-            source = load_source(args.source, args.arg)
+            import torch
+
+            torch.set_num_threads(max(1, args.torch_threads))
+            source = source_from(args)
+            _log(card_guard.summary(card_guard.check()))  # imports done, nothing read
             result = build_source(
                 args.dirs,
                 source,
@@ -781,6 +898,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 finalize=args.finalize,
                 checksum=not args.no_sha256,
                 log=_log,
+                expect_identity=args.expect_identity,
             )
             _log(
                 f"built: {result.written} written, {result.skipped} already done,"
@@ -790,9 +908,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             finalize_store(args.dirs, checksum=not args.no_sha256)
             _log("finalized")
         elif args.cmd == "verify":
-            checked_against = (
-                load_source(args.source, args.arg) if args.source else None
-            )
+            checked_against = source_from(args) if args.source else None
             report = verify_store(
                 args.dirs,
                 sha=not args.no_sha256,
@@ -801,13 +917,53 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sample=args.sample,
             )
             print(json.dumps(report, indent=1))
+            _log(card_guard.summary(card_guard.check()))
             return 0 if report["ok"] else 1
         elif args.cmd == "info":
-            info = info_store(args.dirs)
-            print(json.dumps(info, indent=1) if args.json else format_info(info))
+            if not args.dirs and not args.source:
+                raise ValueError("info needs --dirs and/or --source")
+            out: dict[str, Any] = {}
+            if args.source:
+                src = source_from(args)
+                describe = getattr(src, "info", None)
+                out["source"] = describe() if describe else {"identity": src.identity}
+                out["source_identity"] = src.identity
+            if args.dirs:
+                out["store"] = info_store(args.dirs)
+                if args.source:
+                    out["identity_matches"] = (
+                        out["store"]["identity"] == out["source_identity"]
+                    )
+            if args.json and not args.source:
+                print(json.dumps(out["store"], indent=1))  # the shape it always had
+            elif args.json:
+                print(json.dumps(out, indent=1, default=str))
+            else:
+                if "source" in out and "name_format" in out["source"]:
+                    from vllm.model_executor.offloader.expert_store_ckpt import (
+                        format_info as format_source,
+                    )
+
+                    print(format_source(out["source"]))
+                elif "source" in out:
+                    print(f"source      identity {out['source_identity']}")
+                if "store" in out:
+                    print(format_info(out["store"]))
+                if "identity_matches" in out:
+                    print(
+                        "identity    the store's identity "
+                        + ("MATCHES" if out["identity_matches"] else "DIFFERS from")
+                        + " the source's"
+                    )
+            _log(card_guard.summary(card_guard.check()))
         elif args.cmd == "checksums":
             count = add_checksums(args.dirs, force=args.force)
             _log(f"{count} unit checksums written")
+        if args.cmd == "build":
+            _log(card_guard.summary(card_guard.check()))
+    except card_guard.CardTouchedError as exc:
+        _log(f"error: the accelerator was touched: {exc}")
+        return 3
     except (es.ExpertStoreError, ValueError, OSError) as exc:
         _log(f"error: {exc}")
         return 2
