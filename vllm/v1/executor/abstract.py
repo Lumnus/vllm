@@ -194,6 +194,11 @@ class Executor(ABC):
         (`GPUWorker.kv_cache_shrink_plan`); changes nothing."""
         return self.collective_rpc("kv_cache_shrink_plan", args=(num_blocks,))
 
+    def kv_cache_blocks_releasable(self, num_bytes: int) -> list[int | None]:
+        """Every worker's fewest tail blocks whose release gives back at least
+        num_bytes (None where no shrink frees that much)."""
+        return self.collective_rpc("kv_cache_blocks_releasable", args=(num_bytes,))
+
     def shrink_kv_cache(self, num_blocks: int) -> list[int]:
         """Release the blocks from num_blocks on, on every worker; the bytes
         each released. Raises if any worker could not finish."""

@@ -92,6 +92,11 @@ from vllm.v1.engine import (
     UtilityOutput,
     UtilityResult,
 )
+from vllm.v1.engine.kv_cache_resize import (
+    KVCacheMemoryHolder,
+    KVCacheResize,
+    KVCacheResizeState,
+)
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
@@ -951,18 +956,87 @@ class EngineCore:
             reset_running_requests, reset_connector
         )
 
-    def resize_kv_cache(self, target_num_blocks: int) -> int:
-        """Grow the KV cache toward target_num_blocks while serving; returns the
-        block count in force afterwards (the target, or less if the workers'
-        memory fits less, and never fewer than before).
+    # The current or last KV cache resize, and holders of device memory to
+    # tell when a shrink gives some back (see vllm/v1/engine/kv_cache_resize.py).
+    _kv_resize: KVCacheResize | None = None
+    _kv_memory_holders: tuple[KVCacheMemoryHolder, ...] = ()
+    # Seconds between attempts to finish a release a worker failed.
+    KV_RESIZE_RETRY_INTERVAL_S = 1.0
+    # A shrink's default deadline for the drain, in seconds.
+    KV_SHRINK_DEFAULT_DEADLINE_S = 60.0
+
+    def resize_kv_cache(
+        self,
+        target_num_blocks: int,
+        deadline_s: float | None = None,
+        preempt: bool = False,
+    ) -> dict[str, Any]:
+        """Resize the KV cache toward target_num_blocks while serving; returns
+        the resize's record (`KVCacheResize.record`).
+
+        A larger target grows the cache within the call: the workers commit
+        what their memory fits, up to the target, and the record is FINISHED
+        (or UNCHANGED). A smaller one starts a shrink and returns at once,
+        usually DRAINING: the blocks from the target on are fenced, and the
+        busy loop finishes the shrink at a step boundary once no request holds
+        one (`_advance_kv_resize`); read the progress with
+        `get_kv_cache_resize_state`. If the drain is not over after deadline_s
+        (default KV_SHRINK_DEFAULT_DEADLINE_S, 0 for none) the shrink is
+        aborted, or, with preempt, the running requests holding fenced blocks
+        are preempted. The target may not go below the floor where one request
+        of max_model_len still fits, and a shrink that would release nothing
+        (no kv_cache_release_chunk_mib) is refused. One resize at a time: a
+        repeat of the shrink in progress returns its record, anything else is
+        refused while it runs.
 
         Runs as a utility, so the busy loop calls it between two steps and never
         while one waits for its output (`_INPUTS_HANDLED_DURING_STEP` leaves
         utilities queued). Every batch launched so far then has both
-        `execute_model` and `sample_tokens` ahead of this RPC on each worker,
-        and the first step that can use a new block is scheduled after the
+        `execute_model` and `sample_tokens` ahead of the workers' calls, and
+        the first step that can use a new block is scheduled after the
         workers committed it.
         """
+        self._check_kv_cache_resizable()
+        old_num_blocks = self.vllm_config.cache_config.num_gpu_blocks
+        current = self._kv_resize
+        if current is not None and current.state.active:
+            if current.direction == "shrink" and current.to_blocks == target_num_blocks:
+                self._advance_kv_resize()
+                return self.get_kv_cache_resize_state()
+            raise RuntimeError(
+                f"A KV cache shrink to {current.to_blocks} blocks is "
+                f"{current.state.value}; one resize at a time."
+            )
+        if target_num_blocks < old_num_blocks:
+            return self._begin_kv_cache_shrink(
+                target_num_blocks,
+                self.KV_SHRINK_DEFAULT_DEADLINE_S if deadline_s is None else deadline_s,
+                preempt,
+            )
+        num_blocks = old_num_blocks
+        if target_num_blocks > old_num_blocks:
+            num_blocks = self.model_executor.resize_kv_cache(target_num_blocks)
+        if num_blocks > old_num_blocks:
+            self.scheduler.grow_kv_cache(num_blocks)
+            logger.info(
+                "Grew KV cache from %d to %d blocks (%s tokens).",
+                old_num_blocks,
+                num_blocks,
+                f"{self.vllm_config.cache_config.kv_cache_size_tokens:,}",
+            )
+        self._kv_resize = KVCacheResize(
+            direction="grow",
+            from_blocks=old_num_blocks,
+            to_blocks=num_blocks,
+            state=(
+                KVCacheResizeState.FINISHED
+                if num_blocks > old_num_blocks
+                else KVCacheResizeState.UNCHANGED
+            ),
+        )
+        return self._kv_resize.record(num_blocks)
+
+    def _check_kv_cache_resizable(self) -> None:
         vllm_config = self.vllm_config
         if not vllm_config.cache_config.enable_extensible_kv_cache:
             raise ValueError("Resizing the KV cache needs the extensible KV cache.")
@@ -981,17 +1055,229 @@ class EngineCore:
             )
         if self.model_executor.is_sleeping:
             raise RuntimeError("Cannot resize the KV cache while asleep.")
-        old_num_blocks = vllm_config.cache_config.num_gpu_blocks
-        num_blocks = self.model_executor.resize_kv_cache(target_num_blocks)
-        if num_blocks > old_num_blocks:
-            self.scheduler.grow_kv_cache(num_blocks)
-            logger.info(
-                "Grew KV cache from %d to %d blocks (%s tokens).",
-                old_num_blocks,
-                num_blocks,
-                f"{vllm_config.cache_config.kv_cache_size_tokens:,}",
+
+    def _begin_kv_cache_shrink(
+        self, target_num_blocks: int, deadline_s: float, preempt: bool
+    ) -> dict[str, Any]:
+        old_num_blocks = self.vllm_config.cache_config.num_gpu_blocks
+        plans = self.model_executor.kv_cache_shrink_plan(target_num_blocks)
+        releasable = min(plan["releasable_bytes"] for plan in plans)
+        if releasable <= 0:
+            if any(plan["release_chunk_bytes"] is None for plan in plans):
+                raise ValueError(
+                    "Shrinking the KV cache releases nothing: it was committed in "
+                    "one allocation per segment. Start the engine with "
+                    "--kv-cache-release-chunk-mib to make it releasable."
+                )
+            raise ValueError(
+                f"Shrinking the KV cache to {target_num_blocks} blocks releases "
+                "no whole release chunk; ask for fewer blocks."
             )
-        return num_blocks
+        # Refuses a target below the floor, before anything is fenced.
+        self.scheduler.begin_kv_cache_shrink(target_num_blocks)
+        fenced, held = self.scheduler.kv_cache_shrink_progress()
+        resize = KVCacheResize(
+            direction="shrink",
+            from_blocks=old_num_blocks,
+            to_blocks=target_num_blocks,
+            state=KVCacheResizeState.DRAINING,
+            deadline_s=deadline_s,
+            preempt=preempt,
+            fenced_blocks=fenced,
+            held_blocks=held,
+        )
+        self._kv_resize = resize
+        logger.info(
+            "KV cache shrink from %d to %d blocks: draining (%d blocks fenced, %d "
+            "held by requests; %s bytes per rank to release; deadline %s s, %s).",
+            old_num_blocks,
+            target_num_blocks,
+            fenced,
+            held,
+            f"{releasable:,}",
+            deadline_s or "none",
+            "preempt at the deadline" if preempt else "abort at the deadline",
+        )
+        self._advance_kv_resize()
+        return self.get_kv_cache_resize_state()
+
+    def get_kv_cache_resize_state(self) -> dict[str, Any]:
+        """The record of the current or last resize, after advancing it."""
+        self._advance_kv_resize()
+        num_blocks = self.vllm_config.cache_config.num_gpu_blocks
+        if self._kv_resize is None:
+            return {"state": "idle", "num_blocks": num_blocks}
+        return self._kv_resize.record(num_blocks)
+
+    def _advance_kv_resize(self) -> None:
+        """Move a shrink on, at a step boundary: release once drained, act on
+        the deadline, retry an unfinished release."""
+        resize = self._kv_resize
+        if resize is None or not resize.state.active:
+            return
+        now = time.monotonic()
+        if resize.state == KVCacheResizeState.DRAINING:
+            resize.fenced_blocks, resize.held_blocks = (
+                self.scheduler.kv_cache_shrink_progress()
+            )
+            if resize.held_blocks and resize.deadline_passed(now):
+                if resize.preempt and not resize.preempted_requests:
+                    resize.preempted_requests = (
+                        self.scheduler.preempt_kv_cache_shrink_holders()
+                    )
+                    _, resize.held_blocks = self.scheduler.kv_cache_shrink_progress()
+                    logger.info(
+                        "KV cache shrink to %d blocks: deadline passed, preempted "
+                        "%d requests holding fenced blocks; %d still held.",
+                        resize.to_blocks,
+                        resize.preempted_requests,
+                        resize.held_blocks,
+                    )
+                if resize.held_blocks:
+                    self.abort_kv_cache_resize(
+                        f"deadline of {resize.deadline_s} s passed with "
+                        f"{resize.held_blocks} fenced blocks held"
+                    )
+                    return
+            if resize.held_blocks:
+                return
+            logger.info(
+                "KV cache shrink to %d blocks: drained after %.2f s; releasing.",
+                resize.to_blocks,
+                now - resize.started,
+            )
+        elif resize.state == KVCacheResizeState.UNFINISHED:
+            if now - resize.last_release_attempt < self.KV_RESIZE_RETRY_INTERVAL_S:
+                return
+        self._release_kv_cache_tail(resize)
+
+    def _release_kv_cache_tail(self, resize: KVCacheResize) -> None:
+        resize.state = KVCacheResizeState.RELEASING
+        resize.last_release_attempt = time.monotonic()
+        try:
+            resize.released_bytes = self.model_executor.shrink_kv_cache(
+                resize.to_blocks
+            )
+        except TimeoutError:
+            resize.state = KVCacheResizeState.UNFINISHED
+            resize.message = "the workers did not answer in time"
+            self._fail_kv_resize_executor()
+            return
+        except Exception as e:
+            self._after_failed_release(resize, e)
+            return
+        self.scheduler.finish_kv_cache_shrink()
+        resize.state = KVCacheResizeState.FINISHED
+        resize.held_blocks = 0
+        released = min(resize.released_bytes)
+        resize.message = ""
+        logger.info(
+            "Shrank KV cache from %d to %d blocks (%s tokens), released %.2f GiB "
+            "per rank, in %.2f s.",
+            resize.from_blocks,
+            resize.to_blocks,
+            f"{self.vllm_config.cache_config.kv_cache_size_tokens:,}",
+            released / (1 << 30),
+            time.monotonic() - resize.started,
+        )
+        for holder in self._kv_memory_holders:
+            try:
+                holder.on_kv_cache_released(released, resize.to_blocks)
+            except Exception:
+                logger.exception("A KV cache memory holder failed to take the news.")
+
+    def _after_failed_release(self, resize: KVCacheResize, error: Exception) -> None:
+        """A failed release either changed nothing on any worker (the first
+        agreement failed: abort and serve the whole pool again) or left some
+        worker past the point of no return (keep the fence, retry)."""
+        try:
+            plans = self.model_executor.kv_cache_shrink_plan(resize.to_blocks)
+            untouched = all(
+                plan["num_committed_blocks"] > resize.to_blocks for plan in plans
+            )
+        except Exception:
+            logger.exception("Could not read the workers' KV cache state.")
+            untouched = False
+        if untouched:
+            resize.state = KVCacheResizeState.DRAINING
+            self.abort_kv_cache_resize(f"the workers refused: {error}")
+            return
+        resize.state = KVCacheResizeState.UNFINISHED
+        resize.message = f"a worker failed past the point of no return: {error}"
+        logger.warning(
+            "KV cache shrink to %d blocks is unfinished (%s); the fence stays and "
+            "the release is repeated.",
+            resize.to_blocks,
+            error,
+        )
+
+    def _fail_kv_resize_executor(self) -> None:
+        """Workers that did not answer may answer later, into the next call:
+        the in-process engine core has no executor to give up; the busy-loop
+        one does (EngineCoreProc)."""
+
+    def abort_kv_cache_resize(self, reason: str = "aborted") -> dict[str, Any]:
+        """Abort a shrink that is draining: the fenced blocks go back into use.
+        A shrink past the point of no return cannot be aborted."""
+        resize = self._kv_resize
+        if resize is None or not resize.state.active:
+            return self.get_kv_cache_resize_state()
+        if resize.state != KVCacheResizeState.DRAINING:
+            raise RuntimeError(
+                f"The KV cache shrink to {resize.to_blocks} blocks is "
+                f"{resize.state.value} and cannot be aborted."
+            )
+        self.scheduler.abort_kv_cache_shrink()
+        resize.state = KVCacheResizeState.ABORTED
+        resize.message = reason
+        logger.info(
+            "KV cache shrink from %d to %d blocks aborted: %s.",
+            resize.from_blocks,
+            resize.to_blocks,
+            reason,
+        )
+        return resize.record(self.vllm_config.cache_config.num_gpu_blocks)
+
+    def _settle_kv_resize(self, reason: str, *, memory_changes: bool) -> None:
+        """Before a pause or a sleep: a draining shrink is aborted; an
+        unfinished one is tried once more, and must be finished before
+        anything that changes device memory (sleep, a KV cache release)."""
+        resize = self._kv_resize
+        if resize is None or not resize.state.active:
+            return
+        if resize.state == KVCacheResizeState.DRAINING:
+            self.abort_kv_cache_resize(reason)
+            return
+        self._release_kv_cache_tail(resize)
+        if memory_changes and resize.state.active:
+            raise RuntimeError(
+                f"The KV cache shrink to {resize.to_blocks} blocks is unfinished "
+                f"({resize.message}); it must finish before {reason}."
+            )
+
+    def register_kv_cache_memory_holder(self, holder: KVCacheMemoryHolder) -> None:
+        """Have holder told whenever a shrink gives device memory back."""
+        self._kv_memory_holders = (*self._kv_memory_holders, holder)
+
+    def request_kv_cache_release(
+        self,
+        bytes_per_rank: int,
+        urgent: bool = False,
+        deadline_s: float | None = None,
+    ) -> dict[str, Any]:
+        """For a holder of other device memory: shrink the KV cache by the
+        fewest tail blocks that give back bytes_per_rank on every rank (whole
+        release chunks), preempting the holders of those blocks at the
+        deadline when urgent. Returns the shrink's record, like
+        `resize_kv_cache`."""
+        self._check_kv_cache_resizable()
+        counts = self.model_executor.kv_cache_blocks_releasable(bytes_per_rank)
+        if any(count is None for count in counts):
+            raise ValueError(
+                f"The KV cache cannot give back {bytes_per_rank:,} bytes per rank."
+            )
+        num_blocks = self.vllm_config.cache_config.num_gpu_blocks - max(counts)
+        return self.resize_kv_cache(num_blocks, deadline_s=deadline_s, preempt=urgent)
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
@@ -1098,6 +1384,7 @@ class EngineCore:
             raise ValueError(f"Invalid pause mode: {mode}")
         if mode == "wait":
             raise ValueError("'wait' mode can't be used in inproc-engine mode")
+        self._settle_kv_resize("a pause", memory_changes=False)
 
         if mode == "abort":
             self.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
@@ -1168,6 +1455,7 @@ class EngineCore:
             raise RuntimeError(
                 f"Cannot sleep while the checkpoint state is {self._checkpoint_state}"
             )
+        self._settle_kv_resize("sleeping", memory_changes=level >= 1)
         # Pause scheduler before sleeping.
         clear_prefix_cache = level >= 1
         pause_future = self.pause_scheduler(
@@ -1245,6 +1533,7 @@ class EngineCore:
             raise RuntimeError(
                 "release_kv_cache_memory() requires all executor memory to be resident"
             )
+        self._settle_kv_resize("releasing the KV cache memory", memory_changes=True)
         self._reset_caches(reset_connector=reset_connector)
         self.model_executor.discard(("kv_cache",))
 
@@ -1858,6 +2147,8 @@ class EngineCoreProc(EngineCore):
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
         while self._handle_shutdown():
+            # A KV cache shrink moves on between steps, like a utility.
+            self._advance_kv_resize()
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # Publish request counts before and after GPU step to ensure freshness.
@@ -1881,17 +2172,25 @@ class EngineCoreProc(EngineCore):
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
-    def resize_kv_cache(self, target_num_blocks: int) -> int:
+    def resize_kv_cache(
+        self,
+        target_num_blocks: int,
+        deadline_s: float | None = None,
+        preempt: bool = False,
+    ) -> dict[str, Any]:
         try:
-            return super().resize_kv_cache(target_num_blocks)
+            return super().resize_kv_cache(target_num_blocks, deadline_s, preempt)
         except TimeoutError:
-            # The workers may still answer, and their replies would be read as
-            # those of the next call: the executor cannot be used any further.
-            logger.error(
-                "Resizing the KV cache timed out on the workers; failing the engine."
-            )
-            self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
+            self._fail_kv_resize_executor()
             raise
+
+    def _fail_kv_resize_executor(self) -> None:
+        # The workers may still answer, and their replies would be read as
+        # those of the next call: the executor cannot be used any further.
+        logger.error(
+            "Resizing the KV cache timed out on the workers; failing the engine."
+        )
+        self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
@@ -2503,6 +2802,7 @@ class EngineCoreProc(EngineCore):
         """
         if mode not in get_args(PauseMode):
             raise ValueError(f"Invalid pause mode: {mode}")
+        self._settle_kv_resize("a pause", memory_changes=False)
 
         def engine_idle_callback(engine: "EngineCoreProc", future: Future[Any]) -> None:
             try:

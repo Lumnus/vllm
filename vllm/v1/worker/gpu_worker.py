@@ -1050,6 +1050,13 @@ class Worker(WorkerBase):
             raise RuntimeError("The KV cache is not extensible.")
         return kv_cache_shrink_plan(self.model_runner, num_blocks)
 
+    def kv_cache_blocks_releasable(self, num_bytes: int) -> int | None:
+        """Fewest tail blocks whose release gives back num_bytes on this rank."""
+        kv_cache = getattr(self.model_runner, "extensible_kv_cache", None)
+        if kv_cache is None:
+            raise RuntimeError("The KV cache is not extensible.")
+        return kv_cache.blocks_releasable(num_bytes)
+
     def shrink_kv_cache(self, num_blocks: int) -> int:
         """Release the extensible KV cache's blocks from num_blocks on, once
         the scheduler has drained them. Returns the bytes this rank released.
