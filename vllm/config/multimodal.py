@@ -286,6 +286,9 @@ class MultiModalDummyOptions(dict[str, BaseDummyOptions]):
 
 
 HostTowerDType = Literal["float32", "model"]
+HostTowerResidency = Literal["host", "dynamic"]
+HostTowerIdleLocation = Literal["host", "disk"]
+HostTowerCardLayout = Literal["replicated", "sharded"]
 
 
 @dataclass(config=ConfigDict(extra="forbid"))
@@ -306,6 +309,49 @@ class HostTowerOptions:
     """Host memory (in GiB) for this tower's embeddings while they wait to be
     copied to the accelerator. Embeddings of recent items stay there and are
     reused without running the tower again."""
+
+    residency: HostTowerResidency = "host"
+    """Where the tower lives while the engine runs. `"host"` (default) keeps
+    it in host memory for the engine's lifetime. `"dynamic"` moves it to the
+    accelerator when its modality is in use and back when it is not:
+    `promote_after` requests within `promote_window_s` bring it to the
+    accelerator (the KV cache gives up the memory first), and
+    `demote_idle_s` without one send it back to `idle_location` (the KV cache
+    takes the memory back). Requests are served from host memory while the
+    tower moves. Needs the extensible KV cache with
+    `--kv-cache-release-chunk-mib`."""
+
+    promote_after: int = Field(default=2, ge=1)
+    """Requests with an item of the tower's modalities, within
+    `promote_window_s`, that bring a `"dynamic"` tower to the accelerator."""
+
+    promote_window_s: float = Field(default=600.0, gt=0)
+    """The window `promote_after` is counted in, in seconds."""
+
+    demote_idle_s: float = Field(default=1800.0, gt=0)
+    """Seconds without a request for the tower's modalities after which a
+    `"dynamic"` tower leaves the accelerator for `idle_location`, or leaves
+    host memory when `idle_location` is `"disk"`."""
+
+    idle_location: HostTowerIdleLocation = "host"
+    """Where a `"dynamic"` tower rests while unused: `"host"` keeps its host
+    copy, `"disk"` gives that memory up too (the next request reloads it)."""
+
+    card_layout: HostTowerCardLayout = "replicated"
+    """How a `"dynamic"` tower is laid out on the accelerators.
+    `"replicated"`: every rank holds the whole tower and computes the
+    embeddings alone, with no collective. `"sharded"`: tensor-parallel shards
+    as when the tower is built with the model (about half the bytes per rank),
+    with the all-reduces of that layout."""
+
+    card_reserve_mib: int = Field(default=128, ge=0)
+    """Accelerator memory per rank asked of the KV cache on top of the
+    tower's weights, for its activations (the engine's startup profile did not
+    run a tower that was in host memory)."""
+
+    shrink_deadline_s: float = Field(default=60.0, ge=0)
+    """How long a promotion waits for the KV cache to drain the blocks it
+    gives up before it gives up itself (0 waits without limit)."""
 
 
 MMEncoderTPMode = Literal["weights", "data"]
@@ -433,6 +479,11 @@ class MultiModalConfig:
 
     Full format:
         {"vision_tower": {"threads": 16, "dtype": "float32", "cache_gb": 1}}
+
+    A tower that moves to the accelerator while its modality is in use:
+        {"vision_tower": {"threads": 16, "residency": "dynamic",
+                          "promote_after": 2, "promote_window_s": 600,
+                          "demote_idle_s": 1800, "idle_location": "host"}}
 
     Empty (default) keeps every tower on the accelerator. Only supported on a
     per-model basis."""
