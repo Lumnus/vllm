@@ -233,6 +233,25 @@ def test_seconds_to_the_next_event():
     assert env.controller.seconds_to_next_event() == pytest.approx(1300.01)
 
 
+def test_requests_on_the_card_do_not_wake_an_idle_engine_early():
+    env = _setup()
+    _image(env, 1000)
+    _image(env, 1001)
+    _step(env, 1001)
+    _image(env, 1100)
+    _image(env, 1101)
+    assert env.controller.seconds_to_next_event() == pytest.approx(1800.01)
+
+
+def test_a_held_off_promotion_wakes_at_the_end_of_the_hold():
+    env = _setup()
+    env.scheduler.floor = 95
+    _image(env, 1000)
+    _image(env, 1001)
+    _step(env, 1001)  # refused: held off until 1061
+    assert env.controller.seconds_to_next_event() == pytest.approx(60.01)
+
+
 # ----------------------------------------------------------------------
 # The moves and the memory exchange
 # ----------------------------------------------------------------------
