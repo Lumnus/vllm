@@ -147,6 +147,20 @@ class EPLBConfig:
     into the same file. A missing or unreadable file starts from the identity
     placement."""
 
+    trace_path: str | None = None
+    """If set, trace the routed expert load over time. Every
+    `trace_interval` steps, the load of those steps, per MoE layer and logical
+    expert, is appended to `<trace_path>.rank<R>` (R is the rank of the writing
+    process; the counts are that rank's, before EPLB's all-reduce). Needs EPLB
+    on. Recording then runs on every step, not only in the last `window_size`
+    steps before a rearrangement. The copy to the host is non-blocking and the
+    record is written a step or more later. To only observe, set a
+    `step_interval` larger than the run will ever reach (no rearrangement
+    happens) and a small `window_size`, and leave `state_path` unset. The
+    format is described in `vllm/distributed/eplb/eplb_trace.py`."""
+    trace_interval: int = Field(default=20, gt=0)
+    """With `trace_path`: how many steps one trace record sums."""
+
     tier_hysteresis: float = Field(default=1.1, ge=1.0)
     """With expert slots in tiers (`--cpu-offload-per-expert`), an expert in a
     slow slot takes the fast slot of a rank's least-loaded fast expert only
@@ -179,6 +193,8 @@ class EPLBConfig:
             self,
             ignored_factors={
                 "state_path",
+                "trace_path",
+                "trace_interval",
                 "max_moves_per_rank",
                 "tier_hysteresis",
                 "decode_token_weight",
