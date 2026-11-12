@@ -9,8 +9,10 @@ the standard library and numpy.
 
     python tools/analyze_expert_trace.py TRACE [TRACE ...] [options]
 
-TRACE is a file, or the `trace_path` prefix (then `<prefix>.rank*` is read).
-The files of several ranks are added record by record (equal `step`). A saved
+TRACE is a file, or the `trace_path` prefix (then `<prefix>.rank*` is read,
+rotated segments `<prefix>.rank<R>.<n>` included, oldest first). The files of
+several ranks are added record by record (equal `step`). A trace that samples
+(`trace_sample`) counts `sample` steps per record; rates per step use that. A saved
 EPLB state file (`EPLBConfig.state_path`: a JSON object layer name -> list of
 loads) gives the cumulative table only.
 
@@ -46,6 +48,7 @@ What is printed (a "call" is one token routed to one expert of one layer):
 import argparse
 import glob
 import json
+import re
 import struct
 import sys
 import zlib
@@ -64,6 +67,11 @@ class Trace:
     steps: np.ndarray  # [T] step counter at the end of each record
     wall: np.ndarray  # [T] wall time
     counts: np.ndarray  # [T, layers, experts] uint32
+    sample: int = 0  # engine steps counted per record (0: all of `interval`)
+
+    @property
+    def steps_per_record(self) -> int:
+        return self.sample or self.interval
 
     @property
     def num_intervals(self) -> int:
@@ -110,17 +118,60 @@ def read_trace_file(path: str) -> Trace:
         steps=np.array(steps, dtype=np.int64),
         wall=np.array(walls, dtype=np.float64),
         counts=counts,
+        sample=int(meta.get("sample", meta["interval"])),
     )
+
+
+def join_segments(parts: list[Trace]) -> Trace:
+    """One rank's segments, oldest first, as one trace. A segment whose steps
+    start at or below the previous one's last step is a restart: its steps are
+    shifted to continue."""
+    first = parts[0]
+    steps, walls, counts = [first.steps], [first.wall], [first.counts]
+    last = int(first.steps[-1]) if len(first.steps) else 0
+    for part in parts[1:]:
+        if (
+            part.layers != first.layers
+            or part.counts.shape[1:] != first.counts.shape[1:]
+        ):
+            raise ValueError("segments of one rank differ in layers or experts")
+        shift = last if len(part.steps) and part.steps[0] <= last else 0
+        steps.append(part.steps + shift)
+        walls.append(part.wall)
+        counts.append(part.counts)
+        if len(part.steps):
+            last = int(part.steps[-1]) + shift
+    return Trace(
+        layers=first.layers,
+        interval=first.interval,
+        steps=np.concatenate(steps),
+        wall=np.concatenate(walls),
+        counts=np.concatenate(counts),
+        sample=first.sample,
+    )
+
+
+def rank_files(prefix: str) -> list[list[str]]:
+    """The files of `<prefix>.rank*` grouped by rank, each oldest first (the
+    rotated segments by number, then the live file)."""
+    by_rank: dict[int, list[tuple[float, str]]] = {}
+    for name in glob.glob(prefix + ".rank*"):
+        match = re.search(r"\.rank(\d+)(?:\.(\d+))?$", name)
+        if match is None:
+            continue
+        order = float(match.group(2)) if match.group(2) else float("inf")
+        by_rank.setdefault(int(match.group(1)), []).append((order, name))
+    return [[n for _, n in sorted(by_rank[r])] for r in sorted(by_rank)]
 
 
 def read_trace(paths: list[str]) -> Trace:
     """Files given, or prefixes whose `.rank*` files are read; ranks are added
     on the steps they share."""
-    files: list[str] = []
+    groups: list[list[str]] = []
     for path in paths:
-        found = sorted(glob.glob(path + ".rank*"))
-        files.extend(found if found else [path])
-    traces = [read_trace_file(f) for f in files]
+        found = rank_files(path)
+        groups.extend(found if found else [[path]])
+    traces = [join_segments([read_trace_file(f) for f in g]) for g in groups]
     first = traces[0]
     if len(traces) == 1:
         return first
@@ -141,6 +192,7 @@ def read_trace(paths: list[str]) -> Trace:
         steps=np.array(keep, dtype=np.int64),
         wall=first.wall[[idx[s] for s in keep]],
         counts=total.astype(np.uint32),
+        sample=first.sample,
     )
 
 
@@ -301,7 +353,7 @@ def replay(
                 np.put_along_axis(keep, top, True, axis=-1)
                 in_pool = keep & candidate
     counted = max(t_total - warm, 0)
-    steps = counted * trace.interval
+    steps = counted * trace.steps_per_record
     with np.errstate(invalid="ignore", divide="ignore"):
         hit = 1 - missed_calls / calls
         per_k = 1000 * miss_events / calls
@@ -367,8 +419,13 @@ def main(argv: list[str] | None = None) -> int:
     tops = [n for n in args.top_n if n <= n_exp]
     span = ""
     if not state_only:
-        total_steps = trace.num_intervals * trace.interval
-        span = f" x {trace.interval} steps = {total_steps} steps"
+        total_steps = trace.num_intervals * trace.steps_per_record
+        every = (
+            f" (the first {trace.sample} of every {trace.interval})"
+            if trace.sample and trace.sample != trace.interval
+            else ""
+        )
+        span = f" x {trace.steps_per_record} steps{every} = {total_steps} steps"
     print(f"layers {n_layers}, experts {n_exp}, intervals {trace.num_intervals}{span}")
     cum, rows = cumulative_table(trace, tops, args.calls_per_token)
     layer_calls = np.maximum(cum.sum(axis=-1), 1)
@@ -415,7 +472,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"\n5. Replay (K = {args.warm} warm-up intervals not counted; "
-        f"interval = {trace.interval} steps)"
+        f"interval = {trace.steps_per_record} steps)"
     )
     print("   F     P  policy        hit   miss/1000 calls   miss/step   worst layer")
     for f in args.fixed:

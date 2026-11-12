@@ -153,14 +153,30 @@ class EPLBConfig:
     `trace_interval` steps, the load of those steps, per MoE layer and logical
     expert, is appended to `<trace_path>.rank<R>` (R is the rank of the writing
     process; the counts are that rank's, before EPLB's all-reduce). Needs EPLB
-    on. Recording then runs on every step, not only in the last `window_size`
-    steps before a rearrangement. The copy to the host is non-blocking and the
-    record is written a step or more later. To only observe, set a
+    on. Recording then runs on the steps `trace_sample` picks (every step by
+    default), not only in the last `window_size` steps before a rearrangement.
+    The copy to the host is non-blocking and a background thread writes the
+    record. The counts are attributed with the placement the steps ran on, so
+    a rearrangement does not mix experts. To only observe, set a
     `step_interval` larger than the run will ever reach (no rearrangement
     happens) and a small `window_size`, and leave `state_path` unset. The
     format is described in `vllm/distributed/eplb/eplb_trace.py`."""
     trace_interval: int = Field(default=20, gt=0)
-    """With `trace_path`: how many steps one trace record sums."""
+    """With `trace_path`: how many steps one trace record covers."""
+    trace_sample: int | None = Field(default=None, gt=0)
+    """With `trace_path`: how many steps of each `trace_interval` the router
+    kernel counts (the first ones). A record then sums those steps only. None
+    (default) counts every step. The counting is an atomic add per routed
+    expert in every MoE layer, inside the graph, so sampling is what lowers the
+    cost of a trace that runs for days; the routing statistics are the same
+    in expectation."""
+    trace_rotate_mb: int = Field(default=256, ge=0)
+    """With `trace_path`: a rank's file is moved aside to
+    `<trace_path>.rank<R>.<n>` and a new one started once it holds this many
+    MiB (0: never)."""
+    trace_keep: int = Field(default=0, ge=0)
+    """With `trace_path`: how many rotated files per rank to keep, the newest
+    (0: all)."""
 
     tier_hysteresis: float = Field(default=1.1, ge=1.0)
     """With expert slots in tiers (`--cpu-offload-per-expert`), an expert in a
@@ -226,6 +242,9 @@ class EPLBConfig:
                 "state_path",
                 "trace_path",
                 "trace_interval",
+                "trace_sample",
+                "trace_rotate_mb",
+                "trace_keep",
                 "max_moves_per_rank",
                 "tier_hysteresis",
                 "decode_token_weight",
@@ -242,6 +261,8 @@ class EPLBConfig:
 
     @model_validator(mode="after")
     def _validate_eplb_config(self) -> Self:
+        if self.trace_sample is not None and self.trace_sample > self.trace_interval:
+            raise ValueError("trace_sample cannot exceed trace_interval")
         if self.use_async and self.policy not in ("default", "incremental"):
             raise ValueError(
                 "Async EPLB is only supported with the default and incremental "

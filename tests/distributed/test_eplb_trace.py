@@ -5,11 +5,13 @@ that reads it."""
 
 import importlib.util
 import pathlib
+import threading
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from vllm.config.parallel import EPLBConfig
 from vllm.distributed.eplb.eplb_trace import (
@@ -57,7 +59,7 @@ def _write_trace(path, counts: np.ndarray, interval: int = 1, rank: int = 0) -> 
         for k in range(interval):
             if k == 0:
                 state.expert_load_pass.copy_(torch.from_numpy(chunk.astype(np.int32)))
-            tracer.accumulate([state])
+            tracer.accumulate([state], True)
             state.expert_load_pass.zero_()
             tracer.end_step([state])
     tracer.drain()
@@ -119,7 +121,7 @@ def test_interval_sums_steps_and_maps_physical_to_logical(tmp_path):
     tracer = ExpertLoadTracer(str(tmp_path / "t"), 2, rank=0)
     for load in ([1, 2, 3, 4, 9], [10, 20, 30, 40, 9], [5, 0, 0, 0, 0]):
         state.expert_load_pass.copy_(torch.tensor([load], dtype=torch.int32))
-        tracer.accumulate([state])
+        tracer.accumulate([state], True)
         state.expert_load_pass.zero_()
         tracer.end_step([state])
     tracer.drain()
@@ -152,7 +154,7 @@ def test_with_the_trace_on_eplb_records_every_step_and_never_moves(
         total = np.zeros((2, 4), dtype=np.int64)
         for _ in range(3):
             load = rng.integers(0, 9, size=(2, 4))
-            model_state.expert_load_pass.copy_(torch.from_numpy(load.astype(np.int32)))
+            model_state.expert_load_pass += torch.from_numpy(load.astype(np.int32))
             state.step()
             total += load
         expected.append(total)
@@ -186,7 +188,7 @@ def test_dummy_steps_are_not_traced(monkeypatch, tmp_path):
     model_state = next(iter(state.model_states.values()))
     model_state.expert_load_pass.fill_(7)
     state.step(is_dummy=True)
-    model_state.expert_load_pass.copy_(torch.tensor([[1, 2, 3, 4]], dtype=torch.int32))
+    model_state.expert_load_pass += torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
     state.step()
     assert state._trace is not None
     state._trace.drain()
@@ -313,3 +315,320 @@ def test_the_script_runs_end_to_end_on_a_trace(tmp_path, capsys):
     for head in ("Cumulative", "Per interval", "Working set", "Replay"):
         assert head in out
     assert "80 x 2 steps = 160 steps" in out
+
+
+# ---- the cost of the trace on the stepping thread, and what it attributes
+
+
+class _Counter(TorchDispatchMode):
+    """Counts the device operations a block issues (views and metadata are
+    not submissions) and notes any read of a value on the host."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ops: list[str] = []
+        self.host_reads: list[str] = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        returns = func._schema.returns
+        is_view = any(
+            r.alias_info is not None and not r.alias_info.is_write for r in returns
+        )
+        if func._schema.name in ("aten::_local_scalar_dense", "aten::item"):
+            self.host_reads.append(func._schema.name)
+        if not is_view:
+            self.ops.append(func._schema.name)
+        return func(*args, **(kwargs or {}))
+
+
+def _ops_per_step(monkeypatch, tmp_path, layers: int, steps: int, **eplb_kwargs):
+    """The operations each `EplbState.step` issues, with the router kernel's
+    adds (outside the count) feeding the pass whenever the flag asks for it."""
+    state = single_rank_eplb(monkeypatch, **eplb_kwargs)
+    add_model(state, FakeMoEModel(num_layers=layers, num_logical=16))
+    model_state = next(iter(state.model_states.values()))
+    state.should_record_tensor = torch.ones((), dtype=torch.bool)
+    state.expert_rearrangement_step = 0  # EPLB starts at 3/4 of the interval
+    per_step = []
+    for _ in range(steps):
+        if bool(state.should_record_tensor):
+            model_state.expert_load_pass += 1
+        with _Counter() as counter:
+            state.step()
+        assert counter.host_reads == []
+        per_step.append(len(counter.ops))
+    return state, per_step
+
+
+@pytest.mark.parametrize("layers", [2, 48])
+def test_the_trace_adds_no_operation_to_a_step_outside_the_window(
+    monkeypatch, tmp_path, layers
+):
+    common = dict(step_interval=2_000_000_000, window_size=1, trace_interval=4)
+    _, off = _ops_per_step(monkeypatch, tmp_path, layers, 12, **common)
+    state, on = _ops_per_step(
+        monkeypatch, tmp_path, layers, 12, trace_path=str(tmp_path / "t"), **common
+    )
+    assert state._trace is not None
+    assert off[1:] == [0] * 11  # today: nothing between window steps
+    # the first step sets the flag; the interval ends (steps 4, 8, 12) cost a
+    # fixed handful of operations per model, whatever the layer count
+    ends = [i for i in range(12) if (i + 1) % 4 == 0]
+    assert [n for i, n in enumerate(on) if i not in ends and i > 0] == [0] * 8
+    assert all(0 < on[i] <= 14 for i in ends)
+
+
+def test_the_cost_per_step_does_not_grow_with_the_layers(monkeypatch, tmp_path):
+    common = dict(step_interval=100, window_size=100, trace_interval=4)
+    runs = {}
+    for layers in (2, 48):
+        _, off = _ops_per_step(monkeypatch, tmp_path, layers, 9, **common)
+        _, on = _ops_per_step(
+            monkeypatch,
+            tmp_path,
+            layers,
+            9,
+            trace_path=str(tmp_path / f"t{layers}"),
+            **common,
+        )
+        runs[layers] = (off, on)
+    # the window records every step: its own copy and zero, plus one add
+    for off, on in runs.values():
+        added = [a - b for a, b in zip(on[1:], off[1:])]
+        assert set(added) <= {0, 1} | set(range(2, 15))
+        assert [d for i, d in enumerate(added, 1) if (i + 1) % 4 != 0] == [1] * 6
+    assert runs[2][1] == runs[48][1]  # operation for operation the same
+
+
+def test_with_the_trace_off_the_step_is_todays(monkeypatch, tmp_path):
+    state, per_step = _ops_per_step(
+        monkeypatch, tmp_path, 3, 6, step_interval=10, window_size=3
+    )
+    assert state._trace is None
+    assert all(m.map_change_hook is None for m in state.model_states.values())
+    # not near a rearrangement: no operation (the first step sets the flag
+    # off); in the window: the pass is copied into it and zeroed, and the flag
+    # goes on for the next step
+    assert per_step == [1, 0, 0, 0, 0, 0]
+    state.expert_rearrangement_step = 7
+    model_state = next(iter(state.model_states.values()))
+    model_state.expert_load_pass += 1
+    with _Counter() as counter:
+        state.step()
+    assert counter.ops == ["aten::copy_", "aten::zero_", "aten::fill_"]
+    assert model_state.expert_load_pass.sum() == 0
+
+
+class _ThreadEvent:
+    """A device event that notes the thread it is waited on from."""
+
+    waits: list[int] = []
+    gate: threading.Event | None = None
+
+    def record(self) -> None:
+        pass
+
+    def synchronize(self) -> None:
+        type(self).waits.append(threading.get_ident())
+        if type(self).gate is not None:
+            type(self).gate.wait(10)
+
+
+def test_only_the_writer_thread_waits_and_a_slow_writer_drops_not_blocks(
+    monkeypatch, tmp_path
+):
+    _ThreadEvent.waits = []
+    _ThreadEvent.gate = threading.Event()
+    state = single_rank_eplb(
+        monkeypatch,
+        trace_path=str(tmp_path / "t"),
+        trace_interval=1,
+        step_interval=2_000_000_000,
+        window_size=1,
+    )
+    add_model(state, FakeMoEModel(num_layers=1, num_logical=4))
+    tracer = state._trace
+    assert tracer is not None
+    tracer._event_factory = _ThreadEvent
+    model_state = next(iter(state.model_states.values()))
+    for _ in range(20):  # the writer waits on its first event: nothing blocks
+        model_state.expert_load_pass += 1
+        state.step()
+    assert tracer.dropped > 0
+    _ThreadEvent.gate.set()
+    tracer.drain()
+    assert _ThreadEvent.waits
+    assert threading.get_ident() not in _ThreadEvent.waits
+    trace = analyze.read_trace([str(tmp_path / "t")])
+    assert trace.num_intervals == 20 - tracer.dropped
+
+
+def test_a_trace_that_cannot_be_written_is_dropped_and_the_pass_returns(
+    monkeypatch, tmp_path
+):
+    state = single_rank_eplb(
+        monkeypatch,
+        trace_path=str(tmp_path / "missing" / "t"),
+        trace_interval=1,
+        step_interval=2_000_000_000,
+        window_size=1,
+    )
+    add_model(state, FakeMoEModel(num_layers=1, num_logical=4))
+    model_state = next(iter(state.model_states.values()))
+    model_state.expert_load_pass += 1
+    state.step()
+    assert state._trace is not None
+    state._trace.drain()
+    model_state.expert_load_pass += 1
+    state.step()  # sees the failure
+    assert state._trace is None
+    assert model_state.map_change_hook is None
+    assert model_state.expert_load_pass.sum() == 0
+
+
+def _true_logical_loads(state, model_state, hot: list[int], rng) -> np.ndarray:
+    """Add one step's routing for logical experts `hot` (skewed) to the pass,
+    on whatever slots the current placement gives them; return the logical
+    counts."""
+    layers, physical = model_state.expert_load_pass.shape
+    num_logical = model_state.model.num_logical_experts
+    truth = np.zeros((layers, num_logical), dtype=np.int64)
+    p2l = model_state.physical_to_logical_map
+    for layer in range(layers):
+        for expert, calls in zip(hot, (40, 20, 10, 5)):
+            slots = (p2l[layer] == expert).nonzero().flatten().tolist()
+            for k in range(calls):
+                model_state.expert_load_pass[layer, slots[k % len(slots)]] += 1
+            truth[layer, expert] += calls
+    return truth
+
+
+@pytest.mark.parametrize("hook", [True, False])
+def test_the_counts_are_logical_across_a_rearrangement(monkeypatch, tmp_path, hook):
+    path = str(tmp_path / "trace")
+    state = single_rank_eplb(
+        monkeypatch,
+        trace_path=path,
+        trace_interval=4,
+        step_interval=6,
+        window_size=6,
+        policy="default",
+    )
+    model = FakeMoEModel(num_layers=2, num_logical=4, num_redundant=2)
+    add_model(state, model)
+    model_state = next(iter(state.model_states.values()))
+    state.expert_rearrangement_step = 0
+    if not hook:
+        model_state.map_change_hook = None  # what attributing at the end does
+    rng = np.random.default_rng(0)
+    before = model_state.physical_to_logical_map.clone()
+    truth = []
+    for _ in range(12):
+        truth.append(_true_logical_loads(state, model_state, [0, 1, 2, 3], rng))
+        state.step()
+    assert not torch.equal(model_state.physical_to_logical_map, before)
+    assert physical_rows_hold(model, state)
+    tracer = state._trace
+    assert tracer is not None
+    tracer.drain()
+    trace = analyze.read_trace([path])
+    expected = np.stack([sum(truth[i : i + 4]) for i in (0, 4, 8)])
+    assert trace.steps.tolist() == [4, 8, 12]
+    if hook:
+        assert np.array_equal(trace.counts, expected)
+    else:
+        # the interval that spans the move is attributed with the new placement
+        assert not np.array_equal(trace.counts, expected)
+        assert trace.counts.sum() == expected.sum()
+
+
+def test_sampling_counts_only_the_first_steps_of_each_interval(monkeypatch, tmp_path):
+    path = str(tmp_path / "trace")
+    state = single_rank_eplb(
+        monkeypatch,
+        trace_path=path,
+        trace_interval=5,
+        trace_sample=2,
+        step_interval=2_000_000_000,
+        window_size=1,
+    )
+    add_model(state, FakeMoEModel(num_layers=1, num_logical=4))
+    model_state = next(iter(state.model_states.values()))
+    state.should_record_tensor = torch.ones((), dtype=torch.bool)
+    flags = []
+    for step in range(15):
+        flags.append(bool(state.should_record_tensor))
+        if flags[-1]:
+            model_state.expert_load_pass += step + 1
+        state.step()
+    assert flags == [True, True, False, False, False] * 3
+    assert state._trace is not None
+    state._trace.drain()
+    trace = analyze.read_trace([path])
+    assert trace.sample == 2 and trace.interval == 5 and trace.steps_per_record == 2
+    assert trace.counts[:, 0, 0].tolist() == [1 + 2, 6 + 7, 11 + 12]
+
+
+def test_a_dirty_pass_is_not_copied_into_the_window(monkeypatch, tmp_path):
+    state = single_rank_eplb(
+        monkeypatch,
+        trace_path=str(tmp_path / "trace"),
+        trace_interval=100,
+        step_interval=10,
+        window_size=2,
+    )
+    add_model(state, FakeMoEModel(num_layers=1, num_logical=4))
+    model_state = next(iter(state.model_states.values()))
+    state.expert_rearrangement_step = 0
+    for _ in range(7):  # outside the window: the pass keeps adding
+        model_state.expert_load_pass += 1
+        state.step()
+    assert model_state.expert_load_pass.sum() == 7 * 4
+    model_state.expert_load_pass += 1
+    state.step()  # the next step is the window's first: the pass is taken
+    assert model_state.expert_load_pass.sum() == 0
+    model_state.expert_load_pass += 1
+    state.step()
+    assert model_state.expert_load_window[0].sum() == 4  # this step alone
+    assert state._trace is not None
+    state._trace.drain()
+
+
+def test_files_rotate_by_size_keep_the_newest_and_read_as_one(tmp_path):
+    state = _tracer_state(2, 8)
+    tracer = ExpertLoadTracer(str(tmp_path / "r"), 1, rank=0, rotate_bytes=300, keep=3)
+    rng = np.random.default_rng(1)
+    loads = []
+    for _ in range(40):
+        load = rng.integers(0, 200, size=(2, 8))
+        loads.append(load)
+        state.expert_load_pass.copy_(torch.from_numpy(load.astype(np.int32)))
+        tracer.accumulate([state], True)
+        state.expert_load_pass.zero_()
+        tracer.end_step([state])
+        tracer.drain()
+    names = sorted(p.name for p in tmp_path.iterdir())
+    assert "r.rank0" in names and len(names) == 4  # live file + 3 kept
+    for path in tmp_path.iterdir():
+        assert path.read_bytes().startswith(TRACE_MAGIC)
+        assert path.stat().st_size <= 300 + 200  # a record may overshoot once
+    trace = analyze.read_trace([str(tmp_path / "r")])
+    assert trace.steps.tolist() == sorted(trace.steps.tolist())
+    assert np.array_equal(trace.counts, np.stack(loads)[-trace.num_intervals :])
+    assert trace.steps[-1] == 40
+
+
+def test_a_restart_starts_a_new_file_and_the_steps_continue(tmp_path):
+    state = _tracer_state(1, 4)
+    for _ in range(2):  # two runs write the same prefix
+        tracer = ExpertLoadTracer(str(tmp_path / "r"), 1, rank=0)
+        for _ in range(3):
+            state.expert_load_pass += 1
+            tracer.accumulate([state], True)
+            state.expert_load_pass.zero_()
+            tracer.end_step([state])
+        tracer.drain()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["r.rank0", "r.rank0.1"]
+    trace = analyze.read_trace([str(tmp_path / "r")])
+    assert trace.steps.tolist() == [1, 2, 3, 4, 5, 6]
+    assert (trace.counts == 1).all()

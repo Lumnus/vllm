@@ -28,7 +28,7 @@ physical experts.
 import threading
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import torch
@@ -277,6 +277,9 @@ class EplbModelState:
     layers' debug setting on)."""
     residency: ResidencyMask | None = None
     """The model's residency mask (`EPLBConfig.residency_mask`), if on."""
+    map_change_hook: Callable[["EplbModelState"], None] | None = None
+    """Called before a placement is committed to this model (the expert load
+    trace maps the counts so far with the placement still in force)."""
 
 
 class EplbState:
@@ -348,7 +351,12 @@ class EplbState:
                 else 0
             )
             self._trace = ExpertLoadTracer(
-                eplb_config.trace_path, eplb_config.trace_interval, rank
+                eplb_config.trace_path,
+                eplb_config.trace_interval,
+                rank,
+                sample=eplb_config.trace_sample,
+                rotate_bytes=eplb_config.trace_rotate_mb << 20,
+                keep=eplb_config.trace_keep,
             )
         self.is_async: bool = False
         """
@@ -660,6 +668,8 @@ class EplbState:
             )
         elif any(f is not None for f in fast_slots):
             model_state.fast_slots = fast_slots
+        if self._trace is not None:
+            model_state.map_change_hook = self._trace.before_map_change
         self.model_states[hash_config_cached(model_config)] = model_state
         self._add_residency_mask(model_state)
         if self.parallel_config.eplb_config.state_path is not None:
@@ -1002,9 +1012,13 @@ class EplbState:
 
         # Update the expert load sliding window
         if not is_dummy:
-            should_record = self._should_record_current_step(log_stats=log_stats)
-            if self._trace is not None:
-                self._trace.accumulate(list(self.model_states.values()))
+            trace = self._trace
+            if trace is not None and trace.failed:
+                self._drop_trace()
+                trace = None
+            should_record = self._window_records_current_step(log_stats=log_stats)
+            if trace is not None:
+                trace.accumulate(list(self.model_states.values()), should_record)
             for eplb_model_state in self.model_states.values():
                 if should_record:
                     eplb_model_state.expert_load_window[
@@ -1020,8 +1034,8 @@ class EplbState:
                 if self.expert_load_window_step >= self.expert_load_window_size:
                     self.expert_load_window_step = 0
 
-            if self._trace is not None:
-                self._trace.end_step(list(self.model_states.values()))
+            if trace is not None:
+                trace.end_step(list(self.model_states.values()))
 
         # Step the expert rearrangement step
         # Note that even if this is a dummy step, we still increment the
@@ -1198,14 +1212,30 @@ class EplbState:
                 )
 
     def _should_record_current_step(self, log_stats: bool = False) -> bool:
-        """Return whether expert-load recording should be enabled this step.
+        """Return whether the router kernel should count this step's load: the
+        window needs it (`_window_records_current_step`), or the trace samples
+        the step."""
+        if self._window_records_current_step(log_stats):
+            return True
+        return self._trace is not None and self._trace.records_next_step()
+
+    def _drop_trace(self) -> None:
+        """The trace cannot be written: stop it, and leave the load pass as it
+        is without a trace (zero between window steps)."""
+        logger.warning("EPLB: the expert load trace is off from here.")
+        self._trace = None
+        for model_state in self.model_states.values():
+            model_state.map_change_hook = None
+            model_state.expert_load_pass.zero_()
+        self._should_record_value = None
+
+    def _window_records_current_step(self, log_stats: bool = False) -> bool:
+        """Return whether the sliding window takes this step's load.
 
         Recording is enabled when we are close to either:
         1) The next rearrangement step, so the sliding window is ready.
         2) The next balancedness logging step, when log_stats is enabled.
         """
-        if self._trace is not None:
-            return True  # the trace follows every step
         steps_remaining = (
             self.expert_rearrangement_step_interval - self.expert_rearrangement_step
         )
@@ -1223,6 +1253,10 @@ class EplbState:
 
     def _update_layer_should_record(self, log_stats: bool = False) -> None:
         """Update the shared `should_record_tensor` for all layers."""
+        if self._trace is not None and self._window_records_current_step(log_stats):
+            # The window starts to copy the pass next step: it must not hold
+            # steps the trace let accumulate.
+            self._trace.fold_pending(list(self.model_states.values()))
         if self.should_record_tensor is None:
             return
         should_record = self._should_record_current_step(log_stats=log_stats)
@@ -1714,6 +1748,8 @@ class EplbState:
         expanded_physical_to_logical: torch.Tensor,
     ) -> None:
         eplb_model_state = self.model_states[hash_config_cached(model_config)]
+        if eplb_model_state.map_change_hook is not None:
+            eplb_model_state.map_change_hook(eplb_model_state)
         eplb_model_state.physical_to_logical_map_buffer.copy_(
             expanded_physical_to_logical
         )
@@ -1974,6 +2010,8 @@ def _commit_eplb_maps_for_layer(
     function completes, the new mappings will become the current mappings and will be
     visible to the model.
     """
+    if model_state.map_change_hook is not None:
+        model_state.map_change_hook(model_state)
     # Commit physical_to_logical_map
     src = new_physical_to_logical_map
     dst = model_state.physical_to_logical_map[layer]
@@ -2008,6 +2046,8 @@ def _commit_eplb_maps(
     the new mappings will become the current mappings and will be visible to the
     model.
     """
+    if model_state.map_change_hook is not None:
+        model_state.map_change_hook(model_state)
     # Commit physical_to_logical_map
     src = new_physical_to_logical_map
     dst = model_state.physical_to_logical_map
