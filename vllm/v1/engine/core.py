@@ -970,6 +970,15 @@ class EngineCore:
             raise NotImplementedError(
                 "Resizing the KV cache is not supported with data parallelism."
             )
+        if (
+            vllm_config.parallel_config.distributed_executor_backend
+            == "external_launcher"
+        ):
+            # Each engine has one rank of the group the workers agree in, and
+            # the other engines would never get this call.
+            raise NotImplementedError(
+                "Resizing the KV cache is not supported with the external launcher."
+            )
         if self.model_executor.is_sleeping:
             raise RuntimeError("Cannot resize the KV cache while asleep.")
         old_num_blocks = vllm_config.cache_config.num_gpu_blocks
@@ -1871,6 +1880,18 @@ class EngineCoreProc(EngineCore):
                 *counts, kv_cache_usage=self.scheduler.get_kv_cache_usage()
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
+
+    def resize_kv_cache(self, target_num_blocks: int) -> int:
+        try:
+            return super().resize_kv_cache(target_num_blocks)
+        except TimeoutError:
+            # The workers may still answer, and their replies would be read as
+            # those of the next call: the executor cannot be used any further.
+            logger.error(
+                "Resizing the KV cache timed out on the workers; failing the engine."
+            )
+            self.input_queue.put_nowait((EngineCoreRequestType.EXECUTOR_FAILED, b""))
+            raise
 
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""

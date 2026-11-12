@@ -176,8 +176,15 @@ class Executor(ABC):
     def resize_kv_cache(self, target_num_blocks: int) -> int:
         """Grow the extensible KV cache on the workers toward the target; the
         block count they now all hold."""
+        # The workers agree among themselves inside the call; bound the wait
+        # as for a model step, so that workers stuck there surface as a
+        # timeout instead of an engine that stops answering.
+        from vllm import envs
+
         results: list[int] = self.collective_rpc(
-            "resize_kv_cache", args=(target_num_blocks,)
+            "resize_kv_cache",
+            args=(target_num_blocks,),
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
         )
         assert len(set(results)) == 1, f"Workers disagree on the size: {results}"
         return results[0]

@@ -127,7 +127,9 @@ def _make_core(executor, scheduler, *, resize_to=None) -> EngineCoreProc:
         cache_config=SimpleNamespace(
             enable_extensible_kv_cache=True, num_gpu_blocks=10, kv_cache_size_tokens=0
         ),
-        parallel_config=SimpleNamespace(data_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, distributed_executor_backend="mp"
+        ),
     )
     core.has_work = lambda: True  # type: ignore[method-assign]
     core._should_throttle_prefills = lambda: False  # type: ignore[method-assign]
@@ -238,6 +240,12 @@ def test_resize_only_grows_the_scheduler_when_the_workers_did():
             lambda c: setattr(c.parallel_config, "data_parallel_size", 2),
             "data parallelism",
         ),
+        (
+            lambda c: setattr(
+                c.parallel_config, "distributed_executor_backend", "external_launcher"
+            ),
+            "external launcher",
+        ),
     ],
 )
 def test_resize_refuses_where_it_cannot_run(change, match):
@@ -256,3 +264,39 @@ def test_resize_refuses_while_asleep():
     with pytest.raises(RuntimeError, match="asleep"):
         EngineCore.resize_kv_cache(core, 25)
     assert executor.calls == []
+
+
+def test_resize_that_times_out_fails_the_engine():
+    """Workers that did not answer in time may answer later, into the next
+    call: the engine core gives the executor up instead of going on."""
+    executor = RecordingExecutor()
+
+    def resize_kv_cache(target_num_blocks: int) -> int:
+        raise TimeoutError("RPC call to resize_kv_cache timed out.")
+
+    executor.resize_kv_cache = resize_kv_cache  # type: ignore[method-assign]
+    scheduler = FakeScheduler(executor, [])
+    core = _make_core(executor, scheduler)
+
+    with pytest.raises(TimeoutError):
+        core.resize_kv_cache(25)
+
+    request_type, _ = core.input_queue.get_nowait()
+    assert request_type == EngineCoreRequestType.EXECUTOR_FAILED
+    assert scheduler.grown_to == []
+
+
+def test_executor_bounds_the_wait_for_the_workers():
+    from vllm.v1.executor.abstract import Executor
+
+    seen: dict[str, Any] = {}
+
+    def collective_rpc(method, timeout=None, args=(), kwargs=None, non_block=False):
+        seen.update(method=method, timeout=timeout, args=args)
+        return [12, 12]
+
+    executor = SimpleNamespace(collective_rpc=collective_rpc)
+    assert Executor.resize_kv_cache(executor, 12) == 12  # type: ignore[arg-type]
+    assert seen["method"] == "resize_kv_cache"
+    assert seen["args"] == (12,)
+    assert seen["timeout"] is not None and seen["timeout"] > 0
