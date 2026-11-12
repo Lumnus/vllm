@@ -125,6 +125,10 @@ class LLM(
         extensible_kv_cache_initial_blocks: Most KV cache blocks to commit at
             startup with the extensible KV cache, when the measured memory
             fits more. The rest of the reserved range can be committed later.
+        kv_cache_release_chunk_mib: Commit the extensible KV cache in
+            physical allocations of at most this many MiB, so the tail of the
+            committed range can be returned to the device in whole
+            allocations.
         cpu_offload_gb: The size (GiB) of CPU memory to use for offloading
             the model weights. This virtually increases the GPU memory space
             you can use to hold the model weights, at the cost of CPU-GPU data
@@ -223,6 +227,7 @@ class LLM(
         kv_cache_memory_bytes: int | None = None,
         enable_extensible_kv_cache: bool | None = None,
         extensible_kv_cache_initial_blocks: int | None = None,
+        kv_cache_release_chunk_mib: int | None = None,
         compilation_config: int | dict[str, Any] | CompilationConfig | None = None,
         quantization_config: dict[str, Any] | QuantizationConfigArgs | None = None,
         logits_processors: list[str | type[LogitsProcessor]] | None = None,
@@ -322,6 +327,7 @@ class LLM(
             kv_cache_memory_bytes=kv_cache_memory_bytes,
             enable_extensible_kv_cache=enable_extensible_kv_cache,
             extensible_kv_cache_initial_blocks=extensible_kv_cache_initial_blocks,
+            kv_cache_release_chunk_mib=kv_cache_release_chunk_mib,
             cpu_offload_gb=cpu_offload_gb,
             offload_group_size=offload_group_size,
             offload_num_in_group=offload_num_in_group,
