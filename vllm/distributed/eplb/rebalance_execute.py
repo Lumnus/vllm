@@ -77,6 +77,10 @@ class AsyncEplbLayerResult:
     """
     prepared: Any = None
     """What an `ExpertMover` prepared for the layer; committed by the main thread."""
+    abandoned: bool = False
+    """This rank's `ExpertMover` could not prepare the layer (a read failed
+    or did not return). The ranks then agree to leave the layer, and the rest
+    of the rearrangement, as they are."""
 
 
 def get_ep_ranks_with_experts_batch(

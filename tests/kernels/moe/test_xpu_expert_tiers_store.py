@@ -76,9 +76,7 @@ def test_build_then_fill_give_the_host_rows_the_checkpoint_path_gives(
     tstore.reset_sessions()
 
 
-def test_a_store_of_another_checkpoint_is_refused_unless_rebuild(
-    monkeypatch, tmp_path
-):
+def test_a_store_of_another_checkpoint_is_refused_unless_rebuild(monkeypatch, tmp_path):
     from vllm.model_executor.offloader.expert_store import ExpertStore
 
     first = run(monkeypatch, tmp_path, store=True)
@@ -276,6 +274,42 @@ def test_a_unit_that_fails_its_digest_is_never_mapped(monkeypatch, tmp_path):
     assert stats["check_failures"] == 1
     tiers.demote(2)  # a clean unit still moves
     assert placement.tier[2] == 1
+    tstore.reset_sessions()
+
+
+def test_a_read_that_does_not_return_is_reported_and_its_row_is_held(
+    monkeypatch, tmp_path
+):
+    from concurrent.futures import Future
+
+    from vllm.model_executor.offloader.expert_store import ExpertStoreError
+
+    env = Env(monkeypatch, tmp_path, True)
+    env.store_cfg.read_timeout_s = 0.2
+    env.construct()
+    env.load()
+    env.process()
+    tiers = env.tiers[0]
+    store = tiers.store_binding.session.store
+    pool = tiers.placement.pool
+    stuck: Future = Future()
+    stuck.set_running_or_notify_cancel()  # a read under way: not cancellable
+    real = store.read_into_async
+
+    def one_stuck(key, dests):
+        return stuck if key == (0, 1) else real(key, dests)
+
+    monkeypatch.setattr(store, "read_into_async", one_stuck)
+    free = pool.free_count
+    with pytest.raises(ExpertStoreError, match=r"did not return within 0\.2 s"):
+        tiers.demote(1)
+    assert tiers.placement.tier[1] == 0  # nothing moved
+    # the row the stuck read may still write is not handed out again
+    assert pool.free_count == free - 1 and pool.quarantined == 1
+    tiers.demote(2)  # other moves go on with the rows that are left
+    assert tiers.placement.tier[2] == 1
+    stuck.set_result("direct")
+    assert pool.free_count == free - 1 and pool.quarantined == 0  # row is back
     tstore.reset_sessions()
 
 

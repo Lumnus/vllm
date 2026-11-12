@@ -127,7 +127,8 @@ def _run_async_cycle(state, model_state) -> None:
         if not model_state.rebalanced:
             break
         if model_state.pending_result is not None:
-            eplb_state_mod._move_to_workspace(model_state, 0)
+            # what the step hook does: commit the layer, or leave it
+            state._consume_async_result(model_state, 0)
         else:
             thread.join(0.001)
             if errors:
@@ -330,6 +331,86 @@ def test_swaps_per_rearrangement_are_bounded_by_the_spare_rows(monkeypatch, tmp_
     for i in range(LAYERS):
         for slot in range(E):
             assert _holds(env, i, slot, slot), (i, slot)
+    tstore.reset_sessions()
+
+
+def _fast_set(tiers) -> set[int]:
+    return set(np.flatnonzero(tiers.placement.tier == 0).tolist())
+
+
+def _maps_agree(tiers) -> bool:
+    fm, sm = tiers.placement.maps(tiers.slot_global, tiers.num_global)
+    return tiers.fast_map.tolist() == fm.tolist() and (
+        tiers.slow_map.tolist() == sm.tolist()
+    )
+
+
+@pytest.mark.parametrize("bad_layer", [0, 1])
+def test_a_failed_read_abandons_the_rearrangement_and_serving_goes_on(
+    monkeypatch, tmp_path, bad_layer
+):
+    """A layer whose reads fail: nothing of it is mapped, its rows are back,
+    the main thread sees no error, the cycle ends, and the next cycle works."""
+    from vllm.model_executor.offloader.expert_store import ExpertStoreError
+
+    env, model, state, model_state, log = _build(monkeypatch, tmp_path, spare=4)
+    loads = [[1, 1, 1, 0, 2, 40, 50, 60]] * LAYERS
+    _window(model_state, loads)
+    bad = env.tiers[bad_layer]
+    real_fill = bad._fill_rows
+
+    def drive_gone(reads, rows):
+        raise ExpertStoreError("drive gone")
+
+    bad._fill_rows = drive_gone
+    free = [t.placement.pool.free_count for t in env.tiers]
+    _run_async_cycle(state, model_state)  # raises if the worker or the hook did
+    assert state.async_worker_error is None
+    assert model_state.abandoned_rearrangements == 1
+    assert any(f"abandoned at layer {bad_layer} of" in x for x in log.lines)
+    # layers before the bad one are committed, the bad one and later are not
+    for i, tiers in enumerate(env.tiers):
+        want = {5, 6, 7} if i < bad_layer else {0, 1, 2}
+        assert _fast_set(tiers) == want, i
+        assert _maps_agree(tiers)
+        tiers.placement.check()
+        for slot in range(E):
+            assert _holds(env, i, slot, slot), (i, slot)
+    assert env.tiers[bad_layer].placement.pool.free_count == free[bad_layer]
+    # the next cycle, with the reads back, finishes the job
+    bad._fill_rows = real_fill
+    _window(model_state, loads)
+    _run_async_cycle(state, model_state)
+    assert all(_fast_set(t) == {5, 6, 7} for t in env.tiers)
+    assert model_state.abandoned_rearrangements == 1
+    tstore.reset_sessions()
+
+
+def test_a_rank_gives_its_rows_back_when_a_peer_could_not_prepare(
+    monkeypatch, tmp_path
+):
+    """Every rank takes the same branch: this rank prepared the layer, a peer
+    did not, so this rank commits nothing and returns what it read into."""
+    env, model, state, model_state, log = _build(monkeypatch, tmp_path, spare=4)
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+
+    def with_a_peers_vote(flags):
+        flags += torch.tensor([0, 0, 1], dtype=flags.dtype)  # a peer abandons
+        return flags
+
+    monkeypatch.setattr(
+        eplb_state_mod,
+        "get_ep_group",
+        lambda: SimpleNamespace(device_group=group, cpu_all_reduce_=with_a_peers_vote),
+    )
+    _window(model_state, [[1, 1, 1, 0, 2, 40, 50, 60]] * LAYERS)
+    free = [t.placement.pool.free_count for t in env.tiers]
+    _run_async_cycle(state, model_state)
+    assert model_state.abandoned_rearrangements == 1
+    assert any("see their logs" in x for x in log.lines)
+    for i, tiers in enumerate(env.tiers):
+        assert _fast_set(tiers) == {0, 1, 2} and _maps_agree(tiers)
+        assert tiers.placement.pool.free_count == free[i]
     tstore.reset_sessions()
 
 

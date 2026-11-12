@@ -77,6 +77,12 @@ class ExpertStoreConfig:
     check_threads: int = Field(default=2, ge=0)
     """Hashing threads of one unit check (0: as many as the library likes)."""
 
+    read_timeout_s: float = Field(default=30.0, gt=0)
+    """Seconds a move waits for the units of one layer. A read that fails or
+    does not return in time does not stop serving: the rearrangement is
+    abandoned from that layer on, on every rank, with an error line on the
+    rank that saw it."""
+
     spare_rows: int | None = Field(default=None, ge=0)
     """Host rows per layer beyond the host tier's slots, for experts being
     read while the old ones still serve. None: EPLB's ``max_moves_per_rank``,
@@ -151,6 +157,7 @@ class ExpertStoreConfig:
                 "verify",
                 "check_every",
                 "check_threads",
+                "read_timeout_s",
                 "stats_interval_s",
             },
         )
