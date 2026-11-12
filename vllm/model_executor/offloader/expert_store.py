@@ -39,6 +39,8 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from vllm.model_executor.offloader import expert_store_integrity as _integrity
+
 FORMAT = "expert-store/v1"
 PAGE = 4096
 DATA_OFFSET = PAGE
@@ -71,6 +73,18 @@ _ITEMSIZE = {
 }
 
 Key = tuple[int, int]
+
+READ_MODES = ("auto", "direct", "buffered", "bounce")
+# Auto mode: the mode a pool moves to when the kernel refuses a read (EFAULT).
+_NEXT_MODE = {"direct": "buffered", "buffered": "bounce", "bounce": "bounce"}
+
+
+class _ReadFallback(Exception):
+    """A read the kernel refused in a way another read mode may get around."""
+
+    def __init__(self, code: int):
+        super().__init__(code)
+        self.code = code
 
 
 class ExpertStoreError(Exception):
@@ -419,6 +433,29 @@ def _read_header(path: str) -> dict[str, Any]:
         raise StoreCorruptError(f"{path}: header is not valid JSON") from exc
 
 
+def _make_checker(
+    directory: str, manifest: Mapping[str, Any], every: int, threads: int
+) -> "_integrity.UnitChecker | None":
+    """The unit checker for ``every`` > 0 (None for 0); needs a store with digests."""
+    if every < 0:
+        raise ValueError("check_every must be >= 0")
+    if every == 0:
+        return None
+    info = manifest.get("unit_checksums")
+    if not info:
+        raise StoreMismatchError(
+            "this store has no per-unit checksums (it was written before they "
+            "existed); add them with `python -m "
+            "vllm.model_executor.offloader.expert_store_build checksums <dirs>`, "
+            "rebuild it, or open with check_every=0"
+        )
+    try:
+        table = _integrity.load_table(directory, info)
+    except ValueError as exc:
+        raise StoreCorruptError(f"unit checksum table: {exc}") from exc
+    return _integrity.UnitChecker(table, every, threads)
+
+
 # --------------------------------------------------------------------------
 # Writer
 # --------------------------------------------------------------------------
@@ -472,11 +509,12 @@ class ExpertStoreWriter:
         if not dirs:
             raise ValueError("at least one directory is needed")
         self.dirs = [os.fspath(d) for d in dirs]
-        self.layout = _Layout(schema, len(self.dirs), identity)
+        self.layout = self._make_layout(schema, len(self.dirs), identity)
         self.writer_id = writer_id or f"w{os.getpid()}-{secrets.token_hex(3)}"
         if not self.writer_id.replace("-", "").replace("_", "").isalnum():
             raise ValueError("writer_id may hold letters, digits, '-' and '_'")
         self._lock = threading.Lock()
+        self._crc = _integrity.ChecksumLog(self.layout.total_units)
         self._bitmap = bytearray(-(-self.layout.total_units // 8))
         self._count = 0
         self._closed = False
@@ -494,6 +532,15 @@ class ExpertStoreWriter:
         self._load_own_record()
 
     # -- opening -----------------------------------------------------------
+
+    @staticmethod
+    def _make_layout(schema: Any, num_stripes: int, identity: str) -> Any:
+        """The layout for ``schema``; a subclass with another layout overrides."""
+        return _Layout(schema, num_stripes, identity)
+
+    @property
+    def _crc_path(self) -> str:
+        return os.path.join(self.dirs[0], WRITERS_DIR, f"{self.writer_id}.crc")
 
     def _prepare_dirs(self, rebuild: bool) -> None:
         layout = self.layout
@@ -547,6 +594,7 @@ class ExpertStoreWriter:
             DATA_FILE,
             DATA_FILE + PART_SUFFIX,
             DATA_FILE + SIDECAR_SUFFIX,
+            _integrity.CHECKSUM_FILE,
         ):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(os.path.join(directory, name))
@@ -561,6 +609,11 @@ class ExpertStoreWriter:
             return
         if record.get("layout_sha256") != self._core_sha:
             raise StoreMismatchError(f"{self._record_path} is from another layout")
+        if record["runs"] and not self._crc.load(self._crc_path):
+            raise StoreMismatchError(
+                f"{self._record_path} was saved without unit checksums (an older "
+                "writer); pass rebuild=True"
+            )
         for start, end in record["runs"]:
             for index in range(start, end):
                 self._set_bit(index)
@@ -614,6 +667,8 @@ class ExpertStoreWriter:
                 )
             buf[place.offset : place.offset + place.nbytes] = raw
         view = memoryview(buf)
+        index = layout.unit_index(layer, expert)
+        self._crc.set(index, _integrity.unit_digest(view, index))
         done = 0
         while done < unit_bytes:
             done += os.pwrite(self._fds[stripe], view[done:], offset + done)
@@ -623,6 +678,15 @@ class ExpertStoreWriter:
     @property
     def units_written(self) -> int:
         return self._count
+
+    def has_unit(self, layer: int, expert: int) -> bool:
+        """Whether this writer has recorded the unit (a resumed writer skips it)."""
+        index = self.layout.unit_index(layer, expert)
+        return bool(self._bitmap[index >> 3] & (1 << (index & 7)))
+
+    def _unit_key(self, index: int) -> Any:
+        """The (layer, expert) key of a global unit index, for messages."""
+        return divmod(index, self.layout.experts)
 
     def _runs(self) -> list[list[int]]:
         runs: list[list[int]] = []
@@ -645,6 +709,7 @@ class ExpertStoreWriter:
             count = self._count
         for fd in self._fds:
             os.fdatasync(fd)
+        self._crc.save(self._crc_path)
         record = {
             "writer": self.writer_id,
             "layout_sha256": self._core_sha,
@@ -720,11 +785,17 @@ class ExpertStoreWriter:
         total = self.layout.total_units
         missing = [i for i in range(total) if not union[i >> 3] & (1 << (i & 7))]
         if missing:
-            first = [divmod(i, self.layout.experts) for i in missing[:5]]
+            first = [self._unit_key(i) for i in missing[:5]]
             raise StoreIncompleteError(
                 f"{len(missing)} of {total} units are not recorded by any writer "
                 f"(first: layer/expert {first})"
             )
+        try:
+            table = _integrity.merge_logs(
+                os.path.join(self.dirs[0], WRITERS_DIR), total
+            )
+        except ValueError as exc:
+            raise StoreIncompleteError(f"unit checksums: {exc}") from exc
         if not self._closed:
             for fd in self._fds:
                 os.fsync(fd)
@@ -754,6 +825,7 @@ class ExpertStoreWriter:
             complete=True,
             checksummed=checksum,
             writers=records,
+            unit_checksums=_integrity.publish_table(self.dirs, table),
             finalized_unix=int(time.time()),
         )
         payload = json.dumps(manifest, indent=1, sort_keys=True).encode()
@@ -998,6 +1070,7 @@ class _Stripe:
         self.retired: list[int] = []
         self.direct = False
         self.fd = -1
+        self.bfd = -1  # buffered descriptor, opened when a buffered read needs it
         if want_direct:
             try:
                 self.fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
@@ -1014,8 +1087,17 @@ class _Stripe:
                 self.fd = os.open(self.path, os.O_RDONLY)
                 self.direct = False
 
+    def buffered_fd(self) -> int:
+        """A descriptor without O_DIRECT (the stripe's own if it has none)."""
+        with self.lock:
+            if not self.direct:
+                return self.fd
+            if self.bfd < 0:
+                self.bfd = os.open(self.path, os.O_RDONLY)
+            return self.bfd
+
     def close(self) -> None:
-        for fd in [self.fd, *self.retired]:
+        for fd in [self.fd, self.bfd, *self.retired]:
             with contextlib.suppress(OSError):
                 os.close(fd)
 
@@ -1063,6 +1145,12 @@ class ExpertStore:
         self._lock = threading.RLock()
         self._closed = False
         self._executor = ThreadPoolExecutor(io_threads, thread_name_prefix="expert-io")
+        self._integrity: _integrity.UnitChecker | None = None
+        self._mode = "direct"
+        self._forced: str | None = None
+        self._tls = threading.local()
+        self._reads_bounce = 0
+        self._fallbacks: dict[str, int] = {}
         # statistics
         self._hits = self._misses = self._joins = self._reads = 0
         self._bytes_read = self._evictions = self._errors = 0
@@ -1086,6 +1174,9 @@ class ExpertStore:
         decay_interval: int = 256,
         policy: EvictionPolicy | None = None,
         preadv: Callable[..., int] = os.preadv,
+        check_every: int = 0,
+        check_threads: int = 4,
+        read_mode: str = "auto",
     ) -> "ExpertStore":
         """Open a complete store whose identity is ``identity``.
 
@@ -1093,6 +1184,21 @@ class ExpertStore:
         incomplete, of another identity or layout, missing a stripe, or with a
         stripe of the wrong size; ``verify`` also hashes every stripe against
         its sidecar (a full read).
+
+        ``check_every`` checks units against their recorded digests as they are
+        read: 0 never (no work on the read path), 1 every read, N the 1st,
+        (N+1)th, ... read. A unit that fails is not handed out: its waiters get
+        :class:`StoreCorruptError` naming the key. ``check_threads`` is
+        BLAKE3's worker count per check. A store built before unit checksums
+        existed opens with ``check_every=0`` only.
+
+        ``read_mode``: ``auto`` tries a direct read first and, if the kernel
+        refuses it on the pool's memory (EFAULT, as for pinned XPU memory),
+        moves the pool to a buffered read straight into the slot and, if that
+        is refused too, to a direct read into a bounce buffer plus a copy;
+        what worked is kept. ``direct``, ``buffered`` and ``bounce`` force one.
+        Counters: ``read_mode``, ``reads_bounce``, ``read_fallbacks`` (by
+        reason) in :meth:`stats`.
         """
         dirs = [os.fspath(d) for d in dirs]
         if not dirs:
@@ -1163,7 +1269,8 @@ class ExpertStore:
             for stripe_dir in ordered:
                 assert stripe_dir is not None
                 stripes.append(_Stripe(os.path.join(stripe_dir, DATA_FILE), direct))
-            return cls(
+            checker = _make_checker(str(ordered[0]), first, check_every, check_threads)
+            store = cls(
                 stripes,
                 layout,
                 pool_bytes,
@@ -1172,6 +1279,9 @@ class ExpertStore:
                 policy or CountDecayPolicy(decay_interval),
                 preadv,
             )
+            store._integrity = checker
+            store.set_read_mode(read_mode)
+            return store
         except BaseException:
             for stripe in stripes:
                 stripe.close()
@@ -1265,6 +1375,28 @@ class ExpertStore:
             entry = future.result()
             if entry.held:
                 entry.release()
+
+    def set_read_mode(self, mode: str) -> None:
+        """``auto`` (direct, then buffered, then bounce, as the kernel refuses),
+        or force ``direct``, ``buffered`` or ``bounce`` (a direct read into an
+        ordinary aligned buffer, then a copy into the slot). Before reads."""
+        if mode not in READ_MODES:
+            raise ValueError(f"read mode {mode!r} is not one of {READ_MODES}")
+        with self._lock:
+            self._forced = None if mode == "auto" else mode
+            self._mode = "direct" if mode == "auto" else mode
+
+    def _check_unit(self, key: Key, data: np.ndarray) -> None:
+        """Check a unit just read against its digest (I/O thread, no lock)."""
+        checker = self._integrity
+        if checker is None or not checker.due():
+            return
+        index = self.layout.unit_index(*key)
+        if checker.check(index, data) is not None:
+            raise StoreCorruptError(
+                f"unit {key} does not match its recorded checksum "
+                "(the data on the drive differs from what was written)"
+            )
 
     def _attach(self, key: Key, lease: bool, count: bool) -> Future:
         """A future for ``key``, creating its state if needed (lock held)."""
@@ -1373,6 +1505,8 @@ class ExpertStore:
                 slot.chunk.array[slot.start : slot.start + size],
             )
             latency = time.perf_counter() - start
+            if self._integrity is not None:
+                self._check_unit(key, slot.chunk.array[slot.start : slot.start + size])
         except BaseException as exc:  # noqa: BLE001 - delivered to the waiters
             self._fail(key, index, exc)
             return
@@ -1420,12 +1554,57 @@ class ExpertStore:
 
     def _read_unit(self, stripe: _Stripe, offset: int, out: np.ndarray) -> bool:
         """Fill ``out`` from the stripe at ``offset``; True if O_DIRECT was used."""
+        while True:
+            mode = self._mode
+            try:
+                if mode == "bounce":
+                    bounce = self._bounce_buffer(len(out))
+                    direct = self._fill(stripe, offset, bounce, True, mode)
+                    out[:] = bounce
+                    with self._lock:
+                        self._reads_bounce += 1
+                    return direct
+                return self._fill(stripe, offset, out, mode == "direct", mode)
+            except _ReadFallback as fb:
+                self._demote(mode, fb.code)
+
+    def _bounce_buffer(self, size: int) -> np.ndarray:
+        """The calling I/O thread's page-aligned (ordinary memory) buffer."""
+        buf = getattr(self._tls, "buf", None)
+        if buf is None or buf.size < size:
+            buf = np.frombuffer(mmap.mmap(-1, _round_up(size, PAGE)), dtype=np.uint8)
+            self._tls.buf = buf
+        return buf[:size]
+
+    def _demote(self, mode: str, code: int) -> None:
+        """Move an auto pool to the next read mode after a refused read."""
+        with self._lock:
+            if self._mode != mode:
+                return  # another thread already moved on
+            self._mode = _NEXT_MODE[mode]
+            reason = f"{errno.errorcode.get(code, code)}_{mode}"
+            self._fallbacks[reason] = self._fallbacks.get(reason, 0) + 1
+
+    def _fill(
+        self,
+        stripe: _Stripe,
+        offset: int,
+        out: np.ndarray,
+        want_direct: bool,
+        mode: str,
+    ) -> bool:
+        """Fill ``out`` from the stripe; True if O_DIRECT was used."""
         view = memoryview(out)
         need = len(view)
         got = 0
         attempt = 0
+        direct = False
+        auto = self._forced is None
         while got < need:
-            fd, direct = stripe.fd, stripe.direct
+            if want_direct and stripe.direct:
+                fd, direct = stripe.fd, True
+            else:
+                fd, direct = stripe.buffered_fd(), False
             error = ""
             try:
                 count = self._preadv(fd, [view[got:]], offset + got)
@@ -1439,6 +1618,8 @@ class ExpertStore:
                 if exc.errno == errno.EINVAL and direct:
                     stripe.fall_back(fd)
                     continue
+                if exc.errno == errno.EFAULT and auto and mode != "bounce":
+                    raise _ReadFallback(exc.errno) from exc
                 error = f"errno {exc.errno} ({exc.strerror})"
             if attempt >= len(RETRY_BACKOFF_S):
                 raise ExpertStoreError(
@@ -1446,7 +1627,7 @@ class ExpertStore:
                 )
             time.sleep(RETRY_BACKOFF_S[attempt])
             attempt += 1
-        return stripe.direct
+        return direct
 
     # -- leases ------------------------------------------------------------
 
@@ -1505,6 +1686,11 @@ class ExpertStore:
                 "occupancy": used / self.num_slots,
                 "pool_bytes": self.num_slots * self.layout.slot_bytes,
                 "pinned": self.pinned,
+                "read_mode": self._mode,
+                "reads_bounce": self._reads_bounce,
+                "read_fallbacks": dict(self._fallbacks),
+                "checked": self._integrity.checked if self._integrity else 0,
+                "check_failures": self._integrity.failed if self._integrity else 0,
             }
         if lat.size:
             out["read_ms"] = {
