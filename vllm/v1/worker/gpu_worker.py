@@ -115,9 +115,11 @@ from vllm.v1.worker.extensible_kv_cache import (
     extend_kv_cache,
     grow_kv_cache,
     kv_cache_lent_for_weight_update,
+    kv_cache_shrink_plan,
     measure_kv_cache_blocks,
     pad_kv_cache_segments,
     registers_kv_cache_memory,
+    shrink_kv_cache,
 )
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
@@ -1040,6 +1042,25 @@ class Worker(WorkerBase):
         )
         self.cache_config.num_gpu_blocks = num_blocks
         return num_blocks
+
+    def kv_cache_shrink_plan(self, num_blocks: int) -> dict:
+        """What shrinking the extensible KV cache to num_blocks would release
+        on this rank; changes nothing."""
+        if getattr(self.model_runner, "extensible_kv_cache", None) is None:
+            raise RuntimeError("The KV cache is not extensible.")
+        return kv_cache_shrink_plan(self.model_runner, num_blocks)
+
+    def shrink_kv_cache(self, num_blocks: int) -> int:
+        """Release the extensible KV cache's blocks from num_blocks on, once
+        the scheduler has drained them. Returns the bytes this rank released.
+        """
+        if getattr(self.model_runner, "extensible_kv_cache", None) is None:
+            raise RuntimeError("The KV cache is not extensible.")
+        released = shrink_kv_cache(
+            self.model_runner, num_blocks, reduce_min=_min_across_ranks
+        )
+        self.cache_config.num_gpu_blocks = num_blocks
+        return released
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
