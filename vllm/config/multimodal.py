@@ -349,6 +349,12 @@ class HostTowerOptions:
     tower's weights, for its activations (the engine's startup profile did not
     run a tower that was in host memory)."""
 
+    host_available_floor_gib: float = Field(default=0.0, ge=0)
+    """A `"dynamic"` tower does not move to the accelerators when the host's
+    available memory (Linux MemAvailable), less what the move holds in host
+    memory while it loads, would fall under this many GiB; it stays in host
+    memory and the move is tried again later. `0` (default) does not check."""
+
     shrink_deadline_s: float = Field(default=60.0, ge=0)
     """How long a promotion waits for the KV cache to drain the blocks it
     gives up before it gives up itself (0 waits without limit)."""

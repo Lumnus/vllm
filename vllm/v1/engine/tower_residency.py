@@ -63,6 +63,18 @@ PLACE_CODE = {TowerPlace.DISK: 0.0, TowerPlace.HOST: 1.0, TowerPlace.CARD: 2.0}
 _RESIZE_ACTIVE = ("draining", "releasing", "unfinished")
 
 
+def mem_available_bytes() -> int | None:
+    """The host's MemAvailable (Linux), or None where it cannot be read."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
 class TowerResidency:
     """One dynamic tower's place and the moves between places."""
 
@@ -70,8 +82,11 @@ class TowerResidency:
     POLL_INTERVAL_S = 0.5
     # Seconds a failed promotion holds off the next one.
     FAILURE_HOLD_S = 60.0
-    # Longest wait for a rank's weight read at commit time.
+    # Longest wait for a rank's weight warm up at commit time.
     COMMIT_WAIT_S = 120.0
+    # Longest wait for the ranks' reply to a residency call (the commit gets
+    # COMMIT_WAIT_S on top); a rank that does not answer fails the executor.
+    RPC_TIMEOUT_S = 120.0
 
     def __init__(
         self,
@@ -198,19 +213,23 @@ class TowerResidency:
         self._reason = reason
         self._blocks_before = self._num_blocks()
         logger.info(
-            "Tower %s: moving to the accelerators (%s); every rank stages a copy "
-            "in host memory first.",
+            "Tower %s: moving to the accelerators (%s); every rank measures its "
+            "copy and warms its weights first.",
             self.name,
             reason,
         )
         try:
-            results = self._engine.collective_rpc(
-                "tower_residency_stage", args=(self.name,)
-            )
+            results = self._rpc("tower_residency_stage")
         except Exception as e:
             self._fail(now, f"a rank could not stage its copy: {e}")
             return
         self._card_bytes = max(int(r["bytes"]) for r in results)
+        refusal = self._host_memory_refusal(
+            sum(int(r.get("host_bytes", 0)) for r in results)
+        )
+        if refusal is not None:
+            self._fail(now, refusal)
+            return
         self.phase = TowerPhase.STAGING
         self._last_poll = float("-inf")
         self._publish()
@@ -221,9 +240,7 @@ class TowerResidency:
             return
         self._last_poll = now
         try:
-            results = self._engine.collective_rpc(
-                "tower_residency_poll", args=(self.name,)
-            )
+            results = self._rpc("tower_residency_poll")
         except Exception as e:
             self._fail(now, f"a rank could not report its staging: {e}")
             return
@@ -264,8 +281,10 @@ class TowerResidency:
 
     def _commit(self, now: float) -> None:
         try:
-            results = self._engine.collective_rpc(
-                "tower_residency_commit", args=(self.name, self.COMMIT_WAIT_S)
+            results = self._rpc(
+                "tower_residency_commit",
+                self.COMMIT_WAIT_S,
+                timeout=self.COMMIT_WAIT_S + self.RPC_TIMEOUT_S,
             )
         except Exception as e:
             self._release_everywhere()
@@ -291,7 +310,7 @@ class TowerResidency:
 
     def _fail(self, now: float, why: str) -> None:
         try:
-            self._engine.collective_rpc("tower_residency_discard", args=(self.name,))
+            self._rpc("tower_residency_discard")
         except Exception:
             logger.exception("Tower %s: dropping the staged copies failed.", self.name)
         self.phase = TowerPhase.STEADY
@@ -320,13 +339,11 @@ class TowerResidency:
 
     def _release_everywhere(self) -> int:
         try:
-            results = self._engine.collective_rpc(
-                "tower_residency_release", args=(self.name,)
-            )
+            results = self._rpc("tower_residency_release")
         except Exception:
             logger.exception(
-                "Tower %s: a rank could not drop its accelerator copy; that "
-                "memory stays taken. Requests are served from host memory.",
+                "Tower %s: a rank did not confirm that its accelerator copy is "
+                "gone. Requests are served from host memory.",
                 self.name,
             )
             return 0
@@ -387,6 +404,30 @@ class TowerResidency:
     # Helpers
     # ------------------------------------------------------------------
 
+    def _rpc(self, method: str, *args: Any, timeout: float | None = None) -> list:
+        return self._engine.collective_rpc(
+            method,
+            timeout=self.RPC_TIMEOUT_S if timeout is None else timeout,
+            args=(self.name, *args),
+        )
+
+    def _host_memory_refusal(self, host_bytes: int) -> str | None:
+        """Why the host cannot take the staging now, or None. The ranks hold
+        at most host_bytes together while they load (one tensor each)."""
+        floor = int(self.options.host_available_floor_gib * (1 << 30))
+        if floor <= 0:
+            return None
+        available = mem_available_bytes()
+        if available is None:
+            return None
+        if available - host_bytes >= floor:
+            return None
+        return (
+            f"host memory: {available / (1 << 30):.2f} GiB available, the "
+            f"copies need {host_bytes / (1 << 30):.2f} GiB while they load, and "
+            f"{self.options.host_available_floor_gib:.2f} GiB must stay available"
+        )
+
     def _num_blocks(self) -> int:
         return int(self._engine.vllm_config.cache_config.num_gpu_blocks)
 
@@ -444,6 +485,10 @@ class TowerResidency:
             demotions=float(self.demotions),
             failed_promotions=float(self.failed_promotions),
         )
+        # The gauges move now, not with the next step's output.
+        publish = getattr(self._engine, "_publish_scheduler_stats", None)
+        if publish is not None:
+            publish()
 
     def record(self) -> dict[str, Any]:
         return {

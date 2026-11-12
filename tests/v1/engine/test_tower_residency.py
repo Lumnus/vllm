@@ -19,6 +19,8 @@ from vllm.v1.engine.tower_residency import (
 
 TOWER = "vision_tower"
 TOWER_BYTES = 6 * MIB
+HOST_BYTES = 512 * MIB  # per rank, while it loads
+GIB = 1 << 30
 
 
 class Clock:
@@ -76,9 +78,11 @@ class FakeRanks:
         self.polls = 0
         self.read_error: str | None = None
         self.fail: dict[str, int] = {}  # method -> rank that raises
+        self.timeouts: dict[str, float | None] = {}
 
     def __call__(self, method, timeout=None, args=(), kwargs=None):
         self.executor.calls.append(method.removeprefix("tower_residency_"))
+        self.timeouts[method] = timeout
         results = []
         error: Exception | None = None
         for rank in range(len(self.state)):
@@ -98,7 +102,11 @@ class FakeRanks:
         if method == "tower_residency_stage":
             if self.state[rank] != "card":
                 self.state[rank] = "staged"
-            return {"bytes": TOWER_BYTES, "on_card": self.state[rank] == "card"}
+            return {
+                "bytes": TOWER_BYTES,
+                "host_bytes": HOST_BYTES,
+                "on_card": self.state[rank] == "card",
+            }
         if method == "tower_residency_poll":
             if rank == 0:
                 self.polls += 1
@@ -472,6 +480,82 @@ def test_the_host_copy_goes_to_disk_after_the_idle_time():
     _step(env, 2800)
     assert env.tower.place == TowerPlace.DISK
     assert env.delegate.host.releases == 2
+
+
+def _available(monkeypatch, gib: float | None) -> None:
+    import vllm.v1.engine.tower_residency as module
+
+    monkeypatch.setattr(
+        module,
+        "mem_available_bytes",
+        lambda: None if gib is None else int(gib * GIB),
+    )
+
+
+def test_too_little_host_memory_keeps_the_tower_on_the_host(monkeypatch, caplog):
+    # Two ranks hold 0.5 GiB each while they load: 26.5 - 1 < 26.
+    _available(monkeypatch, 26.5)
+    env = _setup(host_available_floor_gib=26)
+    caplog.set_level(logging.WARNING, logger="vllm.v1.engine.tower_residency")
+    _image(env, 1000)
+    _image(env, 1001)
+    _step(env, 1001)
+    assert env.tower.place == TowerPlace.HOST
+    assert env.executor.calls == ["stage", "discard"]
+    assert env.scheduler.events == []  # the KV cache was not touched
+    warnings = [r.getMessage() for r in caplog.records]
+    assert len(warnings) == 1 and "26.00 GiB must stay available" in warnings[0]
+    assert env.delegate.stats["failed_promotions"] == 1.0
+
+
+def test_enough_host_memory_moves_the_tower(monkeypatch):
+    _available(monkeypatch, 27.5)
+    env = _setup(host_available_floor_gib=26)
+    _image(env, 1000)
+    _image(env, 1001)
+    _step(env, 1001)
+    assert env.tower.place == TowerPlace.CARD
+
+
+@pytest.mark.parametrize("gib", [None, 1.0])
+def test_without_a_floor_or_meminfo_nothing_is_checked(monkeypatch, gib):
+    _available(monkeypatch, gib)
+    env = _setup()  # floor 0
+    _image(env, 1000)
+    _image(env, 1001)
+    _step(env, 1001)
+    assert env.tower.place == TowerPlace.CARD
+
+
+def test_every_residency_call_has_a_deadline():
+    env = _setup()
+    _image(env, 1000)
+    _image(env, 1001)
+    _step(env, 1001)
+    _step(env, 1001 + 1800)
+    timeouts = env.ranks.timeouts
+    assert set(timeouts) == {
+        "tower_residency_stage",
+        "tower_residency_poll",
+        "tower_residency_commit",
+        "tower_residency_release",
+    }
+    assert all(t is not None and t > 0 for t in timeouts.values())
+    assert timeouts["tower_residency_commit"] > timeouts["tower_residency_stage"]
+
+
+def test_each_transition_sends_the_stats_at_once():
+    env = _setup()
+    sent = []
+    env.core._publish_scheduler_stats = lambda: sent.append(
+        env.delegate.stats["location"]
+    )
+    _image(env, 1000)
+    _image(env, 1001)
+    _step(env, 1001)
+    assert sent[-1] == 2.0
+    _step(env, 1001 + 1800)
+    assert sent[-1] == 1.0
 
 
 def test_a_failing_step_does_not_stop_the_engine(monkeypatch):
