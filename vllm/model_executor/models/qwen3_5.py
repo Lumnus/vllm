@@ -470,6 +470,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
 )
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid):
     supports_multimodal_pruning = True
+    supports_host_tower = True
 
     hf_to_vllm_mapper = (
         Qwen3VLForConditionalGeneration.hf_to_vllm_mapper
@@ -516,6 +517,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
                 input_norm=build_mm_input_norm(self.model_config),
                 prefix=maybe_prefix(prefix, "visual"),
             )
+
+        if getattr(multimodal_config, "mm_encoder_host_twin", None) is not None:
+            # Host-tower copy: the tower above is all it holds.
+            self.language_model = self._omit_language_model("language_model")
+            return
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3_5ForCausalLM(

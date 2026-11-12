@@ -7,6 +7,7 @@ from bisect import bisect_right
 from collections.abc import (
     AsyncGenerator,
     Callable,
+    Collection,
     Hashable,
     Mapping,
     MutableSequence,
@@ -234,6 +235,20 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
     Set internally by `_mark_tower_model`.
     """
 
+    _tower_modalities: dict[str, frozenset[str]] = {}
+    """
+    The modalities each tower serves, by tower name.
+    Set internally by `_mark_tower_model`.
+    """
+
+    supports_host_tower: ClassVar[bool] = False
+    """
+    A flag that indicates whether this model supports
+    `multimodal_config.mm_encoder_host_towers`: built from a config with
+    `mm_encoder_host_twin` set, it constructs that tower alone, without the
+    language model, and `embed_multimodal` then runs in host memory.
+    """
+
     _has_oov_mm_tokens: bool = False
     """
     In general, this should be set at init time by invoking
@@ -345,6 +360,19 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
 
         self._language_model_names = children_names
 
+    def _omit_language_model(self, *names: str) -> nn.Module:
+        """Record the language model components `names` as left out and return
+        the placeholder to assign in their place.
+
+        For a host-tower copy (`mm_encoder_host_twin`), which is built outside
+        the model-parallel world: unlike `_mark_language_model` in
+        `--mm-encoder-only` mode, the language model is not constructed at all.
+        """
+        from .utils import StageMissingLayer
+
+        self._language_model_names = list(names)
+        return StageMissingLayer("language_model")
+
     @contextmanager
     def _mark_tower_model(
         self,
@@ -366,6 +394,10 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
         Marked components are also routed through the active offloader (when
         it supports tower offloading), since `make_layers` only ever sees the
         decoder layer stack.
+
+        A tower named in `mm_encoder_host_towers` is skipped as well: it lives
+        in host memory, in a copy of this model built with
+        `mm_encoder_host_twin` set, which in turn skips every other tower.
         """
         from vllm.distributed import get_pp_group
         from vllm.model_executor.offloader import get_offloader
@@ -381,6 +413,16 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
             stage_name = "_".join([*modalities, "tower"])
 
         mm_config = vllm_config.model_config.get_multimodal_config()
+        host_twin = getattr(mm_config, "mm_encoder_host_twin", None)
+        host_towers = getattr(mm_config, "mm_encoder_host_towers", None)
+        is_host_twin = isinstance(host_twin, str)
+        if is_host_twin:
+            # A host-tower copy holds that one tower only.
+            lives_elsewhere = stage_name != host_twin
+        else:
+            lives_elsewhere = (
+                isinstance(host_towers, dict) and stage_name in host_towers
+            )
 
         with collect_children(self, targets=targets) as children_names:  # noqa: SIM117
             with (
@@ -390,18 +432,23 @@ class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
                     targets=targets,
                 )
                 if all(mm_config.get_limit_per_prompt(m) == 0 for m in modalities)
+                or lives_elsewhere
                 or not get_pp_group().is_first_rank
                 else nullcontext()
             ):
                 yield
 
         self._tower_model_names = children_names
+        self._tower_modalities = {
+            **self._tower_modalities,
+            stage_name: frozenset(modalities),
+        }
 
         # Towers are constructed directly, so `make_layers` never routes them
         # through the offloader. Do it here, at the same construction stage,
         # so offloaded tower weights are never allocated on the device.
         offloader = get_offloader()
-        if offloader.supports_tower_offload:
+        if offloader.supports_tower_offload and not is_host_twin:
             for name in children_names:
                 modules = (module for module in [attrgetter(name)(self)])
                 offloader.wrap_modules(modules, prefix=name)
@@ -617,6 +664,24 @@ def requires_raw_input_tokens(model: type[object] | object) -> bool:
 
 def supports_multimodal_encoder_tp_data(model: type[object] | object) -> bool:
     return getattr(model, "supports_encoder_tp_data", False)
+
+
+def supports_host_tower(model: type[object] | object) -> bool:
+    return getattr(model, "supports_host_tower", False)
+
+
+def get_host_tower_modalities(
+    model: object, host_towers: Collection[str]
+) -> frozenset[str]:
+    """The modalities of `model` whose tower is one of `host_towers`, i.e. is
+    kept in host memory rather than in this model."""
+    towers: dict[str, frozenset[str]] = getattr(model, "_tower_modalities", {})
+    return frozenset(
+        modality
+        for name, modalities in towers.items()
+        if name in host_towers
+        for modality in modalities
+    )
 
 
 @overload
