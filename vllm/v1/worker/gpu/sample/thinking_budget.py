@@ -152,7 +152,10 @@ def _load_effective_token(
     return tl.load(input_ids_ptr + input_pos)
 
 
-@triton.jit
+# The request ids arrive as a slice of the batch's index mapping, so the base
+# pointer's alignment varies; it is a scalar load, and specialising on it would
+# only compile further variants on a request.
+@triton.jit(do_not_specialize_on_alignment=["req_ids_ptr"])
 def _update_committed_marker_cache_kernel(
     req_ids_ptr,
     thinking_token_budget_ptr,
@@ -250,7 +253,15 @@ def _update_committed_marker_cache_kernel(
     tl.store(cached_scan_pos_ptr + req_state_idx, new_scan_pos)
 
 
-@triton.jit
+# Same for the per-logit index, position and input-id rows: scalar loads from
+# gathered or sliced tensors.
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "expanded_idx_mapping_ptr",
+        "input_ids_ptr",
+        "expanded_local_pos_ptr",
+    ]
+)
 def _thinking_budget_kernel(
     logits_ptr,
     logits_stride,
