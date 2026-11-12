@@ -730,7 +730,8 @@ class Qwen3_VisionTransformer(nn.Module):
         pinned = torch.empty(
             (num_pos, pos_ids[0].shape[1]),
             dtype=pos_ids[0].dtype,
-            pin_memory=PIN_MEMORY,
+            # Pinning only serves the copy to an accelerator.
+            pin_memory=PIN_MEMORY and self.device.type != "cpu",
         )
         pos_ids = torch.cat(pos_ids, dim=0, out=pinned).to(
             self.device, non_blocking=True
@@ -747,8 +748,12 @@ class Qwen3_VisionTransformer(nn.Module):
     def fast_pos_embed_interpolate(
         self, grid_thw: Sequence[Sequence[int]]
     ) -> torch.Tensor:
+        # The Triton kernel runs on the accelerator; a tower whose weights are
+        # in host memory takes the eager path.
         interpolate_fn = (
-            triton_pos_embed_interpolate if HAS_TRITON else pos_embed_interpolate_native
+            triton_pos_embed_interpolate
+            if HAS_TRITON and self.device.type != "cpu"
+            else pos_embed_interpolate_native
         )
         outputs = []
         for t, h, w in grid_thw:
@@ -1969,6 +1974,7 @@ class Qwen3VLForConditionalGeneration(
     supports_encoder_tp_data = True
     supports_tower_connector_lora = True
     supports_mm_device_do_normalize = True
+    supports_host_tower = True
 
     supported_video_pruning_methods = ("evs", "vidcom2")
 
@@ -2045,6 +2051,11 @@ class Qwen3VLForConditionalGeneration(
             # Tracks the valid token span currently stored in the buffer.
             # Zero means there is no active deepstack payload to consume.
             self.deepstack_input_embeds_num_tokens = 0
+
+        if getattr(multimodal_config, "mm_encoder_host_twin", None) is not None:
+            # Host-tower copy: the tower above is all it holds.
+            self.language_model = self._omit_language_model("language_model")
+            return
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen3LLMForCausalLM(

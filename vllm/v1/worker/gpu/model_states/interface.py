@@ -10,6 +10,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.models.interfaces import (
     SupportsEncoderCudaGraph,
+    get_host_tower_modalities,
     supports_encoder_cudagraph,
 )
 from vllm.tasks import GenerationTask
@@ -81,7 +82,11 @@ class ModelState(ABC):
 
             self.encoder_cache = encoder_cache
             observability_config = vllm_config.observability_config
+            mm_config = self.model_config.multimodal_config
             self.encoder_runner = EncoderRunner(
+                host_modalities=get_host_tower_modalities(
+                    model, getattr(mm_config, "mm_encoder_host_towers", ())
+                ),
                 model=self.model,
                 max_num_tokens=self.max_num_tokens,
                 hidden_size=self.inputs_embeds_size,

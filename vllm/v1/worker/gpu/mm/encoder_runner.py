@@ -42,8 +42,12 @@ class EncoderRunner:
         device: torch.device,
         cudagraph_manager: "EncoderCudaGraphManager | None" = None,
         enable_timing: bool = False,
+        host_modalities: Collection[str] = (),
     ):
         self.model = model
+        # Modalities whose tower is kept in host memory: this runner only
+        # receives their embeddings.
+        self.host_modalities = frozenset(host_modalities)
         self.max_num_tokens = max_num_tokens
         self.hidden_size = hidden_size
         self.encoder_cache = encoder_cache
@@ -135,6 +139,30 @@ class EncoderRunner:
             max_mm_items_per_batch,
             dummy_modality,
         )
+
+        if dummy_modality in self.host_modalities:
+            # The tower is not on this device, so there is no encoder
+            # activation to profile. Its outputs still land in the encoder
+            # cache: reserve that.
+            logger.info_once(
+                "The %s tower is kept in host memory: profiling the encoder "
+                "cache without an encoder run.",
+                dummy_modality,
+            )
+            num_embeds = budget.mm_max_toks_per_item[dummy_modality]
+            self.encoder_cache.encoder_outputs.update(
+                (
+                    f"tmp_{i}",
+                    torch.zeros(
+                        num_embeds,
+                        self.hidden_size,
+                        dtype=self.dtype,
+                        device=self.device,
+                    ),
+                )
+                for i in range(max_mm_items_per_batch)
+            )
+            return
 
         dummy_encoder_outputs = self.execute_mm_encoder(dummy_mm_inputs)
 

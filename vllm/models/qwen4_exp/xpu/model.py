@@ -1775,6 +1775,7 @@ class Qwen4ExpForConditionalGeneration(
 
     requires_raw_input_tokens = True
     supports_multimodal_pruning = True
+    supports_host_tower = True
     is_3d_moe_weight: ClassVar[bool] = True
 
     packed_modules_mapping = Qwen3VLForConditionalGeneration.packed_modules_mapping | {
@@ -1836,6 +1837,11 @@ class Qwen4ExpForConditionalGeneration(
                     input_norm=build_mm_input_norm(self.model_config),
                     prefix=maybe_prefix(prefix, "visual"),
                 )
+
+        if getattr(multimodal_config, "mm_encoder_host_twin", None) is not None:
+            # Host-tower copy: the tower above is all it holds.
+            self.language_model = self._omit_language_model("language_model")
+            return
 
         with self._mark_language_model(vllm_config):
             self.language_model = Qwen4ExpForCausalLM(
