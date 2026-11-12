@@ -220,12 +220,14 @@ def test_resize_only_grows_the_scheduler_when_the_workers_did():
     executor = RecordingExecutor(resize_to=10)
     scheduler = FakeScheduler(executor, [])
     core = _make_core(executor, scheduler)
-    assert EngineCore.resize_kv_cache(core, 25) == 10
+    record = EngineCore.resize_kv_cache(core, 25)
+    assert record["num_blocks"] == 10 and record["state"] == "unchanged"
     assert scheduler.grown_to == []
     assert core.vllm_config.cache_config.num_gpu_blocks == 10
 
     executor.resize_to = 25
-    assert EngineCore.resize_kv_cache(core, 25) == 25
+    record = EngineCore.resize_kv_cache(core, 25)
+    assert record["num_blocks"] == 25 and record["state"] == "finished"
     assert scheduler.grown_to == [25]
 
 
