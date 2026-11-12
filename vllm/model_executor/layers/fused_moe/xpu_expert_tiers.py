@@ -651,17 +651,44 @@ class ExpertTiers:
     def _fill_rows(self, reads: Mapping[int, int], rows: Mapping[int, int]) -> None:
         """Read the units of ``reads`` (slot -> logical expert) into the pool
         rows ``rows`` (slot -> row), all in flight at once."""
+        from concurrent.futures import TimeoutError as ReadTimeout
+
+        from vllm.model_executor.offloader.expert_store import ExpertStoreError
+
         binding, _, _ = self._require_store()
         store = binding.session.store
-        futures = []
-        for slot, logical in reads.items():
-            row = rows[slot]
-            dests = {k: _u8(t)[row] for k, t in self.slow.items()}
-            futures.append(
-                store.read_into_async((binding.store_layer, int(logical)), dests)
-            )
-        for future in futures:
-            future.result()
+        timeout = binding.session.config.read_timeout_s
+        pending: list[tuple[int, tuple[int, int], Any]] = []
+        try:
+            for slot, logical in reads.items():
+                row = rows[slot]
+                key = (binding.store_layer, int(logical))
+                dests = {k: _u8(t)[row] for k, t in self.slow.items()}
+                pending.append((row, key, store.read_into_async(key, dests)))
+            deadline = time.monotonic() + timeout
+            for _, _, future in pending:
+                future.result(max(0.0, deadline - time.monotonic()))
+        except BaseException as exc:
+            # Reads not started are cancelled; the ones under way may still
+            # write their rows, which the placement then holds until they
+            # are done.
+            in_flight = {
+                row: future
+                for row, _, future in pending
+                if not future.cancel() and not future.done()
+            }
+            if isinstance(exc, ReadTimeout):
+                stuck = [key for _, key, future in pending if not future.done()]
+                error = ExpertStoreError(
+                    f"{self.layer_name}: {len(stuck)} of {len(pending)} unit "
+                    f"reads did not return within {timeout:g} s (first: unit "
+                    f"{stuck[0] if stuck else '?'}): the drive or the store's "
+                    "reader threads are stuck"
+                )
+                error.rows_in_flight = in_flight  # type: ignore[attr-defined]
+                raise error from None
+            exc.rows_in_flight = in_flight  # type: ignore[attr-defined]
+            raise
 
     def _copy_rows(self, slot: int, pool_row: int, fast_row: int) -> None:
         """Enqueue the copy of one expert's bytes from a pool row into a fast

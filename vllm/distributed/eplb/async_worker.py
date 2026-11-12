@@ -175,6 +175,7 @@ def _transfer_cycle(
 
             transfer_metadata = None
             prepared = None
+            abandoned = False
             mover = (
                 None if model_state.movers is None else model_state.movers[layer_idx]
             )
@@ -183,12 +184,28 @@ def _transfer_cycle(
                 # (this rank only); nothing crosses ranks.
                 assert model_state.plan_load is not None
                 started = time.perf_counter()
-                prepared = mover.prepare(
-                    physical_to_logical_map_cpu[layer_idx].numpy(),
-                    new_physical_to_logical_map[layer_idx].numpy(),
-                    model_state.plan_load[layer_idx].float().numpy(),
-                    state.parallel_config.eplb_config.tier_hysteresis,
-                )
+                try:
+                    prepared = mover.prepare(
+                        physical_to_logical_map_cpu[layer_idx].numpy(),
+                        new_physical_to_logical_map[layer_idx].numpy(),
+                        model_state.plan_load[layer_idx].float().numpy(),
+                        state.parallel_config.eplb_config.tier_hysteresis,
+                    )
+                except Exception:
+                    # A rearrangement is optional work: a read that failed or
+                    # did not return must not take serving down. Nothing was
+                    # mapped and the mover gave its rows back; the ranks agree
+                    # (in the step hook) to leave this layer and the rest of
+                    # the cycle as they are.
+                    abandoned = True
+                    logger.exception(
+                        "EPLB layer %d (EP rank %d): the layer could not "
+                        "prepare its move after %.1f s; abandoning the "
+                        "rearrangement from this layer on",
+                        layer_idx,
+                        ep_rank,
+                        time.perf_counter() - started,
+                    )
                 logger.debug(
                     "EPLB layer %d prepared in %.1f ms",
                     layer_idx,
@@ -232,6 +249,7 @@ def _transfer_cycle(
                 transfer_metadata=transfer_metadata,
                 consumed_event=consumed_event,
                 prepared=prepared,
+                abandoned=abandoned,
             )
             # A fault recovery happened during the transfer, so the main
             # thread will never consume this result. Drop it and abandon

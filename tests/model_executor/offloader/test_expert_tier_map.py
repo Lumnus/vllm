@@ -317,6 +317,38 @@ def test_a_failed_fill_returns_its_rows():
     assert layer.placement.pool.free_count == free
 
 
+def test_rows_a_failed_fill_may_still_write_are_held_until_its_reads_end():
+    """A fill that fails while some of its reads are still under way: their
+    rows are not handed out again before the reads are done, or a later move
+    could be given a row a stale read then overwrites."""
+    from concurrent.futures import Future
+
+    layer = _Layer(S=8, F=3, spare=3)
+    new = layer.logical.copy()
+    new[4], new[5] = 10, 11
+    plan = layer.placement.plan(layer.logical, new, np.ones(layer.S), 1.1)
+    stale: Future = Future()
+    taken: dict[int, int] = {}
+
+    def fails_with_a_read_under_way(reads, rows):
+        taken.update(rows)
+        error = OSError("one unit failed")
+        error.rows_in_flight = {rows[5]: stale}  # type: ignore[attr-defined]
+        raise error
+
+    pool = layer.placement.pool
+    assert pool.free_count == 3
+    with pytest.raises(OSError):
+        layer.placement.prepare(plan, fails_with_a_read_under_way)
+    assert pool.free_count == 2 and pool.quarantined == 1
+    assert taken[5] not in pool.free_rows()
+    with pytest.raises(RowsUnavailable):
+        pool.acquire(3)
+    stale.set_result("direct")  # the stale read has finished writing
+    assert pool.free_count == 3 and taken[5] in pool.free_rows()
+    layer.placement.check()
+
+
 def test_demote_promote_swap_leave_every_slot_mapped_once():
     layer = _Layer(S=6, F=2, spare=2, num_logical=6)
     p = layer.placement

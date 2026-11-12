@@ -262,6 +262,12 @@ class EplbModelState:
     rearrangement_stats: dict[str, float] = field(default_factory=dict)
     """Units and bytes read and milliseconds spent by the movers since the
     last log line of a store-backed rearrangement."""
+    abandon_votes: int = 0
+    """Ranks whose mover could not prepare the pending layer, as of the last
+    `_all_ranks_result_ready` that answered true (the same on every rank)."""
+    abandoned_rearrangements: int = 0
+    """Rearrangements the ranks agreed to stop because a mover could not
+    prepare a layer."""
 
 
 class EplbState:
@@ -992,15 +998,7 @@ class EplbState:
             # Run _move_to_workspace if all ranks have finished transferring the
             # new weights to the intermediate buffer
             for eplb_model_state in self.model_states.values():
-                # rebalanced must remain consistent amongst all ranks otherwise the
-                # all_reduce in _all_ranks_result_ready will hang
-                if eplb_model_state.rebalanced and self._all_ranks_result_ready(
-                    eplb_model_state
-                ):
-                    _move_to_workspace(
-                        model_state=eplb_model_state,
-                        ep_rank=ep_group.rank(),
-                    )
+                self._consume_async_result(eplb_model_state, ep_group.rank())
 
         if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
             if self.is_async and any(
@@ -1429,22 +1427,43 @@ class EplbState:
                     model_key,
                 )
 
+    def _consume_async_result(self, model_state: EplbModelState, ep_rank: int) -> None:
+        """The step hook's part of an async rearrangement, for one model: once
+        every rank has the pending layer's result, commit it, or, if any
+        rank's mover could not prepare it, leave the layer and the rest of
+        the cycle as they are. The same branch on every rank at the same
+        step."""
+        # rebalanced must remain consistent amongst all ranks otherwise the
+        # all_reduce in _all_ranks_result_ready will hang
+        if not (model_state.rebalanced and self._all_ranks_result_ready(model_state)):
+            return
+        if model_state.abandon_votes:
+            _abandon_layer(model_state=model_state, ep_rank=ep_rank)
+        else:
+            _move_to_workspace(model_state=model_state, ep_rank=ep_rank)
+
     def _all_ranks_result_ready(self, model_state: EplbModelState) -> bool:
+        result = model_state.pending_result
         flags = torch.tensor(
             (
                 int(self.async_worker_error is not None),
-                int(model_state.pending_result is None),
+                int(result is None),
+                int(result is not None and result.abandoned),
             ),
             dtype=torch.int32,
             device="cpu",
         )
-        # cpu_all_reduce_ only sums, so count failed and pending ranks.
+        # cpu_all_reduce_ only sums, so count failed, pending and abandoning
+        # ranks.
         get_ep_group().cpu_all_reduce_(flags)
-        num_failed, num_pending = flags.tolist()
+        num_failed, num_pending, num_abandoning = flags.tolist()
         if num_failed:
             raise RuntimeError(
                 "Async EPLB worker failed on at least one rank; see the worker logs."
             ) from self.async_worker_error
+        if num_pending == 0:
+            # Only meaningful once every rank has its result.
+            model_state.abandon_votes = num_abandoning
         return num_pending == 0
 
     def _allreduce_list(self, tensor_list: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -1813,6 +1832,45 @@ def _commit_eplb_maps(
     if PIN_MEMORY:
         src = src.pin_memory()
     dst.copy_(src, non_blocking=True)
+
+
+def _abandon_layer(
+    model_state: EplbModelState,
+    ep_rank: int,
+) -> None:
+    """Every rank has the pending layer's result and at least one rank's mover
+    could not prepare it: nobody commits the layer. This rank gives back what
+    it prepared, and the cycle ends here on every rank (the worker's next
+    coordinated flag sees `rebalanced` false everywhere). Layers already
+    committed keep the new placement, this layer and the later ones keep the
+    old one, and EPLB's maps agree with both; the next rearrangement plans
+    from there."""
+    result = model_state.pending_result
+    assert result is not None
+    if result.prepared is not None and model_state.movers is not None:
+        mover = model_state.movers[result.layer_idx]
+        assert mover is not None
+        mover.discard(result.prepared)
+    model_state.abandoned_rearrangements += 1
+    logger.warning(
+        "EPLB (EP rank %d): rearrangement of %s abandoned at layer %d of %d: "
+        "%d rank(s) could not prepare the layer (%s). Nothing of it was "
+        "mapped; serving continues on the current placement.",
+        ep_rank,
+        model_state.model_name,
+        result.layer_idx,
+        model_state.model.num_moe_layers,
+        model_state.abandon_votes,
+        "this rank among them, see the error above"
+        if result.abandoned
+        else "see their logs",
+    )
+    model_state.rebalanced = False
+    model_state.abandon_votes = 0
+    model_state.rearrangement_stats.clear()
+    # Reset pending_result before unblocking the async worker
+    model_state.pending_result = None
+    result.consumed_event.record()
 
 
 def _move_to_workspace(

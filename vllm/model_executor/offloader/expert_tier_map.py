@@ -32,6 +32,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -172,7 +173,11 @@ class RowAllocator:
             return
         keep = []
         for row, event in self._quarantine:
-            if event is None or self._done(event):
+            if isinstance(event, Future):
+                finished = event.done()  # a host read still writing the row
+            else:
+                finished = event is None or self._done(event)
+            if finished:
                 self._free.append(row)
             else:
                 keep.append((row, event))
@@ -197,7 +202,8 @@ class RowAllocator:
 
     def release(self, rows: Iterable[int], event: Any) -> None:
         """Give rows back, unmapped as of ``event`` (None: nothing can read
-        them)."""
+        them). ``event`` may also be the future of a host read that may still
+        write the rows: they are free once it is done."""
         with self._lock:
             for row in rows:
                 self._quarantine.append((int(row), event))
@@ -457,15 +463,22 @@ class TierPlacement:
         """Take pool rows for the plan's reads, call ``fill(reads, rows)``
         (``reads``: slot -> logical expert; ``rows``: slot -> pool row) to put
         the bytes there, and choose fast rows. On a failure of ``fill`` the
-        rows go back and the error propagates."""
+        rows go back and the error propagates. A failed ``fill`` whose reads
+        may still be writing some rows names them in the error's
+        ``rows_in_flight`` (row -> the read's future): those rows are held
+        until their read is done, so a later move cannot be handed a row a
+        stale read then overwrites."""
         slots = sorted(plan.reads)
         rows = self.pool.acquire(len(slots), timeout=timeout)
         pool_dest = dict(zip(slots, rows))
         try:
             fill(plan.reads, pool_dest)
             return self._assign(plan, pool_dest)
-        except BaseException:
-            self.pool.give_back_unused(rows)
+        except BaseException as exc:
+            busy: Mapping[int, Any] = getattr(exc, "rows_in_flight", None) or {}
+            self.pool.give_back_unused([r for r in rows if r not in busy])
+            for row, read in busy.items():
+                self.pool.release([row], read)
             raise
 
     def _assign(self, plan: MovePlan, pool_dest: dict[int, int]) -> PreparedMove:
