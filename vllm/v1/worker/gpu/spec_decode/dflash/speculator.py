@@ -197,6 +197,16 @@ class DFlashSpeculator(DraftModelSpeculator):
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
 
+    def forget_block_ids_from(self, num_blocks: int) -> None:
+        """Turn context slots in blocks at or above num_blocks into padding,
+        before those blocks are unmapped. Rows a step uses are rewritten by
+        the step; the kernel-block copies are recomputed from these."""
+        for i, gid in enumerate(self.draft_kv_cache_group_ids):
+            slots = self._context_slot_mappings[i]
+            limit = num_blocks * self.block_tables.block_sizes[gid]
+            slots.masked_fill_(slots >= limit, PAD_SLOT_ID)
+        self._kernel_context_slot_mappings.fill_(PAD_SLOT_ID)
+
     def _prepare_graph_forward(
         self, num_reqs: int, attn_metadata: dict[str, Any] | None
     ) -> None:
