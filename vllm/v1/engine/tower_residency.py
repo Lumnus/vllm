@@ -129,8 +129,12 @@ class TowerResidency:
             self.place == TowerPlace.HOST and self.options.idle_location == "disk"
         ):
             deadlines.append(self.last_use + self.options.demote_idle_s)
-        if len(self.arrivals) >= self.options.promote_after:
-            deadlines.append(max(self.hold_until, now))
+        if (
+            self.place != TowerPlace.CARD
+            and len(self.arrivals) >= self.options.promote_after
+        ):
+            # Held off after a failure, or waiting for another resize.
+            deadlines.append(max(self.hold_until, now + self.POLL_INTERVAL_S))
         if not deadlines:
             return None
         return max(0.0, min(deadlines) - now) + 0.01
