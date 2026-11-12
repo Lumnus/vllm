@@ -461,6 +461,63 @@ def ensure_kv_cache_blocks(runner: "GPUModelRunner", num_blocks: int) -> None:
         kv_cache.commit(num_blocks)
 
 
+def rebind_committed_views(runner: "GPUModelRunner") -> None:
+    """Point the runner at views over the committed blocks of its extensible
+    KV cache, the count in `runner.kv_cache_config.num_blocks`.
+
+    The views have the addresses of the allocation they replace, so graphs
+    captured against it stay valid. The KV connector is not touched.
+    """
+    kv_cache = runner.extensible_kv_cache
+    assert kv_cache is not None
+    forward_context = runner.compilation_config.static_forward_context
+    committed = kv_cache.committed_views(
+        runner.kv_cache_config,
+        runner.cache_config.get_resolved_kv_cache_layout(),
+        runner.kernel_block_sizes,
+    )
+    if committed is not None:
+        if runner.vllm_config.attention_config.hisparse_config is not None:
+            rebind_hisparse_device_caches(
+                forward_context=forward_context,
+                kv_cache_config=runner.kv_cache_config,
+                kv_caches=committed,
+            )
+        # As in `initialize_kv_cache`, draft groups map their views too.
+        attn_groups = [
+            group
+            for groups in runner.attn_groups
+            + getattr(runner.speculator, "attn_groups", [])
+            for group in groups
+        ]
+        bind_kv_caches(
+            committed,
+            forward_context,
+            runner.kv_cache_config,
+            runner.vllm_config,
+            attn_groups,
+        )
+        runner.kv_caches_by_layer = {
+            name: committed.get(name, view)
+            for name, view in runner.kv_caches_by_layer.items()
+        }
+        runner.kv_caches = [
+            cache
+            for cache in runner.kv_caches_by_layer.values()
+            if cache.device == runner.device
+        ]
+        if runner.vllm_config.cache_config.use_replayssm:
+            from vllm.v1.worker.replayssm_utils import (
+                get_replayssm_block_copy_tensors,
+                initialize_replayssm_ring_trackers,
+            )
+
+            initialize_replayssm_ring_trackers(runner.kv_cache_config, forward_context)
+            runner.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
+                forward_context
+            )
+
+
 def extend_kv_cache(
     runner: "GPUModelRunner", kv_cache_config: KVCacheConfig, num_blocks: int
 ) -> None:
@@ -513,52 +570,7 @@ def extend_kv_cache(
         kv_cache.num_committed_blocks,
         kv_cache.physical_bytes / (1 << 30),
     )
-    forward_context = runner.compilation_config.static_forward_context
-    committed = kv_cache.committed_views(
-        runner.kv_cache_config,
-        runner.cache_config.get_resolved_kv_cache_layout(),
-        runner.kernel_block_sizes,
-    )
-    if committed is not None:
-        if runner.vllm_config.attention_config.hisparse_config is not None:
-            rebind_hisparse_device_caches(
-                forward_context=forward_context,
-                kv_cache_config=runner.kv_cache_config,
-                kv_caches=committed,
-            )
-        # As in `initialize_kv_cache`, draft groups map their views too.
-        attn_groups = [
-            group
-            for groups in runner.attn_groups
-            + getattr(runner.speculator, "attn_groups", [])
-            for group in groups
-        ]
-        bind_kv_caches(
-            committed,
-            forward_context,
-            runner.kv_cache_config,
-            runner.vllm_config,
-            attn_groups,
-        )
-        runner.kv_caches_by_layer = {
-            name: committed.get(name, view)
-            for name, view in runner.kv_caches_by_layer.items()
-        }
-        runner.kv_caches = [
-            cache
-            for cache in runner.kv_caches_by_layer.values()
-            if cache.device == runner.device
-        ]
-        if runner.vllm_config.cache_config.use_replayssm:
-            from vllm.v1.worker.replayssm_utils import (
-                get_replayssm_block_copy_tensors,
-                initialize_replayssm_ring_trackers,
-            )
-
-            initialize_replayssm_ring_trackers(runner.kv_cache_config, forward_context)
-            runner.replayssm_block_copy_tensors = get_replayssm_block_copy_tensors(
-                forward_context
-            )
+    rebind_committed_views(runner)
     runner.kv_connector = get_kv_connector(
         runner.vllm_config, runner.kv_caches_by_layer
     )
