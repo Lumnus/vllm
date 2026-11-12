@@ -56,6 +56,18 @@ def unit_digest(data: Any, index: int, threads: int = 1) -> int:
     )
 
 
+def unit_digest_parts(parts: Any, index: int, threads: int = 1) -> int:
+    """:func:`unit_digest` of the concatenation of ``parts`` (bytes-likes),
+    without joining them: a unit read as separate tensors plus its padding."""
+    hasher = _blake3()
+    key = int(index).to_bytes(32, "little")
+    max_threads = hasher.AUTO if threads == 0 else int(threads)
+    state = hasher(key=key, max_threads=max_threads)
+    for part in parts:
+        state.update(part)
+    return int.from_bytes(state.digest(8), "little")
+
+
 def _write_atomic(path: str, data: bytes) -> None:
     tmp = f"{path}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
     with open(tmp, "wb") as handle:
@@ -174,6 +186,16 @@ class UnitChecker:
     def check(self, index: int, data: Any) -> int | None:
         """None if ``data`` is the unit ``index`` as written, else its digest."""
         got = unit_digest(data, index, self.threads)
+        ok = got == int(self.table[index])
+        with self._lock:
+            self.checked += 1
+            if not ok:
+                self.failed += 1
+        return None if ok else got
+
+    def check_parts(self, index: int, parts: Any) -> int | None:
+        """:meth:`check` for a unit held as consecutive pieces."""
+        got = unit_digest_parts(parts, index, self.threads)
         ok = got == int(self.table[index])
         with self._lock:
             self.checked += 1
