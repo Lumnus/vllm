@@ -35,15 +35,33 @@ class _VirtualBuffer:
     """One device VA reservation and the physical chunks mapped into it.
 
     Memory is committed in granules via `ensure_committed_range`; already-mapped
-    granules are skipped, so ranges may abut or overlap.
+    granules are skipped, so ranges may abut or overlap. A physical object can
+    only be released whole, so with `max_chunk_bytes` each unmapped run is
+    mapped as objects of at most that size (rounded up to a multiple of the
+    granularity), and `release_range` can give back every object wholly inside
+    a range. Without it a run is one object.
     """
 
-    def __init__(self, max_bytes: int, device_index: int) -> None:
+    def __init__(
+        self,
+        max_bytes: int,
+        device_index: int,
+        max_chunk_bytes: int | None = None,
+    ) -> None:
         self._driver = get_vmm_driver()
         self._driver.ensure_context(device_index)
         self.device_index = device_index
 
         self.granularity: int = granule_size(device_index)
+        if max_chunk_bytes is not None and max_chunk_bytes <= 0:
+            raise ValueError(
+                f"max_chunk_bytes must be positive, got {max_chunk_bytes}."
+            )
+        self.max_chunk_bytes: int | None = (
+            None
+            if max_chunk_bytes is None
+            else _round_up(max_chunk_bytes, self.granularity)
+        )
         self.reserved_size: int = _round_up(max(max_bytes, 1), self.granularity)
         self.base_ptr: int = self._driver.reserve(self.reserved_size)
 
@@ -59,8 +77,21 @@ class _VirtualBuffer:
         """Total physically mapped bytes (a multiple of the granularity)."""
         return len(self._mapped_granules) * self.granularity
 
-    def ensure_committed_range(self, start: int, end: int) -> None:
-        """Map physical pages so that the byte range `[start, end)` is backed."""
+    def ensure_committed_range(
+        self,
+        start: int,
+        end: int,
+        chunk_origin: int = 0,
+        whole_runs: bool = False,
+    ) -> None:
+        """Map physical pages so that the byte range `[start, end)` is backed.
+
+        With `max_chunk_bytes` set, each unmapped run is split into objects at
+        multiples of it counted from `chunk_origin` (the granule holding that
+        byte), so a caller that commits a region as a prefix gets the same
+        objects whatever the sizes it commits in. `whole_runs` maps each run as
+        one object regardless.
+        """
         if not 0 <= start <= end:
             raise ValueError(f"Invalid range [{start}, {end}).")
         if end > self.reserved_size:
@@ -72,31 +103,84 @@ class _VirtualBuffer:
             return
         first = start // self.granularity
         last = (end + self.granularity - 1) // self.granularity  # exclusive
+        # All or nothing: whatever this call creates is undone if any of it fails.
+        objects_before = len(self._handles)
+        recorded: list[int] = []
         run_start: int | None = None
-        for g in range(first, last + 1):
-            unmapped = g < last and g not in self._mapped_granules
-            if unmapped and run_start is None:
-                run_start = g
-            elif not unmapped and run_start is not None:
-                offset = run_start * self.granularity
-                size = (g - run_start) * self.granularity
-                self._map_chunk_at(offset, size)
-                # Grant before recording the run as mapped: a failure in a
-                # later run must not leave these granules mapped but
-                # inaccessible, since later commits would skip them.
-                try:
-                    self._grant_access(*self._run_bounds(run_start, g))
-                except Exception:
-                    # The run is not recorded as mapped, so a later commit
-                    # maps it again: take this chunk out first.
-                    handle, _, _ = self._handles.pop()
-                    with suppress(Exception):
-                        self._driver.unmap(self.base_ptr + offset, size)
-                    with suppress(Exception):
-                        self._driver.release(handle)
-                    raise
-                self._mapped_granules.update(range(run_start, g))
-                run_start = None
+        try:
+            for g in range(first, last + 1):
+                unmapped = g < last and g not in self._mapped_granules
+                if unmapped and run_start is None:
+                    run_start = g
+                elif not unmapped and run_start is not None:
+                    self._map_run(run_start, g, chunk_origin, whole_runs, recorded)
+                    run_start = None
+        except Exception as error:
+            undo_error = self._undo_call(objects_before, recorded)
+            if undo_error is not None:
+                raise error from undo_error
+            raise
+
+    def _map_run(
+        self,
+        first: int,
+        last: int,
+        chunk_origin: int,
+        whole_run: bool,
+        recorded: list[int],
+    ) -> None:
+        """Map the unmapped granule run `[first, last)` as one or more objects.
+
+        Granules are recorded as mapped (and appended to `recorded`) only once
+        access to the whole run is granted; on a failure nothing of this run is
+        recorded and the caller undoes the objects it created.
+        """
+        size = self.granularity
+        chunk = None if whole_run else self.max_chunk_bytes
+        step = chunk // size if chunk else 0
+        origin = chunk_origin // size
+        mapped_to = first
+        while mapped_to < last:
+            stop = last
+            if step:
+                # Next boundary of the chunk grid strictly after mapped_to.
+                boundary = origin + ((mapped_to - origin) // step + 1) * step
+                stop = min(boundary, last)
+            self._map_chunk_at(mapped_to * size, (stop - mapped_to) * size)
+            mapped_to = stop
+        # Grant before recording the run as mapped: a failure in a later run
+        # must not leave these granules mapped but inaccessible, since later
+        # commits would skip them.
+        self._grant_access(*self._run_bounds(first, last))
+        self._mapped_granules.update(range(first, last))
+        recorded.extend(range(first, last))
+
+    def _undo_call(
+        self, objects_before: int, recorded: list[int]
+    ) -> Exception | None:
+        """Unmap and release the objects a failed `ensure_committed_range`
+        created and forget the granules it recorded. Objects that cannot be
+        released stay in the books, with their granules, so a later call can
+        reuse or release them. Returns the last undo failure, if any."""
+        created = self._handles[objects_before:]
+        kept = self._handles[:objects_before]
+        self._mapped_granules.difference_update(recorded)
+        undo_error: Exception | None = None
+        left: list[tuple[int, int, int]] = []
+        for handle, offset, size in reversed(created):
+            try:
+                self._driver.unmap(self.base_ptr + offset, size)
+                self._driver.release(handle)
+            except Exception as e:  # noqa: BLE001
+                undo_error = e
+                left.append((handle, offset, size))
+                first = offset // self.granularity
+                self._mapped_granules.update(
+                    range(first, first + size // self.granularity)
+                )
+        left.reverse()
+        self._handles = kept + left
+        return undo_error
 
     def _run_bounds(self, first: int, last: int) -> tuple[int, int]:
         """Bounds of the maximal contiguous mapped run covering `[first, last)`."""
@@ -138,6 +222,57 @@ class _VirtualBuffer:
             raise
         # Access is granted by the caller, per contiguous run.
         self._handles.append((handle, offset, size))
+
+    def _objects_within(self, start: int, end: int) -> list[tuple[int, int, int]]:
+        """Mapped physical objects lying wholly inside `[start, end)`."""
+        return [
+            (handle, offset, size)
+            for handle, offset, size in self._handles
+            if start <= offset and offset + size <= end
+        ]
+
+    def releasable_bytes(self, start: int, end: int) -> int:
+        """Bytes `release_range(start, end)` would give back."""
+        if not 0 <= start <= end:
+            raise ValueError(f"Invalid range [{start}, {end}).")
+        return sum(size for _, _, size in self._objects_within(start, end))
+
+    def release_range(self, start: int, end: int) -> int:
+        """Unmap and release the physical objects wholly inside `[start, end)`.
+
+        An object cannot be released in part, so one that straddles `start` or
+        `end` stays mapped: the release rounds inward to whole objects, never
+        outward, and bytes outside the range keep their contents. Returns the
+        bytes released. The caller guarantees nothing reads or writes the
+        range any more; in-flight work on the device is waited for here.
+
+        If a driver call fails, objects already released stay released and the
+        bookkeeping matches the device.
+        """
+        if not 0 <= start <= end:
+            raise ValueError(f"Invalid range [{start}, {end}).")
+        doomed = self._objects_within(start, end)
+        if not doomed:
+            return 0
+        driver = self._driver
+        driver.ensure_context(self.device_index)
+        torch.accelerator.synchronize(self.device_index)
+        released = 0
+        done: set[int] = set()
+        try:
+            for handle, offset, size in doomed:
+                driver.unmap(self.base_ptr + offset, size)
+                done.add(handle)
+                self._mapped_granules.difference_update(
+                    range(
+                        offset // self.granularity, (offset + size) // self.granularity
+                    )
+                )
+                released += size
+                driver.release(handle)
+        finally:
+            self._handles = [h for h in self._handles if h[0] not in done]
+        return released
 
     def release_physical(self) -> None:
         """Unmap and release all physical memory, keeping the VA reservation."""
@@ -257,6 +392,12 @@ class ExtensibleTensor:
     The reservation is divided into contiguous segments whose committed bytes
     form a prefix of each; num_segments equal segments by default, or the
     explicit segment_capacities (in bytes, summing to max_num_bytes).
+
+    With max_chunk_bytes, growing a segment maps its new bytes as physical
+    objects of at most that size, aligned to multiples of it from the segment's
+    start, and `shrink_segments_` gives back the objects that lie wholly above
+    the new size. Without it each grow maps one object per contiguous run and
+    a shrink can only free objects a grow made small enough.
     """
 
     def __init__(
@@ -265,6 +406,7 @@ class ExtensibleTensor:
         device: torch.device | str | int | None = None,
         num_segments: int = 1,
         segment_capacities: Sequence[int] | None = None,
+        max_chunk_bytes: int | None = None,
     ) -> None:
         if max_num_bytes < 0:
             raise ValueError("max_num_bytes must be non-negative.")
@@ -305,7 +447,9 @@ class ExtensibleTensor:
             itertools.accumulate([0, *self._segment_capacities[:-1]])
         )
         self._committed: list[int] = [0] * len(self._segment_capacities)
-        self._buffer: _VirtualBuffer = _VirtualBuffer(max_num_bytes, self._device_index)
+        self._buffer: _VirtualBuffer = _VirtualBuffer(
+            max_num_bytes, self._device_index, max_chunk_bytes
+        )
 
     def full_view(self) -> torch.Tensor:
         """Uint8 view spanning the whole reservation."""
@@ -329,9 +473,9 @@ class ExtensibleTensor:
         """Grow every segment's committed prefix to the same size."""
         self.resize_segments_([bytes_per_segment] * self.num_segments, zero_new)
 
-    def _grown_ranges(self, sizes: Sequence[int]) -> list[tuple[int, int]]:
-        """Reservation byte ranges that growing each segment's committed prefix
-        to `sizes` adds, after checking `sizes`."""
+    def _grown_ranges(self, sizes: Sequence[int]) -> list[tuple[int, int, int]]:
+        """(segment offset, start, end) reservation byte ranges that growing each
+        segment's committed prefix to `sizes` adds, after checking `sizes`."""
         if len(sizes) != self.num_segments:
             raise ValueError(f"Expected {self.num_segments} sizes, got {len(sizes)}.")
         for old, new, capacity in zip(self._committed, sizes, self._segment_capacities):
@@ -346,7 +490,7 @@ class ExtensibleTensor:
                     f"segment capacity {capacity}."
                 )
         return [
-            (start + old, start + new)
+            (start, start + old, start + new)
             for start, old, new in zip(self._segment_offsets, self._committed, sizes)
             if new > old
         ]
@@ -360,19 +504,80 @@ class ExtensibleTensor:
         sizes skips the granules mapped here. If this raises, some granules may
         stay mapped; they hold no committed bytes and later resizes reuse them.
         """
-        for start, end in self._grown_ranges(sizes):
-            self._buffer.ensure_committed_range(start, end)
+        for origin, start, end in self._grown_ranges(sizes):
+            self._buffer.ensure_committed_range(start, end, chunk_origin=origin)
 
-    def resize_segments_(self, sizes: Sequence[int], zero_new: bool = False) -> None:
-        """Grow each segment's committed prefix; optionally zero the new bytes."""
+    def resize_segments_(
+        self,
+        sizes: Sequence[int],
+        zero_new: bool = False,
+        whole_runs: bool = False,
+    ) -> None:
+        """Grow each segment's committed prefix; optionally zero the new bytes.
+
+        `whole_runs` maps each contiguous unmapped run as one physical object
+        even when the tensor has a chunk size, for a caller that needs a range
+        backed by a single allocation.
+        """
         grown = self._grown_ranges(sizes)
-        for start, end in grown:
-            self._buffer.ensure_committed_range(start, end)
+        for origin, start, end in grown:
+            self._buffer.ensure_committed_range(
+                start, end, chunk_origin=origin, whole_runs=whole_runs
+            )
         self._committed = list(sizes)
         if zero_new and grown:
             full = self.full_view()
-            for start, end in grown:
+            for _, start, end in grown:
                 full[start:end].zero_()
+
+    def _shrunk_ranges(self, sizes: Sequence[int]) -> list[tuple[int, int]]:
+        """Reservation byte ranges above each segment's new committed size,
+        up to its capacity, after checking `sizes`.
+
+        To the capacity rather than to the old committed size, so that a shrink
+        also gives back what a failed grow or release left mapped above the
+        committed prefix, and repeating a shrink that failed part-way finishes it.
+        """
+        if len(sizes) != self.num_segments:
+            raise ValueError(f"Expected {self.num_segments} sizes, got {len(sizes)}.")
+        for old, new in zip(self._committed, sizes):
+            if new < 0 or new > old:
+                raise ValueError(f"Cannot shrink a segment from {old} to {new} bytes.")
+        return [
+            (start + new, start + capacity)
+            for start, capacity, new in zip(
+                self._segment_offsets, self._segment_capacities, sizes
+            )
+        ]
+
+    def releasable_bytes(self, sizes: Sequence[int]) -> int:
+        """Physical bytes `shrink_segments_(sizes)` would give back."""
+        return sum(
+            self._buffer.releasable_bytes(start, end)
+            for start, end in self._shrunk_ranges(sizes)
+        )
+
+    def shrink_segments_(self, sizes: Sequence[int]) -> int:
+        """Shrink each segment's committed prefix to `sizes[i]` bytes and give
+        back the physical objects wholly above it. Returns the bytes released.
+
+        Bytes below the new sizes keep their contents. An object that straddles
+        a new size stays mapped (so `physical_bytes` drops by whole objects
+        only, and by nothing for a tensor without `max_chunk_bytes` whose
+        segment is one object); the bytes above the new size inside it are not
+        committed. Objects mapped above the old committed size (by `back_segments_`
+        or a failed grow) go too, when wholly above the new size. Growing again
+        maps fresh objects for the unmapped part and zeroes (with `zero_new`) all
+        bytes from the old committed size.
+
+        The caller guarantees nothing reads or writes the released range any
+        more. If a driver call fails the committed sizes are already the new
+        ones: some memory above them stays mapped, which a later grow reuses and
+        a repeated shrink releases.
+        """
+        ranges = self._shrunk_ranges(sizes)
+        self._committed = list(sizes)
+        return sum(self._buffer.release_range(start, end) for start, end in ranges)
 
     def release_physical(self) -> None:
         """Drop all physical pages but keep the reservation and its views."""
@@ -421,6 +626,11 @@ class ExtensibleTensor:
     def physical_bytes(self) -> int:
         """Physically mapped bytes, including granule rounding."""
         return self._buffer.committed_bytes
+
+    @property
+    def max_chunk_bytes(self) -> int | None:
+        """Largest physical object a grow maps, or None for one per run."""
+        return self._buffer.max_chunk_bytes
 
     @property
     def num_physical_chunks(self) -> int:

@@ -324,3 +324,64 @@ def test_vmm_probe_reports_usable_driver() -> None:
     else:
         # ROCm runtimes older than the hipMemSetAccess fix are rejected.
         assert reason is None or "HIP runtime" in reason
+
+
+@create_new_process_for_each_test("spawn")
+def test_chunked_commit_releases_tail_to_the_device() -> None:
+    _skip_unless_vmm()
+    """With a chunk size, the tail of a committed prefix goes back to the
+    device in whole chunks while the bytes below keep their contents, and a
+    regrow maps fresh zeroed pages."""
+    probe = ExtensibleTensor(max_num_bytes=1, device=DEVICE)
+    g = probe.granularity
+    probe.free()
+    et = ExtensibleTensor(max_num_bytes=16 * g, device=DEVICE, max_chunk_bytes=2 * g)
+    try:
+        et.resize_per_segment_(12 * g, zero_new=True)
+        assert et.num_physical_chunks == 6
+        assert et.physical_bytes == 12 * g
+        et.segment_view(0)[: 8 * g].fill_(5)
+        torch.accelerator.synchronize()
+
+        free_before, _ = torch.accelerator.get_memory_info(et.device)
+        assert et.shrink_segments_([8 * g]) == 4 * g
+        assert et.physical_bytes == 8 * g
+        assert et.num_physical_chunks == 4
+        free_after, _ = torch.accelerator.get_memory_info(et.device)
+        assert free_after - free_before >= 3 * g
+        assert torch.all(et.segment_view(0) == 5)
+
+        et.resize_per_segment_(12 * g, zero_new=True)
+        assert et.physical_bytes == 12 * g
+        view = et.segment_view(0)
+        assert torch.all(view[: 8 * g] == 5)
+        assert torch.count_nonzero(view[8 * g :]) == 0
+    finally:
+        et.free()
+
+
+@create_new_process_for_each_test("spawn")
+def test_release_range_leaves_a_hole_and_a_recommit_fills_it() -> None:
+    _skip_unless_vmm()
+    """A range inside a reservation can be released and committed again while
+    the ranges on both sides stay mapped (the fast-row buffer's use)."""
+    probe = ExtensibleTensor(max_num_bytes=1, device=DEVICE)
+    g = probe.granularity
+    probe.free()
+    et = ExtensibleTensor(max_num_bytes=8 * g, device=DEVICE, max_chunk_bytes=g)
+    try:
+        buffer = et._buffer
+        buffer.ensure_committed_range(0, 8 * g)
+        full = et.full_view()
+        full.fill_(3)
+        torch.accelerator.synchronize()
+        assert buffer.release_range(2 * g, 6 * g) == 4 * g
+        assert buffer.committed_bytes == 4 * g
+        assert torch.all(full[: 2 * g] == 3)
+        assert torch.all(full[6 * g :] == 3)
+        buffer.ensure_committed_range(2 * g, 6 * g)
+        full[2 * g : 6 * g].zero_()
+        torch.accelerator.synchronize()
+        assert buffer.committed_bytes == 8 * g
+    finally:
+        et.free()
