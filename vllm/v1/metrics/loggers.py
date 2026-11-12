@@ -46,6 +46,20 @@ WAITING_REASON_DEFERRED = "deferred"
 # User-facing reason labels for frontend admission rejections.
 ADMISSION_REASONS = ("max_num_queued_reqs", "max_num_queued_tokens")
 
+# Series of an encoder tower with residency "dynamic"; the keys are those of
+# SchedulerStats.encoder_tower_stats.
+ENCODER_TOWER_GAUGES = {
+    "location": "Where the tower is: 0 disk, 1 host memory, 2 accelerators.",
+    "in_transition": "1 while the tower is moving to the accelerators.",
+    "promotions": "Moves to the accelerators since start.",
+    "demotions": "Moves off the accelerators since start.",
+    "failed_promotions": "Moves to the accelerators that did not finish.",
+    "image_requests": "Requests with an item of the tower's modalities.",
+    "items_encoded_host": "Items the host copy encoded.",
+    "items_encoded_card": "Items scheduled on the accelerators' copy.",
+    "encode_seconds_host": "Seconds the host copy spent encoding.",
+}
+
 PerEngineStatLoggerFactory = Callable[[VllmConfig, int], "StatLoggerBase"]
 AggregateStatLoggerFactory = type["AggregateStatLoggerBase"]
 StatLoggerFactory = AggregateStatLoggerFactory | PerEngineStatLoggerFactory
@@ -656,6 +670,17 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_fenced_blocks, per_engine_labelvalues
         )
 
+        # Encoder towers with residency "dynamic" (one series per tower).
+        self.gauge_encoder_tower = {
+            key: self._gauge_cls(
+                name=f"vllm:encoder_tower_{key}",
+                documentation=documentation,
+                multiprocess_mode="mostrecent",
+                labelnames=[*labelnames, "tower"],
+            )
+            for key, documentation in ENCODER_TOWER_GAUGES.items()
+        }
+
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
                 name="vllm:corrupted_requests",
@@ -1199,6 +1224,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_kv_cache_fenced_blocks[engine_idx].set(
                 scheduler_stats.num_fenced_gpu_blocks
             )
+            for tower, values in scheduler_stats.encoder_tower_stats.items():
+                labels = [*self.per_engine_labelvalues[engine_idx], tower]
+                for key, gauge in self.gauge_encoder_tower.items():
+                    if key in values:
+                        gauge.labels(*labels).set(values[key])
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries
