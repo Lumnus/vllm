@@ -408,6 +408,15 @@ class CacheConfig:
     already committed. If unspecified, startup commits what the measurement
     allows. Requires the extensible KV cache."""
 
+    kv_cache_release_chunk_mib: int | None = Field(default=None, gt=0)
+    """Commit the extensible KV cache in physical allocations of at most this
+    many MiB (rounded up to the driver granularity, 2 MiB at least), so that the
+    tail of the committed range can be returned to the device in whole
+    allocations. Smaller chunks give finer release and cost one driver
+    allocation each at every commit. If unspecified, a commit maps one
+    allocation per contiguous unmapped range. Requires the extensible KV
+    cache."""
+
     kv_offloading_size: float | None = None
     """Size of the KV cache offloading buffer in GiB. When TP > 1, this is
     the total buffer size summed across all TP ranks. By default, this is set
@@ -461,6 +470,7 @@ class CacheConfig:
             # Runtime memory allocation strategy, not graph structure.
             "enable_extensible_kv_cache",
             "extensible_kv_cache_initial_blocks",
+            "kv_cache_release_chunk_mib",
         }
 
         return get_compile_factors(self, ignored_factors)

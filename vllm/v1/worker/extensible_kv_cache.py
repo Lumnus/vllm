@@ -89,6 +89,11 @@ class ExtensibleKVCache:
     layer for block-compact layer-outermost layouts (sized by that layer's
     block stride, possibly padded apart by `pad_kv_cache_segments`), one
     overall for block-outermost. Host-resident tensors live outside it.
+
+    With `release_chunk_bytes`, blocks are committed in physical objects of at
+    most that size (rounded up to the driver granularity), so that `shrink_to`
+    can give the tail of the committed prefix back to the device. Without it a
+    commit maps one object per contiguous run, as before.
     """
 
     def __init__(
@@ -96,6 +101,7 @@ class ExtensibleKVCache:
         kv_cache_config: KVCacheConfig,
         device: torch.device,
         layout: KVCacheLayout,
+        release_chunk_bytes: int | None = None,
     ):
         tensors = [
             tensor
@@ -113,6 +119,9 @@ class ExtensibleKVCache:
         self.segment_offsets, self.segment_strides = self._segments(tensors, layout)
         self.bytes_per_block = sum(self.segment_strides)
         self.num_committed_blocks = 0
+        # The null block (and a second one under block-outermost layouts, see
+        # `allocate`) stays committed.
+        self.min_committed_blocks = 2 if self._is_block_outermost else 1
         # Memory to keep free while committing before the final sizing, e.g.
         # the profiled activation peak the warmup steps are about to hit.
         self.reserved_headroom_bytes = 0
@@ -137,6 +146,7 @@ class ExtensibleKVCache:
                 end - start
                 for start, end in pairwise([*self.segment_offsets, self.size])
             ],
+            max_chunk_bytes=release_chunk_bytes,
         )
 
     def _segments(
@@ -206,8 +216,8 @@ class ExtensibleKVCache:
 
         Grow-only unless shrink is set, which remaps a smaller prefix and
         discards contents. defragment remaps each segment as one driver
-        allocation (discarding contents): UCX cannot RDMA a range spanning
-        several allocations.
+        allocation (discarding contents), whatever the release chunk size: UCX
+        cannot RDMA a range spanning several allocations.
         """
         num_blocks = min(num_blocks, self.capacity_blocks)
         sizes = [num_blocks * stride for stride in self.segment_strides]
@@ -219,7 +229,7 @@ class ExtensibleKVCache:
             self.num_committed_blocks = 0
         if num_blocks <= self.num_committed_blocks:
             return
-        self.buffer.resize_segments_(sizes, zero_new=True)
+        self.buffer.resize_segments_(sizes, zero_new=True, whole_runs=defragment)
         self.num_committed_blocks = num_blocks
         logger.debug(
             "Committed %d of %d KV cache blocks (%.2f GiB physical).",
@@ -259,6 +269,72 @@ class ExtensibleKVCache:
         full = self.buffer.full_view()
         for offset, stride in zip(self.segment_offsets, self.segment_strides):
             full[offset + start * stride : offset + end * stride].zero_()
+
+    def blocks_releasable(self, num_bytes: int) -> int | None:
+        """Fewest tail blocks whose release gives back at least num_bytes of
+        physical memory, or None if no `shrink_to` that keeps the minimum
+        committed blocks frees that much.
+
+        Counts what `shrink_to` frees, which is whole release chunks: a chunk
+        straddling the new size stays, so the answer can be a little above
+        num_bytes / bytes_per_block, and without a release chunk size it is
+        often None.
+        """
+        if num_bytes <= 0:
+            return 0
+        most = self.num_committed_blocks - self.min_committed_blocks
+        if most <= 0 or self._releasable_bytes(self.num_committed_blocks - most) < (
+            num_bytes
+        ):
+            return None
+        low, high = 1, most
+        while low < high:
+            mid = (low + high) // 2
+            if self._releasable_bytes(self.num_committed_blocks - mid) >= num_bytes:
+                high = mid
+            else:
+                low = mid + 1
+        return low
+
+    def _releasable_bytes(self, num_blocks: int) -> int:
+        """Physical bytes `shrink_to(num_blocks)` would give back."""
+        return self.buffer.releasable_bytes(
+            [num_blocks * stride for stride in self.segment_strides]
+        )
+
+    def shrink_to(self, num_blocks: int) -> int:
+        """Commit only the first num_blocks blocks and give back the physical
+        memory of the whole release chunks above them. Returns the bytes
+        released.
+
+        Contents of the kept blocks are untouched; a chunk that straddles the
+        new size stays mapped, so the bytes freed can be less than a
+        block-proportional share. The caller makes sure nothing reads the
+        released blocks any more: the views over the committed prefix are
+        rebuilt first (`rebind_committed_views`), the scheduler no longer hands
+        the blocks out, and the connector has let go of them. Nothing in
+        serving calls this yet.
+        """
+        if not self.min_committed_blocks <= num_blocks <= self.num_committed_blocks:
+            raise ValueError(
+                f"Cannot shrink the KV cache from {self.num_committed_blocks} to "
+                f"{num_blocks} blocks (minimum {self.min_committed_blocks})."
+            )
+        if num_blocks == self.num_committed_blocks:
+            return 0
+        released = self.buffer.shrink_segments_(
+            [num_blocks * stride for stride in self.segment_strides]
+        )
+        self.num_committed_blocks = num_blocks
+        logger.debug(
+            "Shrank the KV cache to %d of %d blocks, released %.2f GiB "
+            "(%.2f GiB physical).",
+            num_blocks,
+            self.capacity_blocks,
+            released / (1 << 30),
+            self.physical_bytes / (1 << 30),
+        )
+        return released
 
     def committed_views(
         self,
@@ -430,6 +506,25 @@ def registers_kv_cache_memory(vllm_config: "VllmConfig") -> bool:
         kv_transfer_config is not None
         and kv_transfer_config.registers_kv_cache_memory()
     )
+
+
+def release_chunk_bytes(vllm_config: "VllmConfig") -> int | None:
+    """Bytes per physical allocation when committing the extensible KV cache in
+    release chunks, or None for one allocation per contiguous run.
+
+    A connector that registers the cache for RDMA needs each segment backed by
+    one allocation, which chunks rule out, so the setting is not applied there.
+    """
+    chunk_mib = vllm_config.cache_config.kv_cache_release_chunk_mib
+    if chunk_mib is None:
+        return None
+    if registers_kv_cache_memory(vllm_config):
+        logger.warning_once(
+            "kv_cache_release_chunk_mib is ignored: the KV connector registers "
+            "the KV cache memory, which needs one allocation per segment."
+        )
+        return None
+    return chunk_mib << 20
 
 
 def pad_kv_cache_segments(

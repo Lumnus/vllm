@@ -2008,6 +2008,7 @@ class VllmConfig:
         self._validate_model_runner()
         self._resolve_extensible_kv_cache()
         self._validate_extensible_kv_cache_initial_blocks()
+        self._validate_kv_cache_release_chunk()
         self._validate_eplb_world()
 
         self._validate_profiler_config()
@@ -3326,6 +3327,19 @@ class VllmConfig:
         ):
             raise ValueError(
                 "extensible_kv_cache_initial_blocks needs the extensible KV cache, "
+                "which is off for this model and platform (or by "
+                "--no-enable-extensible-kv-cache)."
+            )
+
+    def _validate_kv_cache_release_chunk(self) -> None:
+        """The release chunk size is a setting of the extensible KV cache."""
+        cache_config = self.cache_config
+        if (
+            cache_config.kv_cache_release_chunk_mib is not None
+            and not cache_config.enable_extensible_kv_cache
+        ):
+            raise ValueError(
+                "kv_cache_release_chunk_mib needs the extensible KV cache, "
                 "which is off for this model and platform (or by "
                 "--no-enable-extensible-kv-cache)."
             )
