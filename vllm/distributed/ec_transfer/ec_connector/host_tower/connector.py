@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""ECHostTowerConnector: encoder outputs from towers kept in host memory.
+
+Not selected by the user: `--mm-encoder-host-towers` derives it. The connector
+moves nothing between engines. Its scheduler side holds the host towers and
+makes a request wait for their embeddings; its worker side copies the
+embeddings from a shared host region into each rank's encoder cache. To the
+scheduler this is an encoder cache that happens to be filled locally, which is
+why requests without such items never notice it.
+"""
+
+from typing import TYPE_CHECKING, Any
+
+import torch
+
+from vllm.distributed.ec_transfer.ec_connector.base import (
+    ECConnectorBase,
+    ECConnectorRole,
+    ECConnectorWorkerMetadata,
+)
+from vllm.distributed.ec_transfer.ec_connector.cpu.common import (
+    ECCPUConnectorMetadata,
+)
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.outputs import ECConnectorOutput
+    from vllm.v1.request import Request
+
+
+class ECHostTowerConnector(ECConnectorBase):
+    """EC connector whose producer is a set of host towers in this engine."""
+
+    def __init__(self, vllm_config: "VllmConfig", role: ECConnectorRole) -> None:
+        super().__init__(vllm_config=vllm_config, role=role)
+
+        self.connector_scheduler = None
+        self.connector_worker = None
+
+        if role == ECConnectorRole.SCHEDULER:
+            self.connector_scheduler = self._make_scheduler(vllm_config)
+        elif role == ECConnectorRole.WORKER:
+            self.connector_worker = self._make_worker(vllm_config)
+        else:
+            raise ValueError(f"Unknown ECConnectorRole: {role}")
+
+    # Construction seams.
+    def _make_scheduler(self, vllm_config: "VllmConfig"):
+        from vllm.distributed.ec_transfer.ec_connector.host_tower.scheduler import (
+            ECHostTowerScheduler,
+        )
+        from vllm.multimodal.host_tower import build_host_towers
+
+        return ECHostTowerScheduler(vllm_config, build_host_towers(vllm_config))
+
+    def _make_worker(self, vllm_config: "VllmConfig"):
+        from vllm.distributed.ec_transfer.ec_connector.host_tower.worker import (
+            ECHostTowerWorker,
+        )
+
+        return ECHostTowerWorker(vllm_config)
+
+    # Worker-side forwarders.
+    def start_load_caches(
+        self, encoder_cache: dict[str, torch.Tensor], **kwargs
+    ) -> None:
+        assert self.connector_worker is not None
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, ECCPUConnectorMetadata)
+        self.connector_worker.start_load_caches(
+            encoder_cache, connector_metadata=metadata
+        )
+
+    def save_caches(
+        self, encoder_cache: dict[str, torch.Tensor], mm_hash: str, **kwargs
+    ) -> None:
+        # The workers hold no host tower's output to offer.
+        return
+
+    def build_connector_worker_meta(self) -> ECConnectorWorkerMetadata | None:
+        if self.connector_worker is not None:
+            return self.connector_worker.build_connector_worker_meta()
+        return None
+
+    # Scheduler-side forwarders.
+    def has_cache_item(self, identifier: str) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.has_cache_item(identifier)
+
+    def ensure_cache_available(
+        self, request: "Request", num_computed_tokens: int
+    ) -> bool:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.ensure_cache_available(
+            request, num_computed_tokens
+        )
+
+    def take_unavailable_requests(self) -> set[str]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.take_unavailable_requests()
+
+    def update_state_after_alloc(self, request: "Request", index: int) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_state_after_alloc(request, index)
+
+    def update_state_after_free(self, request: "Request", index: int) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_state_after_free(request, index)
+
+    def build_connector_meta(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> ECCPUConnectorMetadata:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.build_connector_meta(scheduler_output)
+
+    def update_connector_output(self, connector_output: "ECConnectorOutput") -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.update_connector_output(connector_output)
+
+    def request_finished(
+        self, request: "Request"
+    ) -> tuple[bool, "dict[str, Any] | None"]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished(request)
+
+    def has_pending_push_work(self) -> bool:
+        if self.connector_scheduler is not None:
+            return self.connector_scheduler.has_pending_push_work()
+        return False
+
+    # Shared.
+    def shutdown(self) -> None:
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.shutdown()
+        if self.connector_worker is not None:
+            self.connector_worker.shutdown()
