@@ -421,6 +421,28 @@ class MultiprocExecutor(Executor):
 
         monitor_workers()
 
+    # How long the other ranks' replies are waited for after one rank failed
+    # an RPC that has no deadline of its own.
+    DRAIN_AFTER_FAILURE_S = 60.0
+
+    def _drain_deadline(self, deadline: float | None) -> float:
+        drain = time.monotonic() + self.DRAIN_AFTER_FAILURE_S
+        return drain if deadline is None else max(deadline, drain)
+
+    def _fail_out_of_step(self, method: str | Callable) -> None:
+        """A rank's reply to a failed RPC never came: the response queues are
+        out of step with the calls, so no later reply can be trusted."""
+        logger.error(
+            "A worker did not reply to %s after another worker failed it; the "
+            "executor's replies are out of step, failing the executor.",
+            method if isinstance(method, str) else "a function",
+        )
+        self.is_failed = True
+        callback = self.failure_callback
+        if callback is not None:
+            self.failure_callback = None
+            callback()
+
     def register_failure_callback(self, callback: FailureCallback):
         if self.is_failed:
             callback()
@@ -522,14 +544,25 @@ class MultiprocExecutor(Executor):
         def get_response():
             responses = []
             has_failure = False
+            # A failed rank's error is raised only after every rank's reply
+            # to this call has been taken off its queue: a reply left behind
+            # would be read as that rank's reply to the next call.
+            error: Exception | None = None
+            drain_deadline: float | None = None
 
             for mq in response_mqs:
+                wait_until = deadline if error is None else drain_deadline
                 dequeue_timeout = (
-                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                    None
+                    if wait_until is None
+                    else max(0.0, wait_until - time.monotonic())
                 )
                 try:
                     status, result = mq.dequeue(timeout=dequeue_timeout)
                 except TimeoutError as e:
+                    if error is not None:
+                        self._fail_out_of_step(method)
+                        raise error from e
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
 
                 if status == WorkerProc.ResponseStatus.FAILURE_WITH_KV_OUTPUT:
@@ -537,7 +570,12 @@ class MultiprocExecutor(Executor):
                         not self.vllm_config.parallel_config.enable_fault_tolerance
                         or self.is_failed
                     ):
-                        raise RuntimeError("Worker failed with KV connector output")
+                        if error is None:
+                            error = RuntimeError(
+                                "Worker failed with KV connector output"
+                            )
+                            drain_deadline = self._drain_deadline(deadline)
+                        continue
                     has_failure = True
                     assert isinstance(result, KVConnectorOutput)
                     responses.append(result)
@@ -546,13 +584,19 @@ class MultiprocExecutor(Executor):
                         not self.vllm_config.parallel_config.enable_fault_tolerance
                         or self.is_failed
                     ):
-                        raise RuntimeError(
-                            f"Worker failed with error '{result}', please check the"
-                            " stack trace above for the root cause"
-                        )
+                        if error is None:
+                            error = RuntimeError(
+                                f"Worker failed with error '{result}', please "
+                                "check the stack trace above for the root cause"
+                            )
+                            drain_deadline = self._drain_deadline(deadline)
+                        continue
                     has_failure = True
                 else:
                     responses.append(result)
+
+            if error is not None:
+                raise error
 
             if has_failure:
                 kv_connector_outputs: list[KVConnectorOutput | None] = []
