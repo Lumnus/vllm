@@ -477,6 +477,11 @@ class ExpertTiers:
                     "kernels. The host tier must be memory the accelerator "
                     "reads in place"
                 )
+        logger.info_once(
+            "Expert store tiers: the device views of the pool rows are the "
+            "pinned rows themselves (a byte per tensor written on the host "
+            "and read back through the view)."
+        )
 
     def slot_bytes(self) -> int:
         """Bytes of one expert in kernel layout (the four tensors)."""
@@ -561,6 +566,10 @@ class ExpertTiers:
                             "with another weight layout. Start once with "
                             "--expert-store-config build set to 'rebuild'"
                         )
+        logger.info_once(
+            "Expert store: the store's units equal the fast rows this start "
+            "built from the checkpoint (three experts per layer compared)."
+        )
 
     def impls(
         self,
@@ -1042,6 +1051,33 @@ def slot_tensor_bytes(
         "w13_scales": groups13 * w13_out * itemsize,
         "w2_scales": groups2 * hidden_size * itemsize,
     }
+
+
+def kernel_layout_unit(
+    w13_qweight: torch.Tensor,
+    w13_scales: torch.Tensor,
+    w2_qweight: torch.Tensor,
+    w2_scales: torch.Tensor,
+    scales_dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """One expert's GPTQ tensors as the checkpoint holds them (int32
+    ``[in/8, out]`` qweight, ``[groups, out]`` scales, ``w13`` already
+    stacked over its shards) as the four tensors of the expert's store unit,
+    computed on the host: the bytes the tiers write at the first load, for a
+    slot of either tier. For building a store outside the engine (the unit
+    source of the store's build tool)."""
+    from vllm_xpu_kernels.fused_moe_interface import implement_zp
+
+    unit: dict[str, torch.Tensor] = {}
+    scales = {"w13": w13_scales, "w2": w2_scales}
+    for key, qweight in (("w13", w13_qweight), ("w2", w2_qweight)):
+        packed = qweight.cpu().transpose(0, 1).contiguous().view(torch.uint8)
+        unit[key] = implement_zp(packed)
+    for key in ("w13", "w2"):
+        unit[f"{key}_scales"] = (
+            scales[key].cpu().transpose(0, 1).contiguous().to(scales_dtype)
+        )
+    return unit
 
 
 def _layout_fingerprint() -> str:
