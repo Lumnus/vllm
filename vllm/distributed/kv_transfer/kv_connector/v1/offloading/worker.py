@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 from collections import defaultdict
 from dataclasses import replace
 
@@ -72,6 +73,24 @@ class OffloadingConnectorWorker:
         self.worker = self.spec.get_worker(kv_caches)
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        self._init_worker(self._canonical_kv_caches(kv_caches))
+
+    def resize_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor], num_blocks: int
+    ) -> None:
+        """Follow a KV cache whose committed block count grew to num_blocks.
+
+        The views keep their storage's base address, so transfers already
+        submitted and the pointer arithmetic for new block ids stay valid; only
+        the extent of the views the transfers resolve against changes.
+        """
+        self.kv_cache_config = copy.copy(self.kv_cache_config)
+        self.kv_cache_config.num_blocks = num_blocks
+        self._kv_caches = self._canonical_kv_caches(kv_caches)
+
+    def _canonical_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> CanonicalKVCaches:
         kv_cache_config = self.kv_cache_config
         selected_group_ids = get_offloading_group_ids(kv_cache_config)
         selected_groups = tuple(
@@ -156,13 +175,10 @@ class OffloadingConnectorWorker:
                 (block_stride, 1),
                 storage_offset=0,
             )
-            self._init_worker(
-                CanonicalKVCaches(
-                    [CanonicalKVCacheTensor(packed_tensor, block_stride)],
-                    [[CanonicalKVCacheRef(0, block_stride)] for _ in selected_groups],
-                )
+            return CanonicalKVCaches(
+                [CanonicalKVCacheTensor(packed_tensor, block_stride)],
+                [[CanonicalKVCacheRef(0, block_stride)] for _ in selected_groups],
             )
-            return
 
         block_tensors: list[CanonicalKVCacheTensor] = []
         block_data_refs: dict[str, list[CanonicalKVCacheRef]] = defaultdict(list)
@@ -212,12 +228,10 @@ class OffloadingConnectorWorker:
                 group_refs += block_data_refs[layer_name]
             group_data_refs.append(group_refs)
 
-        canonical_kv_caches = CanonicalKVCaches(
+        return CanonicalKVCaches(
             tensors=block_tensors,
             group_data_refs=group_data_refs,
         )
-
-        self._init_worker(canonical_kv_caches)
 
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         assert self.worker is not None

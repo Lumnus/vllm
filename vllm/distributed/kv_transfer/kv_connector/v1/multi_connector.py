@@ -310,6 +310,15 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         for c in self._connectors:
             c.restore_kv_caches()
 
+    def supports_kv_cache_resize(self) -> bool:
+        return all(c.supports_kv_cache_resize() for c in self._connectors)
+
+    def resize_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor], num_blocks: int
+    ) -> None:
+        for c in self._connectors:
+            c.resize_kv_caches(kv_caches, num_blocks)
+
     def bind_kv_cache_manager(self, kv_cache_manager: "KVCacheManager") -> None:
         for connector in self._connectors:
             connector.bind_kv_cache_manager(kv_cache_manager)

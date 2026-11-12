@@ -118,6 +118,15 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
+    def supports_kv_cache_resize(self) -> bool:
+        return True
+
+    def resize_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor], num_blocks: int
+    ) -> None:
+        assert self.connector_worker is not None
+        self.connector_worker.resize_kv_caches(kv_caches, num_blocks)
+
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         assert self.connector_worker is not None
         assert isinstance(kv_connector_metadata, OffloadingConnectorMetadata)
