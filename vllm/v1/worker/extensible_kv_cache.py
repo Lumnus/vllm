@@ -54,9 +54,20 @@ logger = init_logger(__name__)
 # first prefill of an 8B model needed over 25% beyond its allocated peak before
 # the allocator could serve it, and adversarial workloads reached up to 45%.
 # ROCr also maps kernel scratch outside the allocator when a kernel first needs
-# it, so ROCm keeps a larger floor.
-KV_CACHE_MARGIN_FLOOR_BYTES = (3 if current_platform.is_rocm() else 1) << 30
-KV_CACHE_MARGIN_FRACTION = 0.75
+# it, so ROCm keeps a larger floor. On Arc Pro B70 (4 cards, a hybrid MoE at
+# tensor parallel 4) the measured transient peak already covers what the
+# first requests need: with no margin the cache grew from 765,379 tokens (floor
+# 256 MiB, fraction 0.25) to 801,549, and a stress run (16-stream decode, 2K x
+# 16 prefill, needles at 128K and 240K) passed with no preemptions and a lower
+# peak than the estimate path, so XPU keeps none.
+KV_CACHE_MARGIN_FLOOR_BYTES = (
+    3 << 30
+    if current_platform.is_rocm()
+    else 0
+    if current_platform.is_xpu()
+    else 1 << 30
+)
+KV_CACHE_MARGIN_FRACTION = 0.0 if current_platform.is_xpu() else 0.75
 # Part of the margin kept for allocations outside torch's caching allocator
 # (kernel scratch, NCCL/RCCL buffers, lazily loaded code objects); the
 # allocator is capped to leave it free. The rest absorbs torch's fragmentation,
