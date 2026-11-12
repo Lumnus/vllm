@@ -124,6 +124,43 @@ def test_the_staging_pool_is_pinned_only_when_asked(monkeypatch, tmp_path):
     tstore.reset_sessions()
 
 
+def _flip_unit(env, layer: int, logical: int) -> None:
+    store = env.tiers[layer].store_binding.session.store
+    stripe, offset, _ = store.layout.locate(layer, logical)
+    with open(store._stripes[stripe].path, "r+b") as handle:
+        handle.seek(offset + 10)
+        byte = handle.read(1)
+        handle.seek(offset + 10)
+        handle.write(bytes([byte[0] ^ 0x20]))
+
+
+def test_a_unit_that_fails_its_digest_is_never_mapped(monkeypatch, tmp_path):
+    from vllm.model_executor.offloader.expert_store import StoreCorruptError
+
+    env = Env(monkeypatch, tmp_path, True)
+    env.store_cfg.check_every = 1
+    env.construct()
+    env.load()
+    env.process()
+    tiers = env.tiers[1]
+    placement = tiers.placement
+    _flip_unit(env, 1, 1)  # the unit of slot 1 (fast at load)
+    free = placement.pool.free_count
+    tier, row = placement.tier.copy(), placement.row.copy()
+    maps = (tiers.fast_map.clone(), tiers.slow_map.clone())
+    with pytest.raises(StoreCorruptError, match=r"unit \(1, 1\)"):
+        tiers.demote(1)  # would read the unit into a pool row and map it
+    assert placement.pool.free_count == free
+    assert (placement.tier == tier).all() and (placement.row == row).all()
+    assert torch.equal(tiers.fast_map, maps[0])
+    assert torch.equal(tiers.slow_map, maps[1])
+    stats = tiers.store_binding.session.store.stats()
+    assert stats["check_failures"] == 1
+    tiers.demote(2)  # a clean unit still moves
+    assert placement.tier[2] == 1
+    tstore.reset_sessions()
+
+
 def test_tier_moves_read_the_store_and_keep_every_slot_mapped_once(
     monkeypatch, tmp_path
 ):

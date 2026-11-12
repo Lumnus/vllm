@@ -188,13 +188,15 @@ class StoreSession:
                 verify=cfg.verify,
                 decay_interval=cfg.decay_interval,
                 read_mode=cfg.read_mode,
+                check_every=cfg.check_every,
+                check_threads=cfg.check_threads,
             )
             layout = self._store.layout
             self._start_stats_thread()
             logger.info(
                 "Expert store opened (%s): %d units of %d B, %.2f GiB in %d "
                 "stripe(s) %s, staging pool %d slots (%.2f GiB, %s), read mode "
-                "%s, %.2f s.",
+                "%s, unit checks every %d reads (0: off), %.2f s.",
                 self.mode,
                 layout.total_units,
                 layout.slot_bytes,
@@ -205,6 +207,7 @@ class StoreSession:
                 self._store.num_slots * slot_bytes / 2**30,
                 "pinned" if self._store.pinned else "not pinned",
                 cfg.read_mode,
+                cfg.check_every,
                 time.perf_counter() - t0,
             )
             return self._store

@@ -56,6 +56,7 @@ def test_cli(argv):
     )
     assert config.stats_interval_s == 0.0
     assert config.pool_pinned is False
+    assert (config.check_every, config.check_threads) == (8, 2)
 
 
 def test_validation():
