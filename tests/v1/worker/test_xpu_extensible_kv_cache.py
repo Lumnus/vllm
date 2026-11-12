@@ -594,6 +594,17 @@ class GrowFixture:
         )
         monkeypatch.setattr(extensible_kv_cache, "has_kv_transfer_group", lambda: False)
         monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+        # What torch reports to a measurement while serving.
+        self.torch_stats: dict[str, int] = {}
+        self.torch_reserved = 0
+        monkeypatch.setattr(
+            torch.accelerator, "memory_stats", lambda device=None: self.torch_stats
+        )
+        monkeypatch.setattr(
+            torch.accelerator,
+            "memory_reserved",
+            lambda device=None: self.torch_reserved,
+        )
 
         def record_rebind(runner):
             self.rebinds.append(
@@ -1127,3 +1138,97 @@ def test_rank_that_cannot_finish_an_earlier_grow_stops_every_rank(
     assert isinstance(results[1], RuntimeError)
     assert [c.num_committed_blocks for c in ranks.caches] == [24, 24]
     assert ranks.caches[1].unfinished_grow == (8, 24, None)
+
+
+# Measuring while serving.
+
+
+def _sized_with_reserve(ranks: GrowFixture, transient: int) -> ExtensibleKVCache:
+    """Rank 0 as its startup sizing left it: `transient` bytes kept free beyond
+    the blocks that fit, with torch at 512 MiB reserved and 500 MiB allocated."""
+    cache = ranks.caches[0]
+    cache.reserved_headroom_bytes = transient
+    cache.torch_reserved_at_sizing = 512 * MIB
+    cache.torch_allocated_at_sizing = 500 * MIB
+    ranks.free_memory[0] += transient
+    ranks.torch_reserved = 512 * MIB
+    ranks.torch_stats = {
+        "allocated_bytes.all.current": 500 * MIB,
+        "allocated_bytes.all.peak": 500 * MIB,
+    }
+    return cache
+
+
+def test_serving_measurement_does_not_count_twice_what_torch_took(
+    grow_ranks, monkeypatch
+):
+    """Memory torch reserved since the sizing came out of the transient
+    reserve: the count that fits is the one the sizing found, not that less
+    what torch took. One line reports the numbers."""
+    ranks = grow_ranks([40])
+    transient, taken = 64 * MIB, 24 * MIB
+    _sized_with_reserve(ranks, transient)
+    ranks.torch_reserved += taken
+    ranks.torch_stats = {
+        "allocated_bytes.all.current": 510 * MIB,
+        "allocated_bytes.all.peak": 530 * MIB,
+    }
+    ranks.free_memory[0] -= taken
+    lines: list[str] = []
+    monkeypatch.setattr(
+        extensible_kv_cache.logger,
+        "info",
+        lambda message, *args: lines.append(message % args),
+    )
+
+    assert ranks.grow(0, 50) == 40
+
+    measured = [line for line in lines if "resize measurement" in line]
+    assert len(measured) == 1
+    assert "40 blocks fit" in measured[0]
+    assert "0.02 taken by torch since" in measured[0]
+
+
+def test_serving_measurement_keeps_free_the_peak_serving_has_shown(grow_ranks):
+    """An allocation peak above the startup reserve raises the reserve."""
+    ranks = grow_ranks([40])
+    transient, above = 64 * MIB, 8 * MIB
+    cache = _sized_with_reserve(ranks, transient)
+    ranks.torch_stats["allocated_bytes.all.peak"] = 500 * MIB + transient + above
+    expected = cache.blocks_within(cache.physical_bytes_for(40) - above)
+    assert 8 < expected < 40
+
+    assert ranks.grow(0, 50) == expected
+
+
+def test_serving_measurement_counts_memory_taken_outside_torch(grow_ranks):
+    """Device memory that went elsewhere since the sizing is simply not free."""
+    ranks = grow_ranks([40])
+    cache = _sized_with_reserve(ranks, 64 * MIB)
+    elsewhere = 8 * MIB
+    ranks.free_memory[0] -= elsewhere
+    expected = cache.blocks_within(cache.physical_bytes_for(40) - elsewhere)
+
+    assert ranks.grow(0, 50) == expected
+
+
+def test_sizing_baseline_records_what_torch_holds(fake_xpu, monkeypatch):
+    config, _ = _kv_cache_config(KVCacheLayout.LBNHC)
+    device = torch.device("xpu", 0)
+    kv_cache = ExtensibleKVCache(config, device, KVCacheLayout.LBNHC)
+    resets: list[torch.device] = []
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda device=None: 7)
+    monkeypatch.setattr(torch.accelerator, "memory_allocated", lambda device=None: 5)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "reset_peak_memory_stats",
+        lambda device=None: resets.append(device),
+    )
+    try:
+        assert kv_cache.torch_reserved_at_sizing is None
+        kv_cache.record_sizing_baseline(device)
+        assert kv_cache.torch_reserved_at_sizing == 7
+        assert kv_cache.torch_allocated_at_sizing == 5
+        assert resets == [device]
+    finally:
+        kv_cache.free()

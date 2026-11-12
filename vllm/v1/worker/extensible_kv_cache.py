@@ -126,6 +126,10 @@ class ExtensibleKVCache:
         # from and to and the torch cap before it. Left set by a failure, for
         # the next resize to finish.
         self.unfinished_grow: tuple[int, int, int | None] | None = None
+        # What torch reserved and had allocated when the cache was sized, for
+        # measurements taken later while serving; None until then.
+        self.torch_reserved_at_sizing: int | None = None
+        self.torch_allocated_at_sizing: int | None = None
         self.buffer = ExtensibleTensor(
             self.size,
             device=device,
@@ -238,6 +242,14 @@ class ExtensibleKVCache:
         self.buffer.back_segments_(
             [num_blocks * stride for stride in self.segment_strides]
         )
+
+    def record_sizing_baseline(self, device: torch.device) -> None:
+        """Note what torch holds now that the cache is sized, and restart its
+        peak statistics, so that a measurement while serving can tell how much
+        of the transient reserve torch has taken and how high serving went."""
+        self.torch_reserved_at_sizing = torch.accelerator.memory_reserved(device)
+        self.torch_allocated_at_sizing = torch.accelerator.memory_allocated(device)
+        torch.accelerator.reset_peak_memory_stats(device)
 
     def zero_blocks(self, start: int, end: int) -> None:
         """Zero the committed blocks from start up to end."""
@@ -613,6 +625,7 @@ def measure_kv_cache_bytes(
     transient_peak_bytes: int = 0,
     margin_floor_bytes: int = KV_CACHE_MARGIN_FLOOR_BYTES,
     margin_fraction: float = KV_CACHE_MARGIN_FRACTION,
+    margin_peak_bytes: int | None = None,
 ) -> int:
     """Bytes the KV cache may occupy given the memory measured after warmup.
 
@@ -626,7 +639,11 @@ def measure_kv_cache_bytes(
     """
     non_kv_used = init_free_memory - free_memory - committed_bytes
     headroom = free_memory + committed_bytes
-    margin = max(margin_floor_bytes, int(transient_peak_bytes * margin_fraction))
+    # The margin scales with margin_peak_bytes where that differs from the
+    # bytes to keep free, e.g. once part of the transient peak is in use.
+    if margin_peak_bytes is None:
+        margin_peak_bytes = transient_peak_bytes
+    margin = max(margin_floor_bytes, int(margin_peak_bytes * margin_fraction))
     available = min(requested_memory - non_kv_used, headroom - margin)
     available -= transient_peak_bytes
     return max(available, 0)
@@ -736,6 +753,81 @@ def measure_kv_cache_blocks(
     return num_blocks
 
 
+def _measure_kv_cache_serving(
+    kv_cache: ExtensibleKVCache,
+    vllm_config: "VllmConfig",
+    device: torch.device,
+    *,
+    init_free_memory: int,
+    requested_memory: int,
+) -> int:
+    """Blocks the memory free now fits, measured while serving.
+
+    The sizing after warmup keeps reserved_headroom_bytes free for what torch
+    allocates afterwards. Torch has since taken part of that (what it reserves
+    beyond its reservation at sizing), so only the rest is kept free here:
+    the startup rule applied again would count that part twice, as memory that
+    is no longer free and inside the reserve. The reserve is the larger of the
+    startup one and the highest allocation seen since, above the level at
+    sizing. With nothing else taken from the device since sizing, the result
+    is what the startup sizing gave. Nothing is collected or released: memory
+    torch caches counts as taken. Without a sizing baseline the whole startup
+    reserve is kept free. Logs the numbers, one line per rank.
+    """
+    free_memory = current_platform.free_device_memory(device)
+    stats = torch.accelerator.memory_stats(device)
+    allocated = stats.get("allocated_bytes.all.current", 0)
+    peak = stats.get("allocated_bytes.all.peak", 0)
+    reserved = torch.accelerator.memory_reserved(device)
+    startup_reserve = kv_cache.reserved_headroom_bytes
+    reserve = startup_reserve
+    taken = 0
+    if (
+        kv_cache.torch_reserved_at_sizing is not None
+        and kv_cache.torch_allocated_at_sizing is not None
+    ):
+        reserve = max(reserve, peak - kv_cache.torch_allocated_at_sizing)
+        taken = max(reserved - kv_cache.torch_reserved_at_sizing, 0)
+    available = measure_kv_cache_bytes(
+        init_free_memory=init_free_memory,
+        free_memory=free_memory,
+        committed_bytes=kv_cache.physical_bytes,
+        requested_memory=requested_memory,
+        transient_peak_bytes=max(reserve - taken, 0),
+        margin_peak_bytes=reserve,
+    )
+    try:
+        kv_cache_bytes = reserve_mm_ipc_gpu_memory(
+            available,
+            vllm_config.model_config.multimodal_config,
+            getattr(vllm_config.parallel_config, "_api_process_count", 1),
+        )
+    except ValueError:
+        # Nothing left after the multimodal reservation.
+        kv_cache_bytes = 0
+    fits = kv_cache.blocks_within(kv_cache_bytes)
+    limit = kv_cache.torch_memory_limit
+    logger.info(
+        "KV cache resize measurement: %s GiB free, %s GiB mapped for the KV "
+        "cache, %d blocks committed (%s GiB), transient reserve %s GiB (%s at "
+        "startup, %s taken by torch since), %d blocks fit; torch allocated %s "
+        "GiB, reserved %s GiB, peak %s GiB, cap %s GiB.",
+        format_gib(free_memory),
+        format_gib(kv_cache.physical_bytes),
+        kv_cache.num_committed_blocks,
+        format_gib(kv_cache.num_committed_blocks * kv_cache.bytes_per_block),
+        format_gib(reserve),
+        format_gib(startup_reserve),
+        format_gib(taken),
+        fits,
+        format_gib(allocated),
+        format_gib(reserved),
+        format_gib(peak),
+        "no" if limit is None else format_gib(limit),
+    )
+    return fits
+
+
 def _finish_grow(
     runner: "GPUModelRunner",
     start: int,
@@ -809,8 +901,9 @@ def grow_kv_cache(
 ) -> int:
     """Commit more of an extensible KV cache's reservation while serving.
 
-    Every rank takes part: each measures with the rule of the startup sizing
-    and the ranks agree, through reduce_min (the minimum over ranks), on the
+    Every rank takes part: each measures what its memory fits now
+    (`_measure_kv_cache_serving`), and the ranks agree, through reduce_min
+    (the minimum over ranks), on the
     block count n = the least of the target, what every rank fits and the
     capacity. Physical memory is mapped on every rank before any commits, and
     the ranks agree a second time that it is, so a rank that cannot map leaves
@@ -855,18 +948,13 @@ def grow_kv_cache(
                 end,
             )
             _finish_grow(runner, start, end, torch_memory_limit, recovering=True)
-        try:
-            fits = _measure_kv_cache(
-                kv_cache,
-                vllm_config,
-                runner.device,
-                init_free_memory=init_free_memory,
-                requested_memory=requested_memory,
-            ).num_blocks
-        except ValueError:
-            # Nothing left after the multimodal reservation: this rank fits
-            # no more.
-            fits = kv_cache.num_committed_blocks
+        fits = _measure_kv_cache_serving(
+            kv_cache,
+            vllm_config,
+            runner.device,
+            init_free_memory=init_free_memory,
+            requested_memory=requested_memory,
+        )
         vote = min(target_num_blocks, fits, kv_cache.capacity_blocks)
     except Exception as e:
         logger.exception(

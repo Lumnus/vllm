@@ -1263,6 +1263,8 @@ class Worker(WorkerBase):
                     initial_blocks=self.cache_config.extensible_kv_cache_initial_blocks,
                 )
             )
+            # A resize while serving measures against what torch holds now.
+            kv_cache.record_sizing_baseline(self.device)
 
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
