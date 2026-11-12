@@ -20,8 +20,12 @@ outputs. Every expert stays routable; results equal the all-resident layer up
 to the order of that sum.
 """
 
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import regex as re
 import torch
 
@@ -30,7 +34,14 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
+    from vllm.config.expert_store import ExpertStoreConfig
     from vllm.config.offload import OffloadConfig
+    from vllm.model_executor.offloader.expert_tier_map import (
+        PreparedMove,
+        StreamOps,
+        TierPlacement,
+    )
+    from vllm.model_executor.offloader.expert_tier_store import StoreSession
 
 logger = init_logger(__name__)
 
@@ -187,17 +198,21 @@ class _PinnedArena:
 _ARENA = _PinnedArena()
 
 
-def _repack_int4_pinned(qweight: torch.Tensor, device: torch.device) -> torch.Tensor:
+def _repack_int4_pinned(
+    qweight: torch.Tensor, device: torch.device, rows: int | None = None
+) -> torch.Tensor:
     """GPTQ int32 ``[E, in/8, out]`` (CPU) -> signed-int4 bytes ``[E, out, in/2]``.
 
     The layout transform of the method's post-load step plus ``implement_zp``,
     run on ``device`` a few experts at a time into pinned host memory, so device
-    temporaries stay small.
+    temporaries stay small. ``rows`` > E leaves that many rows in the tensor,
+    the ones beyond E zeroed.
     """
     from vllm_xpu_kernels.fused_moe_interface import implement_zp
 
     e, k8, n = qweight.shape
-    out = _ARENA.empty((e, n, k8 * 4), torch.uint8)
+    out = _ARENA.empty((max(e, rows or 0), n, k8 * 4), torch.uint8)
+    out[e:].zero_()
     step = 16
     for i in range(0, e, step):
         chunk = qweight[i : i + step].to(device)
@@ -206,10 +221,13 @@ def _repack_int4_pinned(qweight: torch.Tensor, device: torch.device) -> torch.Te
     return out
 
 
-def _pin(t: torch.Tensor) -> torch.Tensor:
-    """A pinned copy of ``t``."""
-    pinned = _ARENA.empty(tuple(t.shape), t.dtype)
-    pinned.copy_(t)
+def _pin(t: torch.Tensor, rows: int | None = None) -> torch.Tensor:
+    """A pinned copy of ``t``, with ``rows`` rows if more than it has (the
+    rows beyond zeroed)."""
+    n = max(t.shape[0], rows or 0)
+    pinned = _ARENA.empty((n, *t.shape[1:]), t.dtype)
+    pinned[: t.shape[0]].copy_(t)
+    pinned[t.shape[0] :].zero_()
     return pinned
 
 
@@ -235,9 +253,32 @@ def _slot_maps(
     return fast_map, slow_map
 
 
+@dataclass
+class StoreBinding:
+    """How one layer meets the expert store."""
+
+    session: "StoreSession"
+    store_layer: int  # the store's layer index: the decoder layer number
+    spare_rows: int  # pool rows beyond the host tier's slots
+    initial_logical: np.ndarray  # logical expert in each local slot at load
+    num_logical: int  # logical experts; physical ids below it are not replicas
+
+
+def _u8(t: torch.Tensor) -> torch.Tensor:
+    """``t`` as bytes, one row per leading index."""
+    return t.view(torch.uint8).reshape(t.shape[0], -1)
+
+
 class ExpertTiers:
-    """One layer's local expert slots: ``[0, num_fast)`` in device memory,
-    ``[num_fast, num_local)`` in pinned host memory."""
+    """One layer's local expert slots, in device memory (fast rows) and in
+    pinned host memory (pool rows).
+
+    Without an expert store the tiers are fixed: slots ``[0, num_fast)`` are
+    the rows of the layer's device parameters and ``[num_fast, num_local)`` the
+    rows of the pinned tensors, in slot order. With one (``store``), a slot's
+    tier and row are state of :attr:`placement` and the maps the kernels read
+    are rewritten in place; see :meth:`prepare_move` and :meth:`commit_move`.
+    """
 
     def __init__(
         self,
@@ -246,6 +287,7 @@ class ExpertTiers:
         num_global: int,
         num_local: int,
         num_fast: int,
+        store: StoreBinding | None = None,
     ):
         assert 0 < num_fast < num_local
         self.layer_name = layer_name
@@ -260,13 +302,41 @@ class ExpertTiers:
         self.fast_map: torch.Tensor | None = None
         self.slow_map: torch.Tensor | None = None
         self._impls: tuple[Any, Any] | None = None
+        # Physical expert id of each local slot.
+        self.slot_global = [-1] * num_local
+        for g, slot in local_of.items():
+            if slot >= 0:
+                self.slot_global[slot] = g
+        self.store_binding = store
+        self.placement: TierPlacement | None = None
+        self.ops: StreamOps | None = None
+        # The logical expert in each local slot; moves keep it current.
+        self.slot_logical = (
+            None if store is None else np.array(store.initial_logical, dtype=np.int64)
+        )
+        self.move_log: list[dict[str, float]] = []
 
     @property
     def num_slow(self) -> int:
         return self.num_local - self.num_fast
 
+    @property
+    def num_pool_rows(self) -> int:
+        """Rows of each pinned tensor: the host tier's slots and the spares."""
+        spare = 0 if self.store_binding is None else self.store_binding.spare_rows
+        return self.num_slow + spare
+
+    @property
+    def fills_from_store(self) -> bool:
+        """The host tier is filled from an existing store, not from the
+        checkpoint: the loader skips its slots."""
+        b = self.store_binding
+        return b is not None and b.session.mode == "fill"
+
     def attach_twins(self, layer: torch.nn.Module) -> None:
         """A pageable CPU twin ``[num_slow, ...]`` for every per-expert param."""
+        if self.fills_from_store:
+            return
         for name, param in layer.named_parameters(recurse=False):
             if (
                 name not in _EXPERT_PARAMS
@@ -289,10 +359,13 @@ class ExpertTiers:
 
     def route(
         self, param: torch.nn.Parameter, slot: int
-    ) -> tuple[torch.nn.Parameter, int]:
-        """(param, row) the loader should write local slot ``slot`` into."""
+    ) -> tuple[torch.nn.Parameter | None, int]:
+        """(param, row) the loader should write local slot ``slot`` into, or
+        (None, -1) when the slot is filled from the store instead."""
         if slot < self.num_fast:
             return param, slot
+        if self.fills_from_store:
+            return None, -1
         name = self._param_names.get(id(param))
         if name is None:
             raise RuntimeError(
@@ -320,14 +393,31 @@ class ExpertTiers:
             )
         twins, self.twins, self._param_names = self.twins, {}, {}
         device: torch.device = getattr(layer, "w13_weight").device  # noqa: B009
-        for key in ("w13", "w2"):
-            self.slow[key] = _repack_int4_pinned(
-                twins.pop(f"{key}_qweight").data, device
-            )
-            scales = twins.pop(f"{key}_scales").data.transpose(1, 2).contiguous()
-            self.slow[f"{key}_scales"] = _pin(
-                scales.to(getattr(layer, f"{key}_scales").dtype)
-            )
+        binding = self.store_binding
+        rows = self.num_pool_rows if binding is not None else None
+        if self.fills_from_store:
+            # No twins: the host tier's rows come from the store, in the shape
+            # of the fast tier's tensors.
+            assert rows is not None
+            for key in ("w13", "w2"):
+                fast_w = getattr(layer, f"{key}_weight").data.view(torch.uint8)
+                self.slow[key] = _ARENA.empty((rows, *fast_w.shape[1:]), torch.uint8)
+                fast_s = getattr(layer, f"{key}_scales")
+                self.slow[f"{key}_scales"] = _ARENA.empty(
+                    (rows, *fast_s.shape[1:]), fast_s.dtype
+                )
+            for tensor in self.slow.values():
+                tensor[self.num_slow :].zero_()
+            self._fill_host_tier()
+        else:
+            for key in ("w13", "w2"):
+                self.slow[key] = _repack_int4_pinned(
+                    twins.pop(f"{key}_qweight").data, device, rows
+                )
+                scales = twins.pop(f"{key}_scales").data.transpose(1, 2).contiguous()
+                self.slow[f"{key}_scales"] = _pin(
+                    scales.to(getattr(layer, f"{key}_scales").dtype), rows
+                )
         del twins  # qzeros: symmetric int4 has none on XPU
         for key, tensor in self.slow.items():
             view = get_accelerator_view_from_cpu_tensor(tensor)
@@ -336,7 +426,74 @@ class ExpertTiers:
             self.slow_views[key] = view
         fast_map, slow_map = _slot_maps(self.local_of, self.num_global, self.num_fast)
         self.fast_map, self.slow_map = fast_map.to(device), slow_map.to(device)
+        if binding is not None:
+            from vllm.model_executor.offloader.expert_tier_map import (
+                TierPlacement,
+                TorchStreamOps,
+            )
+
+            self.ops = TorchStreamOps(device)
+            self.placement = TierPlacement(
+                self.num_local,
+                self.num_fast,
+                binding.spare_rows,
+                lambda event: self.ops.done(event),  # type: ignore[union-attr]
+            )
+            binding.session.note_pool(
+                self.num_pool_rows, self.slot_bytes(), self.num_slow
+            )
         experts.tiers = self
+
+    def slot_bytes(self) -> int:
+        """Bytes of one expert in kernel layout (the four tensors)."""
+        return sum(t[0].numel() * t.element_size() for t in self.slow.values())
+
+    # -- the expert store ---------------------------------------------------
+
+    def _fill_host_tier(self) -> None:
+        """Read every host-tier slot of the layer from the store into its row."""
+        binding = self.store_binding
+        assert binding is not None
+        store = binding.session.open_reader()
+        futures = []
+        for slot in range(self.num_fast, self.num_local):
+            row = slot - self.num_fast
+            dests = {k: _u8(t)[row] for k, t in self.slow.items()}
+            logical = int(binding.initial_logical[slot])
+            futures.append(store.read_into_async((binding.store_layer, logical), dests))
+        for future in futures:
+            future.result()
+
+    def _write_units(self) -> None:
+        """Build mode: write the layer's experts (fast rows read back from the
+        card once, host rows from memory) as units keyed by logical expert;
+        replicas are skipped."""
+        binding = self.store_binding
+        assert binding is not None and self._impls is not None
+        fast = self._impls[0]
+        host_fast = {
+            key: _u8(getattr(fast, impl_field)).cpu()
+            for impl_field, key in _TIER_FIELDS
+        }
+        units = []
+        for slot in range(self.num_local):
+            if self.slot_global[slot] >= binding.num_logical:
+                continue  # a replica: its logical expert is written by its owner
+            if slot < self.num_fast:
+                tensors = {k: t[slot] for k, t in host_fast.items()}
+            else:
+                row = slot - self.num_fast
+                tensors = {k: _u8(t)[row] for k, t in self.slow.items()}
+            units.append((int(binding.initial_logical[slot]), tensors))
+        binding.session.write_units(binding.store_layer, units)
+
+    def _after_impls(self) -> None:
+        binding = self.store_binding
+        if binding is None:
+            return
+        if binding.session.mode == "build":
+            self._write_units()
+        binding.session.layer_done(self.layer_name)
 
     def impls(
         self,
@@ -381,7 +538,7 @@ class ExpertTiers:
                 w2=sw2,
                 w2_scales=self.slow_views["w2_scales"],
                 w2_bias=None,
-                num_experts=self.num_slow,
+                num_experts=self.num_pool_rows,
                 expert_map=self.slow_map,
                 **common,
             )
@@ -390,6 +547,7 @@ class ExpertTiers:
             slow.w13._vllm_is_uva_offloaded = True
             slow.w2._vllm_is_uva_offloaded = True
             self._impls = (fast, slow)
+            self._after_impls()
         return self._impls
 
     def eplb_weights(self) -> list[TieredExpertWeight]:
@@ -399,11 +557,143 @@ class ExpertTiers:
         weights = []
         for impl_field, _ in _TIER_FIELDS:
             parts = [getattr(impl, impl_field) for impl in (fast, slow)]
+            # The spare rows beyond the host tier's slots are not EPLB's.
+            parts[1] = parts[1][: self.num_slow]
             parts = [p.view(p.shape[0], -1) for p in parts]
             if parts[0].dtype != parts[1].dtype:  # packed int4: int8 vs uint8
                 parts = [p.view(torch.uint8) for p in parts]
             weights.append(TieredExpertWeight(parts, self.on_rows_written))
         return weights
+
+    # -- moving slots between tiers while serving --------------------------
+
+    def _require_store(self) -> "tuple[StoreBinding, TierPlacement, StreamOps]":
+        if (
+            self.store_binding is None
+            or self.placement is None
+            or self.ops is None
+            or self._impls is None
+        ):
+            raise RuntimeError(
+                f"{self.layer_name}: tier moves need an expert store and built impls"
+            )
+        return self.store_binding, self.placement, self.ops
+
+    def _fill_rows(self, reads: Mapping[int, int], rows: Mapping[int, int]) -> None:
+        """Read the units of ``reads`` (slot -> logical expert) into the pool
+        rows ``rows`` (slot -> row), all in flight at once."""
+        binding, _, _ = self._require_store()
+        store = binding.session.store
+        futures = []
+        for slot, logical in reads.items():
+            row = rows[slot]
+            dests = {k: _u8(t)[row] for k, t in self.slow.items()}
+            futures.append(
+                store.read_into_async((binding.store_layer, int(logical)), dests)
+            )
+        for future in futures:
+            future.result()
+
+    def _copy_rows(self, slot: int, pool_row: int, fast_row: int) -> None:
+        """Enqueue the copy of one expert's bytes from a pool row into a fast
+        row on the side stream."""
+        _, _, ops = self._require_store()
+        assert self._impls is not None
+        fast = self._impls[0]
+        for impl_field, key in _TIER_FIELDS:
+            dst = _u8(getattr(fast, impl_field))[fast_row]
+            ops.side_copy(dst, _u8(self.slow[key])[pool_row])
+
+    def prepare_move(
+        self,
+        new_logical: np.ndarray,
+        slot_load: np.ndarray,
+        hysteresis: float,
+        *,
+        timeout: float = 5.0,
+    ) -> "PreparedMove":
+        """Plan the move to the experts ``new_logical`` (per local slot) with
+        the tier choice for ``slot_load`` (the load of the expert each slot
+        will hold), and read what it needs from the store into free pool rows.
+        Runs on any thread; touches no device state. Commit the result with
+        :meth:`commit_move` between two steps, on the thread that enqueues the
+        forward."""
+        _, placement, _ = self._require_store()
+        assert self.slot_logical is not None
+        t0 = time.perf_counter()
+        plan = placement.plan(self.slot_logical, new_logical, slot_load, hysteresis)
+        move = placement.prepare(plan, self._fill_rows, timeout=timeout)
+        move.stats = {
+            "units": float(len(plan.reads)),
+            "bytes": float(len(plan.reads) * self.slot_bytes()),
+            "prepare_ms": (time.perf_counter() - t0) * 1e3,
+        }
+        return move
+
+    def commit_move(self, move: "PreparedMove") -> None:
+        """Make a prepared move the placement: enqueue its copies and the map
+        writes (see :meth:`TierPlacement.commit` for the stream order)."""
+        _, placement, ops = self._require_store()
+        t0 = time.perf_counter()
+        placement.commit(
+            move,
+            ops,
+            slot_global=self.slot_global,
+            num_global=self.num_global,
+            fast_map=self.fast_map,
+            slow_map=self.slow_map,
+            copy_rows=self._copy_rows,
+            on_pool_rows_changed=lambda: self.on_rows_written([]),
+        )
+        self.slot_logical = move.plan.new_logical.copy()
+        move.stats["commit_ms"] = (time.perf_counter() - t0) * 1e3
+        self.move_log.append(move.stats)
+
+    def _set_fast(self, new_fast: np.ndarray) -> "PreparedMove":
+        _, placement, _ = self._require_store()
+        assert self.slot_logical is not None
+        plan = placement.plan_from_set(self.slot_logical, self.slot_logical, new_fast)
+        move = placement.prepare(plan, self._fill_rows)
+        move.stats = {"units": float(len(plan.reads))}
+        self.commit_move(move)
+        return move
+
+    def swap(self, promote: int, demote: int) -> "PreparedMove":
+        """Put the pool slot ``promote`` in a fast row and the fast slot
+        ``demote`` in a pool row, in one commit (design 5.3): ``demote``'s
+        bytes are read from the store into a spare pool row, ``promote``'s are
+        copied from its pool row into the fast row ``demote`` leaves."""
+        _, placement, _ = self._require_store()
+        new_fast = placement.is_fast().copy()
+        if not new_fast[demote] or new_fast[promote]:
+            raise ValueError(
+                "swap needs a fast slot to demote and a pool slot to promote"
+            )
+        new_fast[demote], new_fast[promote] = False, True
+        return self._set_fast(new_fast)
+
+    def promote(self, slot: int) -> "PreparedMove":
+        """Put the pool slot ``slot`` in a free fast row (one a demotion left)."""
+        _, placement, _ = self._require_store()
+        if placement.tier[slot] == 0:
+            raise ValueError(f"slot {slot} is already in a fast row")
+        if not placement.fast_free:
+            raise RuntimeError(
+                "no free fast row: demote a slot first, or swap two slots"
+            )
+        new_fast = placement.is_fast().copy()
+        new_fast[slot] = True
+        return self._set_fast(new_fast)
+
+    def demote(self, slot: int) -> "PreparedMove":
+        """Put the fast slot ``slot`` in a pool row, its bytes read from the
+        store; the fast row it leaves is free."""
+        _, placement, _ = self._require_store()
+        if placement.tier[slot] != 0:
+            raise ValueError(f"slot {slot} is not in a fast row")
+        new_fast = placement.is_fast().copy()
+        new_fast[slot] = False
+        return self._set_fast(new_fast)
 
     def on_rows_written(self, slots: list[int]) -> None:
         """EPLB wrote slow slots (on the current stream, between steps):
@@ -422,6 +712,113 @@ def remap_unrouted(
     """
     sentinel = num_global - 1 if ep_rank == 0 else 0
     return torch.where(topk_ids < 0, topk_ids.new_full((), sentinel), topk_ids)
+
+
+def _store_config() -> "ExpertStoreConfig | None":
+    """The expert store setting if it is on."""
+    from vllm.config import get_current_vllm_config_or_none
+
+    config = get_current_vllm_config_or_none()
+    store = getattr(config, "expert_store_config", None)
+    return store if store is not None and store.enabled else None
+
+
+def slot_tensor_bytes(
+    quant_method: Any,
+    hidden_size: int,
+    intermediate_size_per_partition: int,
+    params_dtype: torch.dtype,
+) -> dict[str, int]:
+    """Bytes of each of the four tensors of one expert in kernel layout
+    (signed int4 pairs per byte, ``params_dtype`` scales), in unit order."""
+    quant_config = quant_method.quant_config
+    w13_out = quant_method.moe.w13_num_shards * intermediate_size_per_partition
+    groups13 = groups2 = 1
+    if quant_config.group_size != -1:
+        groups13 = hidden_size // quant_config.group_size
+        groups2 = intermediate_size_per_partition // quant_config.group_size
+    itemsize = params_dtype.itemsize
+    return {
+        "w13": w13_out * hidden_size // 2,
+        "w2": hidden_size * intermediate_size_per_partition // 2,
+        "w13_scales": groups13 * w13_out * itemsize,
+        "w2_scales": groups2 * hidden_size * itemsize,
+    }
+
+
+def _ep_barrier() -> None:
+    if not torch.distributed.is_initialized():
+        return
+    from vllm.distributed.parallel_state import get_ep_group
+
+    get_ep_group().barrier()
+
+
+def _store_binding(
+    store_config: "ExpertStoreConfig",
+    layer_name: str,
+    moe_config: Any,
+    quant_method: Any,
+    moe_quant_params: dict[str, Any],
+    local_of: dict[int, int],
+    num_global: int,
+    num_layers: int,
+) -> StoreBinding:
+    """The layer's place in the process's expert store session (created by the
+    first layer): schema and identity from the model, build or fill from the
+    manifest."""
+    from vllm.config import get_current_vllm_config
+    from vllm.model_executor.offloader.expert_tier_store import (
+        StoreSession,
+        build_schema,
+        checkpoint_identity,
+        get_session,
+        store_identity,
+    )
+    from vllm.utils.platform_utils import is_pin_memory_available
+
+    vllm_config = get_current_vllm_config()
+    num_logical = int(moe_config.num_logical_experts)
+    match = _LAYER_RE.search(layer_name)
+    assert match is not None
+    schema = build_schema(
+        num_layers,
+        num_logical,
+        slot_tensor_bytes(
+            quant_method,
+            moe_quant_params["hidden_size"],
+            moe_quant_params["intermediate_size_per_partition"],
+            moe_quant_params["params_dtype"],
+        ),
+    )
+    identity = store_identity(schema, checkpoint_identity(vllm_config.model_config))
+    session = get_session(
+        (identity, tuple(store_config.dirs)),
+        lambda: StoreSession(
+            store_config,
+            schema,
+            identity,
+            rank=int(moe_config.ep_rank),
+            num_ranks=int(moe_config.ep_size),
+            barrier=_ep_barrier,
+            pin=is_pin_memory_available(),
+        ),
+    )
+    session.register(layer_name)
+    # EPLB's initial placement: the routed experts in order, then the
+    # redundant ones cycling over them.
+    physical_to_logical = list(range(num_logical)) + [
+        i % num_logical for i in range(num_global - num_logical)
+    ]
+    num_local = sum(1 for slot in local_of.values() if slot >= 0)
+    initial = np.full(num_local, -1, dtype=np.int64)
+    for g, slot in local_of.items():
+        if slot >= 0:
+            initial[slot] = physical_to_logical[g]
+    spare = store_config.spare_rows_for(
+        vllm_config.parallel_config.eplb_config.max_moves_per_rank
+    )
+    return StoreBinding(session, int(match.group(1)), spare, initial, num_logical)
 
 
 def maybe_tier(
@@ -481,6 +878,19 @@ def maybe_tier(
         bytes_each,
         num_layers,
     )
+    binding = None
+    store_config = _store_config()
+    if store_config is not None:
+        binding = _store_binding(
+            store_config,
+            layer_name,
+            moe_config,
+            quant_method,
+            moe_quant_params,
+            local_of,
+            num_global,
+            num_layers,
+        )
     return ExpertTiers(
-        layer_name, local_of, num_global, num_local, num_local - num_slow
+        layer_name, local_of, num_global, num_local, num_local - num_slow, binding
     )

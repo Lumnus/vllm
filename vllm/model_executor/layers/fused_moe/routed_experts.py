@@ -813,7 +813,10 @@ class RoutedExperts(PluggableLayer):
                 raise NotImplementedError(
                     "--cpu-offload-per-expert: fused 3-D expert tensors"
                 )
-            param, expert_id = self.expert_tiers.route(param, expert_id)
+            tier_param, expert_id = self.expert_tiers.route(param, expert_id)
+            if tier_param is None:  # the expert store fills this slot
+                return True if return_success else None
+            param = tier_param
 
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ/AWQ (K-first format).
