@@ -39,6 +39,10 @@ from typing import Any, Protocol
 
 import numpy as np
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 FORMAT = "expert-store/v1"
 PAGE = 4096
 DATA_OFFSET = PAGE
@@ -54,6 +58,10 @@ CHUNK_BYTES = 1 << 30
 # Retry backoff for a failed or short read, seconds (then raise).
 RETRY_BACKOFF_S = (0.001, 0.010, 0.100)
 DEFAULT_TENSOR_ALIGN = 64
+# Bytes a scatter read's file offset, iovec bases and lengths must be a multiple
+# of for O_DIRECT (the logical block size of the common drives).
+DIRECT_ALIGN = 512
+READ_MODES = ("auto", "scatter", "staged")
 
 _ITEMSIZE = {
     "float64": 8,
@@ -95,6 +103,10 @@ class StoreClosedError(ExpertStoreError):
 
 class EntryEvictedError(ExpertStoreError):
     """A pool entry was evicted before it was leased."""
+
+
+class _ScatterRefused(Exception):
+    """The drive refused a scatter read (EINVAL); internal."""
 
 
 def _round_up(value: int, unit: int) -> int:
@@ -1037,7 +1049,20 @@ class ExpertStore:
         pin: bool,
         policy: EvictionPolicy,
         preadv: Callable[..., int],
+        read_mode: str = "auto",
     ):
+        if read_mode not in READ_MODES:
+            raise ValueError(
+                f"read_mode must be one of {READ_MODES}, got {read_mode!r}"
+            )
+        self.read_mode = read_mode
+        # A scatter read lands in caller memory straight from the drive; it
+        # is switched off for good the first time the drive refuses one.
+        self._scatter_ok = read_mode != "staged"
+        self._into_executor: ThreadPoolExecutor | None = None
+        self._io_threads = io_threads
+        self._reads_scatter = self._reads_staged = self._scatter_fallbacks = 0
+        self._into_bytes = 0
         self.layout = layout
         self._stripes = stripes
         self._policy = policy
@@ -1086,6 +1111,7 @@ class ExpertStore:
         decay_interval: int = 256,
         policy: EvictionPolicy | None = None,
         preadv: Callable[..., int] = os.preadv,
+        read_mode: str = "auto",
     ) -> "ExpertStore":
         """Open a complete store whose identity is ``identity``.
 
@@ -1171,6 +1197,7 @@ class ExpertStore:
                 pin,
                 policy or CountDecayPolicy(decay_interval),
                 preadv,
+                read_mode,
             )
         except BaseException:
             for stripe in stripes:
@@ -1192,6 +1219,191 @@ class ExpertStore:
         with ThreadPoolExecutor(len(ordered)) as pool:
             for future in [pool.submit(check, d) for d in ordered]:
                 future.result()
+
+    @staticmethod
+    def status(dirs: Sequence[str], identity: str) -> str:
+        """What ``open`` would find, from the manifests alone (no pool, no
+        stripe read): ``"complete"`` (opens with this identity), ``"mismatch"``
+        (complete, another identity), ``"incomplete"`` (started, not
+        finalized) or ``"absent"`` (a directory without a manifest)."""
+        manifests = [_read_manifest(os.fspath(d)) for d in dirs]
+        if not manifests or manifests[0] is None:
+            return "absent"
+        first = manifests[0]
+        if not first.get("complete"):
+            return "incomplete"
+        if first.get("identity") != identity:
+            return "mismatch"
+        if any(m is None or not m.get("complete") for m in manifests):
+            return "incomplete"
+        return "complete"
+
+    # -- reads into caller memory -----------------------------------------
+
+    def read_into(self, key: Key, dests: Mapping[str, Any]) -> str:
+        """Read one unit's tensors into caller-owned host memory.
+
+        ``dests`` maps each tensor name of the unit to a writable,
+        C-contiguous buffer of exactly that tensor's bytes (a numpy array, or
+        a torch CPU tensor of any dtype). Blocks until the bytes are there and
+        returns how they came: ``"scatter"``, one ``preadv`` with an iovec per
+        tensor straight from the drive into the buffers (no copy, nothing in
+        the pool), or ``"staged"``, a read into a pool slot and one host copy
+        per tensor.
+
+        The scatter read needs the drive to take direct I/O at the buffers'
+        alignment (``DIRECT_ALIGN``: file offset, buffer addresses and sizes)
+        and the unit's tensors to follow each other without gaps. A unit or
+        drive that does not meet it, or ``read_mode="staged"``, takes the
+        staged path; the first ``EINVAL`` from a scatter read switches
+        scatter off for the store (logged once) and the read is redone staged.
+        """
+        key = (int(key[0]), int(key[1]))
+        stripe_no, offset, _ = self.layout.locate(*key)
+        group = self.layout.group_of(key[0])
+        views = self._dest_views(group, dests)
+        stripe = self._stripes[stripe_no]
+        if self._scatter_ok and self._scatter_fits(group, stripe, offset, views):
+            try:
+                self._scatter_read(stripe, offset, group.payload_bytes, views)
+            except _ScatterRefused:
+                with self._lock:
+                    first = self._scatter_ok
+                    self._scatter_ok = False
+                    self._scatter_fallbacks += 1
+                if first:
+                    logger.warning(
+                        "Expert store: the drive refused a scatter read at the "
+                        "tensor buffers' alignment (EINVAL); reading through "
+                        "pool slots from now on."
+                    )
+            else:
+                with self._lock:
+                    self._reads_scatter += 1
+                    self._into_bytes += group.payload_bytes
+                return "scatter"
+        self._staged_read(key, group, views)
+        with self._lock:
+            self._reads_staged += 1
+            self._into_bytes += group.payload_bytes
+        return "staged"
+
+    def read_into_async(self, key: Key, dests: Mapping[str, Any]) -> Future:
+        """:meth:`read_into` on a thread of its own pool (not the pool's I/O
+        threads, which a staged read waits on); the future's result is the
+        read mode."""
+        with self._lock:
+            if self._closed:
+                raise StoreClosedError("store is closed")
+            if self._into_executor is None:
+                self._into_executor = ThreadPoolExecutor(
+                    self._io_threads, thread_name_prefix="expert-into"
+                )
+            executor = self._into_executor
+        return executor.submit(self.read_into, key, dests)
+
+    @staticmethod
+    def _dest_views(group: _GroupLayout, dests: Mapping[str, Any]) -> list[np.ndarray]:
+        views = []
+        for place in group.tensors:
+            if place.name not in dests:
+                raise ValueError(f"no destination for tensor {place.name!r}")
+            dest = dests[place.name]
+            if not isinstance(dest, np.ndarray):  # a torch CPU tensor
+                import torch
+
+                if dest.dtype != torch.uint8:
+                    dest = dest.view(torch.uint8)
+                dest = dest.numpy()
+            if not (dest.flags.c_contiguous and dest.flags.writeable):
+                raise ValueError(f"destination of {place.name!r} is not writable")
+            dest = dest.reshape(-1).view(np.uint8)
+            if dest.nbytes != place.nbytes:
+                raise ValueError(
+                    f"destination of {place.name!r} is {dest.nbytes} B, the "
+                    f"tensor is {place.nbytes} B"
+                )
+            views.append(dest)
+        extra = set(dests) - {p.name for p in group.tensors}
+        if extra:
+            raise ValueError(f"unknown tensors {sorted(extra)}")
+        return views
+
+    @staticmethod
+    def _scatter_fits(
+        group: _GroupLayout, stripe: "_Stripe", offset: int, views: list[np.ndarray]
+    ) -> bool:
+        end = 0
+        for place in group.tensors:
+            if place.offset != end:  # padding inside the unit: staged
+                return False
+            end += place.nbytes
+        if not stripe.direct:
+            return True
+        return offset % DIRECT_ALIGN == 0 and all(
+            v.ctypes.data % DIRECT_ALIGN == 0 and v.nbytes % DIRECT_ALIGN == 0
+            for v in views
+        )
+
+    def _scatter_read(
+        self, stripe: "_Stripe", offset: int, need: int, views: list[np.ndarray]
+    ) -> None:
+        iovecs = [memoryview(v) for v in views]
+        got = 0
+        attempt = 0
+        start = time.perf_counter()
+        while got < need:
+            fd, direct = stripe.fd, stripe.direct
+            error = ""
+            try:
+                count = self._preadv(fd, iovecs, offset + got)
+                if count > 0:
+                    if direct and got + count < need:
+                        count -= count % DIRECT_ALIGN
+                    got += count
+                    iovecs = self._advance(views, got)
+                    continue
+                error = f"short read ({got} < {need} B)"
+            except OSError as exc:
+                if exc.errno == errno.EINVAL and direct:
+                    raise _ScatterRefused from exc
+                error = f"errno {exc.errno} ({exc.strerror})"
+            if attempt >= len(RETRY_BACKOFF_S):
+                raise ExpertStoreError(
+                    f"read failed at {offset + got} of {stripe.path}: {error}"
+                )
+            time.sleep(RETRY_BACKOFF_S[attempt])
+            attempt += 1
+        latency = time.perf_counter() - start
+        with self._lock:
+            self._latencies.append(latency)
+            self._latency_max = max(self._latency_max, latency)
+            self._reads += 1
+            self._bytes_read += need
+            if stripe.direct:
+                self._reads_direct += 1
+            else:
+                self._reads_buffered += 1
+
+    @staticmethod
+    def _advance(views: list[np.ndarray], consumed: int) -> list[memoryview]:
+        """The iovecs for what is left after ``consumed`` bytes."""
+        out = []
+        for v in views:
+            if consumed >= v.nbytes:
+                consumed -= v.nbytes
+                continue
+            out.append(memoryview(v)[consumed:])
+            consumed = 0
+        return out
+
+    def _staged_read(
+        self, key: Key, group: _GroupLayout, views: list[np.ndarray]
+    ) -> None:
+        with self.get(key, lease=True) as entry:
+            raw = entry.raw
+            for place, view in zip(group.tensors, views):
+                np.copyto(view, raw[place.offset : place.offset + place.nbytes])
 
     # -- requests ----------------------------------------------------------
 
@@ -1505,6 +1717,12 @@ class ExpertStore:
                 "occupancy": used / self.num_slots,
                 "pool_bytes": self.num_slots * self.layout.slot_bytes,
                 "pinned": self.pinned,
+                "read_mode": self.read_mode,
+                "scatter_active": self._scatter_ok,
+                "reads_scatter": self._reads_scatter,
+                "reads_staged": self._reads_staged,
+                "scatter_fallbacks": self._scatter_fallbacks,
+                "into_bytes": self._into_bytes,
             }
         if lat.size:
             out["read_ms"] = {
@@ -1522,6 +1740,8 @@ class ExpertStore:
             if self._closed:
                 return
             self._closed = True
+        if self._into_executor is not None:
+            self._into_executor.shutdown(wait=True, cancel_futures=True)
         self._executor.shutdown(wait=True, cancel_futures=True)
         with self._lock:
             error = StoreClosedError("store was closed")
