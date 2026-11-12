@@ -240,6 +240,10 @@ class SchedulerStats:
     num_gpu_blocks: int = 0
     # Blocks a KV cache shrink in progress takes out of the pool (0 otherwise).
     num_fenced_gpu_blocks: int = 0
+    # Encoder towers with residency "dynamic", by name: location (0 disk,
+    # 1 host, 2 accelerators), whether a move is in progress, and counters
+    # since start. Empty without such a tower.
+    encoder_tower_stats: dict[str, dict[str, float]] = field(default_factory=dict)
     iteration_details: SchedulerIterationDetails | None = None
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)

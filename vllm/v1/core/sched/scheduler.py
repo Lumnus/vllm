@@ -3431,6 +3431,10 @@ class Scheduler(SchedulerInterface):
     def abort_kv_cache_shrink(self) -> None:
         self.kv_cache_manager.abort_shrink()
 
+    def _encoder_tower_stats(self) -> dict[str, dict[str, float]]:
+        stats = getattr(self.ec_connector, "host_tower_stats", None)
+        return stats() if stats is not None else {}
+
     def make_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,
@@ -3469,6 +3473,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_usage=self.kv_cache_manager.usage,
             num_gpu_blocks=self.kv_cache_manager.block_pool.num_gpu_blocks,
             num_fenced_gpu_blocks=self.kv_cache_manager.block_pool.num_fenced_blocks,
+            encoder_tower_stats=self._encoder_tower_stats(),
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,

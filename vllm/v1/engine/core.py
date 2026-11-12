@@ -98,6 +98,7 @@ from vllm.v1.engine.kv_cache_resize import (
     KVCacheResizeState,
 )
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
+from vllm.v1.engine.tower_residency import TowerResidencyController
 from vllm.v1.engine.utils import (
     EngineHandshakeMetadata,
     EngineZmqAddresses,
@@ -215,6 +216,10 @@ class EngineCore:
             self.model_executor.init_ec_output_aggregator()
 
         self.mm_receiver_cache = engine_receiver_cache_from_config(vllm_config)
+
+        # Encoder towers that move between host memory and the accelerators
+        # (residency "dynamic" in --mm-encoder-host-towers); None without one.
+        self._tower_residency = TowerResidencyController.maybe_create(self)
 
         kv_connector = self.scheduler.get_kv_connector()
         self._set_kv_connector_handshake_metadata()
@@ -960,6 +965,7 @@ class EngineCore:
     # tell when a shrink gives some back (see vllm/v1/engine/kv_cache_resize.py).
     _kv_resize: KVCacheResize | None = None
     _kv_memory_holders: tuple[KVCacheMemoryHolder, ...] = ()
+    _tower_residency: TowerResidencyController | None = None
     # Seconds between attempts to finish a release a worker failed.
     KV_RESIZE_RETRY_INTERVAL_S = 1.0
     # A shrink's default deadline for the drain, in seconds.
@@ -2149,6 +2155,9 @@ class EngineCoreProc(EngineCore):
         while self._handle_shutdown():
             # A KV cache shrink moves on between steps, like a utility.
             self._advance_kv_resize()
+            # So do encoder towers moving between host and accelerators.
+            if self._tower_residency is not None:
+                self._tower_residency.advance()
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # Publish request counts before and after GPU step to ensure freshness.
@@ -2210,9 +2219,15 @@ class EngineCoreProc(EngineCore):
                     logger.debug("EngineCore waiting for work.")
                     waited = True
             block = self.process_input_queue_block
+            # An idle engine still wakes for a tower's next residency move.
+            timeout = (
+                self._tower_residency.seconds_to_next_event()
+                if block and self._tower_residency is not None
+                else None
+            )
             try:
                 with get_watch_dog().disable():
-                    req = self.input_queue.get(block=block)
+                    req = self.input_queue.get(block=block, timeout=timeout)
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
