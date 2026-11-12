@@ -721,6 +721,21 @@ def measure_kv_cache_blocks(
         )
     )
     if initial_blocks is not None and initial_blocks < num_blocks:
+        # Warmup and graph capture leave block ids up to the count they
+        # committed in the persistent block tables, in columns a real request
+        # does not overwrite. Committing fewer blocks would unmap the blocks
+        # those ids name, and a kernel that reads a table entry beyond the
+        # blocks it attends then reads unmapped memory. So the setting never
+        # takes the cache below what warmup committed.
+        warmup_blocks = min(kv_cache.num_committed_blocks, num_blocks)
+        if initial_blocks < warmup_blocks:
+            logger.info(
+                "extensible_kv_cache_initial_blocks=%d is below the %d KV cache "
+                "blocks warmup committed; keeping those.",
+                initial_blocks,
+                warmup_blocks,
+            )
+            initial_blocks = warmup_blocks
         logger.info(
             "Committing %d KV cache blocks at startup, not the %d the "
             "measurement allows (extensible_kv_cache_initial_blocks).",

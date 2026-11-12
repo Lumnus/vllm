@@ -1252,6 +1252,18 @@ class Worker(WorkerBase):
         if self.cache_config.enable_extensible_kv_cache:
             kv_cache = self.model_runner.extensible_kv_cache
             assert kv_cache is not None
+            initial_blocks = self.cache_config.extensible_kv_cache_initial_blocks
+            if initial_blocks is not None:
+                # No rank may end below what any rank committed in warmup (see
+                # `measure_kv_cache_blocks`), and all must agree on the count.
+                initial_blocks = max(
+                    initial_blocks,
+                    all_reduce_int(
+                        get_world_group().cpu_group,
+                        kv_cache.num_committed_blocks,
+                        ReduceOp.MAX,
+                    ),
+                )
             # Every rank must size the KV cache identically.
             num_kv_blocks = _min_across_ranks(
                 measure_kv_cache_blocks(
@@ -1260,7 +1272,7 @@ class Worker(WorkerBase):
                     self.device,
                     init_free_memory=self.init_free_memory,
                     requested_memory=int(self.requested_memory),
-                    initial_blocks=self.cache_config.extensible_kv_cache_initial_blocks,
+                    initial_blocks=initial_blocks,
                 )
             )
             # A resize while serving measures against what torch holds now.

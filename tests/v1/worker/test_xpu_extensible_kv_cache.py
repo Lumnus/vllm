@@ -1232,3 +1232,66 @@ def test_sizing_baseline_records_what_torch_holds(fake_xpu, monkeypatch):
         assert resets == [device]
     finally:
         kv_cache.free()
+
+
+@pytest.mark.parametrize(
+    ("initial_blocks", "expected"), [(12, 24), (24, 24), (30, 30), (60, 40)]
+)
+def test_startup_cap_keeps_the_blocks_warmup_committed(
+    fake_xpu, monkeypatch, initial_blocks, expected
+):
+    """Warmup leaves ids of the blocks it committed in the block tables, so a
+    cap below that count must not unmap them. Two ranks with different free
+    memory and no KV connector: both keep the warmup count, the extension
+    unmaps nothing and what warmup wrote in its last block is still there."""
+    layout = KVCacheLayout.LBNHC
+    warmup_blocks = 24
+    fits = [50, 40]
+    caches = []
+    counts = []
+    order: list[str] = []
+    monkeypatch.setattr(
+        extensible_kv_cache, "ensure_kv_transfer_initialized", lambda *a: None
+    )
+    monkeypatch.setattr(extensible_kv_cache, "has_kv_transfer_group", lambda: False)
+    monkeypatch.setattr(
+        extensible_kv_cache,
+        "rebind_committed_views",
+        lambda runner: order.append(f"rebind {runner.kv_cache_config.num_blocks}"),
+    )
+    monkeypatch.setattr(extensible_kv_cache, "get_kv_connector", lambda *a: None)
+    try:
+        for rank in range(2):
+            config, _ = _kv_cache_config(layout)
+            kv_cache = ExtensibleKVCache(config, torch.device("xpu", rank), layout)
+            caches.append((config, kv_cache))
+            kv_cache.allocate(kv_cache.size)
+            kv_cache.commit(warmup_blocks)
+            last = kv_cache.segment_strides[0] * (warmup_blocks - 1)
+            kv_cache.buffer.segment_view(0)[last : last + 64].fill_(7)
+            free = _free_for(warmup_blocks, kv_cache, fits[rank])
+            counts.append(_measure_startup(monkeypatch, kv_cache, initial_blocks, free))
+        assert counts == [min(max(initial_blocks, warmup_blocks), f) for f in fits]
+        num_blocks = min(counts)
+        assert num_blocks == expected
+
+        unmaps = fake_xpu.ops.calls.count("unmap")
+        for config, kv_cache in caches:
+            runner = SimpleNamespace(
+                extensible_kv_cache=kv_cache,
+                vllm_config=SimpleNamespace(kv_transfer_config=None),
+                cache_config=SimpleNamespace(
+                    get_resolved_kv_cache_layout=lambda: layout
+                ),
+                kv_cache_config=copy.copy(config),
+                kv_caches_by_layer={},
+            )
+            extensible_kv_cache.extend_kv_cache(runner, config, num_blocks)
+            assert kv_cache.num_committed_blocks == num_blocks
+            last = kv_cache.segment_strides[0] * (warmup_blocks - 1)
+            assert torch.all(kv_cache.buffer.segment_view(0)[last : last + 64] == 7)
+        assert fake_xpu.ops.calls.count("unmap") == unmaps
+        assert order == [f"rebind {num_blocks}"] * 2
+    finally:
+        for _, kv_cache in caches:
+            kv_cache.free()
