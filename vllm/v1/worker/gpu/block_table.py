@@ -122,6 +122,24 @@ class BlockTables:
         )
         self.input_block_table_ptrs = self._make_ptr_tensor(self.input_block_tables)
 
+    def forget_block_ids_from(self, num_blocks: int) -> None:
+        """Rewrite every entry naming a block id at or above num_blocks, before
+        those blocks are unmapped (the KV cache shrinking).
+
+        Live rows hold no such id once the scheduler has drained the blocks;
+        what can is stale: the columns past a row's own blocks, which gather
+        does not overwrite and kernels may load past the blocks they attend,
+        rows of finished requests, and last step's slot mappings. Block ids
+        become the null block, slots the padding id. Runs between steps.
+        """
+        for table in self.block_tables:
+            table.gpu.masked_fill_(table.gpu >= num_blocks, 0)
+        for table in self.input_block_tables:
+            table.masked_fill_(table >= num_blocks, 0)
+        for group, block_size in enumerate(self.block_sizes):
+            slots = self.slot_mappings[group]
+            slots.masked_fill_(slots >= num_blocks * block_size, PAD_SLOT_ID)
+
     def append_block_ids(
         self,
         req_index: int,

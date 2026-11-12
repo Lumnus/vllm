@@ -412,6 +412,26 @@ class AttentionGroup:
         )
         return out
 
+    def forget_block_ids_from(self, num_blocks: int) -> None:
+        """Rewrite the entries of the persistent kernel block table and slot
+        mapping that name a block id at or above num_blocks (in kernel blocks
+        and slots), before those blocks are unmapped. Both are recomputed
+        from the forward block tables for the rows a step uses; the rest is
+        stale."""
+        if self.kernel_block_table is None or self.kernel_block_size is None:
+            return
+        per_block = self.kernel_block_stride or (
+            self.kv_cache_spec.block_size // self.kernel_block_size
+        )
+        table = self.kernel_block_table
+        table.masked_fill_(table >= num_blocks * per_block, 0)
+        if self.kernel_slot_mapping is not None:
+            from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+            limit = num_blocks * per_block * self.kernel_block_size
+            slots = self.kernel_slot_mapping
+            slots.masked_fill_(slots >= limit, PAD_SLOT_ID)
+
     def map_to_kernel_slot_mapping(
         self,
         slot_mapping: torch.Tensor,
