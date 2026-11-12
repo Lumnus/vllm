@@ -343,7 +343,7 @@ def _write_int8(case) -> tuple:
     return k, v, ks, vs
 
 
-def _run(case, impl: str, int8: bool) -> torch.Tensor:
+def _run(case, impl: str, int8: bool, int8_dot: int = 0) -> torch.Tensor:
     from vllm.models.qwen4_exp.xpu.ops import qsa_attn2
     from vllm.platforms import current_platform
 
@@ -372,6 +372,7 @@ def _run(case, impl: str, int8: bool) -> torch.Tensor:
             False,
             out,
             output_gate=case["gate"],
+            int8_dot=int8_dot,
             **extra,
         )
     finally:
@@ -419,6 +420,51 @@ def _child_kernels(impl: str, hq: int, nkv: int, cell: str) -> None:
     assert rel_k < 1e-2 and cos_k > 0.9999
     assert rel_q < 3e-2 and cos_q > 0.999
     assert rel_b < 1e-2 and cos_b > 0.9999
+
+
+def _patch_interpreter_int8_dot() -> None:
+    """Test harness only: the interpreter multiplies int8 operands of tl.dot in
+    int8; widen them to int32, the result type of the compiled dot."""
+    import numpy as np
+    import triton.language as tl
+    from triton.runtime import interpreter
+
+    builder = interpreter.InterpreterBuilder
+    create_dot = builder.create_dot
+
+    def widen(handle):
+        if handle.dtype.scalar != tl.int8:
+            return handle
+        return interpreter.TensorHandle(handle.data.astype(np.int32), tl.int32)
+
+    def dot(self, a, b, d, input_precision, max_num_imprecise_acc):
+        return create_dot(
+            self, widen(a), widen(b), d, input_precision, max_num_imprecise_acc
+        )
+
+    builder.create_dot = dot  # type: ignore[method-assign]
+
+
+def _child_int8_dot(mode: int, hq: int, nkv: int, cell: str) -> None:
+    _patch_interpreter()
+    _patch_interpreter_int8_dot()
+    from vllm.models.qwen4_exp.xpu.ops import qsa_attn2
+
+    case = _paged_case(hq, nkv, HALVES[cell], rows=3, width=67, seed=mode + hq + nkv)
+    k, v, _, _ = _write_int8(case)
+    # The query quantization follows the KV writer's rounding.
+    q_i8, q_scale = qsa_attn2.quantize_q_int8(case["q"])
+    ref_i8, ref_scale = quantize_pth(case["q"])
+    assert torch.equal(q_i8, ref_i8) and torch.equal(q_scale, ref_scale)
+    gather = qsa_attn2.int8_dot_gather_kwargs(k, v, HD)
+    assert gather["ALIGN8"] and gather["V_OFF"] == HALVES[cell]
+    assert gather["KV_ALIGN"] == (16 if HALVES[cell] % 16 == 0 else 8)
+
+    widened = _run(case, "attn2", True)
+    out = _run(case, "attn2", True, int8_dot=mode)
+    rel, cos = _metrics(out, widened)
+    print(f"int8 dot mode {mode} hq={hq} nkv={nkv} {cell}: rel={rel:.2e} cos={cos:.6f}")
+    assert rel < 3e-2 and cos > 0.999
 
 
 def _child_fused_prepare(nkv: int, cell: str) -> None:
@@ -555,3 +601,27 @@ def test_fused_prepare_writes_the_writer_formula(nkv, cell) -> None:
 @pytest.mark.parametrize("cell", sorted(HALVES))
 def test_unfused_update_writes_only_mapped_slots(cell) -> None:
     _in_interpreter(f"_child_unfused_update({cell!r})")
+
+
+@pytest.mark.parametrize("mode", [1, 2])
+@pytest.mark.parametrize("hq,nkv", [(24, 2), (12, 1)])
+@pytest.mark.parametrize("cell", sorted(HALVES))
+def test_attn2_int8_dot_matches_the_widened_path(mode, hq, nkv, cell) -> None:
+    _in_interpreter(f"_child_int8_dot({mode}, {hq}, {nkv}, {cell!r})")
+
+
+def test_int8_dot_launches_and_gathers() -> None:
+    from vllm.models.qwen4_exp.xpu.ops import qsa_attn2
+
+    assert qsa_attn2._select_launch(4096, True) is qsa_attn2._PREFILL
+    assert qsa_attn2._select_launch(64, True) is qsa_attn2._DECODE
+    for mode in (1, 2):
+        prefill = qsa_attn2._select_launch(4096, True, mode)
+        decode = qsa_attn2._select_launch(4096, False, mode)
+        assert prefill is qsa_attn2._INT8_DOT_PREFILL[mode]
+        assert decode is qsa_attn2._INT8_DOT_DECODE[mode]
+        # An int8 DPAS dot consumes the head dim in steps of 32.
+        assert HD // prefill.num_dchunk >= 32 and HD // decode.num_dchunk >= 32
+    # Views that are not the inline cell keep the plain gathers.
+    k = torch.zeros(2, 16, 1, HD, dtype=torch.int8)
+    assert qsa_attn2.int8_dot_gather_kwargs(k, k.clone(), HD) == {"ALIGN8": False}

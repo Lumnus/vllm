@@ -202,6 +202,9 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
     _k_scale_cache: torch.Tensor | None = None
     _v_scale_cache: torch.Tensor | None = None
     _pth_views: tuple | None = None
+    # `AttentionConfig.qsa_int8_dot` as the kernels take it (0, 1 or 2); set by
+    # the owning layer for an int8 per-token-head cache on XPU.
+    int8_dot: int = 0
 
     def __init__(
         self,
@@ -388,6 +391,7 @@ class Qwen4ExpQSAImpl(AttentionImplBase[Qwen4ExpQSAMetadata]):
             output_gate=output_gate[:num_tokens],
             k_scale_cache=k_scale_cache,
             v_scale_cache=v_scale_cache,
+            int8_dot=self.int8_dot,
         )
         return output
 
@@ -531,6 +535,16 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             self.num_kv_heads,
             self.kv_cache_dtype,
         )
+        int8_dot = vllm_config.attention_config.qsa_int8_dot
+        if int8_dot != "off":
+            if self.impl.is_int8_pth and current_platform.is_xpu():
+                self.impl.int8_dot = {"qk": 1, "qk_pv": 2}[int8_dot]
+            else:
+                logger.warning_once(
+                    "qsa_int8_dot=%s is ignored: it needs an int8_per_token_head "
+                    "main KV cache on XPU.",
+                    int8_dot,
+                )
         self.indexer = QSAIndexer(
             vllm_config=vllm_config,
             config=config,
