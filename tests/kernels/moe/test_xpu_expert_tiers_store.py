@@ -104,6 +104,26 @@ def test_a_store_of_another_checkpoint_is_rebuilt_or_refused(monkeypatch, tmp_pa
     tstore.reset_sessions()
 
 
+def test_the_staging_pool_is_pinned_only_when_asked(monkeypatch, tmp_path):
+    """Direct reads must land in memory every kernel takes: the staging slots
+    are ordinary memory unless ``pool_pinned`` is set."""
+    env = Env(monkeypatch, tmp_path, True)
+    monkeypatch.setattr(
+        "vllm.utils.platform_utils.is_pin_memory_available", lambda: True
+    )
+    env.construct()
+    assert env.tiers[0].store_binding.session.pin is False
+    tstore.reset_sessions()
+    env = Env(monkeypatch, tmp_path, True)
+    monkeypatch.setattr(
+        "vllm.utils.platform_utils.is_pin_memory_available", lambda: True
+    )
+    env.store_cfg.pool_pinned = True
+    env.construct()
+    assert env.tiers[0].store_binding.session.pin is True
+    tstore.reset_sessions()
+
+
 def test_tier_moves_read_the_store_and_keep_every_slot_mapped_once(
     monkeypatch, tmp_path
 ):
