@@ -50,6 +50,12 @@ class FusedMoERouter(PluggableLayer, ABC):
         """Whether `select_experts` already gives padding rows expert id -1."""
         return False
 
+    @property
+    def residency_mask_active(self) -> bool:
+        """Whether an EPLB residency mask is handed to this router."""
+        state = self.eplb_state
+        return state is not None and state.residency_mask is not None
+
     def prepare_monolithic_logits(self, router_logits: torch.Tensor) -> torch.Tensor:
         return router_logits
 

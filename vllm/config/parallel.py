@@ -38,6 +38,7 @@ ExpertPlacementStrategy = Literal["linear", "round_robin"]
 DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
 EPLBPolicyOption = Literal["default", "incremental"]
+EPLBResidencyMaskOption = Literal["off", "nonresident", "coldest"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 EPLBCommunicatorBackend = Literal[
     "torch_nccl", "torch_gloo", "torch_xccl", "nixl", "pynccl", "symm_mem"
@@ -181,6 +182,36 @@ class EPLBConfig:
     """Weight of a prefill token in the expert load; see
     `decode_token_weight`."""
 
+    residency_mask: EPLBResidencyMaskOption = "off"
+    """Keep the router away from chosen experts: their router logits are set
+    to -inf before top-k, and the router renormalises over the experts it
+    picks, as it does without the mask. The mask is over logical experts, per
+    MoE layer, the same on every rank, and changes only between steps.
+    - "off" (default): no mask; routing is unchanged.
+    - "nonresident": mask the experts that no tier holds, as the layers'
+      expert movers report them (`nonresident_physical()`); a logical expert
+      is masked when none of its physical replicas is held. With every expert
+      held, as today, the mask is empty.
+    - "coldest": an experiment mode for measuring what not computing an
+      expert costs. Every `residency_mask_interval` steps, per layer, the
+      least-routed experts that together carried at most
+      `residency_mask_share` of the last `window_size` steps' routing are
+      masked. The routing counted is the router's choice before the mask, so
+      a masked expert that becomes busy is unmasked again.
+    The mask changes what the model computes for the masked share of the
+    routing; each refresh logs, per model, how many top-k calls of the
+    unmasked routing went to masked experts and the routing weight they
+    carried."""
+    residency_mask_share: float = Field(default=0.0, ge=0.0, lt=1.0)
+    """With `residency_mask="coldest"`: the share of each layer's recent
+    routing that the masked experts may carry. 0 masks nothing."""
+    residency_mask_interval: int = Field(default=20, gt=0)
+    """Steps between two refreshes of the residency mask (and its log line)."""
+    residency_mask_stats: bool = True
+    """With a residency mask: count what it displaces (a second top-k over
+    the unmasked logits in every MoE layer, a few small kernels per layer).
+    Needed by "coldest"; with "nonresident" it can be turned off."""
+
     @property
     def weights_tokens(self) -> bool:
         """Whether the load is weighted by phase (not the default)."""
@@ -199,6 +230,8 @@ class EPLBConfig:
                 "tier_hysteresis",
                 "decode_token_weight",
                 "prefill_token_weight",
+                "residency_mask_share",
+                "residency_mask_interval",
             },
         )
 
@@ -235,6 +268,15 @@ class EPLBConfig:
             )
         if self.log_balancedness and self.log_balancedness_interval <= 0:
             raise ValueError("log_balancedness_interval must be greater than 0.")
+        if self.residency_mask == "coldest" and not self.residency_mask_stats:
+            raise ValueError(
+                'residency_mask="coldest" chooses from the unmasked routing it '
+                "counts: residency_mask_stats must stay true."
+            )
+        if self.residency_mask != "coldest" and self.residency_mask_share != 0.0:
+            raise ValueError(
+                'residency_mask_share applies to residency_mask="coldest" only.'
+            )
         return self
 
 

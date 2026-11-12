@@ -409,6 +409,10 @@ class FusedTopKBiasRouter(BaseRouter):
         self.shared_expert_weight = shared_expert_weight
 
     @property
+    def supports_residency_mask(self) -> bool:
+        return False  # a bias or a hash table chooses after the scores
+
+    @property
     def masks_padding(self) -> bool:
         return not rocm_aiter_ops.is_fused_moe_enabled()
 

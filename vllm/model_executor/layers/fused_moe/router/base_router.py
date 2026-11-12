@@ -7,6 +7,11 @@ import torch
 
 import vllm.envs as envs
 from vllm.distributed.eplb.eplb_state import EplbLayerState
+from vllm.distributed.eplb.residency_mask import (
+    DISPLACED_CALLS,
+    DISPLACED_WEIGHT,
+    ROUTED_CALLS,
+)
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.model_executor.layers.fused_moe.eplb_triton import eplb_map_and_record
 from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
@@ -207,6 +212,73 @@ class BaseRouter(FusedMoERouter):
             )
         return topk_ids
 
+    @property
+    def supports_residency_mask(self) -> bool:
+        """Whether -inf logits keep an expert out of this router's top-k with
+        the router's own weights over the rest: plain softmax or sigmoid
+        scoring, no score-correction bias added after scoring (a masked
+        expert's 0 + bias could still be chosen), no custom routing."""
+        return (
+            getattr(self, "e_score_correction_bias", None) is None
+            and getattr(self, "custom_routing_function", None) is None
+            and getattr(self, "scoring_func", "softmax") in ("softmax", "sigmoid")
+        )
+
+    def _apply_residency_mask(self, router_logits: torch.Tensor) -> torch.Tensor:
+        """The logits with the layer's residency mask applied (-inf for the
+        masked experts), counting what it displaced; the logits unchanged
+        when the mask is off."""
+        state = self.eplb_state
+        mask = None if state is None else state.residency_mask
+        if mask is None:
+            return router_logits
+        assert state is not None
+        if not self.supports_residency_mask:
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot keep masked experts out of its "
+                "top-k (score-correction bias, custom routing or scoring "
+                f"{getattr(self, 'scoring_func', None)!r}): the EPLB residency "
+                "mask is not supported for this model"
+            )
+        if router_logits.shape[-1] != mask.shape[0]:
+            raise ValueError(
+                f"router logits over {router_logits.shape[-1]} experts, residency "
+                f"mask over {mask.shape[0]}"
+            )
+        if state.residency_stats is not None:
+            assert state.residency_shadow_load is not None
+            self._count_displaced(router_logits, mask, state)
+        return router_logits.masked_fill(mask, float("-inf"))
+
+    def _count_displaced(
+        self, router_logits: torch.Tensor, mask: torch.Tensor, state: EplbLayerState
+    ) -> None:
+        """Add this step's routing before the mask to the layer's counters:
+        top-k calls to masked experts, all top-k calls, the renormalised
+        weight of the displaced calls, and calls per expert. Padding rows are
+        not counted. Fixed shapes and in-place adds only (graph-safe)."""
+        stats = state.residency_stats
+        shadow = state.residency_shadow_load
+        assert stats is not None and shadow is not None
+        num_tokens = router_logits.shape[0]
+        values, ids = torch.topk(router_logits.float(), self.top_k, dim=-1)
+        if getattr(self, "scoring_func", "softmax") == "sigmoid":
+            weights = values.sigmoid()
+            weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        else:
+            weights = values.softmax(dim=-1)
+        if state.num_unpadded_tokens_tensors is not None:
+            num_real = state.num_unpadded_tokens_tensors[dbo_current_ubatch_id()]
+            real = torch.arange(num_tokens, device=router_logits.device) < num_real
+        else:
+            real = torch.ones(num_tokens, dtype=torch.bool, device=router_logits.device)
+        real = real.unsqueeze(-1).expand_as(ids)
+        displaced = mask[ids] & real
+        stats[DISPLACED_CALLS].add_(displaced.sum().to(stats.dtype))
+        stats[ROUTED_CALLS].add_(real.sum().to(stats.dtype))
+        stats[DISPLACED_WEIGHT].add_((weights * displaced).sum().to(stats.dtype))
+        shadow.index_add_(0, ids.reshape(-1).long(), real.reshape(-1).to(shadow.dtype))
+
     def _convert_indices_dtype(
         self, topk_ids: torch.Tensor, indices_type: torch.dtype | None
     ) -> torch.Tensor:
@@ -272,6 +344,10 @@ class BaseRouter(FusedMoERouter):
         """
         # Step 1: Validate EPLB state
         self._validate_eplb_state()
+
+        # Step 1b: Keep the router away from masked experts (EPLB residency
+        # mask; a no-op when it is off)
+        router_logits = self._apply_residency_mask(router_logits)
 
         # Step 2: Compute routing (delegated to subclass)
         topk_weights, topk_ids = self._compute_routing(

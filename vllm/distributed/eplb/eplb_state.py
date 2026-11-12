@@ -75,6 +75,7 @@ from .rebalance_execute import (
     move_from_buffer,
     rearrange_expert_weights_inplace,
 )
+from .residency_mask import ResidencyMask, logical_mask_from_residency
 
 logger = init_logger(__name__)
 
@@ -274,6 +275,8 @@ class EplbModelState:
     load_scrubbed: bool = False
     """The movers' scrub after load has been offered (it runs only with the
     layers' debug setting on)."""
+    residency: ResidencyMask | None = None
+    """The model's residency mask (`EPLBConfig.residency_mask`), if on."""
 
 
 class EplbState:
@@ -658,6 +661,7 @@ class EplbState:
         elif any(f is not None for f in fast_slots):
             model_state.fast_slots = fast_slots
         self.model_states[hash_config_cached(model_config)] = model_state
+        self._add_residency_mask(model_state)
         if self.parallel_config.eplb_config.state_path is not None:
             self._read_saved_load(model_state)
 
@@ -1025,11 +1029,18 @@ class EplbState:
         # performing collective communication.
         self.expert_rearrangement_step += 1
 
+        # Models whose pending layer was committed (or given up) at this step:
+        # the same on every rank, since every rank takes the same branch.
+        settled: set[int] = set()
         if self.is_async:
             # Run _move_to_workspace if all ranks have finished transferring the
             # new weights to the intermediate buffer
             for eplb_model_state in self.model_states.values():
+                pending = eplb_model_state.pending_result
                 self._consume_async_result(eplb_model_state, ep_group.rank())
+                if pending is not None and eplb_model_state.pending_result is None:
+                    settled.add(id(eplb_model_state))
+        self._step_residency_masks(settled)
 
         if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
             if self.is_async and any(
@@ -1045,6 +1056,124 @@ class EplbState:
             self.rearrange()
 
         self._update_layer_should_record(log_stats=log_stats)
+
+    def _add_residency_mask(self, model_state: EplbModelState) -> None:
+        """Create the model's residency mask and hand each MoE layer's router
+        its rows (`EPLBConfig.residency_mask`)."""
+        config = self.parallel_config.eplb_config
+        if config.residency_mask == "off":
+            return
+        model = model_state.model
+        top_k = _router_top_k(model)
+        mask = ResidencyMask(
+            mode=config.residency_mask,
+            num_layers=model.num_moe_layers,
+            num_logical=model.num_logical_experts,
+            top_k=top_k,
+            share=config.residency_mask_share,
+            interval=config.residency_mask_interval,
+            window_steps=config.window_size,
+            count_displaced=config.residency_mask_stats,
+            device=self.device,
+        )
+        model_state.residency = mask
+        handed = 0
+        for idx, layer in enumerate(model.moe_layers):
+            layer_state = getattr(layer, "eplb_state", None)
+            if isinstance(layer_state, EplbLayerState):
+                (
+                    layer_state.residency_mask,
+                    layer_state.residency_stats,
+                    layer_state.residency_shadow_load,
+                ) = mask.layer_tensors(idx)
+                handed += 1
+        logger.info(
+            "EPLB residency mask (%s%s) on %d of %d MoE layers of %s: refreshed "
+            "every %d steps over %d experts per layer, top_k %d, displaced "
+            "calls %s.",
+            config.residency_mask,
+            f", share {config.residency_mask_share}"
+            if config.residency_mask == "coldest"
+            else "",
+            handed,
+            model.num_moe_layers,
+            model_state.model_name,
+            config.residency_mask_interval,
+            model.num_logical_experts,
+            top_k,
+            "counted" if config.residency_mask_stats else "not counted",
+        )
+
+    def _step_residency_masks(self, settled: set[int]) -> None:
+        """The step hook's part of the residency masks: refresh a model's mask
+        every `residency_mask_interval` steps, at the first step, and, for
+        "nonresident", at every step that committed an async layer (a commit
+        may change what the tiers hold). Runs at the same step on every rank,
+        between steps, on the stream the next forward is enqueued on."""
+        for model_state in self.model_states.values():
+            mask = model_state.residency
+            if mask is None:
+                continue
+            mask.steps += 1
+            due = mask.steps % mask.interval == 0
+            if mask.mode == "nonresident":
+                due = due or mask.steps == 1 or id(model_state) in settled
+            if due:
+                self._refresh_residency_mask(model_state, mask)
+
+    def _refresh_residency_mask(
+        self, model_state: EplbModelState, mask: ResidencyMask
+    ) -> None:
+        ep_group = get_ep_group().device_group
+        if mask.mode == "coldest":
+            load = self._allreduce_list([mask.take_interval_load()])[0]
+            with gpu_sync_allowed():
+                load_cpu = load.cpu().numpy()
+            new = mask.choose_coldest(mask.add_interval_load(load_cpu))
+        else:
+            if mask.count_displaced:
+                mask.take_interval_load()  # counted for the log only
+            counts = self._allreduce_list([self._nonresident_counts(model_state)])[0]
+            with gpu_sync_allowed():
+                counts_cpu = counts.cpu().numpy()
+                phys2log = model_state.physical_to_logical_map.cpu().numpy()
+            new = logical_mask_from_residency(
+                counts_cpu, phys2log, mask.num_logical, mask.top_k
+            )
+        changed = mask.write(new)
+        if not mask.count_displaced:
+            return
+        with gpu_sync_allowed():
+            # a copy: on a CPU device .cpu() would alias the zeroed counters
+            stats = mask.stats.cpu().numpy().copy()
+        mask.stats.zero_()
+        line = mask.take_stats(stats)
+        if line is not None and ep_group.rank() == 0:
+            logger.info(
+                "EPLB residency mask (%s, %s) at step %d: %s%s.",
+                mask.mode,
+                model_state.model_name,
+                mask.steps,
+                line,
+                "; mask changed" if changed else "",
+            )
+
+    def _nonresident_counts(self, model_state: EplbModelState) -> torch.Tensor:
+        """`[layers, physical]` int32 on the device: 1 where this rank owns a
+        slot that its layer's mover reports held by no tier."""
+        model = model_state.model
+        counts = torch.zeros(
+            (model.num_moe_layers, model.num_physical_experts), dtype=torch.int32
+        )
+        movers = model_state.movers or [None] * model.num_moe_layers
+        for layer, mover in enumerate(movers):
+            report = getattr(mover, "nonresident_physical", None)
+            if report is None:
+                continue
+            ids = list(report())
+            if ids:
+                counts[layer, ids] = 1
+        return counts.to(self.device)
 
     def _maybe_log_balancedness(self) -> None:
         pending = self._pending_balancedness
@@ -1682,6 +1811,15 @@ class EplbLayerState:
     Reference to the parent `EplbModelState`'s tensor list so the
     router can read the correct per-[u]batch unpadded token count.
     """
+    residency_mask: torch.Tensor | None = None
+    """`[logical experts]` bool, this layer's row of the model's residency
+    mask (`EPLBConfig.residency_mask`); None when the mask is off."""
+    residency_stats: torch.Tensor | None = None
+    """`[3]` float32: displaced calls, routed calls, displaced weight, added
+    to by the router; None when not counted."""
+    residency_shadow_load: torch.Tensor | None = None
+    """`[logical experts]` float32: top-k calls of the unmasked logits per
+    expert, added to by the router; None when not counted."""
 
     def set_layer_state(
         self,
@@ -1693,6 +1831,17 @@ class EplbLayerState:
         self.expert_load_view = expert_load_view[moe_layer_idx]
         self.logical_to_physical_map = logical_to_physical_map[moe_layer_idx]
         self.logical_replica_count = logical_replica_count[moe_layer_idx]
+
+
+def _router_top_k(model: MixtureOfExperts) -> int:
+    """The router's top_k of the model's MoE layers."""
+    for layer in model.moe_layers:
+        top_k = getattr(getattr(layer, "router", None), "top_k", None)
+        if top_k:
+            return int(top_k)
+    raise ValueError(
+        "EPLB residency mask: no MoE layer of the model exposes its router's top_k"
+    )
 
 
 def _node_count_with_rank_mapping(

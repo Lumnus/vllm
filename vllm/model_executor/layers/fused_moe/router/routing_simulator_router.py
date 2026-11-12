@@ -331,6 +331,10 @@ class RoutingSimulator:
 class RoutingSimulatorRouter(BaseRouter):
     """Router that uses routing simulation strategies for testing/debugging."""
 
+    @property
+    def supports_residency_mask(self) -> bool:
+        return False  # it routes by its strategy, not by the logits
+
     def __init__(
         self,
         top_k: int,

@@ -878,6 +878,19 @@ class ExpertTiers:
             }
         )
 
+    def nonresident_physical(self) -> list[int]:
+        """Physical expert ids this rank owns that neither tier holds (the
+        EPLB residency mask keeps the router away from them). Empty while
+        every owned slot is in a fast or a pool row, which is the invariant
+        of the tiers as they are."""
+        from vllm.model_executor.offloader.expert_tier_map import FAST, POOL
+
+        placement = self.placement
+        if placement is None:
+            return []
+        held = np.isin(placement.tier, (FAST, POOL))
+        return [g for g, slot in self.local_of.items() if slot >= 0 and not held[slot]]
+
     @property
     def scrub_every(self) -> int:
         """The debug setting: scrub after every Nth rearrangement (0: off)."""
