@@ -3026,6 +3026,34 @@ class VllmConfig:
             )
         mm_config.mm_encoder_only = True
 
+    def _check_dynamic_host_towers(self, flag: str, names: list[str]) -> None:
+        """Refuse what a tower that moves to the accelerators and back
+        cannot do. The KV cache settings are the user's own; whether the
+        platform serves the extensible KV cache is checked when the engine
+        starts (the KV cache must be resizable then)."""
+        mm_config = self.model_config.get_multimodal_config()
+        what = f"{flag} with residency 'dynamic' ({', '.join(names)})"
+        if mm_config.mm_encoder_tp_mode != "weights":
+            raise ValueError(
+                f"{what} needs mm_encoder_tp_mode='weights': in 'data' mode the "
+                "model splits the encoder batch across ranks itself."
+            )
+        parallel_config = self.parallel_config
+        if parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(f"{what} is not supported with pipeline parallelism.")
+        if parallel_config.data_parallel_size > 1:
+            raise ValueError(
+                f"{what} is not supported with data parallelism: the KV cache "
+                "cannot be resized there."
+            )
+        cache_config = self.cache_config
+        if cache_config.kv_cache_release_chunk_mib is None:
+            raise ValueError(
+                f"{what} gives the tower's accelerator memory back and forth "
+                "with the KV cache, which needs --kv-cache-release-chunk-mib "
+                "(and the extensible KV cache)."
+            )
+
     def _resolve_mm_encoder_host_towers(self) -> None:
         """Wire `mm_encoder_host_towers` to the connector that serves them.
 
@@ -3090,6 +3118,13 @@ class VllmConfig:
                 f"{flag} does not support enable_tower_connector_lora: "
                 "adapters are not applied to a host tower."
             )
+        dynamic = sorted(
+            name
+            for name, options in mm_config.mm_encoder_host_towers.items()
+            if options.residency == "dynamic"
+        )
+        if dynamic:
+            self._check_dynamic_host_towers(flag, dynamic)
 
         if derived is not None:
             # This config was built from one that already went through here
