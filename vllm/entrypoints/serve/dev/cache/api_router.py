@@ -48,26 +48,49 @@ async def reset_prefix_cache(
 async def resize_kv_cache(
     raw_request: Request,
     num_blocks: int = Query(gt=0),
+    deadline_s: float | None = Query(default=None, ge=0),
+    preempt: bool = Query(default=False),
 ):
-    """Grow the extensible KV cache toward `num_blocks` blocks while serving.
+    """Resize the extensible KV cache toward `num_blocks` blocks while serving.
 
-    The engine commits what the memory on every card fits, up to `num_blocks`
-    and the reserved capacity, and never fewer blocks than it has. Returns
-    `{"num_blocks": int}`, the count in force afterwards; a request at or below
-    the current size changes nothing.
+    Above the current size the engine commits what the memory on every card
+    fits, up to `num_blocks` and the reserved capacity, and returns when done
+    (`state` "finished" or "unchanged"). Below it the engine starts a shrink
+    and returns at once, usually with `state` "draining": the blocks from
+    `num_blocks` on are handed out no more, and are given back once the
+    requests holding them finish; read the progress with
+    `GET /kv_cache_resize`. After `deadline_s` (engine default if unset, 0 for
+    none) a drain still waiting is aborted, or with `preempt=true` the
+    requests holding those blocks are preempted. The record carries
+    `num_blocks` (in force now), `from_blocks`, `to_blocks`, `fenced_blocks`,
+    `held_blocks`, `released_bytes_per_rank` and a `message`.
 
     Example:
        POST /resize_kv_cache?num_blocks=9000
+       POST /resize_kv_cache?num_blocks=6000&deadline_s=30&preempt=true
 
     """
     logger.info("Resizing the KV cache toward %d blocks...", num_blocks)
     try:
-        committed = await engine_client(raw_request).resize_kv_cache(num_blocks)
+        record = await engine_client(raw_request).resize_kv_cache(
+            num_blocks, deadline_s, preempt
+        )
     except Exception as e:  # noqa: BLE001
         # The engine core reports a failed call as a plain Exception.
         logger.warning("Resizing the KV cache failed: %s", e)
         return JSONResponse(content={"error": str(e)}, status_code=400)
-    return JSONResponse(content={"num_blocks": committed})
+    return JSONResponse(content=record)
+
+
+@router.get("/kv_cache_resize")
+async def kv_cache_resize_state(raw_request: Request):
+    """The record of the current or last KV cache resize (see
+    `POST /resize_kv_cache`), or `{"state": "idle", "num_blocks": int}`."""
+    try:
+        record = await engine_client(raw_request).get_kv_cache_resize_state()
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+    return JSONResponse(content=record)
 
 
 @router.post("/reset_mm_cache")
