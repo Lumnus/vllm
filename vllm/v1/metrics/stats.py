@@ -238,6 +238,8 @@ class SchedulerStats:
     kv_cache_usage: float = 0.0
     # Blocks in the KV cache pool now; it changes only when the cache is resized.
     num_gpu_blocks: int = 0
+    # Blocks a KV cache shrink in progress takes out of the pool (0 otherwise).
+    num_fenced_gpu_blocks: int = 0
     iteration_details: SchedulerIterationDetails | None = None
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)

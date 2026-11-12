@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The dev endpoint that grows the KV cache of a serving engine."""
+"""The dev endpoints that resize the KV cache of a serving engine."""
 
 import pytest
 from fastapi import FastAPI
@@ -14,12 +14,22 @@ class FakeEngineClient:
         self.result = result
         self.error = error
         self.requested: list[int] = []
+        self.options: list[tuple[float | None, bool]] = []
 
-    async def resize_kv_cache(self, target_num_blocks: int) -> int:
+    async def resize_kv_cache(
+        self, target_num_blocks: int, deadline_s=None, preempt=False
+    ) -> dict:
         self.requested.append(target_num_blocks)
+        self.options.append((deadline_s, preempt))
         if self.error is not None:
             raise self.error
-        return self.result
+        state = "draining" if target_num_blocks < self.result else "finished"
+        return {"state": state, "num_blocks": self.result}
+
+    async def get_kv_cache_resize_state(self) -> dict:
+        if self.error is not None:
+            raise self.error
+        return {"state": "idle", "num_blocks": self.result}
 
 
 def _client(engine: FakeEngineClient) -> TestClient:
@@ -33,8 +43,30 @@ def test_resize_returns_the_block_count_in_force():
     engine = FakeEngineClient(result=9000)
     response = _client(engine).post("/resize_kv_cache", params={"num_blocks": 12000})
     assert response.status_code == 200
-    assert response.json() == {"num_blocks": 9000}
+    assert response.json() == {"state": "finished", "num_blocks": 9000}
     assert engine.requested == [12000]
+    assert engine.options == [(None, False)]
+
+
+def test_a_smaller_count_returns_the_shrink_state_with_its_options():
+    engine = FakeEngineClient(result=9000)
+    response = _client(engine).post(
+        "/resize_kv_cache",
+        params={"num_blocks": 6000, "deadline_s": 30, "preempt": "true"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"state": "draining", "num_blocks": 9000}
+    assert engine.options == [(30.0, True)]
+
+
+def test_the_resize_state_can_be_read():
+    engine = FakeEngineClient(result=9000)
+    response = _client(engine).get("/kv_cache_resize")
+    assert response.status_code == 200
+    assert response.json() == {"state": "idle", "num_blocks": 9000}
+
+    engine = FakeEngineClient(error=Exception("engine dead"))
+    assert _client(engine).get("/kv_cache_resize").status_code == 500
 
 
 @pytest.mark.parametrize("num_blocks", ["0", "-5", "many"])

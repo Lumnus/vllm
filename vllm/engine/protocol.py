@@ -199,11 +199,21 @@ class EngineClient(ABC):
         """Reset the prefix cache and optionally any configured connector cache."""
         ...
 
-    async def resize_kv_cache(self, target_num_blocks: int) -> int:
-        """Grow the extensible KV cache toward target_num_blocks while serving.
-
-        Returns the block count in force afterwards.
+    async def resize_kv_cache(
+        self,
+        target_num_blocks: int,
+        deadline_s: float | None = None,
+        preempt: bool = False,
+    ) -> dict[str, Any]:
+        """Resize the extensible KV cache toward target_num_blocks while
+        serving: a grow completes within the call, a shrink starts and is
+        read with `get_kv_cache_resize_state`. Returns the resize's record
+        (state, block counts, bytes released per rank).
         """
+        raise NotImplementedError
+
+    async def get_kv_cache_resize_state(self) -> dict[str, Any]:
+        """The record of the current or last KV cache resize."""
         raise NotImplementedError
 
     @abstractmethod

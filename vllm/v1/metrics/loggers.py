@@ -632,6 +632,30 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_usage, per_engine_labelvalues
         )
 
+        gauge_kv_cache_num_blocks = self._gauge_cls(
+            name="vllm:kv_cache_num_blocks",
+            documentation=(
+                "Blocks in the KV cache pool; it changes when the cache is "
+                "resized while serving."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_kv_cache_num_blocks = create_metric_per_engine(
+            gauge_kv_cache_num_blocks, per_engine_labelvalues
+        )
+        gauge_kv_cache_fenced_blocks = self._gauge_cls(
+            name="vllm:kv_cache_fenced_blocks",
+            documentation=(
+                "KV cache blocks a shrink in progress takes out of the pool."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_kv_cache_fenced_blocks = create_metric_per_engine(
+            gauge_kv_cache_fenced_blocks, per_engine_labelvalues
+        )
+
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
                 name="vllm:corrupted_requests",
@@ -1169,6 +1193,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     scheduler_stats.num_kv_fetch_reqs_by_stage.get(stage, 0)
                 )
             self.gauge_kv_cache_usage[engine_idx].set(scheduler_stats.kv_cache_usage)
+            self.gauge_kv_cache_num_blocks[engine_idx].set(
+                scheduler_stats.num_gpu_blocks
+            )
+            self.gauge_kv_cache_fenced_blocks[engine_idx].set(
+                scheduler_stats.num_fenced_gpu_blocks
+            )
 
             self.counter_prefix_cache_queries[engine_idx].inc(
                 scheduler_stats.prefix_cache_stats.queries

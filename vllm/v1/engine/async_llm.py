@@ -1214,8 +1214,18 @@ class AsyncLLM(EngineClient):
     async def reset_encoder_cache(self) -> None:
         await self.engine_core.reset_encoder_cache_async()
 
-    async def resize_kv_cache(self, target_num_blocks: int) -> int:
-        return await self.engine_core.resize_kv_cache_async(target_num_blocks)
+    async def resize_kv_cache(
+        self,
+        target_num_blocks: int,
+        deadline_s: float | None = None,
+        preempt: bool = False,
+    ) -> dict[str, Any]:
+        return await self.engine_core.resize_kv_cache_async(
+            target_num_blocks, deadline_s, preempt
+        )
+
+    async def get_kv_cache_resize_state(self) -> dict[str, Any]:
+        return await self.engine_core.get_kv_cache_resize_state_async()
 
     async def sleep(
         self, level: int = 1, mode: PauseMode = "abort", reset_connector: bool = True

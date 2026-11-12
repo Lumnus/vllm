@@ -3468,6 +3468,7 @@ class Scheduler(SchedulerInterface):
             num_kv_fetch_reqs_by_stage=self._kv_fetch_counts.copy(),
             kv_cache_usage=self.kv_cache_manager.usage,
             num_gpu_blocks=self.kv_cache_manager.block_pool.num_gpu_blocks,
+            num_fenced_gpu_blocks=self.kv_cache_manager.block_pool.num_fenced_blocks,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
