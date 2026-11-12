@@ -101,8 +101,10 @@ def test_submit_brings_the_tower_to_the_host_by_itself():
     tower.shutdown()
 
 
-@pytest.mark.parametrize("move", ["to_card", "release"])
+@pytest.mark.parametrize("move", ["to_card"])
 def test_a_move_that_is_not_built_leaves_the_tower_serving(move):
+    # The accelerator copy is the workers' (vllm/multimodal/card_tower.py);
+    # the host copy does not move there itself.
     tower = make_tower()
     tower.to_host()
     module = tower._module
@@ -115,6 +117,20 @@ def test_a_move_that_is_not_built_leaves_the_tower_serving(move):
     item = make_item("a", 4)
     result = tower.submit([("image", item)]).result(timeout=60)
     assert torch.equal(result.embeddings[0], direct_embedding(tower, item))
+    tower.shutdown()
+
+
+def test_release_drops_the_host_copy_and_the_next_encode_brings_it_back():
+    tower = make_tower()
+    tower.to_host()
+    nbytes = tower.nbytes
+    assert tower.release(wait=False).result(timeout=60) == nbytes
+    assert tower.location is TowerLocation.DISK
+    assert tower._module is None
+    item = make_item("a", 4)
+    result = tower.submit([("image", item)]).result(timeout=60)
+    assert torch.equal(result.embeddings[0], direct_embedding(tower, item))
+    assert tower.location is TowerLocation.HOST
     tower.shutdown()
 
 

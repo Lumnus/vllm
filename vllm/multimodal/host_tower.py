@@ -28,6 +28,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -104,14 +105,13 @@ class HostTower:
     * `to_host()` leaves the tower able to encode in host memory. It is
       idempotent, safe to call concurrently, and never drops a submitted
       encode: encodes submitted while it runs wait for it.
-    * `to_card()` must hand the tower to the workers at a step boundary on
-      every rank, and only after every encode submitted before it has
-      delivered its embeddings; requests admitted on those embeddings keep
-      them. Not implemented: `NotImplementedError`, tower unchanged.
-    * `release()` must wait for the encodes in flight, then drop the host
-      weights; embeddings already produced stay valid, and a later `submit`
-      brings the tower back by itself. Not implemented: `NotImplementedError`,
-      tower unchanged.
+    * `to_card()` is not this object's move: a copy on the accelerators is
+      built by the workers and switched to by the engine core
+      (`vllm/v1/engine/tower_residency.py`); this host copy stays as it is
+      meanwhile. Raises `NotImplementedError`, tower unchanged.
+    * `release()` runs after the encodes already submitted, on the tower's
+      thread, then drops the host weights; embeddings already produced stay
+      valid, and a later `submit` brings the tower back by itself.
 
     `submit` is the only way work reaches the tower: one encode at a time, on
     the tower's own thread, with `threads` CPU threads inside it.
@@ -196,15 +196,37 @@ class HostTower:
 
     def to_card(self) -> None:
         raise NotImplementedError(
-            f"Host tower {self.name!r} cannot be moved to the accelerator "
-            "while the engine runs."
+            f"Host tower {self.name!r} is the host copy; the accelerators get "
+            "their own (residency 'dynamic' in --mm-encoder-host-towers)."
         )
 
-    def release(self) -> None:
-        raise NotImplementedError(
-            f"Host tower {self.name!r} cannot give up its host memory while "
-            "the engine runs."
+    def release(self, wait: bool = True) -> "Future[int]":
+        """Drop the host weights once the encodes submitted before this call
+        have run. The future resolves to the bytes given up (0 when the tower
+        was not in host memory). Never wait on it from the tower's thread."""
+        future = self._executor.submit(self._release_now)
+        if wait:
+            future.result()
+        return future
+
+    def _release_now(self) -> int:
+        with self._move_lock:
+            module = self._module
+            if module is None:
+                return 0
+            nbytes = self.nbytes
+            # A source that keeps nothing of its own cannot release; dropping
+            # the module frees its parameters.
+            with suppress(NotImplementedError):
+                self._weights.release(module)
+            self._module = None
+            self._location = TowerLocation.DISK
+        logger.info(
+            "Host tower %s: released its host memory (%s GiB).",
+            self.name,
+            format_gib(nbytes),
         )
+        return nbytes
 
     def submit(
         self, items: Sequence[tuple[str, "MultiModalKwargsItem"]]
@@ -264,13 +286,21 @@ def resolve_host_tower_threads(options: "HostTowerOptions") -> int:
 
 
 def make_host_tower_config(
-    vllm_config: "VllmConfig", tower_name: str, options: "HostTowerOptions"
+    vllm_config: "VllmConfig",
+    tower_name: str,
+    options: "HostTowerOptions",
+    *,
+    for_card: bool = False,
 ) -> "VllmConfig":
     """The config a host tower's module is built from.
 
     A private copy of the engine's config that describes the tower alone, in
     host memory, in one piece: no language model, no tensor parallelism, no
     compilation, nothing offloaded. The engine's config is not changed.
+
+    With `for_card`, the copy describes the accelerator copy a worker builds
+    of a tower with residency "dynamic": the model's dtype, and the worker's
+    parallel config (a "sharded" layout is cut by the worker's own groups).
     """
     from vllm.config import CompilationConfig, DeviceConfig, ParallelConfig
     from vllm.config.compilation import CompilationMode, CUDAGraphMode
@@ -286,12 +316,13 @@ def make_host_tower_config(
     mm_config.mm_encoder_only = True
     mm_config.mm_encoder_tp_mode = "weights"
     model_config.multimodal_config = mm_config
-    if options.dtype == "float32":
+    if options.dtype == "float32" and not for_card:
         model_config.dtype = torch.float32
     config.model_config = model_config
 
     config.device_config = DeviceConfig(device="cpu")
-    config.parallel_config = ParallelConfig()
+    if not for_card:
+        config.parallel_config = ParallelConfig()
     config.compilation_config = CompilationConfig(
         mode=CompilationMode.NONE,
         cudagraph_mode=CUDAGraphMode.NONE,
@@ -317,12 +348,19 @@ def _use_host_forward(module: nn.Module) -> None:
             submodule._forward_method = submodule.forward_cpu
 
 
-def build_host_tower_module(twin_config: "VllmConfig") -> nn.Module:
+def build_host_tower_module(
+    twin_config: "VllmConfig", *, host_forward: bool = True, whole: bool = True
+) -> nn.Module:
     """Build the module of a host tower, without weights.
 
     The model's own class is constructed from `twin_config` (see
     `make_host_tower_config`): it builds the named tower whole, in host
     memory, and nothing else, and its `embed_multimodal` is what encodes.
+
+    A worker building the accelerator copy of a tower passes
+    `host_forward=False` (its custom ops keep the accelerator's kernels) and,
+    for tensor-parallel shards, `whole=False` (the worker's own groups cut
+    it).
 
     Raises:
         ValueError: The model cannot keep this tower on the host.
@@ -350,7 +388,7 @@ def build_host_tower_module(twin_config: "VllmConfig") -> nn.Module:
     with (
         set_default_torch_dtype(model_config.dtype),
         torch.device("cpu"),
-        single_rank_model_parallel(),
+        single_rank_model_parallel() if whole else nullcontext(),
     ):
         module = initialize_model(vllm_config=twin_config, model_config=model_config)
 
@@ -366,7 +404,8 @@ def build_host_tower_module(twin_config: "VllmConfig") -> nn.Module:
             f"serves ({sorted(towers[tower_name])}) is disabled."
         )
 
-    _use_host_forward(module)
+    if host_forward:
+        _use_host_forward(module)
     return module
 
 
