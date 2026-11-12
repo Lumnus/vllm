@@ -845,3 +845,73 @@ def test_resize_kv_caches_follows_a_grown_cache():
     for ref, ptr in zip(grown.group_data_refs[0], ptrs.ptrs):
         tensor = grown.tensors[ref.tensor_idx].tensor
         assert ptr == tensor.data_ptr() + last * tensor.stride(0)
+
+
+def test_resize_kv_caches_waits_for_stores_before_a_shrink():
+    """Before the blocks above the new count are unmapped, stores deferred to
+    the next step are submitted against the views that still cover them, and
+    every store in flight is waited for. A grow waits for nothing."""
+    from vllm.v1.kv_offload.pointer_utils import resolve_device_pointers
+
+    attn_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    page = attn_spec.page_size_bytes
+    layers = ["layer0", "layer1"]
+
+    def config(num_blocks: int) -> KVCacheConfig:
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=2 * page * num_blocks,
+                    layers=layers,
+                    layer_stride=page * num_blocks,
+                    block_stride=page,
+                )
+            ],
+            kv_cache_groups=[KVCacheGroupSpec(layers, attn_spec)],
+        )
+
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    big = config(3 * NUM_BLOCKS)
+    worker, spec = _make_worker(big)
+    worker.register_kv_caches(_allocate_kv_caches(big, [], device=device))
+    transfers = worker.worker
+    big_views = worker._kv_caches
+    last = 3 * NUM_BLOCKS - 1
+    src = GPULoadStoreSpec([last], group_sizes=(1,), block_indices=(0,))
+    worker._unsubmitted_store_jobs.append((7, src, "dst"))
+    worker._inflight_store_jobs.add(5)
+
+    # Growing does not touch the stores.
+    worker.resize_kv_caches(_allocate_kv_caches(big, [], device=device), 3 * NUM_BLOCKS)
+    transfers.wait.assert_not_called()
+    assert worker._unsubmitted_store_jobs
+
+    small = config(NUM_BLOCKS)
+    worker._kv_caches = big_views
+    worker.resize_kv_caches(_allocate_kv_caches(small, [], device=device), NUM_BLOCKS)
+
+    (call,) = transfers.submit_store.call_args_list
+    job_id, ptrs, dst = call.args
+    assert job_id == 7 and dst == "dst"
+    import numpy as np
+
+    assert np.array_equal(ptrs.ptrs, resolve_device_pointers(src, big_views).ptrs)
+    transfers.wait.assert_called_once_with({5, 7})
+    assert worker._unsubmitted_store_jobs == []
+    assert all(t.tensor.shape[0] == NUM_BLOCKS for t in worker._kv_caches.tensors)
+
+    # A finished store leaves the in-flight set.
+    from vllm.v1.kv_offload.base import TransferResult
+
+    transfers.get_finished.return_value = [
+        TransferResult(job_id=7, success=True),
+        TransferResult(job_id=5, success=True),
+    ]
+    worker.get_finished(set())
+    assert worker._inflight_store_jobs == set()

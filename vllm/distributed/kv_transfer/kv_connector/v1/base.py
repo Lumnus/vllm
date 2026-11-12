@@ -338,18 +338,21 @@ class KVConnectorBase_V1(ABC):
 
     def supports_kv_cache_resize(self) -> bool:
         """Whether `resize_kv_caches` keeps this connector correct when the KV
-        cache grows while serving. Connectors that register KV cache memory
-        or keep their own views of it must opt in."""
+        cache grows or shrinks while serving. Connectors that register KV
+        cache memory or keep their own views of it must opt in."""
         return False
 
     def resize_kv_caches(
         self, kv_caches: dict[str, torch.Tensor], num_blocks: int
     ) -> None:
-        """Follow a KV cache whose committed block count grew to num_blocks.
+        """Follow a KV cache whose committed block count changed to num_blocks.
 
         The views in kv_caches have the same base addresses as before and
-        cover num_blocks blocks. Only called on connectors that return True
-        from `supports_kv_cache_resize`.
+        cover num_blocks blocks. On a shrink the blocks from num_blocks on are
+        still mapped during the call and unmapped right after it: a connector
+        must finish or cancel every transfer touching them before returning.
+        Only called on connectors that return True from
+        `supports_kv_cache_resize`.
 
         Args:
             kv_caches: dictionary of layer names, kv cache
