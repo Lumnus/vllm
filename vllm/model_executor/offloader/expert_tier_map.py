@@ -98,6 +98,12 @@ class TorchStreamOps:
         self._torch = torch
         self.mod = torch.get_device_module(device)
         self.side = self.mod.Stream(device)
+        # Host sources of map writes still queued: (event behind the copy,
+        # the pinned tensor). A commit enqueues its map writes behind a wait,
+        # so their copies are pending when this returns; the source must not
+        # go back to the pinned allocator (and be handed out again for the
+        # next map) before its copy has run.
+        self._held: list[tuple[Any, Any]] = []
 
     def record_compute(self) -> Any:
         event = self.mod.Event()
@@ -128,6 +134,8 @@ class TorchStreamOps:
         )
         host.copy_(torch.from_numpy(np.ascontiguousarray(values, dtype=np.int32)))
         dst.copy_(host, non_blocking=True)
+        self._held = [(e, h) for e, h in self._held if not e.query()]
+        self._held.append((self.record_compute(), host))
 
     def done(self, event: Any) -> bool:
         return bool(event.query())

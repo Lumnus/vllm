@@ -405,3 +405,91 @@ def test_the_ordering_rules_are_what_keeps_kernels_correct(monkeypatch):
         )
         > 0
     )
+
+
+# -- the torch stream operations against a stand-in device module ---------------
+
+
+class _FakeStream:
+    def __init__(self, device: Any = None) -> None:
+        self.recorded: list[Any] = []
+        self.waited: list[Any] = []
+
+    def wait_event(self, event: Any) -> None:
+        self.waited.append(event)
+
+
+class _FakeEvent:
+    def __init__(self) -> None:
+        self.finished = False
+
+    def record(self, stream: _FakeStream) -> None:
+        stream.recorded.append(self)
+
+    def query(self) -> bool:
+        return self.finished
+
+
+class _FakeDevice:
+    """The few names ``TorchStreamOps`` uses of a torch device module."""
+
+    Stream = _FakeStream
+    Event = _FakeEvent
+
+    def __init__(self) -> None:
+        self.compute = _FakeStream()
+        self.entered: list[_FakeStream] = []
+
+    def current_stream(self) -> _FakeStream:
+        return self.compute
+
+    def stream(self, stream: _FakeStream):
+        import contextlib
+
+        @contextlib.contextmanager
+        def scope():
+            self.entered.append(stream)
+            yield
+
+        return scope()
+
+
+def test_torch_stream_ops_keep_a_map_source_until_its_copy_has_run(monkeypatch):
+    """A commit's map writes are queued behind a wait: the pinned source of
+    one must not be released (and reused for the next) before the event
+    recorded behind its copy has completed."""
+    import weakref
+
+    from vllm.model_executor.offloader.expert_tier_map import TorchStreamOps
+
+    device = _FakeDevice()
+    monkeypatch.setattr(torch, "get_device_module", lambda d: device)
+    ops = TorchStreamOps("fake")
+    # the stream and event calls a commit makes exist and go where they should
+    drained = ops.record_compute()
+    assert device.compute.recorded == [drained]
+    ops.side_wait(drained)
+    assert ops.side.waited == [drained]
+    dst, src = torch.zeros(4, dtype=torch.uint8), torch.arange(4, dtype=torch.uint8)
+    ops.side_copy(dst, src)
+    assert device.entered == [ops.side] and torch.equal(dst, src)
+    filled = ops.record_side()
+    assert ops.side.recorded == [filled]
+    ops.compute_wait(filled)
+    assert device.compute.waited == [filled] and not ops.done(filled)
+
+    fast_map = torch.full((6,), -1, dtype=torch.int32)
+    slow_map = torch.full((6,), -1, dtype=torch.int32)
+    ops.compute_write(fast_map, np.arange(6))
+    first_event, first_host = ops._held[0]
+    alive = weakref.ref(first_host)
+    del first_host
+    ops.compute_write(slow_map, np.arange(6)[::-1])
+    assert len(ops._held) == 2 and alive() is not None  # both sources kept
+    assert ops._held[0][1] is not ops._held[1][1]
+    assert fast_map.tolist() == [0, 1, 2, 3, 4, 5]
+    assert slow_map.tolist() == [5, 4, 3, 2, 1, 0]
+    # once the first copy's event has completed its source is let go
+    first_event.finished = True
+    ops.compute_write(fast_map, np.zeros(6))
+    assert len(ops._held) == 2 and alive() is None
