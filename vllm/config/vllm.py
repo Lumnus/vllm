@@ -25,6 +25,7 @@ from vllm.platforms import current_platform
 from vllm.transformers_utils.runai_utils import is_runai_obj_uri
 from vllm.utils import random_uuid
 from vllm.utils.math_utils import cdiv
+from vllm.utils.mem_constants import GiB_bytes
 
 from .attention import AttentionConfig, HiSparseConfig
 from .aux_output import AuxOutputConfig
@@ -2003,6 +2004,9 @@ class VllmConfig:
         self._resolve_mm_processor_device()
         self._resolve_mm_video_decode_device()
         self._validate_mm_processor_device()
+        # After the EC role based resolution above: the connector derived here
+        # only moves embeddings inside this engine.
+        self._resolve_mm_encoder_host_towers()
 
         self._disable_cudagraphs_for_stock_torch_compile()
         self._validate_model_runner()
@@ -3013,6 +3017,85 @@ class VllmConfig:
                 "An EC producer-only instance requires a multimodal model."
             )
         mm_config.mm_encoder_only = True
+
+    def _resolve_mm_encoder_host_towers(self) -> None:
+        """Wire `mm_encoder_host_towers` to the connector that serves them.
+
+        Host towers hand their embeddings to the workers through an encoder
+        cache connector that lives inside this engine, so the EC config is
+        derived here rather than set by the user.
+
+        Raises:
+            ValueError: The deployment cannot run its towers on the host.
+
+        """
+        model_config = self.model_config
+        if model_config is None:
+            return
+        mm_config = model_config.multimodal_config
+        if mm_config is None or not mm_config.mm_encoder_host_towers:
+            return
+        if mm_config.mm_encoder_host_twin is not None:
+            # A host tower's own config copy: nothing to wire.
+            return
+
+        flag = "--mm-encoder-host-towers"
+        if mm_config.language_model_only:
+            logger.info_once(
+                "%s has no effect with --language-model-only: "
+                "the model is built without encoder towers.",
+                flag,
+            )
+            return
+        if self.ec_transfer_config is not None:
+            raise ValueError(
+                f"{flag} cannot be combined with --ec-transfer-config: the host "
+                "towers use the encoder cache connector slot of this engine."
+            )
+        if mm_config.mm_encoder_only:
+            raise ValueError(
+                f"{flag} is not supported with --mm-encoder-only: an encode-only "
+                "instance has no language model to keep the accelerator for."
+            )
+        if model_config.is_encoder_decoder:
+            raise ValueError(f"{flag} does not support encoder-decoder models.")
+        if (
+            mm_config.mm_processor_cache_type == "shm"
+            and mm_config.mm_processor_cache_gb > 0
+        ):
+            raise ValueError(
+                f"{flag} needs the processed inputs in the engine process, which "
+                "--mm-processor-cache-type shm hands to the workers only. Use "
+                "--mm-processor-cache-type lru."
+            )
+        if self.compilation_config.cudagraph_mm_encoder:
+            raise ValueError(
+                f"{flag} cannot be combined with cudagraph_mm_encoder=True: "
+                "a host tower is not captured in an accelerator graph."
+            )
+        if (
+            self.lora_config is not None
+            and self.lora_config.enable_tower_connector_lora
+        ):
+            raise ValueError(
+                f"{flag} does not support enable_tower_connector_lora: "
+                "adapters are not applied to a host tower."
+            )
+
+        cache_bytes = int(
+            sum(o.cache_gb for o in mm_config.mm_encoder_host_towers.values())
+            * GiB_bytes
+        )
+        self.ec_transfer_config = ECTransferConfig(
+            ec_connector="ECHostTowerConnector",
+            # The workers only load what the host towers produced.
+            ec_role="ec_consumer",
+            ec_connector_extra_config={"ec_cpu_bytes": cache_bytes},
+        )
+        logger.info_once(
+            "Encoder towers kept in host memory: %s.",
+            ", ".join(sorted(mm_config.mm_encoder_host_towers)),
+        )
 
     def _resolve_mm_processor_device(self) -> None:
         """Settle `--mm-processor-device=auto` now that the EC role is known.

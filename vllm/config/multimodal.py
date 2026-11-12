@@ -285,6 +285,29 @@ class MultiModalDummyOptions(dict[str, BaseDummyOptions]):
         )
 
 
+HostTowerDType = Literal["float32", "model"]
+
+
+@dataclass(config=ConfigDict(extra="forbid"))
+class HostTowerOptions:
+    """Options of one encoder tower that is kept in host memory."""
+
+    threads: int = Field(default=0, ge=0)
+    """CPU threads the tower computes with. `0` uses half of the CPUs this
+    process may run on."""
+
+    dtype: HostTowerDType = "float32"
+    """The dtype the tower computes in on the CPU. `"float32"` (default) holds
+    the checkpoint's weights exactly and is the fast path on CPUs without
+    native half or bfloat16 arithmetic. `"model"` keeps the model's dtype.
+    Either way the embeddings are handed over in the model's dtype."""
+
+    cache_gb: float = Field(default=1.0, gt=0)
+    """Host memory (in GiB) for this tower's embeddings while they wait to be
+    copied to the accelerator. Embeddings of recent items stay there and are
+    reused without running the tower again."""
+
+
 MMEncoderTPMode = Literal["weights", "data"]
 MMCacheType = Literal["shm", "lru"]
 VideoPruningMethod = Literal["evs", "vidcom2"]
@@ -394,6 +417,31 @@ class MultiModalConfig:
       DP (which is controlled by `--data-parallel-size`).
       This is only supported on a per-model basis and falls back to
       `"weights"` if the encoder does not support DP."""
+    mm_encoder_host_towers: dict[str, HostTowerOptions] = Field(default_factory=dict)
+    """Encoder towers to keep in host memory and run on CPU threads, keyed by
+    tower name (`"vision_tower"` for an image/video tower, otherwise
+    `"<modality>_tower"`, e.g. `"audio_tower"`).
+
+    Such a tower takes no accelerator memory: its weights and activations stay
+    on the host, so the KV cache gets that memory. A request with an item of
+    the tower's modalities waits in the scheduler until its embeddings are
+    computed, while every other request keeps being scheduled. The embeddings
+    are then copied to the accelerator's encoder cache.
+
+    Short format (threads only):
+        {"vision_tower": 16}
+
+    Full format:
+        {"vision_tower": {"threads": 16, "dtype": "float32", "cache_gb": 1}}
+
+    Empty (default) keeps every tower on the accelerator. Only supported on a
+    per-model basis."""
+    mm_encoder_host_twin: str | None = None
+    """Name of the tower this config builds a host-memory copy of.
+
+    Derived, not user-settable: set on the private config copy the engine
+    builds a host tower from. A model built from such a config holds that tower
+    only, in host memory, and no language model."""
     mm_encoder_attn_backend: AttentionBackendEnum | None = None
     """Optional override for the multi-modal encoder attention backend when
     using vision transformers. Accepts any value from
@@ -490,6 +538,29 @@ class MultiModalConfig:
             else:
                 out[k] = BaseDummyOptions(**v)
 
+        return out
+
+    @field_validator("mm_encoder_host_towers", mode="before")
+    @classmethod
+    def _validate_mm_encoder_host_towers(
+        cls,
+        value: Mapping[str, int | Mapping[str, Any] | HostTowerOptions] | None,
+    ) -> dict[str, HostTowerOptions]:
+        out: dict[str, HostTowerOptions] = {}
+        for name, options in (value or {}).items():
+            if isinstance(options, int) and not isinstance(options, bool):
+                # Short format where only the thread count is specified
+                options = {"threads": options}
+
+            if isinstance(options, HostTowerOptions):
+                out[name] = options
+            elif isinstance(options, Mapping):
+                out[name] = HostTowerOptions(**options)
+            else:
+                raise ValueError(
+                    f"Invalid options for host tower {name!r}: {options!r}. "
+                    "Expected a thread count or a mapping of options."
+                )
         return out
 
     @field_validator("mm_encoder_attn_backend", mode="before")
@@ -684,6 +755,8 @@ class MultiModalConfig:
             "mm_hasher_algorithm",
             "mm_shm_cache_max_object_size_mb",
             "mm_encoder_only",
+            "mm_encoder_host_towers",
+            "mm_encoder_host_twin",
             "mm_encoder_fp8_scale_save_path",
             "mm_encoder_fp8_scale_save_margin",
             "interleave_mm_strings",

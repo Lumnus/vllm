@@ -687,6 +687,9 @@ class EngineArgs:
     )
     mm_encoder_only: bool = MultiModalConfig.mm_encoder_only
     mm_encoder_tp_mode: MMEncoderTPMode = MultiModalConfig.mm_encoder_tp_mode
+    mm_encoder_host_towers: dict[str, int | dict[str, Any]] = get_field(
+        MultiModalConfig, "mm_encoder_host_towers"
+    )
     mm_encoder_attn_backend: AttentionBackendEnum | str | None = (
         MultiModalConfig.mm_encoder_attn_backend
     )
@@ -1586,6 +1589,10 @@ class EngineArgs:
             "--mm-encoder-tp-mode", **multimodal_kwargs["mm_encoder_tp_mode"]
         )
         multimodal_group.add_argument(
+            "--mm-encoder-host-towers",
+            **multimodal_kwargs["mm_encoder_host_towers"],
+        )
+        multimodal_group.add_argument(
             "--mm-encoder-attn-backend",
             **multimodal_kwargs["mm_encoder_attn_backend"],
         )
@@ -2116,6 +2123,7 @@ class EngineArgs:
             mm_hasher_algorithm=self.mm_hasher_algorithm,
             mm_encoder_only=self.mm_encoder_only,
             mm_encoder_tp_mode=self.mm_encoder_tp_mode,
+            mm_encoder_host_towers=self.mm_encoder_host_towers,
             mm_encoder_attn_backend=self.mm_encoder_attn_backend,
             mm_encoder_attn_dtype=self.mm_encoder_attn_dtype,
             mm_encoder_fp8_scale_path=self.mm_encoder_fp8_scale_path,
