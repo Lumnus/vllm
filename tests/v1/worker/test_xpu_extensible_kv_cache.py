@@ -8,11 +8,14 @@ mapped range reads as zero until written, unmapping drops its contents, and
 every call on an unknown handle or an out-of-range device raises.
 """
 
+import copy
 import ctypes
 import importlib.util
 import mmap
 import sys
+import threading
 import types
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -41,6 +44,8 @@ class FakeXpuVmmOps:
         self._next_handle = 1
         self.calls: list[str] = []
         self.fail_create = False
+        # Devices whose creates fail, the rest of the ranks' being fine.
+        self.fail_create_devices: set[int] = set()
 
     def _device(self, device_index: int) -> None:
         if not 0 <= device_index < NUM_DEVICES:
@@ -70,7 +75,7 @@ class FakeXpuVmmOps:
     def vmm_create(self, size: int, device_index: int) -> int:
         self.calls.append("create")
         self._device(device_index)
-        if self.fail_create:
+        if self.fail_create or device_index in self.fail_create_devices:
             raise RuntimeError("UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY")
         assert size % GRANULE == 0
         handle = self._next_handle
@@ -465,3 +470,514 @@ def test_extensible_kv_cache_resolves_on_xpu(monkeypatch, requested):
     )
     VllmConfig._resolve_extensible_kv_cache(config)
     assert config.cache_config.enable_extensible_kv_cache is (requested is not False)
+
+
+def test_backing_segments_maps_memory_without_committing(fake_xpu):
+    """`back_segments_` maps the physical pages a growth needs and leaves the
+    committed prefixes alone; the resize that follows maps nothing more."""
+    et = ExtensibleTensor(4 * GRANULE, device="xpu:0", num_segments=2)
+    try:
+        et.resize_per_segment_(GRANULE // 2, zero_new=True)
+        et.segment_view(0)[:16].fill_(7)
+        creates = fake_xpu.ops.calls.count("create")
+
+        et.back_segments_([2 * GRANULE] * 2)
+        assert fake_xpu.ops.physical_bytes == 4 * GRANULE
+        assert et.bytes_per_segment == GRANULE // 2
+        assert et.segment_view(0).numel() == GRANULE // 2
+        backed = fake_xpu.ops.calls.count("create")
+        assert backed > creates
+
+        et.resize_segments_([2 * GRANULE] * 2, zero_new=True)
+        assert fake_xpu.ops.calls.count("create") == backed
+        assert et.bytes_per_segment == 2 * GRANULE
+        grown = et.segment_view(0)
+        assert torch.all(grown[:16] == 7)
+        assert torch.count_nonzero(grown[16:]) == 0
+        with pytest.raises(ValueError, match="grow-only"):
+            et.back_segments_([GRANULE] * 2)
+    finally:
+        et.free()
+
+
+# Growing the committed prefix while serving.
+
+MIB = 1 << 20
+
+
+class MinGroup:
+    """`reduce_min` for ranks running in threads of one process."""
+
+    def __init__(self, world_size: int) -> None:
+        self._barrier = threading.Barrier(world_size, timeout=30)
+        self._lock = threading.Lock()
+        self._values: dict[int, list[int]] = {}
+        self.rounds = 0
+
+    def reducer(self, rank: int):
+        calls = iter(range(10**6))
+
+        def reduce_min(value: int) -> int:
+            call = next(calls)
+            with self._lock:
+                self._values.setdefault(call, []).append(value)
+                self.rounds = max(self.rounds, call + 1)
+            self._barrier.wait()
+            return min(self._values[call])
+
+        return reduce_min
+
+
+class GrowFixture:
+    """Ranks of one engine on the fake driver: each an `ExtensibleKVCache` on
+    its own device with a stand-in runner, a platform that reports each
+    device's free memory, and the seams of the grow path recorded."""
+
+    def __init__(self, monkeypatch, fake_xpu, free_memory: list[int], committed: int):
+        self.fake_xpu = fake_xpu
+        self.free_memory = free_memory
+        self.rebinds: list[tuple[int, int]] = []
+        self.torch_fractions: list[float] = []
+        config, self.spec = _kv_cache_config(KVCacheLayout.LBNHC)
+        self.config = config
+        self.layout = KVCacheLayout.LBNHC
+        self.caches: list[ExtensibleKVCache] = []
+        self.runners = []
+        self.initial_physical: list[int] = []
+        for rank in range(len(free_memory)):
+            cache = ExtensibleKVCache(
+                copy.copy(config), torch.device("xpu", rank), self.layout
+            )
+            cache.allocate(cache.size)
+            cache.commit(committed)
+            self.caches.append(cache)
+            runner = SimpleNamespace(
+                extensible_kv_cache=cache,
+                vllm_config=SimpleNamespace(
+                    attention_config=SimpleNamespace(hisparse_config=None),
+                    model_config=SimpleNamespace(multimodal_config=None),
+                    parallel_config=SimpleNamespace(),
+                ),
+                cache_config=SimpleNamespace(
+                    get_resolved_kv_cache_layout=lambda: self.layout
+                ),
+                kv_cache_config=copy.copy(config),
+                device=torch.device("xpu", rank),
+                kv_caches_by_layer={},
+            )
+            runner.kv_cache_config.num_blocks = committed
+            self.runners.append(runner)
+            self.initial_physical.append(cache.physical_bytes)
+        # Free memory falls by what is mapped after the setup.
+        monkeypatch.setattr(
+            extensible_kv_cache,
+            "current_platform",
+            SimpleNamespace(
+                free_device_memory=lambda device: (
+                    self.free_memory[device.index]
+                    - (
+                        self.caches[device.index].physical_bytes
+                        - self.initial_physical[device.index]
+                    )
+                )
+            ),
+        )
+        # The margin the platform keeps free is the sizing tests' concern.
+        monkeypatch.setattr(
+            extensible_kv_cache,
+            "measure_kv_cache_bytes",
+            partial(
+                extensible_kv_cache.measure_kv_cache_bytes,
+                margin_floor_bytes=0,
+                margin_fraction=0.0,
+            ),
+        )
+        monkeypatch.setattr(extensible_kv_cache, "has_kv_transfer_group", lambda: False)
+        monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+
+        def record_rebind(runner):
+            self.rebinds.append(
+                (
+                    runner.kv_cache_config.num_blocks,
+                    runner.extensible_kv_cache.num_committed_blocks,
+                )
+            )
+
+        monkeypatch.setattr(
+            extensible_kv_cache, "rebind_committed_views", record_rebind
+        )
+
+    def grow(self, rank: int, target: int, reduce_min=lambda value: value) -> int:
+        return extensible_kv_cache.grow_kv_cache(
+            self.runners[rank],
+            target,
+            init_free_memory=1024 * MIB,
+            requested_memory=1024 * MIB,
+            reduce_min=reduce_min,
+        )
+
+    def grow_all(self, target: int) -> list[int]:
+        group = MinGroup(len(self.runners))
+        results: list[int | BaseException] = [0] * len(self.runners)
+
+        def run(rank: int) -> None:
+            try:
+                results[rank] = self.grow(rank, target, group.reducer(rank))
+            except BaseException as e:  # noqa: BLE001
+                results[rank] = e
+
+        threads = [
+            threading.Thread(target=run, args=(r,)) for r in range(len(self.runners))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results  # type: ignore[return-value]
+
+    def close(self) -> None:
+        for cache in self.caches:
+            cache.free()
+
+
+def _free_for(committed_blocks: int, kv_cache: ExtensibleKVCache, fits: int) -> int:
+    """Free device memory at which `fits` blocks fit in total, given
+    `committed_blocks` committed, with 1 GiB at init, all of it requested and
+    no transient peak or margin."""
+    # available = min(requested - non_kv_used, free + committed), and
+    # non_kv_used = init_free - free - committed, so both are free + committed.
+    return kv_cache.physical_bytes_for(fits) - kv_cache.physical_bytes_for(
+        committed_blocks
+    )
+
+
+@pytest.fixture
+def grow_ranks(monkeypatch, fake_xpu):
+    made: list[GrowFixture] = []
+
+    def make(free_blocks: list[int], committed: int = 8) -> GrowFixture:
+        # Sizes that fit exactly `free_blocks[r]` blocks on rank r.
+        probe_config, _ = _kv_cache_config(KVCacheLayout.LBNHC)
+        probe = ExtensibleKVCache(
+            probe_config, torch.device("xpu", 0), KVCacheLayout.LBNHC
+        )
+        free = [_free_for(committed, probe, blocks) for blocks in free_blocks]
+        probe.free()
+        fixture = GrowFixture(monkeypatch, fake_xpu, free, committed)
+        made.append(fixture)
+        return fixture
+
+    yield make
+    for fixture in made:
+        fixture.close()
+
+
+def test_grow_commits_what_the_measurement_fits(grow_ranks):
+    ranks = grow_ranks([40])
+    cache = ranks.caches[0]
+    base = cache.buffer.base_ptr
+    # Memory mapped by an earlier attempt holds garbage the grow must not expose.
+    cache.back(24)
+    full = cache.buffer.full_view()
+    for offset, stride in zip(cache.segment_offsets, cache.segment_strides):
+        full[offset + 8 * stride : offset + 24 * stride].fill_(0xFF)
+    cache.buffer.segment_view(0)[:64].fill_(7)
+
+    assert ranks.grow(0, 24) == 24
+
+    assert cache.num_committed_blocks == 24
+    assert cache.buffer.base_ptr == base
+    view = cache.buffer.segment_view(0)
+    assert view.numel() == 24 * ranks.spec.page_size_bytes
+    assert torch.all(view[:64] == 7)
+    assert torch.count_nonzero(view[8 * ranks.spec.page_size_bytes :]) == 0
+    assert ranks.rebinds == [(24, 24)]
+    assert ranks.fake_xpu.ops.physical_bytes == cache.physical_bytes_for(24)
+
+
+def test_grow_stops_at_what_fits_and_at_capacity(grow_ranks):
+    ranks = grow_ranks([20])
+    assert ranks.grow(0, 50) == 20
+    assert ranks.caches[0].num_committed_blocks == 20
+    assert ranks.grow(0, 500) == 20  # nothing more fits
+
+    ranks = grow_ranks([10_000])
+    assert ranks.grow(0, 500) == NUM_BLOCKS
+
+
+def test_grow_to_the_current_size_or_less_changes_nothing(grow_ranks):
+    ranks = grow_ranks([40])
+    creates = ranks.fake_xpu.ops.calls.count("create")
+    reduce_calls: list[int] = []
+
+    def reduce_min(value: int) -> int:
+        reduce_calls.append(value)
+        return value
+
+    assert ranks.grow(0, 8, reduce_min) == 8
+    assert ranks.grow(0, 3, reduce_min) == 8
+    assert ranks.caches[0].num_committed_blocks == 8
+    assert ranks.fake_xpu.ops.calls.count("create") == creates
+    assert ranks.rebinds == []
+    assert reduce_calls == [8, 3]  # only the measurement round ran
+
+
+def test_grow_measures_inside_the_call_and_takes_the_minimum(grow_ranks):
+    """Ranks with different free memory agree on the smaller count."""
+    ranks = grow_ranks([40, 20])
+    assert ranks.grow_all(50) == [20, 20]
+    assert [c.num_committed_blocks for c in ranks.caches] == [20, 20]
+    assert ranks.rebinds == [(20, 20), (20, 20)]
+
+
+def test_failed_map_on_one_rank_leaves_every_rank_at_the_old_size(grow_ranks):
+    ranks = grow_ranks([40, 40])
+    ops = ranks.fake_xpu.ops
+    # The second rank's device cannot back an allocation; the first can.
+    ops.fail_create_devices = {1}
+
+    assert ranks.grow_all(24) == [8, 8]
+
+    assert [c.num_committed_blocks for c in ranks.caches] == [8, 8]
+    assert [r.kv_cache_config.num_blocks for r in ranks.runners] == [8, 8]
+    assert ranks.rebinds == []
+    # Committed bytes did not move; granules mapped by the attempt stay mapped.
+    for cache in ranks.caches:
+        assert cache.buffer.segment_view(0).numel() == 8 * ranks.spec.page_size_bytes
+        assert cache.physical_bytes >= cache.physical_bytes_for(8)
+
+    # The next attempt reuses them and every rank reaches the new size.
+    ops.fail_create_devices = set()
+    assert ranks.grow_all(24) == [24, 24]
+    assert [c.num_committed_blocks for c in ranks.caches] == [24, 24]
+    assert ranks.fake_xpu.ops.physical_bytes == sum(
+        c.physical_bytes_for(24) for c in ranks.caches
+    )
+
+
+def test_grow_lowers_the_torch_cap_by_the_bytes_it_commits(grow_ranks, monkeypatch):
+    ranks = grow_ranks([40])
+    cache = ranks.caches[0]
+    fractions: list[float] = []
+    total = 32 << 30
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda device=None: (total, total)
+    )
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda device=None: 0)
+    monkeypatch.setattr(
+        torch.xpu,
+        "set_per_process_memory_fraction",
+        lambda fraction, device=None: fractions.append(fraction),
+    )
+    cache.set_torch_memory_limit(8 << 30)
+    added = cache.physical_bytes_for(24) - cache.physical_bytes_for(8)
+
+    assert ranks.grow(0, 24) == 24
+
+    assert cache.torch_memory_limit == (8 << 30) - added
+    assert fractions[-1] == pytest.approx(((8 << 30) - added) / total)
+
+
+class FakeConnector:
+    def __init__(self, supported: bool) -> None:
+        self.supported = supported
+        self.resized: list[tuple[object, int]] = []
+
+    def supports_kv_cache_resize(self) -> bool:
+        return self.supported
+
+    def resize_kv_caches(self, kv_caches, num_blocks) -> None:
+        self.resized.append((kv_caches, num_blocks))
+
+
+@pytest.mark.parametrize("supported", [True, False])
+def test_grow_follows_the_connector_or_refuses_before_changing_anything(
+    grow_ranks, monkeypatch, supported
+):
+    ranks = grow_ranks([40])
+    connector = FakeConnector(supported)
+    monkeypatch.setattr(extensible_kv_cache, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(extensible_kv_cache, "get_kv_transfer_group", lambda: connector)
+    creates = ranks.fake_xpu.ops.calls.count("create")
+
+    if supported:
+        assert ranks.grow(0, 24) == 24
+        assert connector.resized == [(ranks.runners[0].kv_caches_by_layer, 24)]
+    else:
+        with pytest.raises(NotImplementedError, match="resizing the KV cache"):
+            ranks.grow(0, 24)
+        assert connector.resized == []
+        assert ranks.caches[0].num_committed_blocks == 8
+        assert ranks.fake_xpu.ops.calls.count("create") == creates
+
+
+def test_grow_refuses_hisparse(grow_ranks):
+    ranks = grow_ranks([40])
+    ranks.runners[0].vllm_config.attention_config.hisparse_config = object()
+    with pytest.raises(NotImplementedError, match="HiSparse"):
+        ranks.grow(0, 24)
+    assert ranks.caches[0].num_committed_blocks == 8
+
+
+def test_rebinding_gives_views_over_the_grown_blocks_at_the_same_base(
+    fake_xpu, monkeypatch
+):
+    config, spec = _kv_cache_config(KVCacheLayout.LBNHC)
+    layout = KVCacheLayout.LBNHC
+    kv_cache = ExtensibleKVCache(config, torch.device("xpu", 0), layout)
+    bound: list[dict[str, torch.Tensor]] = []
+    monkeypatch.setattr(
+        extensible_kv_cache,
+        "bind_kv_caches",
+        lambda committed, *args: bound.append(committed),
+    )
+    runner = SimpleNamespace(
+        extensible_kv_cache=kv_cache,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        cache_config=SimpleNamespace(
+            get_resolved_kv_cache_layout=lambda: layout, use_replayssm=False
+        ),
+        vllm_config=SimpleNamespace(
+            attention_config=SimpleNamespace(hisparse_config=None),
+            cache_config=SimpleNamespace(use_replayssm=False),
+        ),
+        kv_cache_config=copy.copy(config),
+        kernel_block_sizes=None,
+        attn_groups=[],
+        speculator=None,
+        device=torch.device("cpu"),
+        kv_caches_by_layer={},
+    )
+    try:
+        kv_cache.allocate(kv_cache.size)
+        ptrs = []
+        for num_blocks in (8, 24):
+            kv_cache.commit(num_blocks)
+            runner.kv_cache_config.num_blocks = num_blocks
+            extensible_kv_cache.rebind_committed_views(runner)
+            views = bound[-1]
+            assert len(views) == NUM_LAYERS
+            assert all(v.shape[0] == num_blocks for v in views.values())
+            ptrs.append({name: v.data_ptr() for name, v in views.items()})
+        assert ptrs[0] == ptrs[1]
+    finally:
+        kv_cache.free()
+
+
+def test_extend_kv_cache_rebinds_through_the_shared_function(fake_xpu, monkeypatch):
+    """Startup extension commits, rebinds the views, then creates the
+    connector, in that order."""
+    config, _ = _kv_cache_config(KVCacheLayout.LBNHC)
+    layout = KVCacheLayout.LBNHC
+    kv_cache = ExtensibleKVCache(config, torch.device("xpu", 0), layout)
+    order: list[str] = []
+    monkeypatch.setattr(
+        extensible_kv_cache,
+        "ensure_kv_transfer_initialized",
+        lambda *a: order.append("connector config"),
+    )
+    monkeypatch.setattr(extensible_kv_cache, "has_kv_transfer_group", lambda: False)
+    monkeypatch.setattr(
+        extensible_kv_cache,
+        "rebind_committed_views",
+        lambda runner: order.append(f"rebind {runner.kv_cache_config.num_blocks}"),
+    )
+    monkeypatch.setattr(
+        extensible_kv_cache,
+        "get_kv_connector",
+        lambda *a: order.append("connector") or "connector",
+    )
+    runner = SimpleNamespace(
+        extensible_kv_cache=kv_cache,
+        vllm_config=SimpleNamespace(kv_transfer_config=None),
+        cache_config=SimpleNamespace(get_resolved_kv_cache_layout=lambda: layout),
+        kv_cache_config=copy.copy(config),
+        kv_caches_by_layer={},
+    )
+    try:
+        kv_cache.allocate(kv_cache.size)
+        extensible_kv_cache.extend_kv_cache(runner, config, 12)
+        assert order == ["connector config", "rebind 12", "connector"]
+        assert kv_cache.num_committed_blocks == 12
+        assert runner.kv_connector == "connector"
+    finally:
+        kv_cache.free()
+
+
+def _measure_startup(monkeypatch, kv_cache, initial_blocks, free_memory):
+    monkeypatch.setattr(
+        extensible_kv_cache,
+        "current_platform",
+        SimpleNamespace(free_device_memory=lambda device: free_memory),
+    )
+    monkeypatch.setattr(
+        extensible_kv_cache,
+        "measure_kv_cache_bytes",
+        partial(
+            extensible_kv_cache.measure_kv_cache_bytes,
+            margin_floor_bytes=0,
+            margin_fraction=0.0,
+        ),
+    )
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "memory_reserved", lambda device=None: 0)
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda device=None: (1 << 40, 1 << 40)
+    )
+    monkeypatch.setattr(
+        torch.xpu, "set_per_process_memory_fraction", lambda fraction, device=None: None
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(multimodal_config=None),
+        parallel_config=SimpleNamespace(),
+    )
+    return extensible_kv_cache.measure_kv_cache_blocks(
+        kv_cache,
+        vllm_config,
+        torch.device("xpu", 0),
+        init_free_memory=1024 * MIB,
+        requested_memory=1024 * MIB,
+        initial_blocks=initial_blocks,
+    )
+
+
+@pytest.mark.parametrize(
+    ("initial_blocks", "expected"),
+    [(None, 40), (60, 40), (40, 40), (12, 12), (1, 1)],
+)
+def test_startup_commits_no_more_than_the_initial_blocks_setting(
+    fake_xpu, monkeypatch, initial_blocks, expected
+):
+    """Unset, startup commits what the measurement allows (40 blocks here); set,
+    the smaller of the two."""
+    config, _ = _kv_cache_config(KVCacheLayout.LBNHC)
+    kv_cache = ExtensibleKVCache(config, torch.device("xpu", 0), KVCacheLayout.LBNHC)
+    try:
+        free = _free_for(0, kv_cache, 40)
+        assert _measure_startup(monkeypatch, kv_cache, initial_blocks, free) == expected
+    finally:
+        kv_cache.free()
+
+
+@pytest.mark.parametrize(
+    ("enabled", "initial_blocks", "refused"),
+    [(True, 100, False), (False, 100, True), (False, None, False), (True, None, False)],
+)
+def test_initial_blocks_needs_the_extensible_kv_cache(enabled, initial_blocks, refused):
+    """The setting is checked once the extensible KV cache is settled on."""
+    from vllm.config.vllm import VllmConfig
+
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            enable_extensible_kv_cache=enabled,
+            extensible_kv_cache_initial_blocks=initial_blocks,
+        )
+    )
+    if refused:
+        with pytest.raises(ValueError, match="extensible_kv_cache_initial_blocks"):
+            VllmConfig._validate_extensible_kv_cache_initial_blocks(config)
+    else:
+        VllmConfig._validate_extensible_kv_cache_initial_blocks(config)

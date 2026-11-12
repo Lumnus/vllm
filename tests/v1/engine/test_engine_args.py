@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tests.v1.kv_connector.unit import utils as connector_utils
-from vllm.config import ModelConfig
+from vllm.config import CacheConfig, ModelConfig
 from vllm.config.kv_transfer import KVCacheAccess, KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.engine.arg_utils import EngineArgs
@@ -250,6 +250,24 @@ def test_extensible_kv_cache_from_cli():
     args = parser.parse_args(["--no-enable-extensible-kv-cache"])
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.enable_extensible_kv_cache is False
+
+
+def test_extensible_kv_cache_initial_blocks_from_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    assert (
+        EngineArgs.from_cli_args(args=args).extensible_kv_cache_initial_blocks is None
+    )
+
+    args = parser.parse_args(["--extensible-kv-cache-initial-blocks", "5000"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.extensible_kv_cache_initial_blocks == 5000
+
+    cache_config = CacheConfig(extensible_kv_cache_initial_blocks=5000)
+    assert cache_config.extensible_kv_cache_initial_blocks == 5000
+    with pytest.raises(ValueError):
+        CacheConfig(extensible_kv_cache_initial_blocks=0)
 
 
 # Off CUDA and XPU the platform check trips first, before the behavior under test.

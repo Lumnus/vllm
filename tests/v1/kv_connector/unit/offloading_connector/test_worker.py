@@ -791,3 +791,57 @@ def test_register_kv_caches_uniform_type(backend):
     assert layer_b_mapping is not None
     assert layer_a_mapping.parallelism_agnostic
     assert not layer_b_mapping.parallelism_agnostic
+
+
+def test_resize_kv_caches_follows_a_grown_cache():
+    """After the KV cache grows, the worker resolves block ids of the larger
+    cache against views of it, without creating a new offloading worker."""
+    from vllm.v1.kv_offload.pointer_utils import resolve_device_pointers
+
+    attn_spec = FullAttentionSpec(
+        block_size=BLOCK_SIZE,
+        num_kv_heads=NUM_KV_HEADS,
+        head_size=HEAD_SIZE,
+        dtype=DTYPE,
+    )
+    page = attn_spec.page_size_bytes
+    layers = ["layer0", "layer1"]
+
+    def config(num_blocks: int) -> KVCacheConfig:
+        return KVCacheConfig(
+            num_blocks=num_blocks,
+            kv_cache_tensors=[
+                KVCacheTensor(
+                    size=2 * page * num_blocks,
+                    layers=layers,
+                    layer_stride=page * num_blocks,
+                    block_stride=page,
+                )
+            ],
+            kv_cache_groups=[KVCacheGroupSpec(layers, attn_spec)],
+        )
+
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    small = config(NUM_BLOCKS)
+    worker, spec = _make_worker(small)
+    worker.register_kv_caches(_allocate_kv_caches(small, [], device=device))
+    registered = spec.get_worker.call_args[0][0]
+    assert all(t.tensor.shape[0] == NUM_BLOCKS for t in registered.tensors)
+
+    big = config(3 * NUM_BLOCKS)
+    grown_kv_caches = _allocate_kv_caches(big, [], device=device)
+    worker.resize_kv_caches(grown_kv_caches, 3 * NUM_BLOCKS)
+
+    assert spec.get_worker.call_count == 1
+    assert worker.kv_cache_config.num_blocks == 3 * NUM_BLOCKS
+    assert small.num_blocks == NUM_BLOCKS
+    grown = worker._kv_caches
+    assert grown is not registered
+    assert all(t.tensor.shape[0] == 3 * NUM_BLOCKS for t in grown.tensors)
+    last = 3 * NUM_BLOCKS - 1
+    ptrs = resolve_device_pointers(
+        GPULoadStoreSpec([last], group_sizes=(1,), block_indices=(0,)), grown
+    )
+    for ref, ptr in zip(grown.group_data_refs[0], ptrs.ptrs):
+        tensor = grown.tensors[ref.tensor_idx].tensor
+        assert ptr == tensor.data_ptr() + last * tensor.stride(0)
