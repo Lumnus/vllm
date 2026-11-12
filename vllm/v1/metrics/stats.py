@@ -236,6 +236,8 @@ class SchedulerStats:
     current_wave: int = 0
 
     kv_cache_usage: float = 0.0
+    # Blocks in the KV cache pool now; it changes only when the cache is resized.
+    num_gpu_blocks: int = 0
     iteration_details: SchedulerIterationDetails | None = None
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)

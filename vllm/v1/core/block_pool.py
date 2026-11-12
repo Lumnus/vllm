@@ -900,6 +900,24 @@ class BlockPool:
 
         return True
 
+    def grow(self, num_gpu_blocks: int) -> None:
+        """Add blocks so the pool holds num_gpu_blocks.
+
+        The new blocks have the ids after the existing ones and have never held
+        data. They join the end of the free queue, so they are handed out after
+        every block that is free now: blocks holding cached prefixes are not
+        evicted ahead of them. The block list is extended in place, as the
+        cached-block map shares it.
+        """
+        assert num_gpu_blocks > self.num_gpu_blocks
+        new_blocks = [
+            KVCacheBlock(idx, pool=self._weak_self)
+            for idx in range(self.num_gpu_blocks, num_gpu_blocks)
+        ]
+        self.blocks.extend(new_blocks)
+        self.free_block_queue.append_n(new_blocks)
+        self.num_gpu_blocks = num_gpu_blocks
+
     def get_num_free_blocks(self) -> int:
         """Get the number of free blocks in the pool.
 

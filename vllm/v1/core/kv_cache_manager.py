@@ -3,7 +3,7 @@
 
 import itertools
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
@@ -207,6 +207,7 @@ class KVCacheManager:
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
         assert watermark >= 0.0, "watermark must be non-negative"
+        self.watermark = watermark
         self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
         self.kv_cache_event_metadata = tuple(
             (
@@ -234,6 +235,23 @@ class KVCacheManager:
 
         """
         return self.block_pool.get_usage()
+
+    def grow(self, num_blocks: int) -> None:
+        """Grow the block pool to num_blocks blocks, the device memory behind
+        them being in place. Requests running keep their blocks; the new ones
+        are free for the next allocation."""
+        config = self.kv_cache_config
+        assert num_blocks > config.num_blocks
+        self.coordinator.grow(num_blocks)
+        # Tensor sizes follow the block count, as when sizing shrinks it.
+        config.kv_cache_tensors = [
+            tensor
+            if tensor.host_resident
+            else replace(tensor, size=num_blocks * tensor.size // config.num_blocks)
+            for tensor in config.kv_cache_tensors
+        ]
+        config.num_blocks = num_blocks
+        self.watermark_blocks = int(self.watermark * num_blocks)
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.

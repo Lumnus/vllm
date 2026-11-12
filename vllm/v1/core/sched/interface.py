@@ -217,6 +217,11 @@ class SchedulerInterface(ABC):
     def set_pause_state(self, pause_state: PauseState) -> None:
         raise NotImplementedError
 
+    def grow_kv_cache(self, num_blocks: int) -> None:
+        """Make num_blocks blocks (more than now) available to schedule, once
+        the memory behind them is committed on every worker."""
+        raise NotImplementedError
+
     @abstractmethod
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False

@@ -394,6 +394,10 @@ class KVCacheCoordinator(ABC):
                     group_idx,
                 )
 
+    def grow(self, num_blocks: int) -> None:
+        """Grow the device block pool to num_blocks blocks."""
+        self.block_pool.grow(num_blocks)
+
     def reset_prefix_cache(self) -> bool:
         """Reset each manager's pool once."""
         pools = dict.fromkeys(

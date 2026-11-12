@@ -39,7 +39,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, update_kv_cache_capacity
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -3367,6 +3367,16 @@ class Scheduler(SchedulerInterface):
         """
         self.encoder_cache_manager.reset()
 
+    def grow_kv_cache(self, num_blocks: int) -> None:
+        """Make num_blocks blocks (more than now) available to schedule.
+
+        The device memory behind the new block ids must already be committed on
+        every worker. Steps already launched hold only ids below the old count.
+        """
+        self.kv_cache_manager.grow(num_blocks)
+        self.cache_config.num_gpu_blocks = num_blocks
+        update_kv_cache_capacity(self.vllm_config, self.kv_cache_config)
+
     def make_stats(
         self,
         spec_decoding_stats: SpecDecodingStats | None = None,
@@ -3403,6 +3413,7 @@ class Scheduler(SchedulerInterface):
             num_skipped_waiting_reqs=num_deferred,
             num_kv_fetch_reqs_by_stage=self._kv_fetch_counts.copy(),
             kv_cache_usage=self.kv_cache_manager.usage,
+            num_gpu_blocks=self.kv_cache_manager.block_pool.num_gpu_blocks,
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,
