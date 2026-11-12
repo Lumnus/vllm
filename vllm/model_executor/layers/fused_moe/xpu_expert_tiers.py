@@ -265,8 +265,10 @@ class StoreBinding:
 
 
 def _u8(t: torch.Tensor) -> torch.Tensor:
-    """``t`` as bytes, one row per leading index."""
-    return t.view(torch.uint8).reshape(t.shape[0], -1)
+    """``t`` as bytes, one row per leading index: always a view (a tensor
+    that is not contiguous raises here instead of yielding a copy that a
+    row write would silently miss)."""
+    return t.view(torch.uint8).view(t.shape[0], -1)
 
 
 class ExpertTiers:
@@ -431,6 +433,7 @@ class ExpertTiers:
         fast_map, slow_map = _slot_maps(self.local_of, self.num_global, self.num_fast)
         self.fast_map, self.slow_map = fast_map.to(device), slow_map.to(device)
         if binding is not None:
+            self._check_views_alias()
             from vllm.model_executor.offloader.expert_tier_map import (
                 TierPlacement,
                 TorchStreamOps,
@@ -447,6 +450,31 @@ class ExpertTiers:
                 self.num_pool_rows, self.slot_bytes(), self.num_slow
             )
         experts.tiers = self
+
+    def _check_views_alias(self) -> None:
+        """With a store, host threads write the pool rows into the pinned
+        tensors and the kernels read them through the device views: the two
+        must be the same memory. A view made over a copy (memory the
+        accelerator does not take as pinned is copied first) would serve the
+        load-time bytes for ever and none of the store's reads. One byte of
+        a spare row per tensor settles it at load."""
+        last = self.num_pool_rows - 1
+        if last < self.num_slow:
+            return  # no spare row to probe
+        for key, tensor in self.slow.items():
+            host = _u8(tensor)[last]
+            saved = int(host[0])
+            host[0] = saved ^ 0xA5
+            seen = int(_u8(self.slow_views[key])[last][0])
+            host[0] = saved
+            if seen != saved ^ 0xA5:
+                raise RuntimeError(
+                    f"{self.layer_name}: the device view of the host tier "
+                    f"({key}) is a copy, not the pinned rows themselves: "
+                    "experts read from the expert store would never reach the "
+                    "kernels. The host tier must be memory the accelerator "
+                    "reads in place"
+                )
 
     def slot_bytes(self) -> int:
         """Bytes of one expert in kernel layout (the four tensors)."""
