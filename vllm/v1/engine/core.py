@@ -1040,7 +1040,22 @@ class EngineCore:
                 else KVCacheResizeState.UNCHANGED
             ),
         )
+        if num_blocks != old_num_blocks:
+            self._publish_scheduler_stats()
         return self._kv_resize.record(num_blocks)
+
+    def _publish_scheduler_stats(self) -> None:
+        """Send the scheduler's stats now, not with the next step's output:
+        a resize between steps changes gauges (the KV cache size) that an
+        idle engine would otherwise report only after its next step. Only a
+        process with an output queue sends; the in-process engine core reads
+        its stats with each step."""
+        output_queue = getattr(self, "output_queue", None)
+        if output_queue is None:
+            return
+        stats = self.scheduler.make_stats()
+        if stats is not None:
+            output_queue.put_nowait((0, EngineCoreOutputs(scheduler_stats=stats)))
 
     def _check_kv_cache_resizable(self) -> None:
         vllm_config = self.vllm_config
@@ -1104,6 +1119,8 @@ class EngineCore:
             deadline_s or "none",
             "preempt at the deadline" if preempt else "abort at the deadline",
         )
+        # The fence is in the stats (vllm:kv_cache_fenced_blocks) from now.
+        self._publish_scheduler_stats()
         self._advance_kv_resize()
         return self.get_kv_cache_resize_state()
 
@@ -1186,6 +1203,7 @@ class EngineCore:
             released / (1 << 30),
             time.monotonic() - resize.started,
         )
+        self._publish_scheduler_stats()
         for holder in self._kv_memory_holders:
             try:
                 holder.on_kv_cache_released(released, resize.to_blocks)
@@ -1242,6 +1260,7 @@ class EngineCore:
             resize.to_blocks,
             reason,
         )
+        self._publish_scheduler_stats()
         return resize.record(self.vllm_config.cache_config.num_gpu_blocks)
 
     def _settle_kv_resize(self, reason: str, *, memory_changes: bool) -> None:
