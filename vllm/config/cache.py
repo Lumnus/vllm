@@ -376,6 +376,17 @@ class CacheConfig:
     eager prefill steps on each request's trailing window only. Requires model
     runner V2."""
 
+    packed_kv_repeats_per_group: int | None = Field(default=None, gt=0)
+    """Repeats of the layer pattern per KV cache group when a block-outermost
+    layout packs layers of mixed page sizes (e.g. a sparse attention layer
+    beside its indexer cache). Every group draws whole blocks from the shared
+    pool and a block is as wide as the widest group, so fewer repeats per group
+    give narrower blocks: the per-request state groups (Mamba states, circular
+    buffers, draft windows) then reserve less of the pool for each running
+    request, at the cost of more block tables. State groups hold as many states
+    as the narrower block fits. By default the planner keeps a balanced
+    mixed-page bucket whole, in one group."""
+
     kv_cache_memory_bytes: int | None = None
     """Size of KV Cache per GPU in bytes. By default, this is set to None
     and vllm can automatically infer the kv cache size based on
@@ -435,6 +446,7 @@ class CacheConfig:
             "enable_mamba_shared_prefix_checkpoint",
             "mamba_page_size_padded",
             "skip_page_size_padded",
+            "packed_kv_repeats_per_group",
             "user_specified_block_size",
             "_block_size_resolved",
             "_extensible_kv_cache_resolved",

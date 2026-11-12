@@ -888,3 +888,85 @@ class TestSWABoundedReplayGrouping:
         for single in manager.coordinator.single_type_managers:
             cached = single.num_cached_block.get(request.request_id, 0)
             assert cached == (2 if single.kv_cache_spec.prefix_cacheable else 0)
+
+
+class TestPackedRepeatsPerGroup:
+    """`CacheConfig.packed_kv_repeats_per_group` splits a balanced mixed-page
+    bucket into narrower groups; each state group holds what the block fits."""
+
+    NUM_MAMBA = 9
+
+    @classmethod
+    def _groups(cls, repeats, seed=None):
+        import random
+
+        config = _shared_layout_config()
+        config.cache_config.packed_kv_repeats_per_group = repeats
+        items = list(_make_csa_linear_specs(num_mamba=cls.NUM_MAMBA).items())
+        if seed is not None:
+            random.Random(seed).shuffle(items)
+        specs = dict(items)
+        return specs, _get_packed_kv_cache_groups(config, specs)
+
+    @staticmethod
+    def _layer_index(name):
+        return int(name.split("layers.")[1].split(".")[0])
+
+    def test_unset_keeps_the_planner_default(self):
+        specs, default = self._groups(None)
+        _, whole = self._groups(NUM_CACHE_TUPLES)
+        assert [g.layer_names for g in default] == [g.layer_names for g in whole]
+        owner = next(g for g in default if _main_kv_name(0) in g.layer_names)
+        assert len(owner.layer_names) == 2 * NUM_CACHE_TUPLES
+        assert (
+            _get_kv_cache_bytes_per_block(default, KVCacheLayout.BLNHC)
+            == BYTES_PER_BLOCK
+        )
+
+    @pytest.mark.parametrize("seed", [None, 0, 1, 2])
+    @pytest.mark.parametrize("repeats", [1, 2])
+    def test_split_pairs_each_layer_with_its_own_side_cache(self, repeats, seed):
+        specs, groups = self._groups(repeats, seed)
+        assert sorted(n for g in groups for n in g.layer_names) == sorted(specs)
+        owners = [g for g in groups if any("self_attn" in n for n in g.layer_names)]
+        owners = [
+            g
+            for g in owners
+            if not any(n.endswith("raw_key_cache") for n in g.layer_names)
+        ]
+        assert len(owners) == -(-NUM_CACHE_TUPLES // repeats)
+        for group in owners:
+            main = sorted(
+                self._layer_index(n) for n in group.layer_names if n.endswith("attn")
+            )
+            side = sorted(
+                self._layer_index(n)
+                for n in group.layer_names
+                if n.endswith("compressed_key_cache")
+            )
+            assert main == side and 1 <= len(main) <= repeats
+        assert _get_kv_cache_bytes_per_block(groups, KVCacheLayout.BLNHC) == repeats * (
+            MAIN_KV_PAGE_BYTES + COMPRESSED_PAGE_BYTES
+        )
+
+    def test_split_cuts_the_bytes_a_running_request_reserves(self):
+        def reserved(groups):
+            # One block per group is the least a running request holds.
+            return len(groups) * _get_kv_cache_bytes_per_block(
+                groups, KVCacheLayout.BLNHC
+            )
+
+        _, whole = self._groups(None)
+        _, split = self._groups(1)
+        assert reserved(split) < reserved(whole)
+        # The compressor rings still share one group: they fit one block.
+        rings = [
+            g for g in split if any(n.endswith("raw_key_cache") for n in g.layer_names)
+        ]
+        assert len(rings) == 1 and len(rings[0].layer_names) == NUM_CACHE_TUPLES
+        # Each Mamba state group holds the states the narrower block fits.
+        block = _get_kv_cache_bytes_per_block(split, KVCacheLayout.BLNHC)
+        for group in split:
+            spec = next(iter(iter_layer_specs(group.kv_cache_spec)))
+            if isinstance(spec, MambaSpec):
+                assert len(group.layer_names) * spec.page_size_bytes <= block
