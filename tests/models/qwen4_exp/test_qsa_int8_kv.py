@@ -450,6 +450,8 @@ def _child_int8_dot(mode: int, hq: int, nkv: int, cell: str) -> None:
     _patch_interpreter_int8_dot()
     from vllm.models.qwen4_exp.xpu.ops import qsa_attn2
 
+    # Three rows are below the row count the int8 dot starts at.
+    qsa_attn2._INT8_DOT_MIN_ROWS = 1
     case = _paged_case(hq, nkv, HALVES[cell], rows=3, width=67, seed=mode + hq + nkv)
     k, v, _, _ = _write_int8(case)
     # The query quantization follows the KV writer's rounding.
@@ -620,6 +622,9 @@ def test_int8_dot_launches_and_gathers() -> None:
         decode = qsa_attn2._select_launch(4096, False, mode)
         assert prefill is qsa_attn2._INT8_DOT_PREFILL[mode]
         assert decode is qsa_attn2._INT8_DOT_DECODE[mode]
+        # Small batches keep the widened dots.
+        few = qsa_attn2._INT8_DOT_MIN_ROWS - 1
+        assert qsa_attn2._select_launch(few, False, mode) is qsa_attn2._DECODE
         # An int8 DPAS dot consumes the head dim in steps of 32.
         assert HD // prefill.num_dchunk >= 32 and HD // decode.num_dchunk >= 32
     # Views that are not the inline cell keep the plain gathers.

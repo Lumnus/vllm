@@ -499,20 +499,25 @@ class _Launch(NamedTuple):
 _DECODE = _Launch(block_n=32, num_dchunk=8, row_chunk=4096)
 _PREFILL = _Launch(block_n=32, num_dchunk=8, row_chunk=512)
 # The int8-dot launches (`AttentionConfig.qsa_int8_dot`), keyed by mode. An int8
-# DPAS dot takes wider tiles and more than one subgroup, which the BF16 dot does
-# not compile at. Measured on a B70 (12 query heads over 1 KV head, width 2051,
-# 32K of context, kernel only): mode 1 at BLOCK_N 64 with 2 subgroups, prefill
-# 4,096 rows 11.2-11.4 ms against 15.0 ms for the BF16 launch above, decode 64
-# rows 0.246 against 0.30 ms; mode 2 at BLOCK_N 128 with 4 subgroups, prefill
-# 11.0 ms, decode 64 rows 0.170 ms. Register file left to the compiler.
+# DPAS dot takes tiles of 64 with two subgroups, which the BF16 dot does not
+# compile at (nor does either at four subgroups, or the int8 dot at tiles of 32
+# with two). Measured on a B70 (Triton 3.9.1+xpu, IGC 2.41.5, 6 query heads over
+# 1 KV head, width 2051, 32K of context, kernel only): prefill 4,096 rows 9.06 ms
+# (mode 1) and 8.59 ms (mode 2) against 9.37 ms for the BF16 launch above; decode
+# 64 rows 0.81 ms (both) against 1.12 ms. Tiles of 128 with four subgroups are
+# slower (10.0-10.3 ms). Register file left to the compiler.
 _INT8_DOT_DECODE = {
     1: _Launch(block_n=64, num_dchunk=8, row_chunk=4096, num_warps=2, grf_mode="auto"),
-    2: _Launch(block_n=128, num_dchunk=8, row_chunk=4096, num_warps=4, grf_mode="auto"),
+    2: _Launch(block_n=64, num_dchunk=8, row_chunk=4096, num_warps=2, grf_mode="auto"),
 }
 _INT8_DOT_PREFILL = {
     1: _Launch(block_n=64, num_dchunk=8, row_chunk=512, num_warps=2, grf_mode="auto"),
-    2: _Launch(block_n=128, num_dchunk=8, row_chunk=512, num_warps=4, grf_mode="auto"),
+    2: _Launch(block_n=64, num_dchunk=8, row_chunk=512, num_warps=2, grf_mode="auto"),
 }
+# Below this many rows the query quantization costs more than the int8 dot
+# saves (8 rows 0.29 against 0.23 ms, 16 rows 0.30 against 0.26 ms; 32 rows 0.57
+# against 0.74 ms), so those calls keep the widened dots.
+_INT8_DOT_MIN_ROWS = 32
 # Launch options of the XPU backend only (emptied by the interpreter tests).
 _GRF_MODE = {"grf_mode": "256"}
 # Rows at/above which a use_prefill_config call takes the prefill region.
@@ -524,7 +529,7 @@ def _select_launch(
 ) -> _Launch:
     """Launch config of one call: a pure function of shapes (graph-capture stable)."""
     prefill = use_prefill_config and num_rows >= _PREFILL_ROWS
-    if int8_dot:
+    if int8_dot and num_rows >= _INT8_DOT_MIN_ROWS:
         return (_INT8_DOT_PREFILL if prefill else _INT8_DOT_DECODE)[int8_dot]
     return _PREFILL if prefill else _DECODE
 
@@ -561,6 +566,8 @@ def qsa_sparse_paged_attention_attn2(
     num_kv_heads = k_cache.shape[2]
     group_size = q.shape[1] // num_kv_heads
     selection_width = logical_indices.shape[1] - 1
+    if q.shape[0] < _INT8_DOT_MIN_ROWS:
+        int8_dot = 0
     launch = _select_launch(q.shape[0], use_prefill_config, int8_dot)
     dc = head_dim // launch.num_dchunk
     assert dc >= 16 and dc * launch.num_dchunk == head_dim, "attn2 head_dim chunking"
@@ -734,11 +741,12 @@ def warmup_qsa_sparse_paged_attention_attn2(
     partial_output_ptr = TritonWarmupTensor(torch.float32)
     partial_lse_ptr = TritonWarmupTensor(torch.float32)
     warmed = []
-    launches = {_DECODE, _PREFILL}
-    tile_q_ptr = q_ptr
+    # (launch, extra tile kwargs, Q stand-in). With the int8 dot, calls below
+    # _INT8_DOT_MIN_ROWS keep the widened decode launch; every other call takes
+    # the int8 launches.
+    variants = [(launch, {}, q_ptr) for launch in sorted({_DECODE, _PREFILL})]
     if int8_dot:
-        launches = {_INT8_DOT_DECODE[int8_dot], _INT8_DOT_PREFILL[int8_dot]}
-        tile_q_ptr = TritonWarmupTensor(
+        q_i8_ptr = TritonWarmupTensor(
             torch.int8, shape=(num_rows, num_query_heads, head_dim)
         )
         q_scale_ptr = TritonWarmupTensor(
@@ -747,7 +755,7 @@ def warmup_qsa_sparse_paged_attention_attn2(
         int8_kwargs.update(q_scale_ptr=q_scale_ptr, stride_qs_row=num_query_heads)
         _qsa_quant_q_kernel.warmup(
             q_ptr,
-            tile_q_ptr,
+            q_i8_ptr,
             q_scale_ptr,
             row_stride,
             head_dim,
@@ -756,7 +764,13 @@ def warmup_qsa_sparse_paged_attention_attn2(
             num_warps=1,
             grid=(num_rows, num_query_heads),
         )
-    for launch in sorted(launches):
+        variants = [(_DECODE, {}, q_ptr)] + [
+            (launch, int8_kwargs, q_i8_ptr)
+            for launch in sorted(
+                {_INT8_DOT_DECODE[int8_dot], _INT8_DOT_PREFILL[int8_dot]}
+            )
+        ]
+    for launch, tile_kwargs, tile_q_ptr in variants:
         num_tiles = triton.cdiv(selection_width, launch.block_n)
         tiles_per_prog = min(launch.tiles_per_prog, num_tiles)
         _qsa_attn2_tile_kernel.warmup(
@@ -797,7 +811,7 @@ def warmup_qsa_sparse_paged_attention_attn2(
             num_stages=1,
             **_launch_options(launch),
             **pth_scales,
-            **int8_kwargs,
+            **tile_kwargs,
             grid=(num_rows, num_kv_heads, 1),
         )
         _qsa_attn2_merge_kernel.warmup(
