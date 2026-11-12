@@ -29,7 +29,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch.distributed import ProcessGroup, all_reduce
@@ -57,6 +57,8 @@ from .eplb_state_file import read_expert_loads, write_expert_loads
 from .eplb_trace import ExpertLoadTracer
 from .eplb_utils import CpuGpuEvent
 from .expert_weights import (
+    ExpertMover,
+    expert_mover,
     fast_slot_count,
     new_expert_buffer,
     order_slots_by_tier,
@@ -250,6 +252,17 @@ class EplbModelState:
     has_saved_load: bool = False
     """`last_expert_load` holds loads read from `EPLBConfig.state_path` that
     `restore_saved_placement` has not placed the experts by yet."""
+    movers: list[ExpertMover | None] | None = None
+    """Per MoE layer, the mover of a layer that places its own experts (from the
+    expert store) instead of having EPLB send them; set when every layer of
+    the model does. Such a model has no expert buffer and no communicator
+    transfer."""
+    plan_load: torch.Tensor | None = None
+    """The load window (CPU, logical experts) the async worker's current plan was
+    made from."""
+    rearrangement_stats: dict[str, float] = field(default_factory=dict)
+    """Units and bytes read and milliseconds spent by the movers since the
+    last log line of a store-backed rearrangement."""
 
 
 class EplbState:
@@ -553,6 +566,19 @@ class EplbState:
             "EPLB communicator backend must be set by ParallelConfig"
         )
         num_local_experts = model.expert_weights[0][0].shape[0]
+        movers = [expert_mover(ws) for ws in model.expert_weights]
+        store_backed = any(m is not None for m in movers)
+        if store_backed:
+            if not all(m is not None for m in movers):
+                raise NotImplementedError(
+                    "EPLB: some MoE layers place their own experts (expert store) "
+                    "and some do not; the store needs every layer of the model"
+                )
+            if not self.is_async:
+                raise ValueError(
+                    "EPLB with the expert store reads experts while serving: "
+                    "set use_async to true"
+                )
         # Tiered slots keep a full buffer: the tier step after the policy may
         # reorder any of a rank's slots.
         tiered = any(fast_slot_count(ws) is not None for ws in model.expert_weights)
@@ -564,6 +590,8 @@ class EplbState:
         expert_buffer = (
             None
             if backend == "symm_mem"
+            else []  # the experts are read from the store: nothing is staged
+            if store_backed
             else [
                 new_expert_buffer(w)
                 if num_buffer_rows == num_local_experts
@@ -580,7 +608,8 @@ class EplbState:
         expert_buffer = communicator.owned_expert_buffer or expert_buffer
         assert expert_buffer is not None
         # Compile the copy-back kernels now rather than mid-serving (no-op copy).
-        copy_rows(model.expert_weights[0], [0], model.expert_weights[0], [0])
+        if not store_backed:
+            copy_rows(model.expert_weights[0], [0], model.expert_weights[0], [0])
 
         model_state = EplbModelState(
             physical_to_logical_map=physical_to_logical_map,
@@ -605,7 +634,17 @@ class EplbState:
             num_unpadded_tokens_tensors=num_unpadded_tokens_tensors,
         )
         fast_slots = [fast_slot_count(ws) for ws in model.expert_weights]
-        if any(f is not None for f in fast_slots):
+        if store_backed:
+            # The layers choose their fast set themselves, without permuting
+            # slots: EPLB's tier step has nothing to order.
+            model_state.movers = movers
+            logger.info(
+                "EPLB: the expert store mover places the experts of %d layers: "
+                "no expert buffer, no profile-time reservation, no rank-to-rank "
+                "transfer.",
+                len(movers),
+            )
+        elif any(f is not None for f in fast_slots):
             model_state.fast_slots = fast_slots
         self.model_states[hash_config_cached(model_config)] = model_state
         if self.parallel_config.eplb_config.state_path is not None:
@@ -709,7 +748,9 @@ class EplbState:
         all_reduce(pending, group=ep_group)
         with gpu_sync_allowed():
             restore = bool(pending.item())
-        if restore:
+        if restore and any(s.movers is not None for s in self.model_states.values()):
+            self._restore_by_fill()
+        if restore and any(s.movers is None for s in self.model_states.values()):
             # Every rank computes the same placement from the same loads, so
             # every rank stops after the same round.
             for _ in range(self._restore_rounds()):
@@ -718,6 +759,64 @@ class EplbState:
                     break
         for model_state in self.model_states.values():
             model_state.has_saved_load = False
+
+    def _restore_by_fill(self) -> None:
+        """Place the experts by the saved loads, once, before serving, for models
+        whose layers fill their slots from the expert store. The policy's rounds
+        run on the host over the placement alone; the layers are then filled
+        straight into the final placement, so the restore moves no expert
+        between ranks and reads each slot once."""
+        ep_group = get_ep_group().device_group
+        is_main_rank = ep_group.rank() == 0
+        states = [s for s in self.model_states.values() if s.movers is not None]
+        windows = []
+        for state in states:
+            saved = state.last_expert_load
+            windows.append(saved.clone() if is_main_rank else torch.zeros_like(saved))
+        windows = self._allreduce_list(windows)
+        num_nodes = get_node_count()
+        num_gpus = ep_group.size()
+        if num_gpus % num_nodes != 0:
+            num_nodes = 1
+        hysteresis = self.parallel_config.eplb_config.tier_hysteresis
+        start = time.perf_counter()
+        self.last_rearrange_changed = False
+        for state, window in zip(states, windows):
+            assert state.movers is not None
+            state.last_expert_load = window
+            model = state.model
+            with gpu_sync_allowed():
+                load = window.cpu()
+                current = state.physical_to_logical_map.cpu()
+            placement = current
+            for _ in range(self._restore_rounds()):
+                new = self.policy.rebalance_experts(
+                    load,
+                    model.num_physical_experts,
+                    model.num_expert_groups,
+                    num_nodes,
+                    num_gpus,
+                    placement,
+                )
+                if torch.equal(new, placement):
+                    break
+                placement = new
+            changed = not torch.equal(placement, current)
+            self.last_rearrange_changed |= changed
+            # Even with the placement unchanged the saved loads decide which
+            # slots are on the card: the layers fill (or keep) their rows.
+            for layer, mover in enumerate(state.movers):
+                assert mover is not None
+                mover.fill_to(
+                    placement[layer].numpy(), load[layer].float().numpy(), hysteresis
+                )
+            if changed:
+                _commit_eplb_maps(state, new_physical_to_logical_map=placement)
+        logger.info(
+            "EPLB: restored the saved placement by filling the slots from the "
+            "expert store in %.2f s.",
+            time.perf_counter() - start,
+        )
 
     def _save_expert_load(self, global_expert_load_windows: list[torch.Tensor]) -> None:
         """Write the loads a rearrangement uses to `EPLBConfig.state_path`."""
@@ -1157,6 +1256,15 @@ class EplbState:
         ):
             if not is_profile:
                 eplb_model_state.last_expert_load = global_expert_load_window
+            if sync and eplb_model_state.movers is not None:
+                if is_profile or use_last_expert_load:
+                    # nothing to reserve; the restore fills these models itself
+                    continue
+                raise NotImplementedError(
+                    "EPLB: a model whose layers fill their slots from the expert "
+                    "store is rearranged asynchronously only (the boot restore "
+                    "fills the slots directly)"
+                )
             if sync:
                 # Get new expert mappings for the model. The policy runs on the
                 # host, so the load window and current map have to come back.
@@ -1330,6 +1438,10 @@ class EplbState:
                     if result.layer_idx == ms.model.num_moe_layers - 1:
                         ms.rebalanced = False
                     ms.pending_result = None
+                    if result.prepared is not None and ms.movers is not None:
+                        mover = ms.movers[result.layer_idx]
+                        assert mover is not None
+                        mover.discard(result.prepared)
                     result.consumed_event.record()
                 else:
                     time.sleep(0.001)
@@ -1731,13 +1843,29 @@ def _move_to_workspace(
 ) -> None:
     result = model_state.pending_result
     assert result is not None
-    move_from_buffer(
-        expert_weights=model_state.model.expert_weights[result.layer_idx],
-        expert_weights_buffers=model_state.expert_buffer,
-        transfer_metadata=result.transfer_metadata,
-        new_indices=result.new_physical_to_logical_map.numpy(),
-        ep_rank=ep_rank,
-    )
+    if result.prepared is not None:
+        # The layer places its own experts: its prepared rows and tier maps
+        # switch in this window, next to EPLB's maps below.
+        assert model_state.movers is not None
+        mover = model_state.movers[result.layer_idx]
+        assert mover is not None
+        started = time.perf_counter()
+        mover.commit(result.prepared)
+        stats = model_state.rearrangement_stats
+        for key, value in mover.prepared_stats(result.prepared).items():
+            stats[key] = stats.get(key, 0.0) + value
+        stats["commit_ms"] = (
+            stats.get("commit_ms", 0.0) + (time.perf_counter() - started) * 1e3
+        )
+    else:
+        assert result.transfer_metadata is not None
+        move_from_buffer(
+            expert_weights=model_state.model.expert_weights[result.layer_idx],
+            expert_weights_buffers=model_state.expert_buffer,
+            transfer_metadata=result.transfer_metadata,
+            new_indices=result.new_physical_to_logical_map.numpy(),
+            ep_rank=ep_rank,
+        )
 
     _commit_eplb_maps_for_layer(
         model_state,
@@ -1747,6 +1875,19 @@ def _move_to_workspace(
 
     if result.layer_idx == model_state.model.num_moe_layers - 1:
         model_state.rebalanced = False
+        if model_state.rearrangement_stats:
+            stats = model_state.rearrangement_stats
+            logger.info(
+                "Expert store rearrangement (EP rank %d): %d units read "
+                "(%.1f MiB), prepare %.0f ms, commit %.1f ms over %d layers.",
+                ep_rank,
+                int(stats.get("units", 0)),
+                stats.get("bytes", 0.0) / 2**20,
+                stats.get("prepare_ms", 0.0),
+                stats.get("commit_ms", 0.0),
+                model_state.model.num_moe_layers,
+            )
+            stats.clear()
 
     # Reset pending_result before unblocking the async worker
     model_state.pending_result = None
