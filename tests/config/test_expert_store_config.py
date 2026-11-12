@@ -47,7 +47,7 @@ def test_cli(argv):
     assert config is not None and config.enabled
     assert config.dirs == ["/a", "/b"] and config.pool_gib == 8
     assert config.spare_rows == 4
-    # the defaults of DK-E1 §8
+    # the documented defaults
     assert (config.io_threads, config.direct, config.build) == (16, True, "auto")
     assert (config.verify, config.read_mode, config.decay_interval) == (
         False,
