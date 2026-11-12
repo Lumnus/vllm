@@ -134,7 +134,15 @@ class ExpertMover(Protocol):
 class StoreBackedWeight(TieredExpertWeight):
     """A tiered expert tensor of a layer whose slots are placed by an
     :class:`ExpertMover`. EPLB reads shapes and sizes from it as from any
-    tiered tensor; the bytes are moved by ``mover``, never by EPLB."""
+    tiered tensor; the bytes are moved by ``mover``, never by EPLB.
+
+    It cannot be addressed by slot. In such a layer the row that serves a
+    slot is the mover's state and changes while serving, so "slot ``s`` is
+    row ``s`` of a part" stops being true after the first tier move: reading
+    or writing a row through this object would silently touch another
+    expert. Every by-slot access therefore raises; EPLB's transfer paths
+    (which index weights by slot) must not be reached for these layers.
+    """
 
     def __init__(
         self,
@@ -149,6 +157,22 @@ class StoreBackedWeight(TieredExpertWeight):
         return StoreBackedWeight(
             [p.view(dtype) for p in self.parts], self.on_rows_written, self.mover
         )
+
+    def _by_slot(self, what: str) -> RuntimeError:
+        return RuntimeError(
+            f"{what}: the rows of this layer are placed by its expert mover "
+            "and are not addressable by slot (a store-backed layer is "
+            "rearranged through ExpertMover.prepare and commit only)"
+        )
+
+    def tier_of(self, slot: int) -> int:
+        raise self._by_slot("tier_of")
+
+    def __getitem__(self, slot: int) -> torch.Tensor:
+        raise self._by_slot("row access")
+
+    def rows_written(self, slots: Iterable[int]) -> None:
+        raise self._by_slot("rows_written")
 
 
 ExpertWeight = torch.Tensor | TieredExpertWeight
