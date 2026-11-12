@@ -19,7 +19,7 @@ computes and nothing else; its result is picked up by the next call.
 """
 
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -61,6 +61,21 @@ class _Encode:
     waiters: set[str] = field(default_factory=set)
     # When the finished embedding first found the region full.
     space_wait_since: float | None = None
+
+
+def _new_tower_stats() -> dict[str, float]:
+    return {
+        # 0 disk, 1 host, 2 card (vllm/v1/engine/tower_residency.py).
+        "location": 1.0,
+        "in_transition": 0.0,
+        "promotions": 0.0,
+        "demotions": 0.0,
+        "failed_promotions": 0.0,
+        "image_requests": 0.0,
+        "items_encoded_host": 0.0,
+        "items_encoded_card": 0.0,
+        "encode_seconds_host": 0.0,
+    }
 
 
 def _block_runs(block_ids: Sequence[int]) -> Iterator[tuple[int, int]]:
@@ -120,6 +135,15 @@ class ECHostTowerScheduler:
         self._load_acks: dict[int, tuple[str, int]] = {}
         self._next_transfer_id = 0
 
+        # Residency "dynamic" (vllm/v1/engine/tower_residency.py): towers whose
+        # accelerator copy encodes now, the engine core's listener for image
+        # requests, the requests it has heard of, and what was encoded where.
+        # All of it stays empty and unused without a dynamic tower.
+        self._on_card: set[str] = set()
+        self._arrival_listener: Callable[[str], None] | None = None
+        self._seen_requests: set[str] = set()
+        self._tower_stats: dict[str, dict[str, float]] = {}
+
         pc = vllm_config.parallel_config
         # Only pipeline stage 0 runs the connector, on each of its ranks.
         self._expected_load_reports = (
@@ -144,6 +168,8 @@ class ECHostTowerScheduler:
         request_id = request.request_id
         if request_id in self._unavailable:
             return False
+        if self._arrival_listener is not None and request_id not in self._seen_requests:
+            self._note_arrival(request)
         held = self._interest.setdefault(request_id, set())
 
         ready = True
@@ -163,6 +189,10 @@ class ECHostTowerScheduler:
             if entry is not None and entry.ready:
                 held.add(identifier)
                 continue
+            if tower.name in self._on_card and identifier not in self._encodes:
+                # The tower's accelerator copy encodes it on the workers. An
+                # item already on its way through the host copy waits for it.
+                continue
 
             ready = False
             encode = self._encodes.get(identifier)
@@ -172,6 +202,57 @@ class ECHostTowerScheduler:
                     return False
             encode.waiters.add(request_id)
         return ready
+
+    # ------------------------------------------------------------------
+    # Residency "dynamic": the engine core's controller drives these
+    # ------------------------------------------------------------------
+
+    def set_arrival_listener(self, listener: Callable[[str], None]) -> None:
+        """Have `listener(tower_name)` called once per request that has an
+        item of that tower's modalities, when the scheduler first looks at
+        it."""
+        self._arrival_listener = listener
+        for name in self._towers:
+            self._tower_stats.setdefault(name, _new_tower_stats())
+
+    def set_tower_on_card(self, name: str, on_card: bool) -> None:
+        """From the next scheduling pass, items of tower `name` go to the
+        workers' copy (True) or to the host copy (False)."""
+        if on_card:
+            self._on_card.add(name)
+        else:
+            self._on_card.discard(name)
+
+    def tower_on_card(self, name: str) -> bool:
+        return name in self._on_card
+
+    def host_tower(self, name: str) -> "HostTower":
+        return self._towers[name]
+
+    def update_tower_stats(self, name: str, **values: float) -> None:
+        self._tower_stats.setdefault(name, _new_tower_stats()).update(values)
+
+    def host_tower_stats(self) -> dict[str, dict[str, float]]:
+        """Per tower: where it is and what it did (empty without a dynamic
+        tower)."""
+        return {name: dict(stats) for name, stats in self._tower_stats.items()}
+
+    def _note_arrival(self, request: "Request") -> None:
+        self._seen_requests.add(request.request_id)
+        assert self._arrival_listener is not None
+        names = {
+            tower.name
+            for feature in request.mm_features
+            if (tower := self._tower_of.get(feature.modality)) is not None
+        }
+        for name in sorted(names):
+            self._count(name, "image_requests")
+            self._arrival_listener(name)
+
+    def _count(self, name: str, key: str, value: float = 1.0) -> None:
+        stats = self._tower_stats.get(name)
+        if stats is not None:
+            stats[key] += value
 
     def _submit(
         self,
@@ -276,6 +357,9 @@ class ECHostTowerScheduler:
 
         write_blocks(self._region.blocks, entry.block_ids, embedding)
         self._cache.mark_ready(identifier)
+        if self._tower_stats:
+            self._count(encode.tower, "items_encoded_host")
+            self._count(encode.tower, "encode_seconds_host", result.encode_seconds)
         for request_id in encode.waiters:
             self._cache.pin(identifier)
             self._interest.setdefault(request_id, set()).add(identifier)
@@ -312,6 +396,10 @@ class ECHostTowerScheduler:
         entry = self._cache.pin_if_ready(identifier)
         if entry is None or not entry.ready:
             # Not a host tower's item: the workers encode it.
+            if self._on_card:
+                tower = self._tower_of.get(request.mm_features[index].modality)
+                if tower is not None and tower.name in self._on_card:
+                    self._count(tower.name, "items_encoded_card")
             return
         assert entry.shape is not None
         transfer_id = self._next_transfer_id
@@ -382,6 +470,7 @@ class ECHostTowerScheduler:
             if not encode.waiters and encode.future.cancel():
                 del self._encodes[identifier]
         self._unavailable.discard(request_id)
+        self._seen_requests.discard(request_id)
         return False, None
 
     def shutdown(self) -> None:
