@@ -1324,16 +1324,17 @@ class ExpertStore:
     def status(dirs: Sequence[str], identity: str) -> str:
         """What ``open`` would find, from the manifests alone (no pool, no
         stripe read): ``"complete"`` (opens with this identity), ``"mismatch"``
-        (complete, another identity), ``"incomplete"`` (started, not
-        finalized) or ``"absent"`` (a directory without a manifest)."""
+        (a store of another identity, finished or not), ``"incomplete"``
+        (started with this identity, not finalized) or ``"absent"`` (a
+        directory without a manifest)."""
         manifests = [_read_manifest(os.fspath(d)) for d in dirs]
         if not manifests or manifests[0] is None:
             return "absent"
         first = manifests[0]
-        if not first.get("complete"):
-            return "incomplete"
         if first.get("identity") != identity:
             return "mismatch"
+        if not first.get("complete"):
+            return "incomplete"
         if any(m is None or not m.get("complete") for m in manifests):
             return "incomplete"
         return "complete"

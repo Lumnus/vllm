@@ -362,6 +362,10 @@ class ExpertTiers:
     ) -> tuple[torch.nn.Parameter | None, int]:
         """(param, row) the loader should write local slot ``slot`` into, or
         (None, -1) when the slot is filled from the store instead."""
+        if self.store_binding is not None:
+            # The model is constructed by now: refuse a store this model
+            # cannot fill before any weight is loaded.
+            self.store_binding.session.check_layers()
         if slot < self.num_fast:
             return param, slot
         if self.fills_from_store:

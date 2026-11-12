@@ -98,7 +98,8 @@ class Direct:
         total = sum(len(b) for b in bufs)
         self.calls.append((len(bufs), total))
         for b in bufs:
-            if _addr(b) % DIRECT_ALIGN or len(b) % DIRECT_ALIGN or offset % DIRECT_ALIGN:
+            misaligned = _addr(b) % DIRECT_ALIGN or len(b) % DIRECT_ALIGN
+            if misaligned or offset % DIRECT_ALIGN:
                 raise OSError(errno.EINVAL, "misaligned direct I/O")
         if self.partial and total > 2 * DIRECT_ALIGN:
             # a short read that ends mid-tensor, on a 512 boundary
@@ -380,6 +381,8 @@ def test_status_reads_the_manifests_only(tmp_path):
     assert ExpertStore.status(dirs, IDENT) == "absent"
     w = ExpertStoreWriter(dirs, sch, IDENT)
     assert ExpertStore.status(dirs, IDENT) == "incomplete"
+    # another identity's store is a mismatch whether it was finished or not
+    assert ExpertStore.status(dirs, "other") == "mismatch"
     for layer in range(2):
         for e in range(6):
             w.write(layer, e, unit(sch, layer, e))
