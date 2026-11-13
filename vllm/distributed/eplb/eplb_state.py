@@ -30,6 +30,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 import torch
 from torch.distributed import ProcessGroup, all_reduce
@@ -387,6 +388,10 @@ class EplbState:
         """
         Device index for the async EPLB worker thread.
         """
+        self.skipped_rearrangements: int = 0
+        """Rearrangements every rank skipped because one rank could not
+        allocate memory for them (`_skip_rearrangement`); the same on every EP
+        rank."""
         if self.device.type in ("cuda", "xpu"):
             self.device_index = self.device.index
             if self.device_index is None and torch.accelerator.is_available():
@@ -1334,6 +1339,198 @@ class EplbState:
                 "(profile)" if is_profile else "",
             )
 
+        # Every allocation a rearrangement makes before it moves a weight is
+        # made in two phases, each closed by an agreement of the EP ranks on
+        # the host (`_skip_rearrangement`): if any rank could not allocate,
+        # every rank skips this rearrangement, so that no rank enters a
+        # collective the others left and the placement stays the same on
+        # every rank. The device may be full while serving (a KV cache grow or
+        # another holder can take it to the last byte), and a rearrangement
+        # is optional work. A profile run keeps failing loudly.
+        guard = not is_profile
+        self.last_rearrange_changed = False
+
+        # Phase 1, on this rank only: the logical load windows and what the
+        # all-reduce sends.
+        error: torch.OutOfMemoryError | None = None
+        global_expert_load_windows: list[torch.Tensor] = []
+        reduce_input: torch.Tensor | None = None
+        try:
+            global_expert_load_windows = self._logical_load_windows(
+                use_last_expert_load, is_main_rank
+            )
+            if len(global_expert_load_windows) > 1:
+                reduce_input = self._concat_for_allreduce(global_expert_load_windows)
+        except torch.OutOfMemoryError as e:
+            if not guard:
+                raise
+            error = e
+        if guard and self._skip_rearrangement("computing the expert load", error):
+            return None
+        # Perform all-reduce to get the expert load across all ranks for each model
+        global_expert_load_windows = self._allreduce_prepared(
+            global_expert_load_windows, reduce_input
+        )
+        if (
+            self.parallel_config.eplb_config.state_path is not None
+            and is_main_rank
+            and not is_profile
+            and not use_last_expert_load
+        ):
+            self._save_expert_load(global_expert_load_windows)
+
+        # TODO(bowen): Treat differently for prefill and decode nodes
+        eplb_model_state = next(iter(self.model_states.values()))
+        model = eplb_model_state.model
+        num_replicas = model.num_physical_experts
+        num_groups = model.num_expert_groups
+
+        if rank_mapping is not None and len(rank_mapping) == ep_group.size():
+            # NOTE(yongji): scale down, we need to rebalance the experts on
+            # remaining GPUs, transfer the experts while we haven't shutdown
+            # the GPUs to be released.
+            coordinator = get_ep_group()
+            assert isinstance(coordinator, StatelessGroupCoordinator)
+            tcp_store_group = coordinator.tcp_store_group
+            num_nodes = _node_count_with_rank_mapping(tcp_store_group, rank_mapping)
+            num_gpus = sum(new_rank != -1 for new_rank in rank_mapping.values())
+            num_replicas = (
+                num_replicas // ep_group.size() * num_gpus
+            )  # handle num replicas change
+        else:
+            num_nodes = get_node_count()
+            num_gpus = ep_group.size()
+
+        if num_gpus % num_nodes != 0:
+            num_nodes = 1
+            logger.warning_once(
+                f"num_gpus % num_nodes != 0, "
+                "not using hierarchical rearrangement algorithm.\n"
+                f"{num_gpus=}, {num_nodes=}"
+            )
+
+        # Phase 2, on this rank only: every model's plan (sync: the new maps,
+        # computed on the host; async: the snapshot the worker reads), before
+        # any weight moves or any state changes.
+        # (model state, its load window, sync: (old map, new map, skip) or
+        # None; async: the window's snapshot)
+        plans: list[tuple[EplbModelState, torch.Tensor, Any]] = []
+        error = None
+        try:
+            for eplb_model_state, global_expert_load_window in zip(
+                self.model_states.values(), global_expert_load_windows
+            ):
+                if sync and eplb_model_state.movers is not None:
+                    if is_profile or use_last_expert_load:
+                        # nothing to reserve; the restore fills these models itself
+                        plans.append(
+                            (eplb_model_state, global_expert_load_window, None)
+                        )
+                        continue
+                    raise NotImplementedError(
+                        "EPLB: a model whose layers fill their slots from the expert "
+                        "store is rearranged asynchronously only (the boot restore "
+                        "fills the slots directly)"
+                    )
+                plans.append(
+                    (
+                        eplb_model_state,
+                        global_expert_load_window,
+                        self._plan_sync(
+                            eplb_model_state,
+                            global_expert_load_window,
+                            num_replicas,
+                            num_groups,
+                            num_nodes,
+                            num_gpus,
+                            is_profile,
+                            rank_mapping,
+                            is_main_rank,
+                        )
+                        if sync
+                        # We copy the tensor to snapshot the
+                        # global_expert_load_window on the main thread so that
+                        # async worker can access it safely while the main
+                        # thread is running.
+                        else global_expert_load_window.clone(),
+                    )
+                )
+        except torch.OutOfMemoryError as e:
+            if not guard:
+                raise
+            error = e
+        if guard and self._skip_rearrangement("planning the moves", error):
+            return None
+
+        # Phase 3: the moves. Collectives with allocations of their own; a
+        # failure here is not caught (see `_skip_rearrangement`).
+        for eplb_model_state, global_expert_load_window, plan in plans:
+            if not is_profile:
+                eplb_model_state.last_expert_load = global_expert_load_window
+            if sync:
+                if plan is None:
+                    continue
+                old_physical_to_logical_map, new_physical_to_logical_map = (
+                    plan[0],
+                    plan[1],
+                )
+                skip_rearrange = bool(plan[2])
+                if not skip_rearrange and not is_profile:
+                    self.last_rearrange_changed |= bool(
+                        (old_physical_to_logical_map != new_physical_to_logical_map)
+                        .any()
+                        .item()
+                    )
+                if not skip_rearrange:
+                    # Update expert weights
+                    rearrange_expert_weights_inplace(
+                        eplb_model_state.physical_to_logical_map,
+                        new_physical_to_logical_map,
+                        eplb_model_state.model.expert_weights,
+                        eplb_model_state.expert_buffer,
+                        ep_group,
+                        eplb_model_state.communicator,
+                        is_profile,
+                        rank_mapping,
+                    )
+
+                    if not is_profile:
+                        _commit_eplb_maps(
+                            eplb_model_state,
+                            new_physical_to_logical_map=new_physical_to_logical_map,
+                        )
+
+                if is_main_rank:
+                    assert start_event is not None
+                    assert end_event is not None
+                    end_event.record()
+                    end_event.synchronize()
+                    gpu_elapsed = start_event.elapsed_time(end_event) / 1000.0
+                    logger.info(
+                        "Rearranged experts %s in %.2f s.",
+                        " (profile) " if is_profile else " ",
+                        gpu_elapsed,
+                    )
+            else:
+                eplb_model_state.eplb_stats = EplbStats(
+                    global_expert_load_window=plan,
+                    num_replicas=num_replicas,
+                    num_groups=num_groups,
+                    num_nodes=num_nodes,
+                    num_gpus=num_gpus,
+                )
+                eplb_model_state.rebalanced = True
+        # Signal async thread to start transferring layers
+        if not sync:
+            self.rearrange_event.record()
+        return None
+
+    def _logical_load_windows(
+        self, use_last_expert_load: bool, is_main_rank: bool
+    ) -> list[torch.Tensor]:
+        """Each model's load window over its logical experts, summed over the
+        window (this rank's counts; rank 0's saved ones with
+        use_last_expert_load)."""
         # Map the physical expert load to global logical experts
         global_expert_load_windows = []
         for eplb_model_state in self.model_states.values():
@@ -1381,191 +1578,159 @@ class EplbState:
                     dim=0
                 )
             global_expert_load_windows.append(global_expert_load_window)
-        # Perform all-reduce to get the expert load across all ranks for each model
-        global_expert_load_windows = self._allreduce_list(global_expert_load_windows)
+        return global_expert_load_windows
+
+    def _plan_sync(
+        self,
+        eplb_model_state: EplbModelState,
+        global_expert_load_window: torch.Tensor,
+        num_replicas: int,
+        num_groups: int,
+        num_nodes: int,
+        num_gpus: int,
+        is_profile: bool,
+        rank_mapping: dict[int, int] | None,
+        is_main_rank: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """A synchronous rearrangement's plan for one model: the current and
+        the new physical-to-logical map (host) and whether to skip the move."""
+        ep_group = get_ep_group().device_group
+        # Get new expert mappings for the model. The policy runs on the
+        # host, so the load window and current map have to come back.
+        with gpu_sync_allowed():
+            load_window_cpu = global_expert_load_window.cpu()
+            old_physical_to_logical_map = eplb_model_state.physical_to_logical_map.cpu()
+        new_physical_to_logical_map = self.policy.rebalance_experts(
+            load_window_cpu,
+            num_replicas,
+            num_groups,
+            num_nodes,
+            num_gpus,
+            old_physical_to_logical_map,
+        )
+        new_physical_to_logical_map = self.order_tiers(
+            eplb_model_state,
+            new_physical_to_logical_map,
+            load_window_cpu,
+            num_gpus,
+        )
+
+        skip_rearrange = False
         if (
-            self.parallel_config.eplb_config.state_path is not None
-            and is_main_rank
+            current_platform.is_rocm()
             and not is_profile
-            and not use_last_expert_load
+            and rank_mapping is None
+            and bool((old_physical_to_logical_map >= 0).all())
         ):
-            self._save_expert_load(global_expert_load_windows)
+            logical_loads = load_window_cpu.float()
+            ep_size = ep_group.size()
 
-        # TODO(bowen): Treat differently for prefill and decode nodes
-        eplb_model_state = next(iter(self.model_states.values()))
-        model = eplb_model_state.model
-        num_replicas = model.num_physical_experts
-        num_groups = model.num_expert_groups
+            def rank_load_imbalance(
+                mapping: torch.Tensor,
+                logical_loads: torch.Tensor = logical_loads,
+                ep_size: int = ep_size,
+            ) -> float:
+                mapping = mapping.to(
+                    device=logical_loads.device,
+                    dtype=torch.long,
+                )
+                replica_counts = torch.zeros_like(logical_loads)
+                replica_counts.scatter_add_(
+                    dim=1,
+                    index=mapping,
+                    src=torch.ones_like(mapping, dtype=logical_loads.dtype),
+                )
+                loads_per_replica = torch.gather(
+                    logical_loads / replica_counts.clamp_min(1),
+                    dim=1,
+                    index=mapping,
+                )
+                loads_per_rank = loads_per_replica.reshape(
+                    logical_loads.shape[0], ep_size, -1
+                ).sum(dim=(0, 2))
+                mean_load = loads_per_rank.mean()
+                if mean_load == 0:
+                    return 1.0
+                return (loads_per_rank.max() / mean_load).item()
 
-        if rank_mapping is not None and len(rank_mapping) == ep_group.size():
-            # NOTE(yongji): scale down, we need to rebalance the experts on
-            # remaining GPUs, transfer the experts while we haven't shutdown
-            # the GPUs to be released.
-            coordinator = get_ep_group()
-            assert isinstance(coordinator, StatelessGroupCoordinator)
-            tcp_store_group = coordinator.tcp_store_group
-            num_nodes = _node_count_with_rank_mapping(tcp_store_group, rank_mapping)
-            num_gpus = sum(new_rank != -1 for new_rank in rank_mapping.values())
-            num_replicas = (
-                num_replicas // ep_group.size() * num_gpus
-            )  # handle num replicas change
-        else:
-            num_nodes = get_node_count()
-            num_gpus = ep_group.size()
+            current_imbalance = rank_load_imbalance(old_physical_to_logical_map)
+            proposed_imbalance = rank_load_imbalance(new_physical_to_logical_map)
+            relative_improvement = (
+                current_imbalance - proposed_imbalance
+            ) / current_imbalance
+            skip_rearrange = relative_improvement < 0.05
+            if skip_rearrange and is_main_rank:
+                logger.info(
+                    "[EPLB] Skip rearrange: imbalance %.4f -> %.4f (no material gain)",
+                    current_imbalance,
+                    proposed_imbalance,
+                )
+        return old_physical_to_logical_map, new_physical_to_logical_map, skip_rearrange
 
-        if num_gpus % num_nodes != 0:
-            num_nodes = 1
-            logger.warning_once(
-                f"num_gpus % num_nodes != 0, "
-                "not using hierarchical rearrangement algorithm.\n"
-                f"{num_gpus=}, {num_nodes=}"
+    def _skip_rearrangement(
+        self, stage: str, error: "torch.OutOfMemoryError | None"
+    ) -> bool:
+        """The EP ranks agree, on the host (no device memory needed), whether
+        any of them failed to allocate while `stage`; if so every rank skips
+        this rearrangement and the placement stays as it is on every rank.
+        One WARNING on EP rank 0 with the counts; a failing rank other than 0
+        logs its own error at INFO."""
+        ep_group = get_ep_group()
+        num_failed = int(error is not None)
+        if ep_group.device_group.size() > 1:
+            flags = torch.tensor([num_failed], dtype=torch.int32, device="cpu")
+            ep_group.cpu_all_reduce_(flags)
+            num_failed = int(flags.item())
+        if num_failed == 0:
+            return False
+        self.skipped_rearrangements += 1
+        rank = ep_group.device_group.rank()
+        if rank == 0:
+            logger.warning(
+                "EPLB: skipping this rearrangement: %d of %d EP ranks could not "
+                "allocate memory while %s%s. Placement unchanged on every rank; "
+                "the next rearrangement in %d steps (%d skipped so far).",
+                num_failed,
+                ep_group.device_group.size(),
+                stage,
+                "" if error is None else f" (rank 0: {str(error).splitlines()[0]})",
+                self.expert_rearrangement_step_interval,
+                self.skipped_rearrangements,
             )
+        elif error is not None:
+            logger.info(
+                "EPLB (EP rank %d): could not allocate memory while %s: %s",
+                rank,
+                stage,
+                str(error).splitlines()[0],
+            )
+        return True
 
-        # Get new expert mappings
-        self.last_rearrange_changed = False
-        for eplb_model_state, global_expert_load_window in zip(
-            self.model_states.values(), global_expert_load_windows
-        ):
-            if not is_profile:
-                eplb_model_state.last_expert_load = global_expert_load_window
-            if sync and eplb_model_state.movers is not None:
-                if is_profile or use_last_expert_load:
-                    # nothing to reserve; the restore fills these models itself
-                    continue
-                raise NotImplementedError(
-                    "EPLB: a model whose layers fill their slots from the expert "
-                    "store is rearranged asynchronously only (the boot restore "
-                    "fills the slots directly)"
-                )
-            if sync:
-                # Get new expert mappings for the model. The policy runs on the
-                # host, so the load window and current map have to come back.
-                with gpu_sync_allowed():
-                    load_window_cpu = global_expert_load_window.cpu()
-                    old_physical_to_logical_map = (
-                        eplb_model_state.physical_to_logical_map.cpu()
-                    )
-                new_physical_to_logical_map = self.policy.rebalance_experts(
-                    load_window_cpu,
-                    num_replicas,
-                    num_groups,
-                    num_nodes,
-                    num_gpus,
-                    old_physical_to_logical_map,
-                )
-                new_physical_to_logical_map = self.order_tiers(
-                    eplb_model_state,
-                    new_physical_to_logical_map,
-                    load_window_cpu,
-                    num_gpus,
-                )
+    @staticmethod
+    def _concat_for_allreduce(tensor_list: list[torch.Tensor]) -> torch.Tensor:
+        """What `_allreduce_list` sends for several models, in one tensor."""
+        assert all(t.dim() == 2 for t in tensor_list), "All tensors must be 2D."
+        assert all(t.shape[1] == tensor_list[0].shape[1] for t in tensor_list), (
+            "All tensors must have the same shape[1]."
+        )
+        return torch.cat(tensor_list, dim=0)
 
-                skip_rearrange = False
-                if (
-                    current_platform.is_rocm()
-                    and not is_profile
-                    and rank_mapping is None
-                    and bool((old_physical_to_logical_map >= 0).all())
-                ):
-                    logical_loads = load_window_cpu.float()
-                    ep_size = ep_group.size()
-
-                    def rank_load_imbalance(
-                        mapping: torch.Tensor,
-                        logical_loads: torch.Tensor = logical_loads,
-                        ep_size: int = ep_size,
-                    ) -> float:
-                        mapping = mapping.to(
-                            device=logical_loads.device,
-                            dtype=torch.long,
-                        )
-                        replica_counts = torch.zeros_like(logical_loads)
-                        replica_counts.scatter_add_(
-                            dim=1,
-                            index=mapping,
-                            src=torch.ones_like(mapping, dtype=logical_loads.dtype),
-                        )
-                        loads_per_replica = torch.gather(
-                            logical_loads / replica_counts.clamp_min(1),
-                            dim=1,
-                            index=mapping,
-                        )
-                        loads_per_rank = loads_per_replica.reshape(
-                            logical_loads.shape[0], ep_size, -1
-                        ).sum(dim=(0, 2))
-                        mean_load = loads_per_rank.mean()
-                        if mean_load == 0:
-                            return 1.0
-                        return (loads_per_rank.max() / mean_load).item()
-
-                    current_imbalance = rank_load_imbalance(old_physical_to_logical_map)
-                    proposed_imbalance = rank_load_imbalance(
-                        new_physical_to_logical_map
-                    )
-                    relative_improvement = (
-                        current_imbalance - proposed_imbalance
-                    ) / current_imbalance
-                    skip_rearrange = relative_improvement < 0.05
-                    if skip_rearrange and is_main_rank:
-                        logger.info(
-                            "[EPLB] Skip rearrange: imbalance %.4f -> "
-                            "%.4f (no material gain)",
-                            current_imbalance,
-                            proposed_imbalance,
-                        )
-
-                if not skip_rearrange and not is_profile:
-                    self.last_rearrange_changed |= bool(
-                        (old_physical_to_logical_map != new_physical_to_logical_map)
-                        .any()
-                        .item()
-                    )
-                if not skip_rearrange:
-                    # Update expert weights
-                    rearrange_expert_weights_inplace(
-                        eplb_model_state.physical_to_logical_map,
-                        new_physical_to_logical_map,
-                        eplb_model_state.model.expert_weights,
-                        eplb_model_state.expert_buffer,
-                        ep_group,
-                        eplb_model_state.communicator,
-                        is_profile,
-                        rank_mapping,
-                    )
-
-                    if not is_profile:
-                        _commit_eplb_maps(
-                            eplb_model_state,
-                            new_physical_to_logical_map=new_physical_to_logical_map,
-                        )
-
-                if is_main_rank:
-                    assert start_event is not None
-                    assert end_event is not None
-                    end_event.record()
-                    end_event.synchronize()
-                    gpu_elapsed = start_event.elapsed_time(end_event) / 1000.0
-                    logger.info(
-                        "Rearranged experts %s in %.2f s.",
-                        " (profile) " if is_profile else " ",
-                        gpu_elapsed,
-                    )
-            else:
-                eplb_model_state.eplb_stats = EplbStats(
-                    # We copy the tensor to snapshot the global_expert_load_window
-                    # on the main thread so that async worker can access it safely
-                    # while the main thread is running.
-                    global_expert_load_window=global_expert_load_window.clone(),
-                    num_replicas=num_replicas,
-                    num_groups=num_groups,
-                    num_nodes=num_nodes,
-                    num_gpus=num_gpus,
-                )
-                eplb_model_state.rebalanced = True
-        # Signal async thread to start transferring layers
-        if not sync:
-            self.rearrange_event.record()
-        return None
+    def _allreduce_prepared(
+        self, tensor_list: list[torch.Tensor], concat: torch.Tensor | None
+    ) -> list[torch.Tensor]:
+        """`_allreduce_list` with the concatenation already made."""
+        ep_group = get_ep_group().device_group
+        if concat is None:
+            assert len(tensor_list) == 1
+            all_reduce(tensor_list[0], group=ep_group)
+            return tensor_list
+        all_reduce(concat, group=ep_group)
+        all_reduce_list = []
+        offset = 0
+        for tensor in tensor_list:
+            all_reduce_list.append(concat[offset : offset + tensor.shape[0], :])
+            offset += tensor.shape[0]
+        return all_reduce_list
 
     def start_async_loop(
         self,
