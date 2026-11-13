@@ -223,9 +223,7 @@ def _reference_mix(x, norm, down, up_fn, has_inject: bool):
     """The HC mix with the stand-in kernels' math and a given up GEMM."""
     grouped = x.reshape(x.shape[0], HC, N_EMBD).float()
     var = grouped.square().mean(-1, keepdim=True)
-    xn = ((grouped * torch.rsqrt(var + EPS)).flatten(-2)) * (
-        1 + norm.float()
-    )
+    xn = ((grouped * torch.rsqrt(var + EPS)).flatten(-2)) * (1 + norm.float())
     xn = xn.to(x.dtype)
     d = down(xn)
     lora = F.silu(d[:, :LOWRANK].float() / HC).to(x.dtype)
@@ -261,12 +259,16 @@ def test_packed_mapping_has_the_hc_merge():
     )
     from vllm.models.qwen4_exp.xpu.mtp import Qwen4ExpMTP
 
-    assert Qwen4ExpMTP.packed_modules_mapping is Qwen4ExpForCausalLM.packed_modules_mapping
+    assert (
+        Qwen4ExpMTP.packed_modules_mapping is Qwen4ExpForCausalLM.packed_modules_mapping
+    )
 
 
 def test_shard_names_resolve_the_merged_down_only_with_the_mapping(ref_kernel):
     without = HyperConnection(
-        CONFIG, prefix="attn_hyper_connection", quant_config=_ct_config([_DOWN_SHARDS], {})
+        CONFIG,
+        prefix="attn_hyper_connection",
+        quant_config=_ct_config([_DOWN_SHARDS], {}),
     )
     assert isinstance(
         without.input_mix_weight_down_block_inject.quant_method, UnquantizedLinearMethod
@@ -301,11 +303,15 @@ def test_int8_up_and_mixer_load_and_run(monkeypatch, ref_kernel, dtype):
 
     torch.manual_seed(4)
     x = torch.randn(TOKENS, HC, N_EMBD).to(dtype)
-    q_up, s_up = tensors["attn_hyper_connection.input_mix_weight_up.weight"], tensors[
-        "attn_hyper_connection.input_mix_weight_up.weight_scale"
-    ]
+    q_up, s_up = (
+        tensors["attn_hyper_connection.input_mix_weight_up.weight"],
+        tensors["attn_hyper_connection.input_mix_weight_up.weight_scale"],
+    )
     mixed, inject = hc.mix(x)
-    assert ("attn_hyper_connection.input_mix_weight_up", (TOKENS, LOWRANK)) in ref_kernel
+    assert (
+        "attn_hyper_connection.input_mix_weight_up",
+        (TOKENS, LOWRANK),
+    ) in ref_kernel
 
     # The explicit INT8 math, from the checkpoint tensors.
     ref_mixed, ref_inject = _reference_mix(
@@ -321,8 +327,11 @@ def test_int8_up_and_mixer_load_and_run(monkeypatch, ref_kernel, dtype):
     # Against BF16/fp32 math on the dequantized weight: the activation rounding.
     deq_up = (q_up.float() * s_up.float()).to(dtype)
     deq_mixed, _ = _reference_mix(
-        x, w.norm, lambda xn: F.linear(xn, _merged_down(w)),
-        lambda lora: F.linear(lora, deq_up), True,
+        x,
+        w.norm,
+        lambda xn: F.linear(xn, _merged_down(w)),
+        lambda lora: F.linear(lora, deq_up),
+        True,
     )
     rel = (mixed.float() - deq_mixed.float()).norm() / deq_mixed.float().norm()
     assert rel < 0.02, rel
@@ -352,7 +361,7 @@ def test_int8_merged_down_without_the_fused_kernel_runs_through_its_layer(
     if hasattr(torch.ops._xpu_C, "int8_dense_w8a8_fused_gemm"):
         pytest.skip("a build with the fused op is installed")
     _torch_ops(monkeypatch)
-    target = _Target(_ct_config([_UP, _DOWN_SHARDS]))
+    target = _Target(_ct_config([_UP, _MIXER_UP, _DOWN_SHARDS]))
     hc = target.attn_hyper_connection
     w = _weights(torch.float32, seed=5)
     tensors = _checkpoint(w, int8_up=True, int8_mixer_down=False, int8_down=True)
@@ -367,7 +376,9 @@ def test_int8_merged_down_without_the_fused_kernel_runs_through_its_layer(
     rows = merged.weight.t()
     q_down = tensors["attn_hyper_connection.input_mix_weight_down.weight"]
     q_inj = tensors["attn_hyper_connection.block_inject_weight.weight"]
-    assert torch.equal(rows[:LOWRANK], q_down) and torch.equal(rows[LOWRANK:valid], q_inj)
+    assert torch.equal(rows[:LOWRANK], q_down) and torch.equal(
+        rows[LOWRANK:valid], q_inj
+    )
     s_down = tensors["attn_hyper_connection.input_mix_weight_down.weight_scale"]
     s_inj = tensors["attn_hyper_connection.block_inject_weight.weight_scale"]
     torch.testing.assert_close(
@@ -380,7 +391,7 @@ def test_int8_merged_down_without_the_fused_kernel_runs_through_its_layer(
     x = torch.randn(TOKENS, HC, N_EMBD)
     mixed, inject = hc.mix(x)
     q_full = torch.cat((q_down, q_inj, torch.zeros_like(rows[valid:])))
-    s_full = torch.cat((s_down.float(), s_inj.float(), torch.ones(rows.shape[0] - valid, 1)))
+    s_full = torch.cat((s_down.float(), s_inj.float(), torch.ones(PAD, 1)))
     q_up = tensors["attn_hyper_connection.input_mix_weight_up.weight"]
     s_up = tensors["attn_hyper_connection.input_mix_weight_up.weight_scale"]
     ref_mixed, ref_inject = _reference_mix(
@@ -414,11 +425,13 @@ def test_int8_merged_down_with_the_fused_kernel_keeps_it(monkeypatch, ref_kernel
             return fused_ref(x, w, w_scale, bias)
 
         lib.impl("int8_dense_w8a8_fused_gemm", impl, "CPU")
-        target = _Target(_ct_config([_UP, _DOWN_SHARDS]))
+        target = _Target(_ct_config([_UP, _MIXER_UP, _DOWN_SHARDS]))
         _load(
             target,
             _checkpoint(
-                _weights(torch.float32, 7), int8_up=True, int8_mixer_down=False,
+                _weights(torch.float32, 7),
+                int8_up=True,
+                int8_mixer_down=False,
                 int8_down=True,
             ),
         )
@@ -429,7 +442,9 @@ def test_int8_merged_down_with_the_fused_kernel_keeps_it(monkeypatch, ref_kernel
     assert mixed.shape == (TOKENS, N_EMBD) and inject.shape == (TOKENS, HC)
 
 
-def test_online_target_rounds_bf16_up_at_load(monkeypatch, ref_kernel, default_vllm_config):
+def test_online_target_rounds_bf16_up_at_load(
+    monkeypatch, ref_kernel, default_vllm_config
+):
     """The serve-time route on a BF16 checkpoint: a `targets` entry naming the
     up projection (and the final mixer's down) rounds it at load, like the
     trunk's dense INT8 lever did."""
@@ -452,7 +467,10 @@ def test_online_target_rounds_bf16_up_at_load(monkeypatch, ref_kernel, default_v
     config.packed_modules_mapping = Qwen4ExpForCausalLM.packed_modules_mapping
     target = _Target(config)
     hc, mixer = target.attn_hyper_connection, target.hyper_connection_mixer
-    assert isinstance(hc.input_mix_weight_up.quant_method, online_int8.Int8PerChannelOnlineLinearMethod)
+    assert isinstance(
+        hc.input_mix_weight_up.quant_method,
+        online_int8.Int8PerChannelOnlineLinearMethod,
+    )
     assert hc.input_mix_weight_up.weight.is_meta
     # The merged down is not targeted: BF16, today's path.
     assert isinstance(
@@ -483,8 +501,11 @@ def test_online_target_rounds_bf16_up_at_load(monkeypatch, ref_kernel, default_v
     x = torch.randn(TOKENS, HC, N_EMBD)
     mixed, _ = hc.mix(x)
     bf16_mixed, _ = _reference_mix(
-        x, w.norm, lambda xn: F.linear(xn, _merged_down(w)),
-        lambda lora: F.linear(lora, w.up), True,
+        x,
+        w.norm,
+        lambda xn: F.linear(xn, _merged_down(w)),
+        lambda lora: F.linear(lora, w.up),
+        True,
     )
     rel = (mixed - bf16_mixed).norm() / bf16_mixed.norm()
     assert 0 < rel < 0.02, rel
@@ -526,7 +547,9 @@ def test_split_mix_compiles_without_graph_breaks(monkeypatch, ref_kernel):
     _load(
         target,
         _checkpoint(
-            _weights(torch.float32, 9), int8_up=True, int8_mixer_down=True,
+            _weights(torch.float32, 9),
+            int8_up=True,
+            int8_mixer_down=True,
             int8_down=False,
         ),
     )
@@ -545,7 +568,9 @@ def test_one_load_line_counts_the_paths(monkeypatch, ref_kernel):
     _load(
         target,
         _checkpoint(
-            _weights(torch.float32, 10), int8_up=True, int8_mixer_down=True,
+            _weights(torch.float32, 10),
+            int8_up=True,
+            int8_mixer_down=True,
             int8_down=False,
         ),
     )
@@ -585,7 +610,10 @@ def test_mtp_mixer_takes_the_quant_config(monkeypatch):
     monkeypatch.setattr(mtp_module, "_uses_qsa", lambda config: False)
     quant_config = object()
     config = SimpleNamespace(
-        vocab_size=16, hc_count=4, hidden_size=8, rms_norm_eps=1e-6,
+        vocab_size=16,
+        hc_count=4,
+        hidden_size=8,
+        rms_norm_eps=1e-6,
         mtp_num_hidden_layers=1,
     )
     vllm_config = SimpleNamespace(

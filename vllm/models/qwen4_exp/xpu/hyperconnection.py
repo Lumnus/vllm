@@ -92,9 +92,8 @@ logger = init_logger(__name__)
 class _WeightContainer(nn.Module):
     """Holds a single ``weight`` parameter (no bias, no forward).
 
-    Used for the hyper-connection weights, which are plain BF16 tensors
-    (excluded from quantization via ``re:.*hyper_connection.*``) loaded
-    directly from the checkpoint. The container exists only so the weight
+    Used for the hyper-connection weights the quantization config leaves BF16,
+    loaded directly from the checkpoint. The container exists only so the weight
     sits at the exact ``<name>.weight`` path the checkpoint expects.
     """
 
@@ -377,7 +376,11 @@ def _hc_up_mix_fake(
 
 for _name, _func, _fake in (
     ("qwen4_exp_xpu_hc_norm", hc_norm, _hc_norm_fake),
-    ("qwen4_exp_xpu_hc_combine_then_norm", hc_combine_then_norm, _hc_combine_then_norm_fake),
+    (
+        "qwen4_exp_xpu_hc_combine_then_norm",
+        hc_combine_then_norm,
+        _hc_combine_then_norm_fake,
+    ),
     ("qwen4_exp_xpu_hc_down_lora", hc_down_lora, _hc_down_lora_fake),
     ("qwen4_exp_xpu_hc_lowrank_silu", hc_lowrank_silu, _hc_lowrank_silu_fake),
     ("qwen4_exp_xpu_hc_gate_mix", hc_gate_mix_op, _hc_gate_mix_fake),
@@ -609,7 +612,9 @@ class HyperConnection(nn.Module):
         """The mix of the normalized ``xn``, with each projection that is a
         quantized layer run through its own method."""
         if self.down_path == "layer":
-            down = self._down_linear(xn)
+            down_linear = self._down_linear
+            assert down_linear is not None
+            down = down_linear(xn)
             lora = _lowrank_silu_op(down, self.hc, self.lowrank)
             inject = down[:, self.lowrank : self.lowrank + self.hc]
         else:
