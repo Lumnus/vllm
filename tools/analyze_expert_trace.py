@@ -369,6 +369,20 @@ def replay(
 # ---- output
 
 
+def write_loads(trace: Trace, path: str, last: int = 0) -> None:
+    """The calls per logical expert of each layer, summed over the trace (or
+    its last ``last`` intervals), as an EPLB state file (layer name -> loads)."""
+    counts = trace.counts[-last:] if last > 0 else trace.counts
+    total = counts.sum(axis=0, dtype=np.uint64)
+    out = {name: [int(x) for x in total[i]] for i, name in enumerate(trace.layers)}
+    with open(path, "w") as handle:
+        json.dump(out, handle)
+    print(
+        f"wrote the loads of {len(out)} layers over {counts.shape[0]} "
+        f"intervals to {path}"
+    )
+
+
 def pct(x: float) -> str:
     return f"{100 * x:6.2f}%"
 
@@ -409,12 +423,24 @@ def main(argv: list[str] | None = None) -> int:
         help="count-decay half-life, in intervals",
     )
     ap.add_argument("--per-layer", action="store_true", help="working set per layer")
+    ap.add_argument(
+        "--write-loads",
+        metavar="PATH",
+        help="also write the calls per logical expert of each layer (summed "
+        "over the trace, or its last --last intervals) as an EPLB state file: "
+        "the expert store's tier_seed or EPLB's state_path read it",
+    )
+    ap.add_argument(
+        "--last", type=int, default=0, help="intervals --write-loads sums (0: all)"
+    )
     args = ap.parse_args(argv)
 
     trace = read_state_file(args.inputs[0]) if len(args.inputs) == 1 else None
     state_only = trace is not None
     if trace is None:
         trace = read_trace(args.inputs)
+    if args.write_loads:
+        write_loads(trace, args.write_loads, args.last)
     n_layers, n_exp = trace.counts.shape[1:]
     tops = [n for n in args.top_n if n <= n_exp]
     span = ""

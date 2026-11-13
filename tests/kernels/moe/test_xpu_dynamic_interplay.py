@@ -394,7 +394,9 @@ def test_the_bound_over_the_control_surface(monkeypatch, tmp_path, op):
     state = wrc.handle(worker, "state", args={"only": ["tiers", "cpu"]})
     tiers_state = state["tiers"]
     assert tiers_state["resizable"] and tiers_state["resize_blocked"] is None
-    assert tiers_state["settings"] == {"host_tier_bound": 2}
+    # the working set's settings sit beside the bound (all registered with
+    # the CPU tier)
+    assert tiers_state["settings"]["host_tier_bound"] == 2
     assert tiers_state["pinned_slots_per_layer"] == [2]
     assert tiers_state["cpu_slots_per_layer"] == [3]
     assert tiers_state["slots_now"] == {"card": 6, "pinned": 4, "cpu": 6}

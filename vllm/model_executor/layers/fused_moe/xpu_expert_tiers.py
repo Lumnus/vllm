@@ -30,6 +30,7 @@ card, in a pinned row or on the CPU, or the step fails.
 import threading
 import time
 import weakref
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -40,6 +41,11 @@ import torch
 
 from vllm.distributed.eplb.expert_weights import StoreBackedWeight, TieredExpertWeight
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.xpu_working_set import (
+    class_readout,
+    classify,
+    plan_swaps,
+)
 from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
@@ -48,6 +54,7 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.xpu_cpu_experts import (
         CpuExpertRuntime,
     )
+    from vllm.model_executor.layers.fused_moe.xpu_working_set import WorkingSet
     from vllm.model_executor.offloader.expert_tier_map import (
         PreparedMove,
         StreamOps,
@@ -211,6 +218,52 @@ class _PinnedArena:
 
 _ARENA = _PinnedArena()
 
+
+class StageRows:
+    """Pinned rows in the layers' kernel layout that a layer call fills with
+    the CPU-tier experts it routes many tokens to, and the map (physical id
+    -> row, -1 elsewhere) the card's kernel call over them reads. Shared by
+    the layers of a process: a layer writes them only after the host has
+    seen its own routing, which the stream orders after every kernel of the
+    previous layer, so no kernel still reads what is written (R1)."""
+
+    def __init__(
+        self,
+        like: dict[str, torch.Tensor],
+        rows: int,
+        num_global: int,
+        device: torch.device,
+    ):
+        from vllm.utils.platform_utils import is_pin_memory_available
+        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+        self.num_rows = rows
+        self.host = {
+            k: _ARENA.empty((rows, *t.shape[1:]), t.dtype) for k, t in like.items()
+        }
+        self.views: dict[str, torch.Tensor] = {}
+        for key, tensor in self.host.items():
+            view = get_accelerator_view_from_cpu_tensor(tensor)
+            view._vllm_is_uva_offloaded = True  # type: ignore[attr-defined]
+            self.views[key] = view
+        self.map = torch.full((num_global,), -1, dtype=torch.int32, device=device)
+        self.map_host = torch.full(
+            (num_global,), -1, dtype=torch.int32, pin_memory=is_pin_memory_available()
+        )
+
+    def rows_u8(self, key: str) -> torch.Tensor:
+        return _u8(self.host[key])
+
+
+_STAGE_ROWS: StageRows | None = None
+
+
+def reset_stage_rows() -> None:
+    """Forget the process's staging rows (tests; a new model load)."""
+    global _STAGE_ROWS
+    _STAGE_ROWS = None
+
+
 # The layers' tiers in this process once wired to their kernels, for the
 # runtime control surface's readout (`live_tiers`).
 _LIVE_TIERS: "weakref.WeakSet[ExpertTiers]" = weakref.WeakSet()
@@ -304,7 +357,104 @@ def _register_runtime_settings() -> None:
             apply=apply_host_tier_bound,
         ),
     )
+    from vllm.model_executor.layers.fused_moe.xpu_working_set import (
+        RUNTIME_SETTINGS,
+    )
+
+    for name in RUNTIME_SETTINGS:
+        register_tier_setting(
+            name,
+            RuntimeSetting(
+                get=lambda name=name: _ws_get(name),
+                check=lambda value, name=name: _ws_check(name, value),
+                apply=lambda value, name=name: _ws_apply(name, value),
+            ),
+        )
     _RUNTIME_SETTINGS_REGISTERED = True
+
+
+# -- the working set's settings (`tiers.set working_set`, `ws_*`, ...) -------
+
+
+def _ws_settings() -> Any:
+    from vllm.model_executor.layers.fused_moe.xpu_working_set import (
+        current_working_set,
+    )
+
+    ws = current_working_set()
+    return None if ws is None else ws.settings
+
+
+def _ws_get(name: str) -> Any:
+    s = _ws_settings()
+    return None if s is None else getattr(s, name)
+
+
+def _ws_check(name: str, value: Any) -> str | None:
+    from vllm.model_executor.layers.fused_moe.xpu_working_set import (
+        RUNTIME_SETTINGS,
+    )
+
+    s = _ws_settings()
+    if s is None:
+        return "no layer computes experts on the CPU yet"
+    valid, what = RUNTIME_SETTINGS[name]
+    if not valid(value):
+        return f"{what}; got {value!r}"
+    if name == "ws_hot" and value < s.ws_warm:
+        return f"ws_hot {value} is below ws_warm {s.ws_warm}"
+    if name == "ws_warm" and value > s.ws_hot:
+        return f"ws_warm {value} is above ws_hot {s.ws_hot}"
+    return None
+
+
+def _ws_apply(name: str, value: Any) -> None:
+    """Read by every between-steps call and every layer call from now on;
+    switching the working set off drops the batches being read at the next
+    step (their rows go back), nothing that is mapped moves."""
+    s = _ws_settings()
+    assert s is not None
+    old = getattr(s, name)
+    setattr(s, name, type(old)(value) if not isinstance(old, bool) else bool(value))
+    logger.info("Expert working set: %s %s -> %s.", name, old, getattr(s, name))
+
+
+def working_set_state() -> dict[str, Any] | None:
+    """The working set of this rank: settings, counters, and per layer the
+    experts that are hot, warm and cold against the rows each tier has; the
+    sums say whether the bound (or the card tier) is short."""
+    tiers = _cpu_tiers()
+    if not tiers or tiers[0]._ws is None:
+        return None
+    ws = tiers[0]._ws
+    from dataclasses import asdict
+
+    per_layer = [t.working_set_readout() for t in tiers]
+    keys = (
+        "hot",
+        "warm",
+        "cold",
+        "hot_on_card",
+        "warm_or_hot_on_cpu",
+        "cold_on_card",
+        "card_short",
+        "rows_short",
+    )
+    totals = {k: sum(r[k] for r in per_layer) for k in keys}
+    return {
+        "settings": asdict(ws.settings),
+        "counters": ws.snapshot(),
+        "layers": len(per_layer),
+        "totals": totals,
+        "per_layer_min_max": {
+            k: [min(r[k] for r in per_layer), max(r[k] for r in per_layer)]
+            for k in ("hot", "warm", "cold", "rows_short")
+        },
+        "layers_short": sum(1 for r in per_layer if r["rows_short"] > 0),
+        "card_rows": per_layer[0]["card_rows"],
+        "pinned_rows": per_layer[0]["pinned_rows"],
+        "per_layer": {t.layer_name: r for t, r in zip(tiers, per_layer)},
+    }
 
 
 def _repack_int4_pinned(
@@ -454,9 +604,28 @@ class ExpertTiers:
         self.slot_logical = (
             None if store is None else np.array(store.initial_logical, dtype=np.int64)
         )
-        self.move_log: list[dict[str, float]] = []
+        # The last moves' stats (bounded: the working set commits many small
+        # moves) and how many were committed.
+        self.move_log: deque[dict[str, float]] = deque(maxlen=512)
+        self.moves_committed = 0
         # Slots whose row or expert changed since the last scrub.
         self._touched: set[int] = set()
+        # The working set (xpu_working_set): per slot the decayed calls per
+        # token (the temperature's numerator) and the class; the batch of
+        # tier moves being read; a counter of placement changes, which a
+        # batch planned on an older placement must not be committed over.
+        self._ws: WorkingSet | None = None
+        self._ws_ordinal = 0
+        self._heat = np.zeros(num_local, dtype=np.float64)
+        self._cls = np.zeros(num_local, dtype=np.int8)
+        self._ws_batch: tuple[Any, dict[int, int], dict[int, Any], int, list] | None = (
+            None
+        )
+        self._placement_version = 0
+        self._topk: int | None = None
+        self._impl_common: dict[str, Any] | None = None
+        self._stage_impl: Any = None
+        self._prepared_total: float | None = None
 
     @property
     def num_slow(self) -> int:
@@ -653,6 +822,12 @@ class ExpertTiers:
             {name: _u8(self.slow[name])[0].numel() for name in UNIT_TENSORS},
         )
         self.cpu = get_runtime(binding.session.config, binding.session.store, layout)
+        from vllm.model_executor.layers.fused_moe.xpu_working_set import (
+            get_working_set,
+        )
+
+        self._ws = get_working_set(binding.session.config)
+        self._ws_ordinal = len(_cpu_tiers())
         _register_runtime_settings()
         self._prefetch_host(evict=False)
         logger.info_once(
@@ -732,6 +907,7 @@ class ExpertTiers:
             "pinned": int((tier == POOL).sum()),
             "cpu": int((tier == HOST).sum()),
         }
+        self._observe_routing(ids)
         tok, k = np.nonzero(tier == HOST)
         if tok.size == 0:
             return [], tok, k, counts
@@ -747,10 +923,31 @@ class ExpertTiers:
         promotion of a host slot the CPU served often since the last
         rearrangement into a free pinned row (read from the host cache or
         the store in the background, mapped at a later step). EPLB's next
-        rearrangement chooses the pinned set again from its load window."""
+        rearrangement chooses the pinned set again from its load window.
+
+        With the working set on (``working_set``), the slots' temperature
+        decides instead: see :meth:`_working_set_step`."""
         cpu = self.cpu
         if cpu is None:
             return
+        ws = self._ws
+        if ws is not None:
+            self._heat *= ws.settings.decay()
+            ws.tick(self._ws_ordinal)
+            s = ws.settings
+            self._cls = classify(
+                self.temperature(), self._cls, s.ws_hot, s.ws_warm, s.ws_hysteresis
+            )
+            if s.working_set:
+                self._working_set_step(ws)
+                return  # promotions by miss count are the working set's now
+            if self._ws_batch is not None and self._move_lock.acquire(
+                blocking=False
+            ):  # switched off with a batch being read
+                try:
+                    self._drop_ws_batch(count="dropped")
+                finally:
+                    self._move_lock.release()
         cfg = cpu.config
         threshold = int(cfg.host_promote_misses)
         if threshold <= 0:
@@ -824,6 +1021,7 @@ class ExpertTiers:
             # The row is complete (the host wrote it) and no map points at it:
             # map it (R2); the slot leaves the CPU tier at the same point.
             placement.promote_host(slot, row)
+            self._placement_version += 1
             ops = self.ops
             assert ops is not None and self.slow_map is not None
             _, slow_np = placement.maps(self.slot_global, self.num_global)
@@ -843,6 +1041,268 @@ class ExpertTiers:
             )
         finally:
             self._move_lock.release()
+
+    # -- prefill staging of CPU-tier experts (stage_min_calls) ----------------
+
+    def stage_rows(self, device: torch.device) -> "StageRows":
+        """The process's staging rows (made at the first use, sized
+        ``stage_rows`` or this layer's CPU slots)."""
+        global _STAGE_ROWS
+        if _STAGE_ROWS is None:
+            ws = self._ws
+            want = 0 if ws is None else int(ws.settings.stage_rows)
+            assert self.placement is not None
+            rows = want or max(1, self.num_slow)
+            _STAGE_ROWS = StageRows(self.slow, rows, self.num_global, device)
+            logger.info(
+                "CPU experts: %d staging rows (%.2f GiB pinned) for the experts "
+                "of the CPU tier that a large step routes many tokens to; the "
+                "card computes those from the rows.",
+                rows,
+                rows * self.slot_bytes() / 2**30,
+            )
+        return _STAGE_ROWS
+
+    def stage_impl(self, rows: "StageRows") -> Any:
+        """This layer's kernel call over the staging rows (built once; the
+        rows and their map are shared by the layers, which run one at a
+        time)."""
+        if self._stage_impl is None:
+            assert self._impl_common is not None
+            XpuFusedMoe = _xpu_fused_moe()
+            sw13, sw2 = rows.views["w13"], rows.views["w2"]
+            sw13.xpu_fused_moe = True  # type: ignore[attr-defined]
+            impl = XpuFusedMoe(
+                w13=sw13,
+                w13_scales=rows.views["w13_scales"],
+                w13_bias=None,
+                w2=sw2,
+                w2_scales=rows.views["w2_scales"],
+                w2_bias=None,
+                num_experts=rows.num_rows,
+                expert_map=rows.map,
+                **self._impl_common,
+            )
+            impl.w13, impl.w2 = sw13.view(torch.int8), sw2.view(torch.int8)
+            impl.w13._vllm_is_uva_offloaded = True
+            impl.w2._vllm_is_uva_offloaded = True
+            self._stage_impl = impl
+        return self._stage_impl
+
+    # -- the working set (xpu_working_set) -----------------------------------
+
+    def _observe_routing(self, ids: np.ndarray) -> None:
+        """A layer call's routing (physical ids [T, K], every token's): the
+        calls per token of each slot of this rank go into its decayed mean."""
+        ws = self._ws
+        if ws is None or ids.size == 0:
+            return
+        slots = self._slot_of_global[ids.reshape(-1)]
+        slots = slots[slots >= 0]
+        tokens = ids.shape[0]
+        counts = np.bincount(slots, minlength=self.num_local)
+        self._heat += (1.0 - ws.settings.decay()) * counts / tokens
+        ws.observe_tokens(tokens)
+
+    def temperature(self) -> np.ndarray:
+        """Per slot, its decayed calls per token over the mean expert's (top-k
+        over the logical experts): 1.0 is an average expert."""
+        binding = self.store_binding
+        topk = self._topk or 1
+        num_logical = self.num_global if binding is None else binding.num_logical
+        return self._heat * (num_logical / topk)
+
+    def _seed_heat(self, slots: Any, load: np.ndarray, total: float | None) -> None:
+        """Start the slots' temperature from EPLB's load (or a seed file's):
+        the load of each slot's expert as calls per token."""
+        if not total or self._topk is None:
+            return
+        self._heat[slots] = (
+            np.asarray(load, dtype=np.float64)[slots] / total * (self._topk)
+        )
+
+    def _working_set_step(self, ws: "WorkingSet") -> None:
+        """Between two steps: commit the batch being read once it has landed,
+        else (on this layer's turn) start one: the swaps the temperature and
+        the cost model choose, as one move whose experts are read into free
+        pool rows in the background."""
+        from vllm.model_executor.offloader.expert_tier_map import RowsUnavailable
+
+        if self._ws_batch is not None:
+            self._ws_try_commit(ws)
+            return
+        placement, cpu = self.placement, self.cpu
+        if (
+            self._eplb_pending
+            or placement is None
+            or cpu is None
+            or self._topk is None
+            or self.slot_logical is None
+        ):
+            return
+        budget = ws.turn(self._ws_ordinal)
+        budget = min(budget, placement.pool.free_count)
+        if budget <= 0:
+            return
+        if not self._move_lock.acquire(blocking=False):
+            return
+        try:
+            s = ws.settings
+            new_tier, swaps = plan_swaps(
+                placement.tier,
+                self.temperature(),
+                self._cls,
+                self._heat,
+                ws.tokens,
+                placement.num_pinned,
+                s,
+                budget,
+            )
+            if not swaps:
+                return
+            from vllm.model_executor.offloader.expert_tier_map import FAST, POOL
+
+            plan = placement.plan_from_set(
+                self.slot_logical,
+                self.slot_logical,
+                new_tier == FAST,
+                new_tier == POOL,
+                check_budget=False,
+            )
+            assert len(plan.reads) <= len(swaps)
+            try:
+                rows = placement.pool.acquire(len(plan.reads))
+            except RowsUnavailable:
+                return
+            pool_dest = dict(zip(sorted(plan.reads), rows))
+            futures: dict[int, Any] = {}
+            binding = self.store_binding
+            assert binding is not None
+            try:
+                for slot, logical in plan.reads.items():
+                    row = pool_dest[slot]
+                    key = (binding.store_layer, int(logical))
+                    dests = {k: _u8(t)[row] for k, t in self.slow.items()}
+                    future = cpu.cache.copy_out_async(key, dests, ws.executor())
+                    if future is None:
+                        future = binding.session.store.read_into_async(key, dests)
+                        ws.counters.units_drive += 1
+                    else:
+                        ws.counters.units_cache += 1
+                    futures[row] = future
+            except Exception as exc:  # noqa: BLE001 - serving goes on
+                # rows whose read started come back when it is done
+                for row in rows:
+                    if row in futures and not futures[row].done():
+                        placement.pool.release([row], futures[row])
+                    else:
+                        placement.pool.give_back_unused([row])
+                ws.counters.failed += 1
+                logger.warning(
+                    "Expert working set: %s: a batch could not start its reads "
+                    "(%s); the slots stay where they are.",
+                    self.layer_name,
+                    exc,
+                )
+                return
+            ws.spend(max(1, len(rows)))
+            ws.counters.batches += 1
+            self._ws_batch = (
+                plan,
+                pool_dest,
+                futures,
+                self._placement_version,
+                swaps,
+            )
+        finally:
+            self._move_lock.release()
+        if not futures:  # tier changes that read nothing: commit now
+            self._ws_try_commit(ws)
+
+    def _ws_try_commit(self, ws: "WorkingSet") -> None:
+        if not self._move_lock.acquire(blocking=False):
+            return  # an EPLB prepare holds the layer: try at the next step
+        try:
+            # under the lock: an EPLB prepare (another thread) may have
+            # dropped the batch
+            batch = self._ws_batch
+            if batch is None:
+                return
+            plan, pool_dest, futures, version, swaps = batch
+            if not all(f.done() for f in futures.values()):
+                return  # a step never waits for the working set
+            failed = [f.exception() for f in futures.values() if f.exception()]
+            if failed:
+                logger.warning(
+                    "Expert working set: %s: %d of %d reads failed (%s); the "
+                    "batch is dropped and the slots stay where they are.",
+                    self.layer_name,
+                    len(failed),
+                    len(futures),
+                    failed[0],
+                )
+                self._drop_ws_batch(count="failed")
+                return
+            if version != self._placement_version or self._eplb_pending:
+                self._drop_ws_batch(count="dropped")
+                return
+            placement = self.placement
+            assert placement is not None
+            try:
+                move = placement._assign(plan, pool_dest)
+            except Exception as exc:  # noqa: BLE001 - logged, rows given back
+                logger.warning(
+                    "Expert working set: %s: the batch cannot be placed (%s); dropped.",
+                    self.layer_name,
+                    exc,
+                )
+                self._drop_ws_batch(count="failed")
+                return
+            self._ws_batch = None
+            move.stats = {"ws_units": float(len(pool_dest))}
+            self.commit_move(move)
+        finally:
+            self._move_lock.release()
+        c = ws.counters
+        c.committed += 1
+        for sw in swaps:
+            c.swaps[ws.kind(sw.lower, sw.upper)] += 1
+        logger.info_once(
+            "Expert working set: the first batch was committed (%s: %d swaps, "
+            "%d experts read: %s).",
+            self.layer_name,
+            len(swaps),
+            len(pool_dest),
+            ", ".join(ws.kind(sw.lower, sw.upper) for sw in swaps),
+        )
+
+    def _drop_ws_batch(self, count: str | None = None) -> None:
+        """Forget the batch being read: its rows go back once the reads that
+        may still write them are done."""
+        batch = self._ws_batch
+        if batch is None:
+            return
+        self._ws_batch = None
+        placement = self.placement
+        assert placement is not None
+        for row, future in batch[2].items():
+            if future.done():
+                placement.pool.give_back_unused([row])
+            else:
+                placement.pool.release([row], future)
+        if count is not None and self._ws is not None:
+            setattr(self._ws.counters, count, getattr(self._ws.counters, count) + 1)
+
+    def working_set_readout(self) -> dict[str, Any]:
+        """The layer's classes against its tiers (see ``class_readout``)."""
+        placement = self.placement
+        assert placement is not None
+        out = class_readout(
+            self._cls, placement.tier, self.num_fast, placement.num_pinned
+        )
+        temp = self.temperature()
+        out["temp_max"] = round(float(temp.max()), 3) if temp.size else 0.0
+        return out
 
     # -- the pinned bound while serving (runtime control: host_tier_bound) ---
 
@@ -919,11 +1379,16 @@ class ExpertTiers:
                     "can change once it is committed"
                 )
             self._drop_promotion()
+            self._drop_ws_batch(count="dropped")
             load = (
                 np.zeros(self.num_local) if self._slot_load is None else self._slot_load
             )
-            # ascending heat: by load, then by the CPU's count
-            heat = np.lexsort((self._host_count, load))
+            # ascending heat: by load, then by the CPU's count; with the
+            # working set on, by the slots' temperature first
+            keys = [self._host_count, load]
+            if self._ws is not None and self._ws.settings.working_set:
+                keys.append(self._heat)
+            heat = np.lexsort(tuple(keys))
             rank = np.empty(self.num_local, dtype=np.int64)
             rank[heat] = np.arange(self.num_local)
             pool = placement.is_pool().copy()
@@ -1105,6 +1570,8 @@ class ExpertTiers:
                 "ep_size": 2,
                 "gemm1_clamp_limit": gemm1_clamp_limit,
             }
+            self._topk = int(topk)
+            self._impl_common = dict(common)
             fast = XpuFusedMoe(
                 w13=w1,
                 w13_scales=w1_scale,
@@ -1245,7 +1712,13 @@ class ExpertTiers:
         _, placement, _ = self._require_store()
         assert self.slot_logical is not None
         t0 = time.perf_counter()
-        plan = placement.plan(self.slot_logical, new_logical, slot_load, hysteresis)
+        # With the working set on, EPLB moves experts between ranks and the
+        # slots' temperature chooses the tiers (between steps, unbounded by
+        # the moves per rank): the move keeps every slot's tier.
+        tier_moves = not (self._ws is not None and self._ws.settings.working_set)
+        plan = placement.plan(
+            self.slot_logical, new_logical, slot_load, hysteresis, tier_moves=tier_moves
+        )
         move = placement.prepare(plan, self._fill_rows, timeout=timeout)
         self._prepared_load = np.asarray(slot_load, dtype=np.float64).copy()
         move.stats = {
@@ -1274,9 +1747,15 @@ class ExpertTiers:
             on_pool_rows_changed=lambda: self.on_rows_written([]),
         )
         self.slot_logical = move.plan.new_logical.copy()
+        self._placement_version += 1
+        self.moves_committed += 1
+        plan = move.plan
         if self._prepared_load is not None:
             self._slot_load, self._prepared_load = self._prepared_load, None
-        plan = move.plan
+            # a slot that holds another expert now starts from that expert's
+            # load in EPLB's window, not from the old expert's temperature
+            self._seed_heat(plan.changed, self._slot_load, self._prepared_total)
+            self._prepared_total = None
         self._touched.update(plan.changed, plan.demoted, plan.to_fast)
         self._refresh_tiers()
         if self.cpu is not None:
@@ -1339,6 +1818,10 @@ class ExpertTiers:
         # the layer's own promotions wait.
         with self._move_lock:
             self._eplb_pending = True
+            # EPLB's move needs the free rows: a working-set batch being read
+            # gives its rows back (once its reads are done, within ms)
+            self._drop_ws_batch(count="dropped")
+            self._prepared_total = float(np.asarray(logical_load).sum())
             try:
                 return self.prepare_move(new_logical, slot_load, hysteresis)
             except BaseException:
@@ -1356,6 +1839,7 @@ class ExpertTiers:
         written, never mapped, so they are free at once."""
         self._eplb_pending = False
         self._prepared_load = None
+        self._prepared_total = None
         _, placement, _ = self._require_store()
         placement.pool.give_back_unused(prepared.pool_dest.values())
 
@@ -1393,6 +1877,18 @@ class ExpertTiers:
         is_pool = np.zeros(self.num_local, dtype=bool)
         is_pool[order[self.num_fast : self.num_fast + pinned]] = True
         self._slot_load = np.asarray(load, dtype=np.float64).copy()
+        self._drop_ws_batch()
+        # the temperature starts from the loads the placement is made from
+        self._seed_heat(
+            np.arange(self.num_local),
+            self._slot_load,
+            float(np.asarray(logical_load).sum()),
+        )
+        if self._ws is not None:
+            s = self._ws.settings
+            self._cls = classify(
+                self.temperature(), None, s.ws_hot, s.ws_warm, s.ws_hysteresis
+            )
         if (
             np.array_equal(logical, self.slot_logical)
             and np.array_equal(is_fast, placement.is_fast())
@@ -1422,6 +1918,7 @@ class ExpertTiers:
             while not ops.done(done):
                 _time.sleep(0.0005)
         placement.reset_to(tier, row)
+        self._placement_version += 1
         fast_np, slow_np = placement.maps(self.slot_global, self.num_global)
         assert self.fast_map is not None and self.slow_map is not None
         ops.compute_write(self.fast_map, fast_np)

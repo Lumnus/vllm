@@ -259,3 +259,75 @@ def test_the_bound_is_refused_while_a_rearrangement_is_in_flight(monkeypatch, tm
     _cycle(state, model_state, state.rearrange)
     assert all(int((t.placement.tier == POOL).sum()) == 1 for t in env.tiers)
     tstore.reset_sessions()
+
+
+def test_a_tier_seed_places_experts_and_tiers_when_eplb_has_no_loads(
+    monkeypatch, tmp_path
+):
+    """No state_path: the expert store's tier_seed (here a rankings file of
+    the 0.32 line: layer number -> experts hottest first) gives the loads the
+    restore fills the slots by: the hottest on the card, the next pinned, the
+    rest on the CPU; the temperature starts from them."""
+    import json
+
+    seed = tmp_path / "rankings.json"
+    seed.write_text(json.dumps({"0": [7, 6, 5, 4, 3, 2, 1, 0], "1": [0, 1, 2, 3, 4]}))
+    env, state, model_state = _build(monkeypatch, tmp_path, tier_seed=str(seed))
+    assert state.has_tier_seed() and model_state.has_saved_load
+    monkeypatch.setattr(eplb_state_mod, "all_reduce", lambda *a, **k: None)
+    state.restore_saved_placement()
+    for tiers, card, pinned in ((env.tiers[0], {5, 6, 7}, {3, 4}),
+                                (env.tiers[1], {0, 1, 2}, {3, 4})):  # fmt: skip
+        p = tiers.placement
+        p.check()
+        assert set(tiers.slot_logical[p.tier == 0].tolist()) == card
+        assert set(tiers.slot_logical[p.tier == POOL].tolist()) == pinned
+        hottest = int(np.argmax(tiers.temperature()))
+        assert p.tier[hottest] == 0
+        summary = tiers.scrub(None, full=True)
+        assert summary["mismatches"] == 0 and summary["maps_equal"]
+    tstore.reset_sessions()
+
+
+def test_without_a_seed_nothing_is_read(monkeypatch, tmp_path):
+    env, state, model_state = _build(monkeypatch, tmp_path)
+    assert not state.has_tier_seed() and not model_state.has_saved_load
+    tstore.reset_sessions()
+
+
+def test_the_working_set_moves_tiers_from_eplbs_steps_without_a_rearrangement(
+    monkeypatch, tmp_path
+):
+    """Paused EPLB (no rearrangement at all): the steps' between-steps point
+    reinjects the hot CPU slots to the card, beyond the moves per rank (2
+    here) over a few steps; EPLB's placement of experts is unchanged."""
+    import time
+
+    from vllm.model_executor.layers.fused_moe import xpu_working_set as wsm
+
+    wsm.reset_working_set()
+    env, state, model_state = _build(
+        monkeypatch, tmp_path, working_set=True, ws_halflife_steps=2.0,
+        ws_move_us=0.0, ws_batch=1, ws_units_per_step=4,
+    )  # fmt: skip
+    tiers = env.tiers[0]
+    p = tiers.placement
+    p2l = model_state.physical_to_logical_map.clone()
+    state.rearrangements_paused = True
+    host = np.flatnonzero(p.tier == HOST).tolist()
+    ids = torch.tensor([[host[0], host[1]], [host[2], host[0]]], dtype=torch.int32)
+    x = torch.zeros(2, HIDDEN, dtype=torch.bfloat16)
+    for _ in range(60):
+        tiers.cpu.compute(tiers, ids, torch.ones(2, 2), x, torch.empty_like(x))
+        state.step()
+        if all(p.tier[s] != HOST for s in host):
+            break
+        time.sleep(0.005)
+    assert all(p.tier[s] != HOST for s in host)
+    assert int((p.tier == 0).sum()) == tiers.num_fast
+    assert torch.equal(model_state.physical_to_logical_map, p2l)
+    assert tiers._ws.counters.committed >= 3  # one swap per batch here
+    summary = tiers.scrub(p2l[0].numpy(), full=True)
+    assert summary["mismatches"] == 0 and summary["placement_equal"]
+    wsm.reset_working_set()
+    tstore.reset_sessions()

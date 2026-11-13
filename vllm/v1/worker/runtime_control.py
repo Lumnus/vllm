@@ -182,7 +182,10 @@ def _tiers_state() -> dict[str, Any] | None:
         "pool_rows_per_layer": sorted({t.num_pool_rows for t in tiers}),
         "expert_bytes": tiers[0].slot_bytes() if tiers[0].slow else None,
         "store_backed_layers": sum(t.store_binding is not None for t in tiers),
-        "moves_committed": sum(len(t.move_log) for t in tiers),
+        "moves_committed": sum(
+            getattr(t, "moves_committed", len(t.move_log)) for t in tiers
+        ),
+        "working_set": _working_set_state(),
         "pinned_gib": round(pinned_arena_gib(), 3),
         "settings": {name: s.get() for name, s in _TIER_SETTINGS.items()},
         "resizable": "host_tier_bound" in _TIER_SETTINGS,
@@ -190,6 +193,23 @@ def _tiers_state() -> dict[str, Any] | None:
             None if "host_tier_bound" in _TIER_SETTINGS else TIER_RESIZE_BLOCKED
         ),
     }
+
+
+def _working_set_state() -> dict[str, Any] | None:
+    """The working set's readout (classes against rows), without the
+    per-layer table (`tiers` state stays small; `cpu stats` logs it)."""
+    try:
+        from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
+            working_set_state,
+        )
+    except ImportError:
+        return None
+    state = working_set_state()
+    if state is None:
+        return None
+    state = dict(state)
+    state.pop("per_layer", None)
+    return state
 
 
 def _cpu_runtime() -> Any:

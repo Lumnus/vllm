@@ -55,7 +55,7 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from . import fault_injection
 from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
-from .eplb_state_file import read_expert_loads, write_expert_loads
+from .eplb_state_file import read_expert_loads, read_seed_loads, write_expert_loads
 from .eplb_trace import ExpertLoadTracer
 from .eplb_utils import CpuGpuEvent
 from .expert_weights import (
@@ -704,6 +704,41 @@ class EplbState:
         self._add_residency_mask(model_state)
         if self.parallel_config.eplb_config.state_path is not None:
             self._read_saved_load(model_state)
+        if not model_state.has_saved_load and _tier_seed(model_state) is not None:
+            self._read_seed_load(model_state)
+
+    def has_tier_seed(self) -> bool:
+        """Whether a model's expert store names a tier seed (the same on every
+        rank: it is configuration)."""
+        return any(_tier_seed(s) is not None for s in self.model_states.values())
+
+    def _read_seed_load(self, model_state: EplbModelState) -> None:
+        """Fill `last_expert_load` from the expert store's `tier_seed` when
+        `EPLBConfig.state_path` gave none: the restore then places the
+        experts, and the layers' tiers, by it."""
+        path = _tier_seed(model_state)
+        assert path is not None
+        model = model_state.model
+        names = [layer.layer_name for layer in model.moe_layers]
+        seed = read_seed_loads(path, names, model.num_logical_experts)
+        found = 0
+        for layer_idx, name in enumerate(names):
+            loads = seed.get(name)
+            if loads is None:
+                continue
+            model_state.last_expert_load[layer_idx].copy_(
+                torch.tensor(loads, dtype=torch.int64)
+            )
+            found += 1
+        model_state.has_saved_load = found > 0
+        logger.info(
+            "EPLB: no saved expert loads; the tier seed %s gives loads for %d of "
+            "%d MoE layers of %s: the experts and their tiers start from them.",
+            path,
+            found,
+            model.num_moe_layers,
+            model_state.model_name,
+        )
 
     def _read_saved_load(self, model_state: EplbModelState) -> None:
         """Fill `last_expert_load` from `EPLBConfig.state_path`."""
@@ -2288,6 +2323,17 @@ def _commit_eplb_maps(
     if PIN_MEMORY:
         src = src.pin_memory()
     dst.copy_(src, non_blocking=True)
+
+
+def _tier_seed(model_state: EplbModelState) -> str | None:
+    """The expert store's `tier_seed` of a model whose layers place their own
+    experts (None for other models)."""
+    movers = model_state.movers
+    if not movers or movers[0] is None:
+        return None
+    binding = getattr(movers[0], "store_binding", None)
+    config = getattr(getattr(binding, "session", None), "config", None)
+    return getattr(config, "tier_seed", None)
 
 
 def _movers_between_steps(model_state: EplbModelState) -> None:

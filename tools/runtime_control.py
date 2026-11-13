@@ -98,6 +98,16 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
         return f"store.{verb}", a
     if group == "tiers":
         _set(a, "host_tier_bound", ns.host_tier_bound)
+        for item in getattr(ns, "tier_settings", None) or []:
+            name, sep, value = item.partition("=")
+            if not sep:
+                raise SystemExit(f"--set takes NAME=VALUE, got {item!r}")
+            try:
+                a[name] = json.loads(value)
+            except ValueError:
+                a[name] = value
+        if not a:
+            raise SystemExit("tiers set: give --host-tier-bound or --set NAME=VALUE")
         return "tiers.set", a
     if group == "cpu":
         if verb == "set":
@@ -208,6 +218,24 @@ def _print_state(state: dict) -> None:
                 f"{now.get('card', '-')} pinned {now.get('pinned', '-')} CPU "
                 f"{now.get('cpu', '-')}"
             )
+            ws = tiers.get("working_set")
+            if ws:
+                s, t, c = ws["settings"], ws["totals"], ws["counters"]
+                n = max(1, ws["layers"])
+                print(
+                    f"{head} working set {'on' if s['working_set'] else 'off'}"
+                    f" (hot >= {s['ws_hot']}, warm >= {s['ws_warm']}, hysteresis "
+                    f"{s['ws_hysteresis']}, half-life {s['ws_halflife_steps']} "
+                    f"steps; staging from {s['stage_min_calls'] or '-'} calls): per "
+                    f"layer hot {t['hot'] / n:.1f} warm {t['warm'] / n:.1f} cold "
+                    f"{t['cold'] / n:.1f} against card {ws['card_rows']} + pinned "
+                    f"{ws['pinned_rows']} rows; warm/hot on the CPU "
+                    f"{t['warm_or_hot_on_cpu'] / n:.1f}, cold on the card "
+                    f"{t['cold_on_card'] / n:.1f}; short of rows in "
+                    f"{ws['layers_short']} layers ({t['rows_short']} rows); "
+                    f"batches {c['batches']} committed {c['committed']} dropped "
+                    f"{c['dropped']}, swaps {c['swaps']}"
+                )
         cpu = rank.get("cpu")
         if cpu:
             c, s = cpu["counters"], cpu["settings"]
@@ -295,7 +323,17 @@ def _parser() -> argparse.ArgumentParser:
     ss.add_argument("--stats-interval", type=float)
 
     ti = groups.add_parser("tiers").add_subparsers(dest="verb", required=True)
-    ti.add_parser("set").add_argument("--host-tier-bound", type=int, required=True)
+    ts = ti.add_parser("set")
+    ts.add_argument("--host-tier-bound", type=int)
+    ts.add_argument(
+        "--set",
+        dest="tier_settings",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help="any tier setting, value as JSON (e.g. working_set=true, "
+        "ws_warm=0.5, stage_min_calls=12); repeatable",
+    )
 
     cp = groups.add_parser("cpu").add_subparsers(dest="verb", required=True)
     cs = cp.add_parser("set")

@@ -177,12 +177,16 @@ class EPLBController:
     def maybe_restore_saved_placement(
         self, eplb_models_added: bool, load_dummy_weights: bool = False
     ) -> None:
-        """Place the experts by the loads kept in `EPLBConfig.state_path`."""
+        """Place the experts by the loads kept in `EPLBConfig.state_path` (or,
+        when it has none, by the expert store's `tier_seed`)."""
         if (
             not eplb_models_added
             or load_dummy_weights
             or self.state is None
-            or self.parallel_config.eplb_config.state_path is None
+            or (
+                self.parallel_config.eplb_config.state_path is None
+                and not self.state.has_tier_seed()
+            )
         ):
             return
         self.state.restore_saved_placement()

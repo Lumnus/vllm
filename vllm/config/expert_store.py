@@ -129,10 +129,73 @@ class ExpertStoreConfig:
     """Pinned rows per layer beyond the spare rows, for those promotions;
     EPLB's next rearrangement chooses the pinned set again and frees them."""
 
+    tier_seed: str | None = None
+    """Loads to place the experts by at start when EPLB has none of its own
+    (no ``state_path``, or no file there yet): the hottest slots of each rank
+    go to the card, the next ones to the pinned rows, the rest to the CPU,
+    and EPLB's policy balances the ranks by them. The file is an EPLB state
+    file (layer name -> load per logical expert; also what
+    ``tools/analyze_expert_trace.py --write-loads`` writes from a routing
+    trace), a rankings file (decoder layer number -> logical experts hottest
+    first) or a learned-state file (``{"layers": {layer: {expert:
+    score}}}``)."""
+
+    working_set: bool = False
+    """With ``--cpu-offload-pinned-gb``: choose which slots of a layer are on
+    the card, in pinned rows and on the CPU from each slot's temperature
+    (decayed call rate) while serving, between two steps, in budgeted
+    batches read in the background; EPLB's rearrangements then move experts
+    between ranks only. Runtime setting (``tiers.set working_set``)."""
+
+    ws_halflife_steps: float = Field(default=64.0, gt=0)
+    """Steps per half-life of a slot's temperature."""
+
+    ws_hot: float = Field(default=1.5, gt=0)
+    """Temperature (calls per token over the mean expert's) at or above which
+    a slot is hot."""
+
+    ws_warm: float = Field(default=0.5, gt=0)
+    """Temperature at or above which a slot is warm; below it is cold. Only
+    warm and hot slots are moved into a faster tier."""
+
+    ws_hysteresis: float = Field(default=1.25, ge=1.0)
+    """A slot keeps its class until its temperature is below the class's
+    threshold divided by this; a swap within a class needs this ratio."""
+
+    ws_batch: int = Field(default=4, ge=1)
+    """Experts read per layer batch (each swap reads one)."""
+
+    ws_units_per_step: int = Field(default=16, ge=1)
+    """Experts read per step over all layers of a rank."""
+
+    ws_cpu_call_us: float = Field(default=110.0, gt=0)
+    """Cost model: one expert computed on the CPU at a few tokens."""
+
+    ws_pinned_call_us: float = Field(default=28.0, ge=0)
+    """Cost model: one expert read by the card from a pinned row, over a card
+    row."""
+
+    ws_move_us: float = Field(default=250.0, ge=0)
+    """Cost model: one expert copied into a row (a swap pays when its gain
+    over one half-life is at least this)."""
+
+    stage_min_calls: int = Field(default=0, ge=0)
+    """With ``--cpu-offload-pinned-gb``: an expert of the CPU tier that one
+    layer call routes this many tokens to is copied into a staging row of
+    pinned memory and computed by the card (as the pinned rows are) instead
+    of on the CPU; 0 keeps every CPU-tier expert on the CPU. Runtime
+    setting."""
+
+    stage_rows: int = Field(default=0, ge=0)
+    """Staging rows (pinned, shared by the layers of a rank); 0: as many as
+    a layer has CPU slots."""
+
     @model_validator(mode="after")
     def _check_dirs(self) -> "ExpertStoreConfig":
         if len(set(self.dirs)) != len(self.dirs):
             raise ValueError("expert store dirs must be distinct")
+        if self.ws_warm > self.ws_hot:
+            raise ValueError("ws_warm must not be above ws_hot")
         return self
 
     @property
@@ -205,5 +268,20 @@ class ExpertStoreConfig:
                 "host_promote_misses",
                 "host_promote_window",
                 "host_promote_rows",
+                # the working set and the seed only choose which slot is in
+                # which tier; staging adds a call outside the captured graphs
+                "tier_seed",
+                "working_set",
+                "ws_halflife_steps",
+                "ws_hot",
+                "ws_warm",
+                "ws_hysteresis",
+                "ws_batch",
+                "ws_units_per_step",
+                "ws_cpu_call_us",
+                "ws_pinned_call_us",
+                "ws_move_us",
+                "stage_min_calls",
+                "stage_rows",
             },
         )
