@@ -55,6 +55,7 @@ from vllm.utils.hashing import get_hash_fn_by_name
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.utils.system_utils import decorate_logs, set_process_title
 from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
+from vllm.v1 import runtime_debug
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core import kv_cache_utils
 from vllm.v1.core.kv_cache_planning import (
@@ -1016,6 +1017,19 @@ class EngineCore:
         self._check_kv_cache_resizable()
         old_num_blocks = self.vllm_config.cache_config.num_gpu_blocks
         current = self._kv_resize
+        if runtime_debug.on("kv"):
+            runtime_debug.emit(
+                "kv",
+                logger,
+                "resize asked: %d -> %d blocks (deadline %s, preempt %s; %s)",
+                old_num_blocks,
+                target_num_blocks,
+                deadline_s,
+                preempt,
+                "a resize is active"
+                if current is not None and current.state.active
+                else "none active",
+            )
         if current is not None and current.state.active:
             if current.direction == "shrink" and current.to_blocks == target_num_blocks:
                 self._advance_kv_resize()
@@ -1175,6 +1189,17 @@ class EngineCore:
             resize.fenced_blocks, resize.held_blocks = (
                 self.scheduler.kv_cache_shrink_progress()
             )
+            if runtime_debug.on("kv"):
+                runtime_debug.emit(
+                    "kv",
+                    logger,
+                    "shrink to %d blocks draining: %d fenced, %d still held, "
+                    "%.1f s since the start",
+                    resize.to_blocks,
+                    resize.fenced_blocks,
+                    resize.held_blocks,
+                    now - resize.started,
+                )
             if resize.held_blocks and resize.deadline_passed(now):
                 if resize.preempt and not resize.preempted_requests:
                     resize.preempted_requests = (
@@ -2246,6 +2271,9 @@ class EngineCoreProc(EngineCore):
             # And a serving profile being applied (one step at a time).
             if self._serving_profiles is not None:
                 self._advance_serving_profile()
+            # Debug parts switched on over the surface end on their own time.
+            if runtime_debug.armed():
+                runtime_debug.sweep()
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # Publish request counts before and after GPU step to ensure freshness.

@@ -7,7 +7,34 @@ import json
 
 import pytest
 
-from tools.runtime_control import _op_and_args, _parser, _print_state
+from tools.runtime_control import _op_and_args, _parser, _print_schema, _print_state
+
+
+def test_the_schema_prints_one_line_per_parameter(capsys):
+    _print_schema(
+        {
+            "params": [
+                {
+                    "name": "sched.max_num_active_seqs",
+                    "value": 4,
+                    "live": True,
+                    "verb": "sched.set",
+                    "min": 1,
+                },
+                {
+                    "name": "sched.max_num_seqs",
+                    "value": 4,
+                    "live": False,
+                    "restart_reason": "graphs",
+                },
+            ]
+        }
+    )
+    out = capsys.readouterr().out.splitlines()
+    assert out == [
+        "sched.max_num_active_seqs = 4 [1..]; live via sched.set",
+        "sched.max_num_seqs = 4; restart: graphs",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -46,6 +73,18 @@ from tools.runtime_control import _op_and_args, _parser, _print_state
             {"max_num_active_seqs": 4, "max_num_scheduled_tokens": 2048},
         ),
         (["defaults", "state"], "defaults.state", {}),
+        (
+            ["debug", "set", "eplb", "--count", "10"],
+            "debug.set",
+            {"part": "eplb", "on": True, "count": 10},
+        ),
+        (["debug", "set", "cpu", "--off"], "debug.set", {"part": "cpu", "on": False}),
+        (["debug", "state"], "debug.state", {}),
+        (
+            ["sched", "set", "--long-prefill", "512"],
+            "sched.set",
+            {"long_prefill_token_threshold": 512},
+        ),
         (
             [
                 "defaults",

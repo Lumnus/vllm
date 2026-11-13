@@ -63,6 +63,9 @@ ENGINE_OPS = (
     "profile.list",
     "profile.apply",
     "profile.state",
+    "debug.set",
+    "debug.state",
+    "schema",
 )
 # Answered by the API server process itself (request defaults it reads).
 SERVER_OPS = ("defaults.set", "defaults.state")
@@ -267,6 +270,12 @@ class RuntimeControl:
             return self._tower_op(op, args)
         if op.startswith("profile."):
             return self._profile_op(op, args)
+        if op.startswith("debug."):
+            return self._debug_op(op, args)
+        if op == "schema":
+            from vllm.v1.engine.runtime_params import schema
+
+            return {"op": op, "applied": "all", **schema(self.engine, self)}
         if op == "spec.set":
             return self._spec_set(args)
         if op == "sched.set":
@@ -290,6 +299,41 @@ class RuntimeControl:
             profiles = ServingProfiles(engine)
             engine._serving_profiles = profiles
         return profiles.operation(op, args)
+
+    # ------------------------------------------------------------------
+    # Debug tracing (vllm/v1/runtime_debug.py)
+    # ------------------------------------------------------------------
+
+    # Parts whose lines come from the workers (the rest from the engine core).
+    _DEBUG_ON_WORKERS = ("eplb", "cpu")
+
+    def _debug_op(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        from vllm.v1 import runtime_debug
+
+        if op == "debug.state":
+            ranks = self._rpc("state", "", {"only": ["debug"]})
+            return {
+                "op": op,
+                "applied": "all",
+                "debug": runtime_debug.state(),
+                "ranks": [{"rank": r["rank"], **(r.get("debug") or {})} for r in ranks],
+            }
+        if op != "debug.set":
+            raise ControlRefused(f"unknown operation {op!r}")
+        refusal = runtime_debug.check(args)
+        if refusal:
+            if refusal.startswith("restart_required: "):
+                raise RestartRequired(refusal[len("restart_required: ") :])
+            raise ControlRefused(refusal)
+        part = args["part"]
+        reply: dict[str, Any] = {"op": op, "applied": "all"}
+        if part in self._DEBUG_ON_WORKERS or part.startswith("logger:"):
+            reply = {**self._worker_op(op, args), "op": op}
+            if reply["applied"] != "all":
+                return reply
+        if part not in self._DEBUG_ON_WORKERS:
+            reply["debug"] = runtime_debug.apply(args)
+        return reply
 
     # ------------------------------------------------------------------
     # The drafter (speculative decoding)
@@ -445,6 +489,7 @@ class RuntimeControl:
             "max_num_seqs": scheduler.max_num_running_reqs,
             "max_num_scheduled_tokens": scheduler.max_num_scheduled_tokens,
             "max_num_batched_tokens": config.max_num_batched_tokens,
+            "long_prefill_token_threshold": config.long_prefill_token_threshold,
             "chunked_prefill": bool(config.enable_chunked_prefill),
         }
 
@@ -453,7 +498,11 @@ class RuntimeControl:
     ) -> dict[str, Any]:
         scheduler = self.engine.scheduler
         config = scheduler.scheduler_config
-        known = {"max_num_active_seqs", "max_num_scheduled_tokens"}
+        known = {
+            "max_num_active_seqs",
+            "max_num_scheduled_tokens",
+            "long_prefill_token_threshold",
+        }
         unknown = sorted(set(args) - known)
         if unknown:
             if "max_num_seqs" in unknown or "max_num_batched_tokens" in unknown:
@@ -468,9 +517,19 @@ class RuntimeControl:
             )
         seqs = args.get("max_num_active_seqs")
         tokens = args.get("max_num_scheduled_tokens")
+        long_prefill = args.get("long_prefill_token_threshold")
 
         def integer(v: Any) -> bool:
             return isinstance(v, int) and not isinstance(v, bool)
+
+        if long_prefill is not None and (
+            not integer(long_prefill)
+            or not 0 <= long_prefill <= scheduler.max_model_len
+        ):
+            raise ControlRefused(
+                "long_prefill_token_threshold must be an integer in 0..max_model_len "
+                f"({scheduler.max_model_len}; 0 = off), got {long_prefill!r}"
+            )
 
         if seqs is not None:
             if not integer(seqs) or seqs < 1:
@@ -522,6 +581,16 @@ class RuntimeControl:
                 tokens,
             ]
             scheduler.max_num_scheduled_tokens = tokens
+        if (
+            long_prefill is not None
+            and long_prefill != config.long_prefill_token_threshold
+        ):
+            # Read from the engine core's scheduler config at every step.
+            changes["long_prefill_token_threshold"] = [
+                config.long_prefill_token_threshold,
+                long_prefill,
+            ]
+            config.long_prefill_token_threshold = long_prefill
         for name, (a, b) in changes.items():
             logger.info("Runtime control: sched.set %s %s -> %s.", name, a, b)
         if not changes:

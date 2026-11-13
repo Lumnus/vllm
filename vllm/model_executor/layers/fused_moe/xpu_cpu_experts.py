@@ -47,6 +47,7 @@ import numpy as np
 import torch
 
 from vllm.logger import init_logger
+from vllm.v1 import runtime_debug
 
 if TYPE_CHECKING:
     from vllm.config.expert_store import ExpertStoreConfig
@@ -829,6 +830,19 @@ class CpuExpertRuntime:
                 (done - waited) * 1e3,
                 self.cache.hits,
                 self.cache.misses,
+            )
+        if runtime_debug.on("cpu"):
+            runtime_debug.emit(
+                "cpu",
+                logger,
+                "%s: %d calls of %d experts over %d tokens; read %.2f ms, "
+                "compute %.2f ms",
+                tiers.layer_name,
+                len(keys),
+                distinct,
+                n,
+                (read_done - waited) * 1e3,
+                (done - read_done) * 1e3,
             )
         self._maybe_log()
         return True

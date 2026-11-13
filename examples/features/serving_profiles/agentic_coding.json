@@ -9,6 +9,6 @@
     "demote_idle_s": 600,
     "disk_idle_s": 3600
   },
-  "tiers": {"fast_slots": "min"},
+  "tiers": {"fast_rows": "min"},
   "kv": {"fit": true}
 }

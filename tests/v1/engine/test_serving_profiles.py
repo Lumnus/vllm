@@ -22,7 +22,7 @@ EXAMPLES = pathlib.Path(__file__).parents[3] / "examples/features/serving_profil
 
 
 class FakeFast:
-    """The fast tier's verb (`tiers.set fast_slots`), recorded in the
+    """The fast tier's verb (`tiers.set fast_rows`), recorded in the
     executor's call list so that its order against the KV calls shows."""
 
     def __init__(self, calls: list, slots=20, lo=8, hi=32) -> None:
@@ -35,12 +35,17 @@ class FakeFast:
             return None, self.unavailable
         return FastTierView(self.slots, self.lo, self.hi), None
 
-    def resize(self, slots):
+    def resize(self, rows, deadline_s, preempt):
         if self.refuse:
             raise erc.ControlRefused(self.refuse)
-        self.calls.append(f"fast:{slots}")
-        self.slots = slots
-        return {"applied": "all", "changes": {"fast_slots": [self.slots, slots]}}
+        self.calls.append(f"fast:{rows}")
+        self.slots = rows
+        return "wait" if self.pending else None
+
+    pending = False
+
+    def settled(self):
+        return "wait" if self.pending else None
 
 
 def _profiles(core, executor, **fast):
@@ -61,7 +66,7 @@ def test_profile_shapes():
     assert sp.check_profile({"name": "a", "kv": {"tokens": 1000}}) is None
     assert "exactly one" in sp.check_profile({"name": "a", "kv": {}})
     assert "unknown profile sections" in sp.check_profile({"name": "a", "x": {}})
-    assert "fast_slots" in sp.check_profile({"name": "a", "tiers": {"fast_slots": "all"}})
+    assert "fast_rows" in sp.check_profile({"name": "a", "tiers": {"fast_rows": "all"}})
     assert "name" in sp.check_profile({"kv": {"fit": True}})
 
 
@@ -80,8 +85,8 @@ def test_the_shipped_examples_are_profiles():
 def test_memory_is_freed_before_it_is_taken():
     core, executor, _ = _core(100)
     profiles, port = _profiles(core, executor, slots=20)
-    _define(profiles, name="experts", kv={"blocks": 60}, tiers={"fast_slots": 24})
-    _define(profiles, name="kv", kv={"blocks": 100}, tiers={"fast_slots": 20})
+    _define(profiles, name="experts", kv={"blocks": 60}, tiers={"fast_rows": 24})
+    _define(profiles, name="kv", kv={"blocks": 100}, tiers={"fast_rows": 20})
     reply = profiles.operation("profile.apply", {"name": "experts"})
     assert reply["applied"] == "all"
     # the KV cache shrinks first, then the fast tier grows into the room
@@ -100,7 +105,7 @@ def test_memory_is_freed_before_it_is_taken():
 def test_a_draining_shrink_is_waited_for_between_steps():
     core, executor, scheduler = _core(100)
     profiles, _ = _profiles(core, executor, slots=20)
-    _define(profiles, name="experts", kv={"blocks": 60}, tiers={"fast_slots": "max"})
+    _define(profiles, name="experts", kv={"blocks": 60}, tiers={"fast_rows": "max"})
     scheduler.held = 5  # a request still holds fenced blocks
     reply = profiles.operation("profile.apply", {"name": "experts"})
     assert reply["applied"] == "applying"
@@ -118,12 +123,27 @@ def test_a_draining_shrink_is_waited_for_between_steps():
     assert profiles.active == "experts" and profiles.current is None
 
 
+def test_a_fast_tier_grow_that_runs_on_is_waited_for():
+    core, executor, _ = _core(100)
+    profiles, port = _profiles(core, executor, slots=20)
+    _define(profiles, name="experts", kv={"blocks": 60}, tiers={"fast_rows": 24})
+    port.pending = True
+    assert profiles.operation("profile.apply", {"name": "experts"})["applied"] == (
+        "applying"
+    )
+    steps = {s.label: s.status for s in profiles.current.steps}
+    assert steps["fast tier up"] == "waiting"
+    port.pending = False
+    profiles.advance()
+    assert profiles.active == "experts"
+
+
 def test_a_refused_check_changes_nothing():
     core, executor, _ = _core(100)
     profiles, port = _profiles(core, executor)
-    port.unavailable = "no tier setting 'fast_slots'"
-    _define(profiles, name="experts", kv={"blocks": 60}, tiers={"fast_slots": 24})
-    with pytest.raises(erc.ControlRefused, match="tiers.fast_slots: no tier"):
+    port.unavailable = "no tier setting 'fast_rows'"
+    _define(profiles, name="experts", kv={"blocks": 60}, tiers={"fast_rows": 24})
+    with pytest.raises(erc.ControlRefused, match="tiers.fast_rows: no tier"):
         profiles.operation("profile.apply", {"name": "experts"})
     _define(profiles, name="tiny", kv={"blocks": 5})
     with pytest.raises(erc.ControlRefused, match="below the 10"):
@@ -136,7 +156,7 @@ def test_a_failure_midway_says_what_stands_where():
     profiles, port = _profiles(core, executor, slots=20)
     _define(profiles, name="base", kv={"blocks": 100})
     profiles.operation("profile.apply", {"name": "base"})
-    _define(profiles, name="experts", kv={"blocks": 60}, tiers={"fast_slots": 24})
+    _define(profiles, name="experts", kv={"blocks": 60}, tiers={"fast_rows": 24})
     port.refuse = "rank 1: an EPLB rearrangement is in flight"
     reply = profiles.operation("profile.apply", {"name": "experts"})
     assert reply["applied"] == "partial"
@@ -145,7 +165,7 @@ def test_a_failure_midway_says_what_stands_where():
     state = profiles.state()
     assert state["active"] is None and state["previous"] == "base"
     assert state["targets"]["kv.blocks"]["match"] is True
-    assert state["targets"]["tiers.fast_slots"]["match"] is False
+    assert state["targets"]["tiers.fast_rows"]["match"] is False
     # going back is one apply away
     port.refuse = None
     assert profiles.operation("profile.apply", {"name": "base"})["applied"] == "all"
@@ -176,7 +196,9 @@ def test_the_boot_profile_from_a_file(tmp_path, monkeypatch):
     core, executor, _ = _core(100)
     path = tmp_path / "profiles.json"
     path.write_text(
-        json.dumps({"profiles": [{"name": "small", "kv": {"blocks": 80}}], "boot": "small"})
+        json.dumps(
+            {"profiles": [{"name": "small", "kv": {"blocks": 80}}], "boot": "small"}
+        )
     )
     monkeypatch.setenv("VLLM_SERVING_PROFILES", str(path))
     profiles = ServingProfiles.maybe_create(core)
@@ -219,7 +241,9 @@ def test_a_profile_takes_the_tower_off_the_card_before_memory_moves():
     assert env.tower.place == TowerPlace.CARD
     profiles = _with_profiles(env)
     _define(profiles, name="text", tower={"policy": "host", "disk_idle_s": 900})
-    assert profiles.operation("profile.apply", {"name": "text"})["applied"] == "applying"
+    assert (
+        profiles.operation("profile.apply", {"name": "text"})["applied"] == "applying"
+    )
     _step(env, 1002)  # the tower's own controller acts on its policy
     profiles.advance()
     assert env.tower.place == TowerPlace.HOST and profiles.active == "text"
@@ -261,7 +285,10 @@ def test_tower_policy_over_the_surface():
     env.core._tower_residency = env.controller
     control = erc.RuntimeControl(env.core)
     reply = control.apply("tower.set", {"policy": "host", "disk_idle_s": 600})
-    assert reply["changes"] == {"policy": ["dynamic", "host"], "disk_idle_s": [None, 600]}
+    assert reply["changes"] == {
+        "policy": ["dynamic", "host"],
+        "disk_idle_s": [None, 600],
+    }
     with pytest.raises(erc.ControlRefused, match="policy host"):
         control.apply("tower.promote", {})
     with pytest.raises(erc.ControlRefused, match="policy must be"):

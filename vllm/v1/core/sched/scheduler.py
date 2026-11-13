@@ -33,6 +33,7 @@ from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import get_mm_features_in_window
 from vllm.outputs import RequestError
 from vllm.utils.math_utils import cdiv
+from vllm.v1 import runtime_debug
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -1644,6 +1645,19 @@ class Scheduler(SchedulerInterface):
                 input_budget -= num_new_tokens + draft_slots
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                if runtime_debug.on("scheduler"):
+                    runtime_debug.emit(
+                        "scheduler",
+                        logger,
+                        "admitted %s: %d tokens this step, %d of %d computed or "
+                        "cached, %d preemptions before, %d free blocks",
+                        request_id,
+                        num_new_tokens,
+                        num_computed_tokens,
+                        request.num_tokens,
+                        request.num_preemptions,
+                        self.kv_cache_manager.block_pool.get_num_free_blocks(),
+                    )
                 self._set_kv_fetch_stage(request, None)
                 drafts_needed = drafts_needed or not self._drafts_unused(
                     request, num_computed_tokens, num_new_tokens
@@ -1894,6 +1908,17 @@ class Scheduler(SchedulerInterface):
         request.num_output_placeholders = 0
         request.num_preemptions += 1
         self.num_preemptions_total += 1
+        if runtime_debug.on("scheduler"):
+            runtime_debug.emit(
+                "scheduler",
+                logger,
+                "preempted %s (preemption %d of this request; %d running, %d free "
+                "blocks after)",
+                request.request_id,
+                request.num_preemptions,
+                len(self.running),
+                self.kv_cache_manager.block_pool.get_num_free_blocks(),
+            )
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 

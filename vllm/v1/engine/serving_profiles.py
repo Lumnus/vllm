@@ -9,9 +9,10 @@ any of these sections (a section left out is left as it is):
 * ``kv``: ``{"tokens": N}`` or ``{"blocks": N}`` or ``{"fit": true}``, and
   ``deadline_s`` / ``preempt`` for a shrink's drain (``kv.resize``,
   ``kv.fit``);
-* ``tiers``: ``fast_slots`` (card slots per layer, an integer or ``"max"`` /
-  ``"min"``; the fast tier's own verb ``tiers.set fast_slots``, read and
-  written through `FastTierPort`) and ``host_tier_bound`` (pinned slots);
+* ``tiers``: ``fast_rows`` (card rows per MoE layer per rank, an integer or
+  ``"max"`` / ``"min"`` of the fast tier's range; the fast tier's own verb
+  ``tiers.fast``, through `FastTierPort`) and ``host_tier_bound`` (pinned
+  slots);
 * ``cpu``, ``eplb``, ``spec``, ``sched``: the arguments of ``cpu.set``,
   ``eplb.set``, ``spec.set``, ``sched.set``;
 * ``tower``: the arguments of ``tower.set`` (thresholds, ``policy``,
@@ -52,8 +53,9 @@ logger = init_logger(__name__)
 ENV = "VLLM_SERVING_PROFILES"
 SECTIONS = ("kv", "tiers", "cpu", "eplb", "spec", "sched", "tower", "defaults")
 _KV_KEYS = ("tokens", "blocks", "fit", "deadline_s", "preempt")
-_TIERS_KEYS = ("fast_slots", "host_tier_bound")
+_TIERS_KEYS = ("fast_rows", "host_tier_bound")
 _RESIZE_ACTIVE = ("draining", "releasing", "unfinished")
+_FAST_ACTIVE = ("draining", "committing")
 # How long a step may wait for the engine to settle (a tower move).
 TOWER_WAIT_S = 300.0
 
@@ -65,10 +67,10 @@ TOWER_WAIT_S = 300.0
 
 @dataclasses.dataclass
 class FastTierView:
-    slots: int
-    """Card slots per layer now (the least of the ranks)."""
-    min_slots: int
-    max_slots: int
+    rows: int
+    """Card rows per MoE layer per rank now."""
+    min_rows: int
+    max_rows: int
 
 
 class FastTierPort(Protocol):
@@ -76,53 +78,72 @@ class FastTierPort(Protocol):
         """(view, None), or (None, why the fast tier cannot move)."""
         ...
 
-    def resize(self, slots: int) -> dict[str, Any]:
-        """``tiers.set`` reply; raises ControlRefused (nothing changed)."""
+    def resize(self, rows: int, deadline_s: float, preempt: bool) -> str | None:
+        """Start a resize; "wait" while it runs on, None when it is done;
+        raises ControlRefused (nothing changed)."""
+        ...
+
+    def settled(self) -> str | None:
+        """None when the resize is done, "wait", or why it failed."""
         ...
 
 
 class SurfaceFastTierPort:
-    """The fast tier through the runtime control surface: ``tiers.set
-    {"fast_slots": n}``, a tier setting the fast tier registers on every rank
-    with ``register_tier_setting``. Read from each rank's ``tiers`` state:
-    ``settings.fast_slots`` (slots per layer now) and the optional
-    ``setting_bounds.fast_slots`` = ``[min, max]`` (default ``[1, now]``)."""
-
-    SETTING = "fast_slots"
+    """The fast tier's own verb, ``tiers.fast {"rows": n, "from_kv": false,
+    "deadline_s", "preempt"}``, and the state's ``fast_tier`` part
+    (``rows``, ``range``, ``resizable``, ``record``). ``from_kv`` is false:
+    within a profile the KV step alone sizes the KV cache, so a grow uses the
+    memory the KV step freed and a shrink leaves its memory for the KV step
+    that follows."""
 
     def __init__(self, control: Any) -> None:
         self.control = control
 
-    def read(self) -> tuple[FastTierView | None, str | None]:
-        name = self.SETTING
-        views = []
-        for reply in self.control._rpc("state", "", {"only": ["tiers"]}):
-            tiers = reply.get("tiers")
-            if not tiers:
-                return None, "no expert layer keeps its slots in tiers"
-            settings = tiers.get("settings") or {}
-            if name not in settings:
-                blocked = tiers.get("resize_blocked")
-                return None, (
-                    f"the fast tier does not move at run time in this engine "
-                    f"(no tier setting {name!r}" + (f"; {blocked})" if blocked else ")")
-                )
-            now = int(settings[name])
-            lo, hi = (tiers.get("setting_bounds") or {}).get(name, [1, now])
-            views.append(FastTierView(now, int(lo), int(hi)))
-        if not views:
-            return None, "no rank reports"
-        return (
-            FastTierView(
-                slots=min(v.slots for v in views),
-                min_slots=max(v.min_slots for v in views),
-                max_slots=min(v.max_slots for v in views),
-            ),
-            None,
-        )
+    def _fast(self) -> dict[str, Any] | None:
+        return self.control.state(["tiers"]).get("fast_tier")
 
-    def resize(self, slots: int) -> dict[str, Any]:
-        return self.control.apply("tiers.set", {self.SETTING: int(slots)})
+    def read(self) -> tuple[FastTierView | None, str | None]:
+        fast = self._fast()
+        if not fast:
+            return (
+                None,
+                "this engine has no runtime resize of the fast tier (tiers.fast)",
+            )
+        if not fast.get("resizable") or fast.get("rows") is None:
+            return (
+                None,
+                "the fast tier is fixed in this engine (fast_rows_max at start)",
+            )
+        lo, hi = fast.get("range") or [fast["rows"], fast["rows"]]
+        return FastTierView(int(fast["rows"]), int(lo), int(hi)), None
+
+    def resize(self, rows: int, deadline_s: float, preempt: bool) -> str | None:
+        from vllm.v1.engine.runtime_control import ControlRefused
+
+        reply = self.control.apply(
+            "tiers.fast",
+            {
+                "rows": int(rows),
+                "from_kv": False,
+                "deadline_s": deadline_s,
+                "preempt": preempt,
+            },
+        )
+        if reply.get("applied") not in (None, "all"):
+            raise ControlRefused(
+                (reply.get("fast") or {}).get("message") or str(reply.get("applied"))
+            )
+        state = (reply.get("fast") or {}).get("state")
+        return "wait" if state in _FAST_ACTIVE else None
+
+    def settled(self) -> str | None:
+        record = (self._fast() or {}).get("record") or {}
+        state = record.get("state")
+        if state in _FAST_ACTIVE:
+            return "wait"
+        if state in ("finished", "unchanged", "idle", None):
+            return None
+        return f"the fast tier resize ended {state}: {record.get('message', '')}"
 
 
 # --------------------------------------------------------------------------
@@ -163,13 +184,13 @@ def check_profile(profile: Any) -> str | None:
         unknown = sorted(set(tiers) - set(_TIERS_KEYS))
         if unknown:
             return f"unknown tiers keys {unknown}; known: {list(_TIERS_KEYS)}"
-        fast = tiers.get("fast_slots")
+        fast = tiers.get("fast_rows")
         if (
             fast is not None
             and fast not in ("max", "min")
             and (not isinstance(fast, int) or isinstance(fast, bool) or fast < 0)
         ):
-            return 'tiers.fast_slots must be an integer >= 0, "max" or "min"'
+            return 'tiers.fast_rows must be an integer >= 0, "max" or "min"'
     return None
 
 
@@ -455,16 +476,16 @@ class ServingProfiles:
         tiers = profile.get("tiers") or {}
         if "host_tier_bound" in tiers:
             worker("tiers.set", {"host_tier_bound": tiers["host_tier_bound"]})
-        if "fast_slots" in tiers:
+        if "fast_rows" in tiers:
             view, why = self.fast_tier.read()
             if view is None:
-                refusals.append(f"tiers.fast_slots: {why}")
+                refusals.append(f"tiers.fast_rows: {why}")
             else:
-                target = self._fast_target(tiers["fast_slots"], view)
-                if not view.min_slots <= target <= view.max_slots:
+                target = self._fast_target(tiers["fast_rows"], view)
+                if not view.min_rows <= target <= view.max_rows:
                     refusals.append(
-                        f"tiers.fast_slots {target} outside "
-                        f"[{view.min_slots}, {view.max_slots}]"
+                        f"tiers.fast_rows {target} outside "
+                        f"[{view.min_rows}, {view.max_rows}]"
                     )
         kv = profile.get("kv")
         if kv:
@@ -517,9 +538,9 @@ class ServingProfiles:
     @staticmethod
     def _fast_target(value: Any, view: FastTierView) -> int:
         if value == "max":
-            return view.max_slots
+            return view.max_rows
         if value == "min":
-            return view.min_slots
+            return view.min_rows
         return int(value)
 
     def _plan(self, profile: dict[str, Any]) -> list[_Step]:
@@ -573,13 +594,13 @@ class ServingProfiles:
                     self._tower_wait("tower off the accelerators", tower, False)
                 )
         # 2.-5. Accelerator memory: free before take.
-        if "fast_slots" in tiers:
-            steps.append(self._fast_step(tiers["fast_slots"], shrink=True))
+        if "fast_rows" in tiers:
+            steps.append(self._fast_step(tiers["fast_rows"], shrink=True))
         kv = profile.get("kv")
         if kv and not kv.get("fit"):
             steps.append(self._kv_step(kv, shrink=True))
-        if "fast_slots" in tiers:
-            steps.append(self._fast_step(tiers["fast_slots"], shrink=False))
+        if "fast_rows" in tiers:
+            steps.append(self._fast_step(tiers["fast_rows"], shrink=False))
         if kv:
             steps.append(self._kv_step(kv, shrink=False))
         # 6. A tower that goes to the card takes its bytes from the KV cache.
@@ -594,24 +615,21 @@ class ServingProfiles:
     def _fast_step(self, value: Any, shrink: bool) -> _Step:
         step = _Step(f"fast tier {'down' if shrink else 'up'}", lambda: None)
 
-        def run() -> None:
+        def run() -> str | None:
             view, why = self.fast_tier.read()
             if view is None:
                 from vllm.v1.engine.runtime_control import ControlRefused
 
                 raise ControlRefused(why)
             target = self._fast_target(value, view)
-            if (shrink and target < view.slots) or (not shrink and target > view.slots):
-                reply = self.fast_tier.resize(target)
-                if reply.get("applied") not in (None, "all"):
-                    from vllm.v1.engine.runtime_control import ControlRefused
-
-                    raise ControlRefused(reply.get("error") or str(reply["applied"]))
-                step.detail = [view.slots, target]
-            else:
-                step.detail = "nothing to do"
+            if (shrink and target < view.rows) or (not shrink and target > view.rows):
+                step.detail = [view.rows, target]
+                return self.fast_tier.resize(target, 60.0, False)
+            step.detail = "nothing to do"
+            return None
 
         step.run = run
+        step.done = lambda: self.fast_tier.settled()
         return step
 
     def _kv_step(self, kv: dict[str, Any], shrink: bool) -> _Step:
@@ -735,20 +753,20 @@ class ServingProfiles:
             ranks = self.control._rpc("state", "", {"only": ["tiers", "cpu", "eplb"]})
         first = ranks[0] if ranks else {}
         tiers = profile.get("tiers") or {}
-        if "fast_slots" in tiers:
+        if "fast_rows" in tiers:
             view, why = self.fast_tier.read()
             if view is None:
-                out["tiers.fast_slots"] = {
-                    "target": tiers["fast_slots"],
+                out["tiers.fast_rows"] = {
+                    "target": tiers["fast_rows"],
                     "actual": None,
                     "match": False,
                     "why": why,
                 }
             else:
                 put(
-                    "tiers.fast_slots",
-                    self._fast_target(tiers["fast_slots"], view),
-                    view.slots,
+                    "tiers.fast_rows",
+                    self._fast_target(tiers["fast_rows"], view),
+                    view.rows,
                 )
         if "host_tier_bound" in tiers:
             settings = (first.get("tiers") or {}).get("settings") or {}
@@ -772,19 +790,10 @@ class ServingProfiles:
             if "enabled" in spec:
                 put("spec.enabled", spec["enabled"], now > 0)
         sched = profile.get("sched") or {}
-        if scheduler is not None:
-            if "max_num_active_seqs" in sched:
-                put(
-                    "sched.max_num_active_seqs",
-                    sched["max_num_active_seqs"],
-                    scheduler.max_num_active_reqs,
-                )
-            if "max_num_scheduled_tokens" in sched:
-                put(
-                    "sched.max_num_scheduled_tokens",
-                    sched["max_num_scheduled_tokens"],
-                    scheduler.max_num_scheduled_tokens,
-                )
+        if scheduler is not None and sched:
+            now_sched = self.control._sched_state(scheduler)
+            for key, value in sched.items():
+                put(f"sched.{key}", value, now_sched.get(key))
         tower = profile.get("tower") or {}
         if tower:
             try:

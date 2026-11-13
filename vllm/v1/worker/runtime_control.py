@@ -332,6 +332,13 @@ def _ple_state(worker: Any) -> list[dict[str, Any]]:
     return out
 
 
+def _debug_state() -> dict[str, Any]:
+    from vllm.v1 import runtime_debug
+
+    debug = runtime_debug.state()
+    return {"on": debug["on"], "last": debug["last"]}
+
+
 def state(worker: Any, only: list[str] | None = None) -> dict[str, Any]:
     """This rank's readout; `only` names the parts wanted (all by default)."""
     from vllm.distributed.eplb import fault_injection
@@ -357,6 +364,7 @@ def state(worker: Any, only: list[str] | None = None) -> dict[str, Any]:
             "armed": fault_injection.armed(),
             "fired": fault_injection.fired(),
         },
+        "debug": _debug_state,
     }
     out: dict[str, Any] = {"rank": _rank(worker), "ep_rank": _ep_rank(worker)}
     for name, read in parts.items():
@@ -985,6 +993,34 @@ def _apply_fault_clear(worker: Any, args: dict) -> tuple[dict, dict, Any]:
     return changes, {"armed": after}, before
 
 
+# ---- debug tracing (vllm/v1/runtime_debug.py)
+
+
+def _check_debug_set(worker: Any, args: dict) -> str | None:
+    from vllm.v1 import runtime_debug
+
+    return runtime_debug.check(args)
+
+
+def _apply_debug_set(worker: Any, args: dict) -> tuple[dict, dict, Any]:
+    from vllm.v1 import runtime_debug
+
+    part = args["part"]
+    before = part in runtime_debug.state()["on"]
+    result = runtime_debug.apply(args)
+    after = part in result["on"]
+    changes = {part: [before, after]} if before != after else {}
+    return changes, {"debug": result}, (part, before)
+
+
+def _restore_debug_set(worker: Any, undo: tuple) -> None:
+    from vllm.v1 import runtime_debug
+
+    part, was_on = undo
+    if not was_on:
+        runtime_debug.disarm(part, "undone")
+
+
 OPS: dict[str, _Op] = {
     "eplb.set": _Op(_check_eplb_set, _apply_eplb_set, _restore_eplb_set),
     "eplb.pause": _Op(lambda w, a: _need_eplb(w), _apply_pause(True), _restore_pause),
@@ -1002,6 +1038,7 @@ OPS: dict[str, _Op] = {
     "ple.set": _Op(_check_ple_set, _apply_ple_set, _restore_ple_set),
     "fault.arm": _Op(_check_fault_arm, _apply_fault_arm, _restore_faults, True),
     "fault.clear": _Op(lambda w, a: None, _apply_fault_clear, _restore_faults, True),
+    "debug.set": _Op(_check_debug_set, _apply_debug_set, _restore_debug_set),
 }
 
 

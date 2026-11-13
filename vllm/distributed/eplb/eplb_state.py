@@ -51,6 +51,7 @@ from vllm.model_executor.models.interfaces import MixtureOfExperts
 from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import PIN_MEMORY
+from vllm.v1 import runtime_debug
 
 from . import fault_injection
 from .async_worker import start_async_worker
@@ -1661,6 +1662,20 @@ class EplbState:
             load_window_cpu,
             num_gpus,
         )
+        if runtime_debug.on("eplb"):
+            changed = old_physical_to_logical_map != new_physical_to_logical_map
+            runtime_debug.emit(
+                "eplb",
+                logger,
+                "plan (%s): %d of %d slots change, in %d of %d layers; load "
+                "window total %d tokens",
+                eplb_model_state.model_name,
+                int(changed.sum()),
+                changed.numel(),
+                int(changed.any(dim=1).sum()),
+                changed.shape[0],
+                int(load_window_cpu.sum()),
+            )
 
         skip_rearrange = False
         if (
@@ -2224,6 +2239,10 @@ def _commit_eplb_maps_for_layer(
     """
     if model_state.map_change_hook is not None:
         model_state.map_change_hook(model_state)
+    if runtime_debug.on("eplb"):
+        runtime_debug.emit(
+            "eplb", logger, "commit (%s): layer %d", model_state.model_name, layer
+        )
     # Commit physical_to_logical_map
     src = new_physical_to_logical_map
     dst = model_state.physical_to_logical_map[layer]
@@ -2260,6 +2279,14 @@ def _commit_eplb_maps(
     """
     if model_state.map_change_hook is not None:
         model_state.map_change_hook(model_state)
+    if runtime_debug.on("eplb"):
+        runtime_debug.emit(
+            "eplb",
+            logger,
+            "commit (%s): new physical-to-logical map %s",
+            model_state.model_name,
+            tuple(new_physical_to_logical_map.shape),
+        )
     # Commit physical_to_logical_map
     src = new_physical_to_logical_map
     dst = model_state.physical_to_logical_map

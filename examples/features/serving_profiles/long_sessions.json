@@ -4,5 +4,5 @@
   "sched": {"max_num_active_seqs": 4},
   "tower": {"policy": "host", "disk_idle_s": 1800},
   "kv": {"tokens": 240000, "deadline_s": 120, "preempt": false},
-  "tiers": {"fast_slots": "max"}
+  "tiers": {"fast_rows": "max"}
 }

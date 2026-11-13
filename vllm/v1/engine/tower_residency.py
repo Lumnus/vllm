@@ -35,6 +35,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
+from vllm.v1 import runtime_debug
 
 if TYPE_CHECKING:
     from vllm.config.multimodal import HostTowerOptions
@@ -145,6 +146,16 @@ class TowerResidency:
         """A request with an item of this tower's modalities."""
         self.arrivals.append(now)
         self.last_use = now
+        if runtime_debug.on("tower"):
+            runtime_debug.emit(
+                "tower",
+                logger,
+                "%s: a request for its modalities (%d in the window, in %s, policy %s)",
+                self.name,
+                len(self.arrivals),
+                self.place.value,
+                self.policy,
+            )
 
     def seconds_to_next_event(self, now: float) -> float | None:
         if self.phase != TowerPhase.STEADY or self._grow_to is not None:
@@ -239,6 +250,15 @@ class TowerResidency:
         return None
 
     def _start_promotion(self, now: float, reason: str) -> None:
+        if runtime_debug.on("tower"):
+            runtime_debug.emit(
+                "tower",
+                logger,
+                "%s: promotion starts (%s); KV cache %d blocks",
+                self.name,
+                reason,
+                self._num_blocks(),
+            )
         self._from = self.place
         self._started = now
         self._reason = reason

@@ -66,6 +66,29 @@ async def runtime_control_state(raw_request: Request, only: str | None = None):
     return JSONResponse(content=state)
 
 
+@router.get("/runtime_control/schema", dependencies=[Depends(_check_key)])
+async def runtime_control_schema(raw_request: Request):
+    """Every operation and parameter of the surface, with type, unit, range
+    or choices, default, current value, whether it is live (and through
+    which operation) or needs a restart (and why). The request defaults'
+    values are this API server process's."""
+    from vllm.entrypoints.serve.dev.control import server_defaults
+
+    try:
+        reply = await engine_client(raw_request).runtime_control("schema", {})
+    except Exception as e:  # noqa: BLE001 - reported as a plain Exception
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+    now = server_defaults.state(raw_request.app.state)
+    for param in reply.get("params", []):
+        if param.get("side") != "server" or not param["name"].startswith("defaults."):
+            continue
+        key = param["name"][len("defaults.") :]
+        param["value"] = (
+            now.get(key) if key == server_defaults.CJK_KEY else now["defaults"].get(key)
+        )
+    return JSONResponse(content=reply)
+
+
 @router.post("/runtime_control/{op}", dependencies=[Depends(_check_key)])
 async def runtime_control(op: str, raw_request: Request):
     """Apply `op` with the JSON body as its arguments (an empty body is

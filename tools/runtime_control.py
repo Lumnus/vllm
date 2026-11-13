@@ -36,6 +36,12 @@ server has one, is read from `VLLM_API_KEY`.
     runtime_control.py profile apply NAME [--wait]
     runtime_control.py spec set [--tokens N] [--on | --off] [--reset-stats]
     runtime_control.py sched set [--max-active-seqs N] [--max-scheduled-tokens N]
+                                 [--long-prefill N]
+    runtime_control.py debug set PART [--off] [--duration S] [--count N]
+                                 (PART: eplb scheduler kv cpu tower placement
+                                  logger:<name>)
+    runtime_control.py debug state
+    runtime_control.py schema [--json]
     runtime_control.py defaults state
     runtime_control.py defaults set [--temperature X] [--top-p X] [--top-k N]
                                     [--min-p X] [--repetition-penalty X]
@@ -198,6 +204,13 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
         else:
             _set(a, "stage", ns.stage)
         return f"fault.{verb}", a
+    if group == "debug":
+        if verb == "set":
+            a["part"] = ns.part
+            a["on"] = not ns.off
+            _set(a, "duration_s", ns.duration)
+            _set(a, "count", ns.count)
+        return f"debug.{verb}", a
     if group == "profile":
         if verb == "apply":
             a["name"] = ns.name
@@ -217,12 +230,32 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
     if group == "sched":
         _set(a, "max_num_active_seqs", ns.max_active_seqs)
         _set(a, "max_num_scheduled_tokens", ns.max_scheduled_tokens)
+        _set(a, "long_prefill_token_threshold", ns.long_prefill)
         return "sched.set", a
     if group == "defaults":
         if verb == "set":
             a = _defaults_args(ns)
         return f"defaults.{verb}", a
     raise SystemExit(2)
+
+
+def _print_schema(schema: dict) -> None:
+    """One line per parameter: name, value, live (verb) or restart (why)."""
+    for p in schema.get("params", []):
+        how = (
+            f"live via {p['verb']}"
+            if p.get("live")
+            else p.get("unavailable") or f"restart: {p.get('restart_reason', '')}"
+        )
+        bounds = (
+            f" {p['choices']}"
+            if p.get("choices")
+            else f" [{p.get('min', '')}..{p.get('max', '')}]"
+            if "min" in p or "max" in p
+            else ""
+        )
+        unit = f" {p['unit']}" if p.get("unit") else ""
+        print(f"{p['name']} = {p.get('value')}{unit}{bounds}; {how}")
 
 
 def _print_state(state: dict) -> None:
@@ -478,6 +511,18 @@ def _parser() -> argparse.ArgumentParser:
     shs = sh.add_parser("set")
     shs.add_argument("--max-active-seqs", type=int)
     shs.add_argument("--max-scheduled-tokens", type=int)
+    shs.add_argument("--long-prefill", type=int, help="tokens, 0 = off")
+
+    dg = groups.add_parser("debug").add_subparsers(dest="verb", required=True)
+    dgs = dg.add_parser("set")
+    dgs.add_argument("part")
+    dgs.add_argument("--off", action="store_true")
+    dgs.add_argument("--duration", type=float, help="seconds (default 300)")
+    dgs.add_argument("--count", type=int, help="lines (default 2000)")
+    dg.add_parser("state")
+
+    sc = groups.add_parser("schema")
+    sc.add_argument("--json", action="store_true")
 
     df = groups.add_parser("defaults").add_subparsers(dest="verb", required=True)
     df.add_parser("state")
@@ -506,6 +551,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(reply, indent=2))
             return 0 if status == 200 else 1
         _print_state(reply)
+        return 0
+    if ns.group == "schema":
+        status, reply = _request(
+            ns.url, "GET", "/runtime_control/schema", None, ns.timeout
+        )
+        if status != 200 or ns.json:
+            print(json.dumps(reply, indent=2))
+            return 0 if status == 200 else 1
+        _print_schema(reply)
         return 0
     op, body = _op_and_args(ns)
     if op == "profile.define" and isinstance(body.get("profiles"), list):
