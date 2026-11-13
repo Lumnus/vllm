@@ -391,6 +391,9 @@ class TierPlacement:
         pinned = self.num_slow if num_pool_slots is None else num_pool_slots
         assert 0 <= pinned <= self.num_slow
         self.num_pinned = pinned  # slots in pinned rows when the tiers are full
+        # The pinned bound as set (num_pinned is it, clamped to the slots off
+        # the card while the card tier holds more rows than at load).
+        self.pinned_bound = pinned
         self.num_host = self.num_slow - pinned
         # Whether this layer has a host tier at all (decided at load): the
         # pinned capacity may move later (set_pinned_capacity), the planning
@@ -484,7 +487,208 @@ class TierPlacement:
         assert self.host_tier, "the pinned capacity moves only with a host tier"
         assert 0 <= pinned <= self.max_pinned_capacity()
         self.num_pinned = pinned
+        self.pinned_bound = pinned
         self.num_host = self.num_slow - pinned
+
+    # -- the card tier's row count while serving -------------------------
+
+    def _set_num_fast(self, num_fast: int) -> None:
+        self.num_fast = num_fast
+        self.num_slow = self.num_slots - num_fast
+        if self.host_tier:
+            self.num_pinned = min(self.pinned_bound, self.num_slow)
+        else:
+            self.num_pinned = self.num_slow
+        self.num_host = self.num_slow - self.num_pinned
+
+    def grow_fast_rows(self, num_fast: int) -> None:
+        """Fast rows ``[self.num_fast, num_fast)`` exist now (the caller
+        mapped their memory): they are free, for the moves that follow."""
+        assert self.num_fast <= num_fast <= self.num_slots
+        self.fast_free = sorted(
+            set(self.fast_free) | set(range(self.num_fast, num_fast))
+        )
+        self._set_num_fast(num_fast)
+        self.check()
+
+    def shrink_fast_rows(self, num_fast: int) -> None:
+        """Drop fast rows ``[num_fast, self.num_fast)``: none may serve a
+        slot (see :meth:`compact_fast`). The caller releases their memory
+        once the device is past the last kernel that read them."""
+        assert 0 <= num_fast <= self.num_fast
+        top = set(range(num_fast, self.num_fast))
+        assert top <= set(self.fast_free), (
+            "a fast row above the new count still serves a slot"
+        )
+        self.fast_free = sorted(set(self.fast_free) - top)
+        self._set_num_fast(num_fast)
+        self.check()
+
+    def plan_card_round(
+        self, rank: np.ndarray, target: int, budget: int
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """The tier choice for a change of the card tier's size (the one
+        place it is made; the caller only commits it through
+        :meth:`plan_from_set`, :meth:`prepare` and :meth:`commit`, the path
+        EPLB's moves take). ``rank`` orders the slots by EPLB's load (0
+        coldest). The next step toward ``target`` card slots that reads at
+        most ``budget`` units into pinned rows:
+
+        - grow: the hottest slots off the card enter free card rows (a pinned
+          slot by a copy, a CPU slot through a read);
+        - shrink: the coldest card slots leave, into a pinned row (a read; the
+          card is never read back) where one is free or the slot is hotter
+          than the coldest pinned slot, which then goes to the CPU; else to
+          the CPU. Without host slots every leaving slot takes a pinned row.
+
+        Returns (card set, pinned set), or None when nothing fits."""
+        fast, pool, host = self.is_fast(), self.is_pool(), self.is_host()
+        new_fast, new_pool = fast.copy(), pool.copy()
+        n = int(fast.sum())
+        reads = 0
+        changed = False
+        if n < target:
+            room = min(target - n, len(self.fast_free))
+            outside = np.flatnonzero(~fast)
+            for s in outside[np.argsort(-rank[outside], kind="stable")][:room]:
+                cost = 1 if host[s] else 0
+                if reads + cost > budget:
+                    break
+                new_fast[s], new_pool[s] = True, False
+                reads += cost
+                changed = True
+        elif n > target:
+            inside = np.flatnonzero(fast)
+            leaving = inside[np.argsort(rank[inside], kind="stable")][: n - target]
+            cap = int(self.num_pinned)
+            for s in leaving:
+                if not self.host_tier:
+                    if reads + 1 > budget:
+                        break
+                    new_fast[s], new_pool[s] = False, True
+                    reads += 1
+                    changed = True
+                    continue
+                in_pool = np.flatnonzero(new_pool)
+                coldest = (
+                    int(in_pool[np.argmin(rank[in_pool])]) if in_pool.size else None
+                )
+                if in_pool.size < cap or (
+                    coldest is not None and rank[s] > rank[coldest]
+                ):
+                    if reads + 1 > budget:
+                        break
+                    if in_pool.size >= cap and coldest is not None:
+                        new_pool[coldest] = False  # to the CPU, nothing read
+                    new_pool[s] = True
+                    reads += 1
+                new_fast[s] = False
+                changed = True
+        return (new_fast, new_pool) if changed else None
+
+    def plan_pinned_refill(self, rank: np.ndarray, budget: int) -> np.ndarray | None:
+        """With host slots, after a change of the card tier: the pinned set
+        for the bound by EPLB's own pinned-set rule (:func:`choose_pool_set`:
+        over the bound the coldest leave, under it the hottest CPU slots
+        enter), without its swaps (those are the next rearrangement's, by
+        its hysteresis), the units read bounded by ``budget``. None when the
+        pinned set stays."""
+        if not self.host_tier:
+            return None
+        pool = self.is_pool()
+        cap = int(self.num_pinned)
+        count = int(pool.sum())
+        if count < cap:
+            cap = count + min(cap - count, budget)
+        # heat from 1 and an infinite hysteresis: fill and trim, no swaps
+        heat = rank.astype(np.float64) + 1.0
+        want = choose_pool_set(heat, ~self.is_fast(), pool, cap, float("inf"))
+        if np.array_equal(want, pool):
+            return None
+        return want
+
+    def compact_fast(
+        self,
+        limit: int,
+        ops: StreamOps,
+        *,
+        slot_global: Sequence[int],
+        num_global: int,
+        fast_map: Any,
+        copy_fast: Callable[[int, int], None],
+    ) -> int:
+        """Move the slots in fast rows at or above ``limit`` into free rows
+        below it, so that every row from ``limit`` on is free. Stream order
+        as :meth:`commit`: the side stream waits for the compute stream, then
+        copies each slot's row into its new row (``copy_fast(src, dst)``,
+        through ``ops.side_copy``; a free row is read by no kernel after the
+        wait: R1), the compute stream waits for the copies (R2) and the map
+        is rewritten (R3). Returns the slots moved."""
+        high = [
+            s
+            for s in range(self.num_slots)
+            if self.tier[s] == FAST and self.row[s] >= limit
+        ]
+        if not high:
+            return 0
+        low = sorted(r for r in self.fast_free if r < limit)
+        if len(low) < len(high):
+            raise RowsUnavailable(
+                f"{len(high)} slots sit in fast rows at or above {limit} and "
+                f"{len(low)} rows below it are free"
+            )
+        moves = list(zip(high, low))
+        drained = ops.record_compute()
+        ops.side_wait(drained)
+        for s, dst in moves:
+            copy_fast(int(self.row[s]), dst)
+        filled = ops.record_side()
+        ops.compute_wait(filled)
+        freed = []
+        for s, dst in moves:
+            freed.append(int(self.row[s]))
+            self.row[s] = dst
+        self.fast_free = sorted(
+            (set(self.fast_free) - set(low[: len(moves)])) | set(freed)
+        )
+        fast_np, _ = self.maps(slot_global, num_global)
+        ops.compute_write(fast_map, fast_np)
+        self.check()
+        return len(moves)
+
+    def relayout_pool(self, num_pool_rows: int) -> dict[int, int]:
+        """Lay the pool rows out again in ``num_pool_rows`` rows: the rows
+        that serve slots become ``0..k-1`` in slot order, the rest are free.
+        Host state only; the caller copies the rows into the new tensors
+        (old row -> new row, returned), rewrites the slow map, and must have
+        waited for every row in quarantine (nothing reads or writes them)."""
+        used = [
+            (s, int(self.row[s])) for s in range(self.num_slots) if self.tier[s] == POOL
+        ]
+        if len(used) + self.spare > num_pool_rows:
+            raise RowsUnavailable(
+                f"{len(used)} slots in pinned rows and {self.spare} spare rows "
+                f"do not fit {num_pool_rows} rows"
+            )
+        moved = {old: new for new, (_, old) in enumerate(used)}
+        for new, (s, _) in enumerate(used):
+            self.row[s] = new
+        self.extra_rows = num_pool_rows - self.num_pinned - self.spare
+        self.num_pool_rows = num_pool_rows
+        self.pool = RowAllocator(
+            num_pool_rows, range(len(used), num_pool_rows), self.pool._done
+        )
+        self.check()
+        return moved
+
+    def promote_host(self, slot: int, row: int) -> None:
+        """Host slot ``slot`` now holds pinned row ``row`` (taken from the
+        free rows and filled by the caller; the caller writes the maps)."""
+        assert self.tier[slot] == HOST, f"slot {slot} is not a host slot"
+        assert row not in self.row[self.tier == POOL], f"row {row} is in use"
+        self.tier[slot] = POOL
+        self.row[slot] = row
+        self.check()
 
     # -- planning ---------------------------------------------------------
 

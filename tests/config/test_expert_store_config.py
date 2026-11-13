@@ -119,3 +119,38 @@ def test_only_the_shape_of_the_rows_is_a_compile_factor():
     b = ExpertStoreConfig(dirs=["/b", "/c"], pool_gib=9, io_threads=2).compile_factors()
     assert a == b
     assert ExpertStoreConfig(dirs=["/a"], spare_rows=3).compile_factors() != a
+
+
+def test_the_card_tier_settings_leave_the_hash_alone_until_set():
+    """Unset, the factors are the ones before the settings existed (the
+    same keys); fast_rows_max, the capacity the kernels see, enters when
+    set; the run-time settings never do."""
+    base = ExpertStoreConfig(dirs=["/a"]).compile_factors()
+    assert not any(k.startswith(("fast_", "pinned_release")) for k in base)
+    tuned = ExpertStoreConfig(
+        dirs=["/a"], fast_rows_min=2, fast_chunk_mib=8, pinned_release=True
+    ).compile_factors()
+    assert tuned == base
+    sized = ExpertStoreConfig(dirs=["/a"], fast_rows_max=64).compile_factors()
+    assert sized == {**base, "fast_rows_max": 64}
+    assert ExpertStoreConfig(dirs=["/a"], fast_rows_max=64).fast_tier_resizable
+    assert not ExpertStoreConfig(dirs=["/a"]).fast_tier_resizable
+    assert not ExpertStoreConfig(fast_rows_max=64).fast_tier_resizable  # no store
+
+
+def test_the_card_tier_floor_is_below_its_capacity():
+    tiers = SimpleNamespace(cpu_offload_per_expert=True)
+    offload = OffloadConfig(uva=UVAOffloadConfig(cpu_offload_gb=4, **vars(tiers)))
+    eplb = SimpleNamespace(policy="incremental", use_async=True, max_moves_per_rank=8)
+    parallel = SimpleNamespace(
+        enable_elastic_ep=False, pipeline_parallel_size=1, eplb_config=eplb
+    )
+    ExpertStoreConfig(
+        dirs=["/a"], fast_rows_max=8, fast_rows_min=2
+    ).verify_parallel_config(parallel, offload)
+    with pytest.raises(ValueError, match="fast_rows_min=9 is above fast_rows_max=8"):
+        ExpertStoreConfig(
+            dirs=["/a"], fast_rows_max=8, fast_rows_min=9
+        ).verify_parallel_config(parallel, offload)
+    with pytest.raises(ValueError):
+        ExpertStoreConfig(dirs=["/a"], fast_rows_max=-1)

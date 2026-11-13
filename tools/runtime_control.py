@@ -19,6 +19,8 @@ server has one, is read from `VLLM_API_KEY`.
     runtime_control.py store set [--check-every N] [--scrub-every N]
                                  [--stats-interval S]
     runtime_control.py tiers set --host-tier-bound N
+    runtime_control.py tiers fast --rows N | --delta N [--deadline S] [--preempt]
+                                  [--no-kv]
     runtime_control.py kv resize N [--deadline S] [--preempt]
     runtime_control.py kv fit | abort
     runtime_control.py kv set [--release-chunk-mib N|none] [--grow-floor-mib N|default]
@@ -151,6 +153,15 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
             _set(a, "stats_interval_s", ns.stats_interval)
         return f"store.{verb}", a
     if group == "tiers":
+        if verb == "fast":
+            _set(a, "rows", ns.rows)
+            _set(a, "delta", ns.delta)
+            _set(a, "deadline_s", ns.deadline)
+            if ns.preempt:
+                a["preempt"] = True
+            if ns.no_kv:
+                a["from_kv"] = False
+            return "tiers.fast", a
         _set(a, "host_tier_bound", ns.host_tier_bound)
         return "tiers.set", a
     if group == "cpu":
@@ -306,6 +317,16 @@ def _print_state(state: dict) -> None:
             f"{sched['max_num_seqs']}, tokens per step "
             f"{sched['max_num_scheduled_tokens']} of {sched['max_num_batched_tokens']}"
         )
+    fast = state.get("fast_tier") or {}
+    if fast.get("resizable"):
+        record = fast.get("record") or {}
+        print(
+            f"card tier: {fast['rows']} rows per layer (range {fast['range']}), "
+            f"last resize {record.get('from_rows', '-')} -> "
+            f"{record.get('to_rows', '-')} {record.get('state', '-')}"
+            f"{' (' + record['message'] + ')' if record.get('message') else ''}"
+            f"{'' if fast.get('ranks_agree') else '; RANKS DISAGREE'}"
+        )
     for name, tower in state.get("towers", {}).items():
         opts = tower["options"]
         print(
@@ -460,6 +481,17 @@ def _parser() -> argparse.ArgumentParser:
 
     ti = groups.add_parser("tiers").add_subparsers(dest="verb", required=True)
     ti.add_parser("set").add_argument("--host-tier-bound", type=int, required=True)
+    tf = ti.add_parser("fast")
+    rows = tf.add_mutually_exclusive_group(required=True)
+    rows.add_argument("--rows", type=int, help="card rows per layer per rank")
+    rows.add_argument(
+        "--delta", type=int, help="card rows per layer to add (< 0: drop)"
+    )
+    tf.add_argument("--deadline", type=float, help="seconds the KV shrink may drain")
+    tf.add_argument("--preempt", action="store_true")
+    tf.add_argument(
+        "--no-kv", action="store_true", help="free device memory only, no KV resize"
+    )
 
     cp = groups.add_parser("cpu").add_subparsers(dest="verb", required=True)
     cs = cp.add_parser("set")

@@ -26,6 +26,17 @@ from tools.runtime_control import _op_and_args, _parser, _print_state
             "tiers.set",
             {"host_tier_bound": 8},
         ),
+        (["tiers", "fast", "--rows", "40"], "tiers.fast", {"rows": 40}),
+        (
+            ["tiers", "fast", "--delta", "-8", "--deadline", "30", "--preempt"],
+            "tiers.fast",
+            {"delta": -8, "deadline_s": 30.0, "preempt": True},
+        ),
+        (
+            ["tiers", "fast", "--rows", "40", "--no-kv"],
+            "tiers.fast",
+            {"rows": 40, "from_kv": False},
+        ),
         (
             [
                 "cpu",

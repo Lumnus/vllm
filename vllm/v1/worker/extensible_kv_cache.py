@@ -1031,13 +1031,19 @@ def _measure_kv_cache_serving(
     the budget, by whoever commits (`refresh_torch_memory_limit`).
     """
     mapped = kv_cache.physical_bytes
+    # Other holders of VMM memory (e.g. a movable expert tier) share the
+    # budget with the cache: the cap-side room leaves them out too.
+    external = sum(
+        mapped_bytes()
+        for mapped_bytes in getattr(kv_cache, "external_mapped_bytes", ())
+    )
     startup_reserve = kv_cache.reserved_headroom_bytes
     budget = kv_cache.torch_memory_budget
     free_memory = current_platform.free_device_memory(device)
     allocated, peak, reserved = _torch_memory_now(device)
     room = serving_kv_room(
         free_memory=free_memory,
-        mapped_bytes=mapped,
+        mapped_bytes=mapped + external,
         torch_allocated=allocated,
         torch_reserved=reserved,
         torch_peak=peak,
@@ -1059,7 +1065,7 @@ def _measure_kv_cache_serving(
             allocated, peak, reserved = _torch_memory_now(device)
             room = serving_kv_room(
                 free_memory=free_memory,
-                mapped_bytes=mapped,
+                mapped_bytes=mapped + external,
                 torch_allocated=allocated,
                 torch_reserved=reserved,
                 torch_peak=peak,
