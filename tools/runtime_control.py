@@ -30,6 +30,17 @@ server has one, is read from `VLLM_API_KEY`.
     runtime_control.py ple set --stats-interval S
     runtime_control.py fault arm --stage load|plan|copy_rows [--rank R] [--count N]
     runtime_control.py fault clear [--stage S]
+    runtime_control.py governor state
+    runtime_control.py governor set [--mode off|dry_run|on] [--set NAME=VALUE ...]
+    runtime_control.py spec set [--tokens N] [--on | --off] [--reset-stats]
+    runtime_control.py sched set [--max-active-seqs N] [--max-scheduled-tokens N]
+    runtime_control.py defaults state
+    runtime_control.py defaults set [--temperature X] [--top-p X] [--top-k N]
+                                    [--min-p X] [--repetition-penalty X]
+                                    [--presence-penalty X] [--frequency-penalty X]
+                                    [--thinking-budget N|none]
+                                    [--cjk-mask auto|on|off|none]
+    (a value "none" puts the start value back)
 
 Global: --url (default http://localhost:8000), --timeout seconds.
 Exit status: 0 applied on every rank, 1 refused or not applied, 2 bad usage.
@@ -71,6 +82,34 @@ def _set(args: dict, name: str, value: Any) -> None:
 
 def _null_or_int(text: str, null: str) -> int | None:
     return None if text == null else int(text)
+
+
+def _value(text: str) -> Any:
+    """A setting's value as JSON (numbers, true/false, null, lists), else
+    the text itself."""
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def _defaults_args(ns: argparse.Namespace) -> dict:
+    a: dict[str, Any] = {}
+    for name, attr in (
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("top_k", "top_k"),
+        ("min_p", "min_p"),
+        ("repetition_penalty", "repetition_penalty"),
+        ("presence_penalty", "presence_penalty"),
+        ("frequency_penalty", "frequency_penalty"),
+        ("thinking_token_budget", "thinking_budget"),
+        ("cjk_mask_default", "cjk_mask"),
+    ):
+        text = getattr(ns, attr)
+        if text is not None:
+            a[name] = None if text == "none" else _value(text)
+    return a
 
 
 def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
@@ -152,6 +191,32 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
         else:
             _set(a, "stage", ns.stage)
         return f"fault.{verb}", a
+    if group == "governor":
+        if verb == "set":
+            _set(a, "mode", ns.mode)
+            for item in ns.set or []:
+                name, sep, text = item.partition("=")
+                if not sep or not name:
+                    raise SystemExit(f"--set wants NAME=VALUE, got {item!r}")
+                a[name] = _value(text)
+        return f"governor.{verb}", a
+    if group == "spec":
+        _set(a, "num_speculative_tokens", ns.tokens)
+        if ns.on:
+            a["enabled"] = True
+        if ns.off:
+            a["enabled"] = False
+        if ns.reset_stats:
+            a["reset_stats"] = True
+        return "spec.set", a
+    if group == "sched":
+        _set(a, "max_num_active_seqs", ns.max_active_seqs)
+        _set(a, "max_num_scheduled_tokens", ns.max_scheduled_tokens)
+        return "sched.set", a
+    if group == "defaults":
+        if verb == "set":
+            a = _defaults_args(ns)
+        return f"defaults.{verb}", a
     raise SystemExit(2)
 
 
@@ -163,6 +228,34 @@ def _print_state(state: dict) -> None:
         f"{kv.get('release_chunk_mib')} MiB, grow floor {kv.get('grow_floor_mib')} "
         f"MiB, resize {resize.get('state', '-')}"
     )
+    gov = state.get("governor") or {}
+    if gov.get("mode", "off") != "off":
+        inputs = gov.get("inputs", {})
+        print(
+            f"governor: {gov['mode']}, level {gov.get('level')}; used "
+            f"{inputs.get('used', '-')} cached-free {inputs.get('cached_free', '-')}"
+            f" hit rate {inputs.get('hit_rate', '-')} waiting "
+            f"{inputs.get('waiting', '-')}; hot {inputs.get('hot', '-')} cool "
+            f"{inputs.get('cool', '-')}; moves {gov.get('counts')}"
+        )
+    spec = state.get("spec") or {}
+    if spec.get("drafter"):
+        acc = spec.get("acceptance") or {}
+        rate = acc.get("acceptance_rate")
+        print(
+            f"drafter {spec.get('method')}: {spec['num_speculative_tokens']} of "
+            f"{spec['num_speculative_tokens_max']} tokens, decode graphs for "
+            f"{spec.get('decode_graph_tokens')}; acceptance "
+            f"{'-' if rate is None else f'{rate:.3f}'}, mean length "
+            f"{acc.get('mean_acceptance_length', '-')}"
+        )
+    sched = state.get("sched") or {}
+    if sched:
+        print(
+            f"scheduler: active seqs {sched['max_num_active_seqs']} of "
+            f"{sched['max_num_seqs']}, tokens per step "
+            f"{sched['max_num_scheduled_tokens']} of {sched['max_num_batched_tokens']}"
+        )
     for name, tower in state.get("towers", {}).items():
         opts = tower["options"]
         print(
@@ -349,6 +442,43 @@ def _parser() -> argparse.ArgumentParser:
     fa_arm.add_argument("--rank", type=int)
     fa_arm.add_argument("--count", type=int, default=1)
     fa.add_parser("clear").add_argument("--stage")
+
+    gv = groups.add_parser("governor").add_subparsers(dest="verb", required=True)
+    gv.add_parser("state")
+    gs = gv.add_parser("set")
+    gs.add_argument("--mode", choices=("off", "dry_run", "on"))
+    gs.add_argument(
+        "--set", action="append", metavar="NAME=VALUE", help="any setting, repeatable"
+    )
+
+    sp = groups.add_parser("spec").add_subparsers(dest="verb", required=True)
+    sps = sp.add_parser("set")
+    sps.add_argument("--tokens", type=int)
+    onoff = sps.add_mutually_exclusive_group()
+    onoff.add_argument("--on", action="store_true")
+    onoff.add_argument("--off", action="store_true")
+    sps.add_argument("--reset-stats", action="store_true")
+
+    sh = groups.add_parser("sched").add_subparsers(dest="verb", required=True)
+    shs = sh.add_parser("set")
+    shs.add_argument("--max-active-seqs", type=int)
+    shs.add_argument("--max-scheduled-tokens", type=int)
+
+    df = groups.add_parser("defaults").add_subparsers(dest="verb", required=True)
+    df.add_parser("state")
+    dfs = df.add_parser("set")
+    for flag in (
+        "--temperature",
+        "--top-p",
+        "--top-k",
+        "--min-p",
+        "--repetition-penalty",
+        "--presence-penalty",
+        "--frequency-penalty",
+        "--thinking-budget",
+    ):
+        dfs.add_argument(flag, help="a value, or 'none' for the start value")
+    dfs.add_argument("--cjk-mask", choices=("auto", "on", "off", "none"))
     return p
 
 

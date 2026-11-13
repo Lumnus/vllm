@@ -54,6 +54,24 @@ def enabled() -> bool:
     return os.environ.get(ENV, "0") == "1"
 
 
+# What a chat request without an explicit flag gets: "auto" (on unless the
+# prompt has Han), "on" or "off". This process's value; the runtime control
+# surface changes it (`defaults.set {"cjk_mask_default": ...}`).
+DEFAULT_MODES = ("auto", "on", "off")
+_DEFAULT_MODE = "auto"
+
+
+def default_mode() -> str:
+    return _DEFAULT_MODE
+
+
+def set_default_mode(mode: str) -> None:
+    global _DEFAULT_MODE
+    if mode not in DEFAULT_MODES:
+        raise ValueError(f"{XARG} default must be one of {DEFAULT_MODES}, got {mode!r}")
+    _DEFAULT_MODE = mode
+
+
 def has_han(text: str) -> bool:
     return _HAN_RE.search(text) is not None
 
@@ -121,6 +139,8 @@ def chat_extra_args(
         explicit = model_extra.get(XARG)
     if explicit is not None:
         flag = resolve(explicit, False)
+    elif _DEFAULT_MODE != "auto":
+        flag = _DEFAULT_MODE == "on"
     else:
         flag = not messages_have_han(messages)
     out = dict(extra_args)

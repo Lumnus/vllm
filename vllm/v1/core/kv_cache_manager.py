@@ -167,6 +167,8 @@ class KVCacheManager:
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
+        self.prefix_cache_queries_total = 0
+        self.prefix_cache_hits_total = 0
 
         self.coordinator = get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
@@ -336,7 +338,12 @@ class KVCacheManager:
 
     def record_prefix_cache_stats(self, request: Request, num_hits: int) -> None:
         # Don't count a request that skipped the cache lookup.
-        if not self.log_stats or not self.prefix_cache_lookup_enabled(request):
+        if not self.prefix_cache_lookup_enabled(request):
+            return
+        # Since start, whatever the stats logging (read by the KV governor).
+        self.prefix_cache_queries_total += request.num_tokens
+        self.prefix_cache_hits_total += num_hits
+        if not self.log_stats:
             return
         assert self.prefix_cache_stats is not None
         self.prefix_cache_stats.record(

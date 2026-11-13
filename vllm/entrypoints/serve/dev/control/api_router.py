@@ -82,13 +82,55 @@ async def runtime_control(op: str, raw_request: Request):
             content={"error": "the body must be a JSON object"}, status_code=400
         )
     logger.info("Runtime control: %s %s", op, args)
+    if op.startswith("defaults."):
+        return _server_defaults(op, args, raw_request)
     try:
         reply = await engine_client(raw_request).runtime_control(op, args)
     except Exception as e:  # noqa: BLE001 - the engine core reports a refusal so
         logger.warning("Runtime control: %s refused: %s", op, e)
-        return JSONResponse(content={"error": str(e)}, status_code=400)
+        return JSONResponse(content=_refusal(str(e)), status_code=400)
     status = 200 if reply.get("applied") == "all" else 409
     return JSONResponse(content=reply, status_code=status)
+
+
+# A refusal whose reason a restart (with other flags) removes starts with it.
+RESTART_REQUIRED = "restart_required: "
+
+
+def _refusal(text: str) -> dict:
+    """The refusal reply; `restart_required` true when the setting cannot
+    change in a running engine (the reason says why and what to restart
+    with)."""
+    at = text.find(RESTART_REQUIRED)
+    if at < 0:
+        return {"error": text}
+    return {"error": text[at + len(RESTART_REQUIRED) :], "restart_required": True}
+
+
+def _server_defaults(op: str, args: dict, raw_request: Request) -> JSONResponse:
+    """`defaults.state` / `defaults.set`: request defaults of this API server
+    process (see server_defaults.py), answered here, not by the engine."""
+    from vllm.entrypoints.serve.dev.control import server_defaults
+
+    app_state = raw_request.app.state
+    if op == "defaults.state":
+        return JSONResponse(content={"op": op, **server_defaults.state(app_state)})
+    if op != "defaults.set":
+        return JSONResponse(
+            content={
+                "error": f"unknown operation {op!r}; defaults.set, defaults.state"
+            },
+            status_code=400,
+        )
+    try:
+        reply = server_defaults.apply(app_state, args)
+    except server_defaults.DefaultsRefused as e:
+        logger.warning("Runtime control: %s refused: %s", op, e)
+        content: dict = {"error": str(e)}
+        if e.restart_required:
+            content["restart_required"] = True
+        return JSONResponse(content=content, status_code=400)
+    return JSONResponse(content=reply)
 
 
 def attach_router(app: FastAPI, api_keys: list[str] | None = None) -> None:

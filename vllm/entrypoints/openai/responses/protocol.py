@@ -647,7 +647,12 @@ class ResponsesRequest(OpenAIBaseModel):
             ),
             structured_outputs=self.extract_structured_outputs(),
             logit_bias=self.logit_bias,
-            thinking_token_budget=self.thinking_token_budget,
+            # A server default only when one was set (runtime control).
+            thinking_token_budget=(
+                self.thinking_token_budget
+                if self.thinking_token_budget is not None
+                else default_sampling_params.get("thinking_token_budget")
+            ),
             extra_args=extra_args,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             skip_special_tokens=skip_special_tokens,

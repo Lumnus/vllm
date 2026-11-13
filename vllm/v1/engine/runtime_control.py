@@ -57,7 +57,13 @@ ENGINE_OPS = (
     "tower.promote",
     "tower.demote",
     "tower.set",
+    "governor.set",
+    "governor.state",
+    "spec.set",
+    "sched.set",
 )
+# Answered by the API server process itself (request defaults it reads).
+SERVER_OPS = ("defaults.set", "defaults.state")
 DEV_ONLY_OPS = ("fault.arm", "fault.clear")
 
 _TOWER_SETTINGS = {
@@ -73,6 +79,15 @@ _TOWER_SETTINGS = {
 
 class ControlRefused(Exception):
     """An operation the engine will not apply now; nothing was changed."""
+
+
+class RestartRequired(ControlRefused):
+    """A setting that cannot change in a running engine; the reason says
+    why. Its text starts with `restart_required: `, which the HTTP route
+    turns into `"restart_required": true`."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(f"restart_required: {reason}")
 
 
 class RuntimeControl:
@@ -162,14 +177,20 @@ class RuntimeControl:
         if kv["extensible"]:
             kv["resize"] = engine.get_kv_cache_resize_state()
         ranks = self._rpc("state", "", {"only": only} if only else None)
-        return {
+        out = {
             "dev_mode": bool(envs.VLLM_SERVER_DEV_MODE),
-            "operations": sorted(WORKER_OPS + ENGINE_OPS),
+            "operations": sorted(WORKER_OPS + ENGINE_OPS + SERVER_OPS),
             "kv": kv,
             "towers": self._towers_state(),
+            "governor": self._governor_state(),
             "ranks": ranks,
             "ranks_agree": _agreement(ranks),
         }
+        scheduler = getattr(engine, "scheduler", None)
+        if scheduler is not None:
+            out["spec"] = self._spec_state(scheduler)
+            out["sched"] = self._sched_state(scheduler)
+        return out
 
     def _towers_state(self) -> dict[str, Any]:
         controller = self.engine._tower_residency
@@ -234,9 +255,306 @@ class RuntimeControl:
             return self._kv_fit()
         if op.startswith("tower."):
             return self._tower_op(op, args)
+        if op.startswith("governor."):
+            return self._governor_op(op, args)
+        if op == "spec.set":
+            return self._spec_set(args)
+        if op == "sched.set":
+            return self._sched_set(args)
         raise ControlRefused(
-            f"unknown operation {op!r}; one of {sorted(WORKER_OPS + ENGINE_OPS)}"
+            f"unknown operation {op!r}; one of "
+            f"{sorted(WORKER_OPS + ENGINE_OPS + SERVER_OPS)}"
         )
+
+    # ------------------------------------------------------------------
+    # The KV governor (vllm/v1/engine/kv_governor.py)
+    # ------------------------------------------------------------------
+
+    def _governor_state(self) -> dict[str, Any]:
+        governor = getattr(self.engine, "_kv_governor", None)
+        if governor is None:
+            return {"mode": "off"}
+        return governor.state()
+
+    def _governor_op(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        from vllm.v1.engine.kv_governor import (
+            GovernorSettings,
+            KVGovernor,
+            check_settings,
+        )
+
+        engine = self.engine
+        if op == "governor.state":
+            if args:
+                raise ControlRefused("governor.state takes no arguments")
+            return {"op": op, "applied": "all", "governor": self._governor_state()}
+        if op != "governor.set":
+            raise ControlRefused(f"unknown operation {op!r}")
+        governor = getattr(engine, "_kv_governor", None)
+        current = governor.settings if governor is not None else GovernorSettings()
+        refusal = check_settings(current, args)
+        if refusal:
+            raise ControlRefused(refusal)
+        if args.get("mode", current.mode) != "off":
+            try:
+                engine._check_kv_cache_resizable()
+            except (ValueError, NotImplementedError, RuntimeError) as e:
+                raise RestartRequired(
+                    f"the governor moves memory between the KV cache and the "
+                    f"experts and towers, which needs a KV cache resizable "
+                    f"while serving: {e}"
+                ) from e
+            parallel = getattr(engine.vllm_config, "parallel_config", None)
+            if getattr(parallel, "data_parallel_size", 1) > 1:
+                raise RestartRequired(
+                    "the governor runs in the busy loop of a single engine core "
+                    "(no data parallelism)"
+                )
+        if governor is None:
+            # Made on first use: an engine that never turns it on never has one.
+            governor = KVGovernor(engine, GovernorSettings())
+            engine._kv_governor = governor
+        changes = governor.set(args)
+        return {
+            "op": op,
+            "applied": "all",
+            "changes": changes,
+            "governor": governor.state(),
+        }
+
+    # ------------------------------------------------------------------
+    # The drafter (speculative decoding)
+    # ------------------------------------------------------------------
+
+    def _decode_graph_ks(self, k_max: int) -> list[int] | None:
+        """Spec token counts whose uniform decode batches have captured
+        decode graphs (the runner captures them per query length:
+        `VllmConfig.get_decode_cudagraph_query_lens`); None if unknown."""
+        from vllm.config.compilation import CUDAGraphMode
+
+        config = self.engine.vllm_config
+        try:
+            mode = config.compilation_config.cudagraph_mode
+            if (
+                mode is None
+                or not mode.separate_routine()
+                or mode.decode_mode() != CUDAGraphMode.FULL
+            ):
+                return []
+            widest = config.uniform_decode_query_len
+            lens = config.get_decode_cudagraph_query_lens(widest)
+            sampled = widest - config.num_speculative_tokens
+        except Exception:  # noqa: BLE001 - a readout only
+            return None
+        return [k for k in range(k_max + 1) if k + sampled in lens]
+
+    def _spec_state(self, scheduler: Any) -> dict[str, Any]:
+        k_max = int(getattr(scheduler, "num_spec_tokens", 0))
+        if k_max <= 0:
+            return {"drafter": False}
+        config = self.engine.vllm_config
+        spec_config = getattr(config, "speculative_config", None)
+        totals = getattr(scheduler, "spec_totals", None)
+        acceptance: dict[str, Any] | None = None
+        if totals is not None and totals.num_drafts:
+            drafted = totals.num_draft_tokens
+            acceptance = {
+                "drafts": totals.num_drafts,
+                "draft_tokens": drafted,
+                "accepted_tokens": totals.num_accepted_tokens,
+                "acceptance_rate": (
+                    totals.num_accepted_tokens / drafted if drafted else None
+                ),
+                "mean_acceptance_length": 1
+                + totals.num_accepted_tokens / totals.num_drafts,
+                "per_position": [
+                    (a / d if d else None)
+                    for a, d in zip(
+                        totals.num_accepted_tokens_per_pos,
+                        totals.num_draft_tokens_per_pos,
+                    )
+                ],
+            }
+        return {
+            "drafter": True,
+            "method": getattr(spec_config, "method", None),
+            "num_speculative_tokens": scheduler.num_spec_tokens_now,
+            "num_speculative_tokens_max": k_max,
+            "cap": scheduler.spec_tokens_cap,
+            "per_batch_size_schedule": scheduler.dynamic_sd_lookup is not None,
+            "decode_graph_tokens": self._decode_graph_ks(k_max),
+            "acceptance": acceptance,
+            "acceptance_note": (
+                None
+                if getattr(scheduler, "log_stats", False)
+                else "acceptance is counted with stats logging only"
+            ),
+        }
+
+    def _spec_set(self, args: dict[str, Any]) -> dict[str, Any]:
+        from vllm.v1.spec_decode.metrics import SpecDecodingStats
+
+        scheduler = self.engine.scheduler
+        known = {"num_speculative_tokens", "enabled", "reset_stats"}
+        unknown = sorted(set(args) - known)
+        if unknown:
+            raise ControlRefused(
+                f"unknown drafter settings {unknown}; known: {sorted(known)}"
+            )
+        k_max = int(scheduler.num_spec_tokens)
+        if k_max <= 0:
+            raise RestartRequired(
+                "no drafter in this engine: the drafter is loaded, and its "
+                "buffers and graphs are sized, at start (--speculative-config)"
+            )
+        k = args.get("num_speculative_tokens")
+        enabled = args.get("enabled")
+        if k is not None and (not isinstance(k, int) or isinstance(k, bool) or k < 0):
+            raise ControlRefused(
+                f"num_speculative_tokens must be an integer >= 0, got {k!r}"
+            )
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ControlRefused(f"enabled must be true or false, got {enabled!r}")
+        if k is not None and k > k_max:
+            raise RestartRequired(
+                f"num_speculative_tokens {k} is above {k_max}, the number the "
+                f"drafter's buffers, the rejection sampler and the captured "
+                f"graphs were sized for at start; restart with "
+                f"--speculative-config num_speculative_tokens={k}"
+            )
+        old_cap = scheduler.spec_tokens_cap
+        if enabled is False:
+            cap: int | None = 0
+        elif k is not None:
+            cap = k
+        elif enabled is True:
+            cap = None if old_cap == 0 else old_cap
+        else:
+            cap = old_cap
+        if cap == k_max:
+            cap = None
+        old_now = scheduler.num_spec_tokens_now
+        scheduler.spec_tokens_cap = cap
+        new_now = scheduler.num_spec_tokens_now
+        changes: dict[str, list] = {}
+        if old_now != new_now:
+            changes["num_speculative_tokens"] = [old_now, new_now]
+        if args.get("reset_stats"):
+            scheduler.spec_totals = SpecDecodingStats.new(k_max)
+            changes["acceptance"] = ["counted", "reset"]
+        graphs = self._decode_graph_ks(k_max)
+        note = ""
+        if graphs is not None and new_now not in graphs:
+            note = (
+                f"; uniform decode batches of {new_now} draft tokens have no "
+                f"captured decode graph (captured: {graphs}) and run on the "
+                f"token-keyed graphs or eagerly: the same tokens, more time"
+            )
+        for name, (a, b) in changes.items():
+            logger.info("Runtime control: spec.set %s %s -> %s%s.", name, a, b, note)
+        if not changes:
+            logger.info("Runtime control: spec.set unchanged (%d).", new_now)
+        return {
+            "op": "spec.set",
+            "applied": "all",
+            "changes": changes,
+            "spec": self._spec_state(scheduler),
+        }
+
+    # ------------------------------------------------------------------
+    # Scheduler limits
+    # ------------------------------------------------------------------
+
+    def _sched_state(self, scheduler: Any) -> dict[str, Any]:
+        config = scheduler.scheduler_config
+        return {
+            "max_num_active_seqs": scheduler.max_num_active_reqs,
+            "max_num_seqs": scheduler.max_num_running_reqs,
+            "max_num_scheduled_tokens": scheduler.max_num_scheduled_tokens,
+            "max_num_batched_tokens": config.max_num_batched_tokens,
+            "chunked_prefill": bool(config.enable_chunked_prefill),
+        }
+
+    def _sched_set(self, args: dict[str, Any]) -> dict[str, Any]:
+        scheduler = self.engine.scheduler
+        config = scheduler.scheduler_config
+        known = {"max_num_active_seqs", "max_num_scheduled_tokens"}
+        unknown = sorted(set(args) - known)
+        if unknown:
+            if "max_num_seqs" in unknown or "max_num_batched_tokens" in unknown:
+                raise RestartRequired(
+                    "max_num_seqs and max_num_batched_tokens size the model "
+                    "runner's request slots, input buffers and captured graphs "
+                    "at start; max_num_active_seqs and max_num_scheduled_tokens "
+                    "move below them while serving"
+                )
+            raise ControlRefused(
+                f"unknown scheduler settings {unknown}; known: {sorted(known)}"
+            )
+        seqs = args.get("max_num_active_seqs")
+        tokens = args.get("max_num_scheduled_tokens")
+
+        def integer(v: Any) -> bool:
+            return isinstance(v, int) and not isinstance(v, bool)
+
+        if seqs is not None:
+            if not integer(seqs) or seqs < 1:
+                raise ControlRefused(
+                    f"max_num_active_seqs must be an integer >= 1, got {seqs!r}"
+                )
+            if seqs > scheduler.max_num_running_reqs:
+                raise RestartRequired(
+                    f"max_num_active_seqs {seqs} is above max_num_seqs "
+                    f"{scheduler.max_num_running_reqs}, which sizes the model "
+                    f"runner's request slots and captured graphs at start; "
+                    f"restart with --max-num-seqs {seqs}"
+                )
+        if tokens is not None:
+            if not integer(tokens) or tokens < 1:
+                raise ControlRefused(
+                    f"max_num_scheduled_tokens must be an integer >= 1, got {tokens!r}"
+                )
+            if tokens > config.max_num_batched_tokens:
+                raise RestartRequired(
+                    f"max_num_scheduled_tokens {tokens} is above "
+                    f"max_num_batched_tokens {config.max_num_batched_tokens}, "
+                    f"which sizes the runner's input buffers at start; restart "
+                    f"with --max-num-batched-tokens {tokens}"
+                )
+            floor = 1 + int(getattr(scheduler, "num_spec_tokens", 0))
+            if tokens < floor:
+                raise ControlRefused(
+                    f"max_num_scheduled_tokens must hold one decode step "
+                    f"({floor} tokens with the drafter)"
+                )
+            if not config.enable_chunked_prefill and tokens < scheduler.max_model_len:
+                raise ControlRefused(
+                    "without chunked prefill a prompt must fit one step: "
+                    f"max_num_scheduled_tokens must stay >= max_model_len "
+                    f"{scheduler.max_model_len}"
+                )
+        changes: dict[str, list] = {}
+        if seqs is not None and seqs != scheduler.max_num_active_reqs:
+            changes["max_num_active_seqs"] = [scheduler.max_num_active_reqs, seqs]
+            # Admission reads it every step; requests running above a lower
+            # cap finish, new ones wait.
+            scheduler.max_num_active_reqs = seqs
+        if tokens is not None and tokens != scheduler.max_num_scheduled_tokens:
+            changes["max_num_scheduled_tokens"] = [
+                scheduler.max_num_scheduled_tokens,
+                tokens,
+            ]
+            scheduler.max_num_scheduled_tokens = tokens
+        for name, (a, b) in changes.items():
+            logger.info("Runtime control: sched.set %s %s -> %s.", name, a, b)
+        if not changes:
+            logger.info("Runtime control: sched.set unchanged.")
+        return {
+            "op": "sched.set",
+            "applied": "all",
+            "changes": changes,
+            "sched": self._sched_state(scheduler),
+        }
 
     def _kv_fit(self) -> dict[str, Any]:
         """Grow toward the reserved capacity: every rank votes the most its

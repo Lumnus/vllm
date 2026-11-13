@@ -323,6 +323,13 @@ class Scheduler(SchedulerInterface):
         # can use the drafts. Only drafters with their own forward pass reserve
         # lookahead slots.
         self.can_skip_drafts = self.num_lookahead_tokens > 0
+        # At most this many spec tokens per step, below num_spec_tokens; set
+        # over the runtime control surface (`spec.set`), None: no cap.
+        self.spec_tokens_cap: int | None = None
+        # Drafts and acceptances since start (with stats logging), and
+        # preemptions since start: read by the runtime control surface.
+        self.spec_totals: SpecDecodingStats | None = None
+        self.num_preemptions_total = 0
         self.dynamic_sd_lookup: list[int] | None = None
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
@@ -1349,13 +1356,16 @@ class Scheduler(SchedulerInterface):
                     # preserve full cudagraph for this step.
                     # Not for diffusion where draft tokens can't be padded.
                     if (
-                        (self.num_spec_tokens > 0 and self.dynamic_sd_lookup is None)
+                        (
+                            self.num_spec_tokens_now > 0
+                            and self.dynamic_sd_lookup is None
+                        )
                         and self.num_sampled_tokens_per_step > 0
                         and num_new_tokens == 1
                         and not prefill_scheduled
                         and (scheduled_running_reqs or num_computed_tokens > 0)
                     ):
-                        padded_num_tokens = 1 + self.num_spec_tokens
+                        padded_num_tokens = 1 + self.num_spec_tokens_now
                         # Pad only when there is room for the sampled token(s).
                         if (
                             num_computed_tokens
@@ -1412,7 +1422,7 @@ class Scheduler(SchedulerInterface):
                             break
                         if (
                             pad_spec_decode
-                            and num_new_tokens != 1 + self.num_spec_tokens
+                            and num_new_tokens != 1 + self.num_spec_tokens_now
                         ):
                             # Alignment clipped the placeholder rows. The split
                             # aligns prefill chunks, but the padded tail rows are
@@ -1639,10 +1649,10 @@ class Scheduler(SchedulerInterface):
                     request, num_computed_tokens, num_new_tokens
                 )
                 if pad_spec_decode:
-                    assert num_new_tokens == 1 + self.num_spec_tokens
+                    assert num_new_tokens == 1 + self.num_spec_tokens_now
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
-                    ] * self.num_spec_tokens
+                    ] * self.num_spec_tokens_now
                 # Track requests still prefilling after this chunk. A promoted load
                 # also stays tracked until _update_after_schedule drops it.
                 if (
@@ -1766,6 +1776,10 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        if self.spec_tokens_cap is not None:
+            num_spec_tokens_to_schedule = min(
+                num_spec_tokens_to_schedule, self.spec_tokens_cap
+            )
 
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
@@ -1879,6 +1893,7 @@ class Scheduler(SchedulerInterface):
         request.num_stale_output_tokens = request.num_in_flight_tokens
         request.num_output_placeholders = 0
         request.num_preemptions += 1
+        self.num_preemptions_total += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
@@ -3507,7 +3522,19 @@ class Scheduler(SchedulerInterface):
         spec_decoding_stats.observe_draft(
             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
         )
+        if self.spec_totals is None:
+            self.spec_totals = SpecDecodingStats.new(self.num_spec_tokens)
+        self.spec_totals.observe_draft(
+            num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
+        )
         return spec_decoding_stats
+
+    @property
+    def num_spec_tokens_now(self) -> int:
+        """Spec tokens per step now: num_spec_tokens, or the lower cap set
+        over the runtime control surface."""
+        cap = self.spec_tokens_cap
+        return self.num_spec_tokens if cap is None else min(cap, self.num_spec_tokens)
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
