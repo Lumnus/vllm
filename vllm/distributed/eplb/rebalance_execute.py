@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch.distributed import ProcessGroup, all_gather
 
+from vllm.distributed.eplb import fault_injection
 from vllm.distributed.eplb.eplb_communicator import EplbCommunicator
 from vllm.distributed.eplb.eplb_utils import CpuGpuEvent, device_stream
 from vllm.distributed.eplb.expert_weights import (
@@ -641,6 +642,24 @@ def _copy_rows_kernel(
     tl.store(dst_ptr + dst_row * row_len + offs, v, mask=mask)
 
 
+def _rows_kernel_applies(tensors: Sequence[ExpertWeight]) -> bool:
+    """The one-launch copy serves CUDA tensors; anything else (XPU, CPU,
+    tiered weights) copies row by row, without allocating."""
+    return all(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors)
+
+
+def _copy_rows_one_by_one(
+    dst: Sequence[ExpertWeight],
+    dst_rows: list[int],
+    src: Sequence[ExpertWeight],
+    src_rows: list[int],
+) -> None:
+    for d, s in zip(dst, src):
+        for i, j in zip(dst_rows, src_rows):
+            d[i].copy_(s[j], non_blocking=True)
+    notify_rows_written(dst, dst_rows)
+
+
 def copy_rows(
     dst: Sequence[ExpertWeight],
     dst_rows: list[int],
@@ -649,14 +668,27 @@ def copy_rows(
 ) -> None:
     """`d[i].copy_(s[j])` for every tensor pair `(d, s)` and row pair `(i, j)`,
     in one launch per tensor on CUDA (expert weights are contiguous). Tiered
-    weights hear which of their rows were written."""
-    if not all(isinstance(t, torch.Tensor) and t.is_cuda for t in (*dst, *src)):
-        for d, s in zip(dst, src):
-            for i, j in zip(dst_rows, src_rows):
-                d[i].copy_(s[j], non_blocking=True)
-        notify_rows_written(dst, dst_rows)
+    weights hear which of their rows were written.
+
+    The launch needs the row indices on the device, the one allocation here.
+    If it cannot be made the rows are copied one by one, which allocates
+    nothing: the same result on this rank, so the ranks stay consistent
+    without agreeing on anything."""
+    if not _rows_kernel_applies((*dst, *src)):
+        _copy_rows_one_by_one(dst, dst_rows, src, src_rows)
         return
-    rows = async_tensor_h2d(dst_rows + src_rows, dst[0].device, torch.int32)
+    try:
+        fault_injection.maybe_fail("copy_rows")
+        rows = async_tensor_h2d(dst_rows + src_rows, dst[0].device, torch.int32)
+    except torch.OutOfMemoryError as e:
+        logger.warning(
+            "EPLB: no memory for the row indices of %d expert rows (%s); copying "
+            "them one by one.",
+            len(dst_rows),
+            str(e).splitlines()[0],
+        )
+        _copy_rows_one_by_one(dst, dst_rows, src, src_rows)
+        return
     for d, s in zip(dst, src):
         assert isinstance(d, torch.Tensor) and isinstance(s, torch.Tensor)
         row_len = d.numel() // d.shape[0]
