@@ -112,11 +112,14 @@ def test_int8_down_is_row_batch_invariant(monkeypatch, int8_gemm):
         torch.testing.assert_close(part, full[:rows])
 
 
-def test_int8_down_without_the_kernel_refuses(monkeypatch):
+def test_int8_down_without_the_kernel_takes_its_layer(monkeypatch):
+    """Without the fused op the INT8 down runs through its layer's method
+    (test_xpu_hc_int8_up.py runs that path)."""
     if hasattr(torch.ops._xpu_C, "int8_dense_w8a8_fused_gemm"):
         pytest.skip("a build with the op is installed")
     hc = _hc_with_weights(0)
     _as_online_int8(hc)
+    assert hc.down_path == "layer" and hc._split
     with pytest.raises(NotImplementedError, match="int8_dense_w8a8_fused_gemm"):
         hc._down_operands()
 

@@ -134,7 +134,7 @@ from ..nvidia.model import (
 )
 from ..nvidia.ngram_embedding import _maps_entry
 from ..nvidia.qsa import Qwen4ExpQSAAttention
-from .hyperconnection import HyperConnection, _WeightContainer
+from .hyperconnection import HyperConnection, _WeightContainer, log_hc_paths
 from .ple_int8 import MAX_REL_ERROR, decode_rows, read_table_header, relative_l2
 from .ple_rows import RowExtent, merge_extents
 from .ple_table import (
@@ -1289,7 +1289,10 @@ class Qwen4ExpModel(Qwen3NextModel):
         # (there is no separate RMSNorm).
         if get_pp_group().is_last_rank:
             self.hyper_connection_mixer = HyperConnection(
-                config, has_inject=False, prefix=f"{prefix}.hyper_connection_mixer"
+                config,
+                has_inject=False,
+                prefix=f"{prefix}.hyper_connection_mixer",
+                quant_config=self.quant_config,
             )
         else:
             self.hyper_connection_mixer = PPMissingLayer()
@@ -1448,6 +1451,10 @@ class Qwen4ExpModel(Qwen3NextModel):
             _report_dense_qsa(self.config, self.max_model_len)
         return loaded
 
+    def process_weights_after_loading(self) -> None:
+        # Runs after every hyper-connection fixed its paths.
+        log_hc_paths(self, "model")
+
 
 class Qwen4ExpForCausalLM(
     nn.Module,
@@ -1480,6 +1487,11 @@ class Qwen4ExpForCausalLM(
         # GDN fused projections (separate in the checkpoint).
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        # Hyper-connection down and injection projections (one GEMM).
+        "input_mix_weight_down_block_inject": [
+            "input_mix_weight_down",
+            "block_inject_weight",
+        ],
     }
 
     requires_raw_input_tokens = True
@@ -1782,6 +1794,10 @@ class Qwen4ExpForConditionalGeneration(
         "kv_proj": ["key_proj", "value_proj"],
         "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        "input_mix_weight_down_block_inject": [
+            "input_mix_weight_down",
+            "block_inject_weight",
+        ],
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "model"):

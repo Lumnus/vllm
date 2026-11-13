@@ -48,9 +48,10 @@ from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     maybe_prefix,
 )
-from vllm.models.qwen4_exp.xpu.hyperconnection import HyperConnection
+from vllm.models.qwen4_exp.xpu.hyperconnection import HyperConnection, log_hc_paths
 from vllm.models.qwen4_exp.xpu.model import (
     Qwen4ExpDecoderLayer,
+    Qwen4ExpForCausalLM,
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpModel,
     _uses_qsa,
@@ -158,7 +159,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
         # Top-level hyper-connection mixer acts as the final output norm.
         self.hyper_connection_mixer = HyperConnection(
-            config, has_inject=False, prefix=f"{prefix}.hyper_connection_mixer"
+            config,
+            has_inject=False,
+            prefix=f"{prefix}.hyper_connection_mixer",
+            quant_config=vllm_config.quant_config,
         )
 
     def make_empty_intermediate_tensors(
@@ -288,6 +292,10 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=Qwen4ExpModel.hf_to_vllm_mapper)
 
+    def process_weights_after_loading(self) -> None:
+        # Runs after every hyper-connection fixed its paths.
+        log_hc_paths(self, "MTP")
+
 
 class HyperConnectionRMSNorm(nn.Module):
     """RMSNorm (deviation gamma) for the MTP embedding pre-norm.
@@ -319,6 +327,11 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     checkpoint). The LM head and token embedding are replaced by the target's
     after loading.
     """
+
+    # The target's table (the same object), so a quantization config that names
+    # the checkpoint's separate projections resolves the drafter's fused layers,
+    # the hyper-connection down and injection GEMM among them.
+    packed_modules_mapping = Qwen4ExpForCausalLM.packed_modules_mapping
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_text_config
