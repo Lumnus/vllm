@@ -65,6 +65,42 @@ from .qsa_indexer import QSAIndexer
 
 logger = init_logger(__name__)
 
+
+def indexer_projection_mismatch(
+    quant_config: QuantizationConfig,
+    qkv_proj: nn.Module,
+    index_qk_proj: nn.Module,
+) -> str | None:
+    """Why the indexer projection cannot share the q/k/v GEMM, or None.
+
+    Fusing is exact only when both run the same weight and activation scheme:
+    the same quant method class, the same checkpoint scheme where the config
+    can name it (compressed-tensors `get_scheme_dict`), and the same activation
+    and requantization source for online methods.
+    """
+    qkv_method = qkv_proj.quant_method
+    index_method = index_qk_proj.quant_method
+    if type(qkv_method) is not type(index_method):
+        return (
+            f"quant methods differ ({type(qkv_method).__name__} vs "
+            f"{type(index_method).__name__})"
+        )
+    get_scheme_dict = getattr(quant_config, "get_scheme_dict", None)
+    if callable(get_scheme_dict):
+        qkv_scheme = get_scheme_dict(qkv_proj, qkv_proj.prefix)
+        index_scheme = get_scheme_dict(index_qk_proj, index_qk_proj.prefix)
+        if qkv_scheme != index_scheme:
+            return "checkpoint schemes differ"
+    for attr in ("activation_quant_key", "weight_quant", "input_quant"):
+        if getattr(qkv_method, attr, None) != getattr(index_method, attr, None):
+            return f"{attr} differs"
+    qkv_source = getattr(qkv_method, "requantization_source", None)
+    index_source = getattr(index_method, "requantization_source", None)
+    if type(qkv_source) is not type(index_source):
+        return "requantization sources differ"
+    return None
+
+
 # Main KV cache dtypes of the QSA layers. int8_per_token_head: int8 K/V with one
 # fp32 scale per (token, KV head) stored inline after each head, the
 # TRITON_ATTN packing.
@@ -552,13 +588,29 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         )
         # Without a quant config here (BF16, or ModelOpt FP4, which keeps
         # attention in BF16) the fused layer is unquantized. Otherwise the
-        # indexer shares the q/k/v GEMM only if it uses the same quant method.
+        # indexer shares the q/k/v GEMM only if its weight and activation
+        # scheme really match q/k/v's: the fused layer takes q/k/v's scheme,
+        # so a different indexer scheme would be loaded under it silently.
         fused_quant_config = model.without_modelopt_fp4(quant_config)
-        projection_method = type(self.qkv_proj.quant_method)
-        self.fuse_indexer_projection = vllm_config.lora_config is None and (
-            fused_quant_config is None
-            or projection_method is type(self.indexer.index_qk_proj.quant_method)
-        )
+        unfused_reason = None
+        if vllm_config.lora_config is not None:
+            unfused_reason = "LoRA"
+        elif fused_quant_config is not None:
+            unfused_reason = indexer_projection_mismatch(
+                fused_quant_config, self.qkv_proj, self.indexer.index_qk_proj
+            )
+        self.fuse_indexer_projection = unfused_reason is None
+        if fused_quant_config is not None:
+            if unfused_reason is None:
+                logger.info_once(
+                    "QSA indexer projection fused into qkv_proj (%s, same scheme).",
+                    type(self.qkv_proj.quant_method).__name__,
+                )
+            else:
+                logger.info_once(
+                    "QSA indexer projection runs unfused, separate from qkv_proj: %s.",
+                    unfused_reason,
+                )
         if self.fuse_indexer_projection:
             self.index_qk_size = self.indexer.index_qk_proj.output_size
             self.qkv_proj = Qwen4ExpQSAQKVIndexerLinear(
