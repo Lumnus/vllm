@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import math
 import time
 from collections.abc import Callable
 from typing import Any, Protocol
@@ -342,6 +341,19 @@ class ServingProfiles:
                     f"no profile {name!r}; defined: {sorted(self.profiles)}"
                 )
             return {"op": op, **self.start(name)}
+        if op == "profile.get":
+            name = args.get("name")
+            if name not in self.profiles:
+                raise ControlRefused(
+                    f"no profile {name!r}; defined: {sorted(self.profiles)}"
+                )
+            return {
+                "op": op,
+                "applied": "all",
+                "profile": json.loads(json.dumps(self.profiles[name])),
+                "active": self.active == name,
+                "applying": self.current is not None and self.current.name == name,
+            }
         if op == "profile.state":
             return {"op": op, "applied": "all", **self.state()}
         raise ControlRefused(f"unknown operation {op!r}")
@@ -527,13 +539,9 @@ class ServingProfiles:
     def _kv_target(self, kv: dict[str, Any]) -> int:
         if kv.get("blocks"):
             return int(kv["blocks"])
-        cache_config = self.engine.vllm_config.cache_config
-        blocks = cache_config.num_gpu_blocks
-        tokens = getattr(cache_config, "kv_cache_size_tokens", None) or (
-            blocks * cache_config.block_size
-        )
-        per_block = tokens / blocks
-        return int(math.ceil(int(kv["tokens"]) / per_block))
+        from vllm.v1.engine.runtime_control import kv_tokens_to_blocks
+
+        return kv_tokens_to_blocks(self.engine, int(kv["tokens"]))
 
     @staticmethod
     def _fast_target(value: Any, view: FastTierView) -> int:

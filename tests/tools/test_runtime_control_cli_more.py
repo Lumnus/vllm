@@ -42,6 +42,7 @@ def test_the_schema_prints_one_line_per_parameter(capsys):
     [
         (["profile", "list"], "profile.list", {}),
         (["profile", "state"], "profile.state", {}),
+        (["profile", "get", "long-sessions"], "profile.get", {"name": "long-sessions"}),
         (
             ["profile", "apply", "long-sessions"],
             "profile.apply",

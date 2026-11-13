@@ -52,17 +52,18 @@ class Param:
     """(engine, state) -> its value now."""
 
     def describe(self, engine: Any, state: dict) -> dict[str, Any]:
+        # Every field that is set, 0 and False included (only None and an
+        # empty text mean "not given").
         out = {
             k: v
             for k, v in dataclasses.asdict(self).items()
-            if k != "read" and v not in (None, "", False)
+            if k != "read" and v is not None and not (isinstance(v, str) and v == "")
         }
+        out["nullable"] = self.nullable
         out["live"] = self.verb is not None and self.verb in VERBS
         if self.verb is not None and self.verb not in VERBS:
             out["unavailable"] = f"no operation {self.verb} in this engine"
         out["key"] = self.key or self.name.rsplit(".", 1)[-1]
-        if self.nullable:
-            out["nullable"] = True
         if self.read is not None:
             try:
                 out["value"] = self.read(engine, state)
@@ -179,7 +180,8 @@ def _register_builtin() -> None:
             "kv.resize",
             "Grow or shrink the KV cache to num_blocks.",
             args={
-                "num_blocks": "int, blocks",
+                "num_blocks": "int, blocks (or tokens)",
+                "tokens": "int, converted to blocks at the pool's tokens per block now; the reply states both",
                 "deadline_s": "float, s, drain limit of a shrink",
                 "preempt": "bool, preempt holders at the deadline",
             },
@@ -871,7 +873,21 @@ def _register_builtin() -> None:
             },
         )
     )
-    V(Verb("profile.list", "Defined profiles and the active one.", kind="read"))
+    V(
+        Verb(
+            "profile.list",
+            "Defined profiles (name, description, sections) and the active one; profile.get gives a body.",
+            kind="read",
+        )
+    )
+    V(
+        Verb(
+            "profile.get",
+            "One profile's full body as defined, and whether it is active or being applied.",
+            kind="read",
+            args={"name": "str"},
+        )
+    )
     V(
         Verb(
             "profile.apply",

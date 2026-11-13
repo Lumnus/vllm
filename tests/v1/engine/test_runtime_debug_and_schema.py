@@ -223,3 +223,105 @@ def test_the_fast_tier_port_speaks_the_fast_tiers_verb():
     absent = type("C", (), {"state": lambda self, only=None: {}})()
     view, why = SurfaceFastTierPort(absent).read()
     assert view is None and "tiers.fast" in why
+
+
+# ---------------------------------------------------------------- schema shape
+
+
+def _walk_engine():
+    engine = _Engine()
+    engine.scheduler = create_scheduler(num_speculative_tokens=2)
+    engine.vllm_config.cache_config.block_size = 16
+    engine.vllm_config.cache_config.kv_cache_size_tokens = 100 * 16
+    return engine
+
+
+def test_zero_and_false_bounds_and_defaults_are_kept():
+    schema = erc.RuntimeControl(_walk_engine()).apply("schema", {})
+    params = {p["name"]: p for p in schema["params"]}
+    assert params["kv.grow_floor_mib"]["min"] == 0
+    assert params["spec.num_speculative_tokens"]["min"] == 0
+    assert params["tower.host_available_floor_gib"]["default"] == 0.0
+    assert params["tower.host_available_floor_gib"]["min"] == 0
+    assert params["sched.max_num_active_seqs"]["nullable"] is False
+    assert params["kv.release_chunk_mib"]["nullable"] is True
+
+
+def _sample(param: dict):
+    if param.get("choices"):
+        return param["choices"][0]
+    if param["type"] == "bool":
+        return True
+    low = param.get("min")
+    if param["type"] == "int":
+        return max(int(low) if low is not None else 1, 1)
+    if param["type"] == "float":
+        return float(low) + 1.0 if low is not None else 1.0
+    return "x"
+
+
+def test_every_parameter_listed_under_an_operation_is_accepted_by_it():
+    """Posting each operation with each of its parameters, against stand-in
+    workers: a refusal may say the engine cannot do it now (no tower, no
+    EPLB, a range), never that the operation does not take that key."""
+    from vllm.entrypoints.serve.dev.control import server_defaults
+
+    engine = _walk_engine()
+    control = erc.RuntimeControl(engine)
+    schema = control.apply("schema", {})
+    verbs = {v["name"]: v for v in schema["verbs"]}
+    walked = 0
+    for param in schema["params"]:
+        if not param["live"]:
+            continue
+        assert param["name"] in verbs[param["verb"]]["params"], param["name"]
+        if param["side"] == "server":
+            assert param["key"] in [
+                *server_defaults.SAMPLING_DEFAULTS,
+                server_defaults.CJK_KEY,
+            ]
+            continue
+        body = {param["key"]: _sample(param)}
+        try:
+            control.apply(param["verb"], body)
+        except erc.ControlRefused as e:
+            text = str(e)
+            assert "unknown" not in text and "takes no arguments" not in text, (
+                param["name"],
+                text,
+            )
+        walked += 1
+    assert walked >= 30
+
+
+def test_kv_resize_takes_tokens_and_says_both():
+    engine = _walk_engine()
+    control = erc.RuntimeControl(engine)
+    reply = control.apply("kv.resize", {"tokens": 800})
+    assert reply["num_blocks"] == 50 and reply["tokens"] == 800
+    assert engine.resizes[-1][0] == 50
+    with pytest.raises(erc.ControlRefused, match="exactly one"):
+        control.apply("kv.resize", {"tokens": 800, "num_blocks": 50})
+    with pytest.raises(erc.ControlRefused, match="unknown"):
+        control.apply("kv.resize", {"blocks": 50})
+
+
+def test_profile_get_returns_the_body_as_defined():
+    engine = _walk_engine()
+    control = erc.RuntimeControl(engine)
+    body = {"name": "p", "description": "d", "sched": {"max_num_active_seqs": 4}}
+    control.apply("profile.define", body)
+    reply = control.apply("profile.get", {"name": "p"})
+    assert reply["profile"] == body and reply["active"] is False
+    control.apply("profile.apply", {"name": "p"})
+    assert control.apply("profile.get", {"name": "p"})["active"] is True
+    with pytest.raises(erc.ControlRefused, match="no profile"):
+        control.apply("profile.get", {"name": "q"})
+    verbs = {v["name"] for v in control.apply("schema", {})["verbs"]}
+    assert {
+        "profile.define",
+        "profile.list",
+        "profile.apply",
+        "profile.state",
+        "profile.get",
+    } <= verbs

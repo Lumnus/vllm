@@ -63,6 +63,7 @@ ENGINE_OPS = (
     "profile.list",
     "profile.apply",
     "profile.state",
+    "profile.get",
     "debug.set",
     "debug.state",
     "schema",
@@ -252,19 +253,40 @@ class RuntimeControl:
         if op in WORKER_OPS:
             return self._worker_op(op, args)
         if op == "kv.resize":
+            unknown = sorted(
+                set(args) - {"num_blocks", "tokens", "deadline_s", "preempt"}
+            )
+            if unknown:
+                raise ControlRefused(f"unknown kv.resize arguments {unknown}")
             num_blocks = args.get("num_blocks")
+            tokens = args.get("tokens")
+            if (num_blocks is None) == (tokens is None):
+                raise ControlRefused("give exactly one of num_blocks and tokens")
+            if tokens is not None:
+                if (
+                    not isinstance(tokens, int)
+                    or isinstance(tokens, bool)
+                    or tokens <= 0
+                ):
+                    raise ControlRefused("tokens must be a positive integer")
+                num_blocks = kv_tokens_to_blocks(self.engine, tokens)
             if not isinstance(num_blocks, int) or num_blocks <= 0:
                 raise ControlRefused("num_blocks must be a positive integer")
             record = self.engine.resize_kv_cache(
                 num_blocks, args.get("deadline_s"), bool(args.get("preempt", False))
             )
-            return {"op": op, "applied": "all", "kv": record}
+            reply = {"op": op, "applied": "all", "kv": record, "num_blocks": num_blocks}
+            if tokens is not None:
+                reply["tokens"] = tokens
+            return reply
         if op == "kv.abort":
             record = self.engine.abort_kv_cache_resize(
                 "aborted over the runtime control surface"
             )
             return {"op": op, "applied": "all", "kv": record}
         if op == "kv.fit":
+            if set(args) - {"fit"} or args.get("fit", True) is not True:
+                raise ControlRefused('kv.fit takes no arguments (or {"fit": true})')
             return self._kv_fit()
         if op.startswith("tower."):
             return self._tower_op(op, args)
@@ -296,7 +318,7 @@ class RuntimeControl:
         profiles = getattr(engine, "_serving_profiles", None)
         if profiles is None:
             # Made on first use: an engine nobody gives a profile never has one.
-            profiles = ServingProfiles(engine)
+            profiles = ServingProfiles(engine, control=self)
             engine._serving_profiles = profiles
         return profiles.operation(op, args)
 
@@ -863,6 +885,20 @@ def expert_tier_series(ranks: list[dict]) -> dict[str, dict[str, float]]:
                     series[f"slots_{tier}"] = now[tier]
         out[str(reply.get("rank", len(out)))] = {k: float(v) for k, v in series.items()}
     return out
+
+
+def kv_tokens_to_blocks(engine: Any, tokens: int) -> int:
+    """KV cache blocks that hold `tokens`, at the pool's tokens per block
+    now (hybrid models: the size in tokens the pool reports over its
+    blocks)."""
+    import math
+
+    cache_config = engine.vllm_config.cache_config
+    blocks = cache_config.num_gpu_blocks
+    size = getattr(cache_config, "kv_cache_size_tokens", None) or (
+        blocks * cache_config.block_size
+    )
+    return int(math.ceil(int(tokens) / (size / blocks)))
 
 
 def kv_demand(engine: Any) -> dict[str, Any]:

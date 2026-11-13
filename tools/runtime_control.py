@@ -33,6 +33,7 @@ server has one, is read from `VLLM_API_KEY`.
     runtime_control.py fault clear [--stage S]
     runtime_control.py profile define FILE.json   (one profile, or {"profiles": [...]})
     runtime_control.py profile list | state
+    runtime_control.py profile get NAME
     runtime_control.py profile apply NAME [--wait]
     runtime_control.py spec set [--tokens N] [--on | --off] [--reset-stats]
     runtime_control.py sched set [--max-active-seqs N] [--max-scheduled-tokens N]
@@ -212,7 +213,7 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
             _set(a, "count", ns.count)
         return f"debug.{verb}", a
     if group == "profile":
-        if verb == "apply":
+        if verb in ("apply", "get"):
             a["name"] = ns.name
         elif verb == "define":
             with open(ns.file) as f:
@@ -493,6 +494,7 @@ def _parser() -> argparse.ArgumentParser:
     pf.add_parser("define").add_argument("file")
     pf.add_parser("list")
     pf.add_parser("state")
+    pf.add_parser("get").add_argument("name")
     pa = pf.add_parser("apply")
     pa.add_argument("name")
     pa.add_argument(
