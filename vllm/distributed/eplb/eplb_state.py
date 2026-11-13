@@ -52,6 +52,7 @@ from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import PIN_MEMORY
 
+from . import fault_injection
 from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
 from .eplb_state_file import read_expert_loads, write_expert_loads
@@ -273,6 +274,11 @@ class EplbModelState:
     prepare a layer."""
     completed_rearrangements: int = 0
     """Async rearrangements whose last layer was committed."""
+    rearrangement_started: float = 0.0
+    """`time.perf_counter()` when the async rearrangement in flight started."""
+    last_rearrangement_seconds: float | None = None
+    """Seconds from start to the last layer's commit of the last completed
+    async rearrangement on this rank."""
     load_scrubbed: bool = False
     """The movers' scrub after load has been offered (it runs only with the
     layers' debug setting on)."""
@@ -392,6 +398,25 @@ class EplbState:
         """Rearrangements every rank skipped because one rank could not
         allocate memory for them (`_skip_rearrangement`); the same on every EP
         rank."""
+        # Set from outside a step by the runtime control surface
+        # (`vllm/distributed/eplb/runtime_control.py`), between two steps on
+        # every EP rank alike; read by `step`.
+        self.rearrangements_paused: bool = False
+        """While set, an interval that ends starts no rearrangement (one in
+        flight finishes); the step counter starts the next interval."""
+        self.paused_intervals: int = 0
+        """Intervals that ended while rearrangements were paused."""
+        self.next_uses_saved_load: bool = False
+        """The next rearrangement places by `last_expert_load` (loads read
+        from a state file on demand) instead of the load window."""
+        self.window_fill: int = 0
+        """Steps the load window has recorded since the last rearrangement,
+        at most its size."""
+        self.rearrangements: int = 0
+        """Rearrangements started (past both agreements; profile runs and
+        skipped ones not counted)."""
+        self.last_rearrange_seconds: float | None = None
+        """Wall time of the last synchronous rearrangement on this rank."""
         if self.device.type in ("cuda", "xpu"):
             self.device_index = self.device.index
             if self.device_index is None and torch.accelerator.is_available():
@@ -1038,6 +1063,9 @@ class EplbState:
                 self._window_token_weights[self.expert_load_window_step] = (
                     self._step_token_weight
                 )
+                self.window_fill = min(
+                    self.window_fill + 1, self.expert_load_window_size
+                )
                 self.expert_load_window_step += 1
                 if self.expert_load_window_step >= self.expert_load_window_size:
                     self.expert_load_window_step = 0
@@ -1075,7 +1103,13 @@ class EplbState:
                 self._update_layer_should_record(log_stats=log_stats)
                 return
             self.expert_rearrangement_step = 0
-            self.rearrange()
+            if self.rearrangements_paused:
+                self.paused_intervals += 1
+            else:
+                use_saved = self.next_uses_saved_load
+                self.next_uses_saved_load = False
+                self.window_fill = 0
+                self.rearrange(use_last_expert_load=use_saved)
 
         self._update_layer_should_record(log_stats=log_stats)
 
@@ -1358,7 +1392,10 @@ class EplbState:
         error: torch.OutOfMemoryError | None = None
         global_expert_load_windows: list[torch.Tensor] = []
         reduce_input: torch.Tensor | None = None
+        started = time.perf_counter()
         try:
+            if guard:
+                fault_injection.maybe_fail("load")
             global_expert_load_windows = self._logical_load_windows(
                 use_last_expert_load, is_main_rank
             )
@@ -1420,6 +1457,8 @@ class EplbState:
         plans: list[tuple[EplbModelState, torch.Tensor, Any]] = []
         error = None
         try:
+            if guard:
+                fault_injection.maybe_fail("plan")
             for eplb_model_state, global_expert_load_window in zip(
                 self.model_states.values(), global_expert_load_windows
             ):
@@ -1467,6 +1506,8 @@ class EplbState:
 
         # Phase 3: the moves. Collectives with allocations of their own; a
         # failure here is not caught (see `_skip_rearrangement`).
+        if not is_profile:
+            self.rearrangements += 1
         for eplb_model_state, global_expert_load_window, plan in plans:
             if not is_profile:
                 eplb_model_state.last_expert_load = global_expert_load_window
@@ -1523,9 +1564,12 @@ class EplbState:
                     num_gpus=num_gpus,
                 )
                 eplb_model_state.rebalanced = True
+                eplb_model_state.rearrangement_started = started
         # Signal async thread to start transferring layers
         if not sync:
             self.rearrange_event.record()
+        elif not is_profile:
+            self.last_rearrange_seconds = time.perf_counter() - started
         return None
 
     def _logical_load_windows(
@@ -2407,6 +2451,10 @@ def _move_to_workspace(
             )
             stats.clear()
         model_state.completed_rearrangements += 1
+        if model_state.rearrangement_started:
+            model_state.last_rearrangement_seconds = (
+                time.perf_counter() - model_state.rearrangement_started
+            )
         if model_state.movers is not None and model_state.movers[0] is not None:
             every = model_state.movers[0].scrub_every
             if every and model_state.completed_rearrangements % every == 0:
