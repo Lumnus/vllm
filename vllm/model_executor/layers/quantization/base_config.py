@@ -228,6 +228,19 @@ class QuantizationConfig(ABC):
         """
         raise NotImplementedError
 
+    def get_checkpoint_weight_format(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> tuple[str, int] | None:
+        """The checkpoint's weight format for `layer`, as `(kind, bits)` with
+        `kind` in {"int", "float"}, e.g. `("int", 8)` or `("int", 4)`.
+
+        Returns None when the layer is unquantized in the checkpoint or the
+        format is not known to this config. Online quantization uses it to keep
+        a checkpoint-quantized layer as it is when the online spec asks for the
+        same or a coarser integer format (see `resolve_quant_method`).
+        """
+        return None
+
     @staticmethod
     def get_cache_scale_mapper() -> "WeightsMapper":
         """Mapping from checkpoint KV-cache scale names to vLLM scale names.
@@ -308,6 +321,56 @@ class QuantizationConfig(ABC):
         pass
 
 
+def quant_key_weight_format(quant_key: Any) -> tuple[str, int] | None:
+    """`(kind, bits)` of a weight `QuantKey`'s dtype, kind in {"int", "float"}."""
+    dtype = getattr(quant_key, "dtype", None)
+    if dtype is None:
+        return None
+    if isinstance(dtype, torch.dtype):
+        if dtype.is_floating_point:
+            return "float", dtype.itemsize * 8
+        if dtype in (torch.int8, torch.int16, torch.int32):
+            return "int", dtype.itemsize * 8
+        # uint8 is the storage of packed formats (mxfp4, nvfp4, ...), not int8.
+        return None
+    # vllm ScalarType (int4 / uint4b8 / fp4 ...)
+    size_bits = getattr(dtype, "size_bits", None)
+    if size_bits is None:
+        return None
+    is_integer = getattr(dtype, "is_integer", None)
+    if callable(is_integer) and is_integer():
+        return "int", size_bits
+    return "float", size_bits
+
+
+def keeps_checkpoint_weights(
+    checkpoint_format: tuple[str, int] | None,
+    requested_format: tuple[str, int] | None,
+) -> bool:
+    """Whether an online weight spec leaves a checkpoint-quantized layer as is.
+
+    True when both are integer formats and the request is the same or coarser
+    (requested bits >= checkpoint bits): int8 on int8, int8 or int4 on int4.
+    Re-rounding then could only lose the checkpoint's calibration. Any other
+    request (a float format on an int layer, a finer int) is a genuinely
+    different format and goes through requantization.
+    """
+    if checkpoint_format is None or requested_format is None:
+        return False
+    ckpt_kind, ckpt_bits = checkpoint_format
+    req_kind, req_bits = requested_format
+    return ckpt_kind == "int" and req_kind == "int" and req_bits >= ckpt_bits
+
+
+def _record_checkpoint_layer(
+    online_config: Any, table: str, prefix: str, checkpoint: str, requested: str
+) -> None:
+    """Record a checkpoint-quantized layer an online spec matched (for the log)."""
+    layers = getattr(online_config, table, None)
+    if isinstance(layers, dict):
+        layers[prefix] = (checkpoint, requested)
+
+
 def resolve_quant_method(
     quant_config: QuantizationConfig, layer: torch.nn.Module, prefix: str
 ) -> QuantizeMethodBase | None:
@@ -351,6 +414,36 @@ def resolve_quant_method(
                 prefix, type(layer)
             )
             target_spec = target[3] if target is not None else None
+
+    if online_target is not None and not getattr(
+        online_config.args, "requantize_prequantized", False
+    ):
+        # Duck-typed configs (tests, out-of-tree) may not define the hook.
+        get_format = getattr(quant_config, "get_checkpoint_weight_format", None)
+        checkpoint_format = get_format(layer, prefix) if get_format else None
+        requested_format = quant_key_weight_format(online_target[3].weight)
+        if keeps_checkpoint_weights(checkpoint_format, requested_format):
+            # The checkpoint already holds this layer in the requested integer
+            # format (or a finer one): keep its weights and scales as they are.
+            # The online spec's activation still applies, as an activation
+            # override of the checkpoint method (e.g. int8 activations on
+            # checkpoint int4 experts, the W4A8 path).
+            from vllm.config.quantization import QuantSpec
+
+            activation = online_target[3].activation
+            keep_spec = (
+                QuantSpec(activation=activation) if activation is not None else None
+            )
+            with layer_target_spec_scope(keep_spec):
+                base_quant_method = quant_config.get_quant_method(layer, prefix)
+            _record_checkpoint_layer(
+                online_config,
+                "kept_checkpoint_layers",
+                prefix,
+                f"{checkpoint_format[0]}{checkpoint_format[1]}",  # type: ignore[index]
+                online_target[1],
+            )
+            return base_quant_method
 
     # The checkpoint method of requantized experts is only a dequantization source.
     with (
@@ -416,6 +509,13 @@ def resolve_quant_method(
 
         assert isinstance(online_quant_method, (OnlineLinearBase, OnlineMoEMethodBase))
         online_quant_method.set_requantization_source(base_quant_method)
+        _record_checkpoint_layer(
+            online_config,
+            "requantized_checkpoint_layers",
+            prefix,
+            type(base_quant_method).__name__,
+            online_target[1],
+        )
 
         # The online method dequantizes the checkpoint method before requantizing.
         return online_quant_method

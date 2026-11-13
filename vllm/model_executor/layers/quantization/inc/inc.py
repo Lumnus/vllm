@@ -311,6 +311,25 @@ class INCConfig(QuantizationConfig):
     def get_layer_config(self, layer, layer_name: str):
         return self.config_parser.get_layer_config(layer, layer_name)
 
+    def get_checkpoint_weight_format(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> tuple[str, int] | None:
+        if not isinstance(layer, (LinearBase, ParallelLMHead, RoutedExperts)):
+            return None
+        if prefix and self.extra_config:
+            for layer_name in self.extra_config:
+                if (
+                    layer_name == prefix or layer_name == f"model.{prefix}"
+                ) and self.extra_config[layer_name].get("bits", 16) >= 16:
+                    return None
+        try:
+            layer_config = self.config_parser.resolve(layer, prefix)
+        except ValueError:
+            return None
+        if not layer_config.is_wna16_int:
+            return None
+        return "int", int(layer_config.bits)
+
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
         if self.block_name_to_quantize is not None:
             self.block_name_to_quantize = hf_to_vllm_mapper.apply_list(

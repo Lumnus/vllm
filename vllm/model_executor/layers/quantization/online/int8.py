@@ -160,6 +160,9 @@ class Int8OnlineMoEMethod(OnlineMoEMethodBase):
     Loads fp16/bf16 weights and quantizes them per-row to int8 during loading.
     """
 
+    # The kernels it selects take int8 per-token dynamic activations (W8A8).
+    activation_quant_key: QuantKey | None = kInt8DynamicTokenSym
+
     def __init__(
         self,
         *,
