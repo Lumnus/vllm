@@ -89,7 +89,9 @@ class ExpertStoreConfig:
     the most slots one rearrangement changes on a rank."""
 
     stats_interval_s: float = Field(default=0.0, ge=0)
-    """Seconds between store log lines per rank; 0 for none."""
+    """Seconds between store log lines per rank (and, with
+    ``--cpu-offload-pinned-gb``, CPU expert lines: routed calls per tier,
+    host cache hits and drive reads, time per layer); 0 for none."""
 
     scrub_every: int = Field(default=0, ge=0)
     """Debugging aid, off at 0. N: once after load (every slot) and after
@@ -98,6 +100,34 @@ class ExpertStoreConfig:
     device views and compares them with the store, and the tier maps on the
     device with the placement; one log line with the counts, an error line
     naming the first mismatch. The step that scrubs waits for it."""
+
+    host_cache_gib: float = Field(default=4.0, gt=0)
+    """With ``--cpu-offload-pinned-gb``: GiB of ordinary (pageable) host
+    memory per rank for the experts computed on the CPU, a cache in front of
+    the drive. An expert a step routes to that is not in it is read from the
+    drive while the step waits (one unit, about a millisecond on NVMe)."""
+
+    cpu_threads: int = Field(default=8, ge=1, le=1024)
+    """With ``--cpu-offload-pinned-gb``: host threads per rank that compute
+    the experts on the CPU."""
+
+    cpu_isa: Literal["auto", "avx2", "scalar"] = "auto"
+    """The CPU experts' code: ``auto`` takes AVX2 with FMA and refuses to
+    start without it; ``avx2`` the same; ``scalar`` the portable code (the
+    same results, hundreds of times slower; for tests)."""
+
+    host_promote_misses: int = Field(default=0, ge=0)
+    """With ``--cpu-offload-pinned-gb``: promote a host slot to a pinned row
+    between two steps once the CPU has served it in this many layer calls
+    (counts halve every ``host_promote_window`` steps); 0 leaves the pinned
+    set to EPLB's rearrangements alone."""
+
+    host_promote_window: int = Field(default=64, ge=1)
+    """Steps per halving of the counts that ``host_promote_misses`` reads."""
+
+    host_promote_rows: int = Field(default=4, ge=0)
+    """Pinned rows per layer beyond the spare rows, for those promotions;
+    EPLB's next rearrangement chooses the pinned set again and frees them."""
 
     @model_validator(mode="after")
     def _check_dirs(self) -> "ExpertStoreConfig":
@@ -168,5 +198,12 @@ class ExpertStoreConfig:
                 "check_threads",
                 "read_timeout_s",
                 "stats_interval_s",
+                # the CPU experts act inside the opaque moe_forward op
+                "host_cache_gib",
+                "cpu_threads",
+                "cpu_isa",
+                "host_promote_misses",
+                "host_promote_window",
+                "host_promote_rows",
             },
         )
