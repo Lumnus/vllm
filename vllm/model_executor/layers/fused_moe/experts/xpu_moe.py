@@ -4,9 +4,11 @@ import copy
 import enum
 import functools
 import inspect
+from typing import Any
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed.eplb.expert_weights import ExpertWeight
 from vllm.logger import init_logger
@@ -111,6 +113,328 @@ def sentinel_ids_and_counts(
     return out.view(topk_ids.shape), counts
 
 
+@triton.jit(do_not_specialize=["hidden"])
+def _pick_rows_kernel(
+    y_ptr,
+    a_ptr,
+    a_rows_ptr,
+    b_ptr,
+    b_rows_ptr,
+    hidden,
+    HAS_B: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """y[i] = a[a_rows[i]] if a_rows[i] >= 0, else b[b_rows[i]] if
+    b_rows[i] >= 0, else zeros; i runs over the (token, top-k) pairs."""
+    i = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < hidden
+    # The row numbers as vectors, so every mask is a full vector.
+    ra = tl.zeros([BLOCK], dtype=tl.int32) + tl.load(a_rows_ptr + i)
+    in_a = ra >= 0
+    v = tl.load(
+        a_ptr + tl.maximum(ra, 0).to(tl.int64) * hidden + offs,
+        mask=m & in_a,
+        other=0.0,
+    )
+    if HAS_B:
+        rb = tl.zeros([BLOCK], dtype=tl.int32) + tl.load(b_rows_ptr + i)
+        vb = tl.load(
+            b_ptr + tl.maximum(rb, 0).to(tl.int64) * hidden + offs,
+            mask=m & (rb >= 0) & (ra < 0),
+            other=0.0,
+        )
+        v = tl.where(in_a, v, vb)
+    tl.store(y_ptr + i.to(tl.int64) * hidden + offs, v, mask=m)
+
+
+@triton.jit(do_not_specialize=["hidden"])
+def _sum_topk_kernel(
+    out_ptr,
+    w_ptr,
+    a_ptr,
+    a_rows_ptr,
+    b_ptr,
+    b_rows_ptr,
+    hidden,
+    TOPK: tl.constexpr,
+    DIRECT: tl.constexpr,
+    HAS_B: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """out[t] = sum over k = 0 .. TOPK-1, in that order, of w[t, k] times the
+    row of (t, k): row t*TOPK+k of a (DIRECT), or a[a_rows] / b[b_rows] as
+    in _pick_rows_kernel. fp32 accumulation, one store in out's dtype. A pair
+    no source holds adds an exact zero, so the order of the others, and the
+    result, do not depend on which source held which pair."""
+    t = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    m = offs < hidden
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        i = t * TOPK + k
+        wk = tl.load(w_ptr + i).to(tl.float32)
+        if DIRECT:
+            v = tl.load(a_ptr + i.to(tl.int64) * hidden + offs, mask=m, other=0.0)
+        else:
+            ra = tl.zeros([BLOCK], dtype=tl.int32) + tl.load(a_rows_ptr + i)
+            in_a = ra >= 0
+            v = tl.load(
+                a_ptr + tl.maximum(ra, 0).to(tl.int64) * hidden + offs,
+                mask=m & in_a,
+                other=0.0,
+            )
+            if HAS_B:
+                rb = tl.zeros([BLOCK], dtype=tl.int32) + tl.load(b_rows_ptr + i)
+                vb = tl.load(
+                    b_ptr + tl.maximum(rb, 0).to(tl.int64) * hidden + offs,
+                    mask=m & (rb >= 0) & (ra < 0),
+                    other=0.0,
+                )
+                v = tl.where(in_a, v, vb)
+        acc += v.to(tl.float32) * wk
+    tl.store(
+        out_ptr + t.to(tl.int64) * hidden + offs,
+        acc.to(out_ptr.dtype.element_ty),
+        mask=m,
+    )
+
+
+_COMBINE_BLOCK = 1024
+# Tokens per exchange in "exact" mode: bounds the per-(token, top-k) buffer
+# to EXACT_CHUNK x top_k x hidden values.
+EXACT_CHUNK = 512
+
+
+def sum_topk(
+    out: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sources: list[tuple[torch.Tensor, torch.Tensor]],
+) -> None:
+    """``out[t] = sum_k topk_weights[t, k] * row(t, k)`` in k order, fp32
+    accumulation, one rounding to ``out``'s dtype. ``sources`` are one or
+    two ``(rows, row_map)``: the expert-grouped outputs of a fused-MoE call
+    and its ``[tokens, top_k]`` map (-1: not computed there); a pair is taken
+    from the first source that holds it. The sum is the same bits whichever
+    source held which pair."""
+    num_tokens, top_k = topk_weights.shape
+    if num_tokens == 0:
+        return
+    hidden = out.shape[-1]
+    a, a_rows = sources[0]
+    b, b_rows = sources[1] if len(sources) > 1 else (a, a_rows)
+    grid = (num_tokens, triton.cdiv(hidden, _COMBINE_BLOCK))
+    _sum_topk_kernel[grid](
+        out,
+        topk_weights.contiguous(),
+        a,
+        a_rows.contiguous(),
+        b,
+        b_rows.contiguous(),
+        hidden,
+        TOPK=top_k,
+        DIRECT=False,
+        HAS_B=len(sources) > 1,
+        BLOCK=_COMBINE_BLOCK,
+    )
+
+
+def sum_topk_direct(
+    out: torch.Tensor, topk_weights: torch.Tensor, per_k: torch.Tensor
+) -> None:
+    """``sum_topk`` over a dense ``[tokens * top_k, hidden]`` buffer."""
+    num_tokens, top_k = topk_weights.shape
+    if num_tokens == 0:
+        return
+    hidden = out.shape[-1]
+    grid = (num_tokens, triton.cdiv(hidden, _COMBINE_BLOCK))
+    _sum_topk_kernel[grid](
+        out,
+        topk_weights.contiguous(),
+        per_k,
+        per_k,
+        per_k,
+        per_k,
+        hidden,
+        TOPK=top_k,
+        DIRECT=True,
+        HAS_B=False,
+        BLOCK=_COMBINE_BLOCK,
+    )
+
+
+def pick_rows(
+    per_k: torch.Tensor, sources: list[tuple[torch.Tensor, torch.Tensor]]
+) -> None:
+    """``per_k[i]`` = the row of pair ``i`` from the first source holding it,
+    zeros where none does (see ``sum_topk``)."""
+    if per_k.shape[0] == 0:
+        return
+    hidden = per_k.shape[-1]
+    a, a_rows = sources[0]
+    b, b_rows = sources[1] if len(sources) > 1 else (a, a_rows)
+    grid = (per_k.shape[0], triton.cdiv(hidden, _COMBINE_BLOCK))
+    _pick_rows_kernel[grid](
+        per_k,
+        a,
+        a_rows.contiguous().view(-1),
+        b,
+        b_rows.contiguous().view(-1),
+        hidden,
+        HAS_B=len(sources) > 1,
+        BLOCK=_COMBINE_BLOCK,
+    )
+
+
+def combine_exact(
+    output: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sources: list[tuple[torch.Tensor, torch.Tensor]],
+    ep_rank: int,
+    all_reduce: Any,
+    chunk: int = EXACT_CHUNK,
+) -> None:
+    """The routed sum independent of where each expert was computed.
+
+    Every (token, top-k) pair is computed by exactly one expert-parallel rank
+    (one tier of it): each rank writes the pairs it holds into a dense
+    ``[tokens * top_k, hidden]`` buffer, zeros elsewhere, and the all-reduce
+    adds them; with one nonzero term per element that sum is exact. Each
+    rank then has every pair, and rank 0 sums them in k order (``sum_topk``);
+    the other ranks output zeros, so the layer's usual all-reduce of the
+    ranks' outputs adds this sum to nothing. Done in chunks of ``chunk``
+    tokens to bound the buffer."""
+    num_tokens, top_k = topk_weights.shape
+    hidden = output.shape[-1]
+    if ep_rank != 0:
+        output.zero_()
+    for start in range(0, num_tokens, chunk):
+        end = min(start + chunk, num_tokens)
+        per_k = torch.empty(
+            ((end - start) * top_k, hidden),
+            dtype=sources[0][0].dtype,
+            device=output.device,
+        )
+        pick_rows(per_k, [(rows, rmap[start:end]) for rows, rmap in sources])
+        per_k = all_reduce(per_k)
+        if ep_rank == 0:
+            sum_topk_direct(output[start:end], topk_weights[start:end], per_k)
+
+
+class _Captured:
+    """The expert-grouped outputs of one fused-MoE call, from its
+    ``output_hook``: (gemm2 output, row map)."""
+
+    def __init__(self) -> None:
+        self.rows: torch.Tensor | None = None
+        self.row_map: torch.Tensor | None = None
+
+    def __call__(
+        self, gemm2_output: torch.Tensor, act: torch.Tensor, row_map: torch.Tensor
+    ) -> None:
+        self.rows, self.row_map = gemm2_output, row_map
+
+    def source(self) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.rows is not None and self.row_map is not None, (
+            "the fused MoE did not call its output_hook"
+        )
+        return self.rows, self.row_map
+
+
+@functools.cache
+def fused_moe_has_output_hook() -> bool:
+    return "output_hook" in inspect.signature(XpuFusedMoe.apply).parameters
+
+
+class PlacementTrace:
+    """Debug: where each routed expert of every token was computed.
+
+    Set ``VLLM_XPU_MOE_PLACEMENT_TRACE=<prefix>`` and create ``<prefix>.on``
+    while the request of interest runs alone; each rank appends one JSON line
+    per MoE layer call to ``<prefix>.rank<R>.jsonl``: the layer, the call
+    number, and per token and top-k the physical expert id, the router
+    weight, and on this rank ``F<row>`` (device tier), ``S<row>`` (host
+    tier) or ``-`` (another rank), plus the logical expert where this rank
+    knows it (expert store on). Graph replays run no Python, so only eager
+    steps are traced (boot with --enforce-eager for a full trace)."""
+
+    MAX_LINES = 200_000
+
+    def __init__(self, prefix: str, ep_rank: int):
+        self.prefix = prefix
+        self.path = f"{prefix}.rank{ep_rank}.jsonl"
+        self.ep_rank = ep_rank
+        self.calls: dict[str, int] = {}
+        self.lines = 0
+
+    def active(self) -> bool:
+        import os
+
+        accelerator = torch.accelerator
+        capturing = (
+            accelerator.is_available() and accelerator.current_stream().is_capturing()
+        )
+        return (
+            self.lines < self.MAX_LINES
+            and not capturing
+            and os.path.exists(self.prefix + ".on")
+        )
+
+    def record(
+        self,
+        tiers: "ExpertTiers",
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> None:
+        import json
+
+        from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+
+        name = tiers.layer_name
+        call = self.calls.get(name, 0)
+        self.calls[name] = call + 1
+        assert tiers.fast_map is not None and tiers.slow_map is not None
+        with gpu_sync_allowed():
+            ids = topk_ids.long().cpu()
+            weights = topk_weights.float().cpu()
+            fast_map = tiers.fast_map.cpu()
+            slow_map = tiers.slow_map.cpu()
+        valid = (ids >= 0) & (ids < tiers.num_global)
+        safe = torch.where(valid, ids, torch.zeros_like(ids))
+        fast_row = torch.where(valid, fast_map[safe].long(), -1)
+        slow_row = torch.where(valid, slow_map[safe].long(), -1)
+        logical = tiers.slot_logical
+        where: list[list[str]] = []
+        experts: list[list[int]] = []
+        for t in range(ids.shape[0]):
+            row_where, row_logical = [], []
+            for k in range(ids.shape[1]):
+                g = int(ids[t, k])
+                if fast_row[t, k] >= 0:
+                    row_where.append(f"F{int(fast_row[t, k])}")
+                elif slow_row[t, k] >= 0:
+                    row_where.append(f"S{int(slow_row[t, k])}")
+                else:
+                    row_where.append("-")
+                slot = tiers.local_of.get(g, -1) if logical is not None else -1
+                row_logical.append(int(logical[slot]) if slot >= 0 else -1)
+            where.append(row_where)
+            experts.append(row_logical)
+        entry = {
+            "layer": name,
+            "call": call,
+            "rank": self.ep_rank,
+            "tokens": int(ids.shape[0]),
+            "physical": ids.tolist(),
+            "weight": [[round(float(x), 6) for x in r] for r in weights],
+            "where": where,
+            "logical": experts if logical is not None else None,
+        }
+        with open(self.path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        self.lines += 1
+
+
 class EPIdsContract(enum.Enum):
     """Who handles the routed ids a rank does not own, per vllm-xpu-kernels."""
 
@@ -173,6 +497,10 @@ class XPUExperts(mk.FusedMoEExpertsModular):
     impl_apply_kwargs: dict = {}
     # Expert slots in device and host tiers, set by ExpertTiers.finalize.
     tiers: ExpertTiers | None = None
+    # How a token's routed experts are summed (VLLM_XPU_MOE_COMBINE) and the
+    # debug placement trace; set per instance in __init__.
+    combine_mode: str = "split"
+    placement_trace: "PlacementTrace | None" = None
     # apply() reads the weights of the XpuFusedMoe it builds on first use, and
     # stages those itself (staged_impl).
     reads_weight_args = False
@@ -195,6 +523,12 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         is_xe2_or_xe3 = torch.ops._xpu_C.is_xe2_arch() or torch.ops._xpu_C.is_xe3_arch()
         self._expects_unquantized_inputs = is_xe2_or_xe3
         self.ep_contract = ep_ids_contract_for(moe_config)
+        # VLLM_XPU_MOE_COMBINE: "split" is the stock sum (see envs.py).
+        self.combine_mode: str = envs.VLLM_XPU_MOE_COMBINE
+        trace = envs.VLLM_XPU_MOE_PLACEMENT_TRACE
+        self.placement_trace = (
+            PlacementTrace(trace, moe_config.ep_rank) if trace else None
+        )
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -374,6 +708,20 @@ class XPUExperts(mk.FusedMoEExpertsModular):
                 ep_kwargs = {"ids_valid": True, "rows_per_expert": rows_per_expert}
             else:
                 topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
+        if self.moe_config.ep_size > 1 and self._combine_mode(a1q_scale) == "exact":
+            captured = _Captured()
+            impl.apply(
+                output=output,
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                a1q_scale=a1q_scale,
+                output_hook=captured,
+                **self.impl_apply_kwargs,
+                **ep_kwargs,
+            )
+            self._combine_exact(output, topk_weights, [captured.source()])
+            return
         impl.apply(
             output=output,
             hidden_states=hidden_states,
@@ -382,6 +730,54 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             a1q_scale=a1q_scale,
             **self.impl_apply_kwargs,
             **ep_kwargs,
+        )
+
+    def _combine_mode(self, a1q_scale: torch.Tensor | None = None) -> str:
+        """The VLLM_XPU_MOE_COMBINE mode this call runs; raises when a mode
+        other than "split" cannot run here (it needs the fused MoE's
+        output_hook, which takes unquantized activations and no W4A8)."""
+        mode = self.combine_mode
+        if mode == "split":
+            return mode
+        why = None
+        if not fused_moe_has_output_hook():
+            why = "the installed vllm-xpu-kernels' XpuFusedMoe.apply has no output_hook"
+        elif self.impl_apply_kwargs.get("w4a8"):
+            why = "the W4A8 experts path runs no output_hook"
+        elif a1q_scale is not None:
+            why = "the activations are quantized"
+        elif mode == "exact" and getattr(self.moe_config, "dp_size", 1) > 1:
+            why = "data parallelism: the ranks do not hold the same tokens"
+        if why is not None:
+            raise ValueError(f"VLLM_XPU_MOE_COMBINE={mode}: not available: {why}")
+        logger.info_once(
+            "XPU MoE combine: %s (VLLM_XPU_MOE_COMBINE). %s",
+            mode,
+            "One sum over both expert tiers of a rank, independent of the tiers."
+            if mode == "rank"
+            else "Per-expert outputs exchanged between the expert-parallel "
+            "ranks and summed once in top-k order: independent of the rank "
+            "and tier of every expert.",
+        )
+        return mode
+
+    def _combine_exact(
+        self,
+        output: torch.Tensor,
+        topk_weights: torch.Tensor,
+        sources: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> None:
+        if self.moe_config.ep_size > 1:
+            from vllm.distributed.parallel_state import get_ep_group
+
+            all_reduce = get_ep_group().all_reduce
+        else:
+
+            def all_reduce(t: torch.Tensor) -> torch.Tensor:
+                return t
+
+        combine_exact(
+            output, topk_weights, sources, self.moe_config.ep_rank, all_reduce
         )
 
     def _apply_tiered(
@@ -401,6 +797,35 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             topk_ids = remap_unrouted(
                 topk_ids, tiers.num_global, self.moe_config.ep_rank
             )
+        if self.placement_trace is not None and self.placement_trace.active():
+            self.placement_trace.record(tiers, topk_ids, topk_weights)
+        mode = self._combine_mode()
+        if mode != "split":
+            captured = (_Captured(), _Captured())
+            fast.apply(
+                output=output,
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                output_hook=captured[0],
+                **self.impl_apply_kwargs,
+            )
+            # The slow call's own sum lands here and is not used.
+            slow_out = torch.empty_like(output)
+            staged_impl(slow, hidden_states.size(0), "slow").apply(
+                output=slow_out,
+                hidden_states=hidden_states,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                output_hook=captured[1],
+                **self.impl_apply_kwargs,
+            )
+            sources = [c.source() for c in captured]
+            if mode == "rank":
+                sum_topk(output, topk_weights, sources)
+            else:
+                self._combine_exact(output, topk_weights, sources)
+            return
         fast.apply(
             output=output,
             hidden_states=hidden_states,
