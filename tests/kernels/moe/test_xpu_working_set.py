@@ -350,6 +350,7 @@ def test_a_large_call_stages_its_busy_cpu_experts_to_the_card(
     for name, unit in expert_in_store(env, 1, 6).items():
         assert torch.equal(rows.rows_u8(name)[0], unit.reshape(-1).view(torch.uint8))
     assert impl.expert_map is rows.map and impl.num_experts == rows.num_rows
+    assert rows.num_rows == tiers.num_host == 3  # one per CPU slot by default
     assert tiers.stage_impl(rows) is impl  # built once
     # the CPU computes the rest: expert 7 (token 2) and 5 (token 3)
     out = rt.finish(pending, torch.device("cpu"))

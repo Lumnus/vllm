@@ -1052,7 +1052,7 @@ class ExpertTiers:
             ws = self._ws
             want = 0 if ws is None else int(ws.settings.stage_rows)
             assert self.placement is not None
-            rows = want or max(1, self.num_slow)
+            rows = want or max(1, self.num_host)
             _STAGE_ROWS = StageRows(self.slow, rows, self.num_global, device)
             logger.info(
                 "CPU experts: %d staging rows (%.2f GiB pinned) for the experts "
