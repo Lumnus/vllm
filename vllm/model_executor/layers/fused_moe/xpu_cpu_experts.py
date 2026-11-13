@@ -214,6 +214,9 @@ class HostExpertCache:
         self._free: list[int] = list(range(num_rows))
         self._filling: dict[Key, tuple[int, Future]] = {}
         self._busy: set[int] = set()
+        # Rows a background copy reads (out of the cache into a pinned row):
+        # a count per row, never evicted while above zero.
+        self._held: dict[int, int] = {}
         self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0  # read from the drive while a step waited
@@ -242,7 +245,7 @@ class HostExpertCache:
         if not evict:
             return None
         for key, row in self._rows.items():  # oldest first
-            if row not in self._busy:
+            if row not in self._busy and row not in self._held:
                 del self._rows[key]
                 self.evicted += 1
                 return row
@@ -364,6 +367,29 @@ class HostExpertCache:
         with self._lock:
             return self._rows.get(key)
 
+    def copy_unit_out(self, key: Key, dests: Mapping[str, torch.Tensor]) -> bool:
+        """Copy the unit of ``key`` from its row into ``dests`` (the four
+        tensors of a pinned row), from any thread: the row is held, so not
+        evicted, while it is copied. False when the cache does not hold it."""
+        with self._lock:
+            row = self._rows.get(key)
+            if row is None:
+                return False
+            self._rows.move_to_end(key)
+            self._held[row] = self._held.get(row, 0) + 1
+        try:
+            src = self.dests(row)
+            for name, dst in dests.items():
+                dst.copy_(src[name])
+        finally:
+            with self._lock:
+                left = self._held.get(row, 1) - 1
+                if left > 0:
+                    self._held[row] = left
+                else:
+                    self._held.pop(row, None)
+        return True
+
     def rows_for_gib(self, gib: float) -> int:
         return max(1, int(gib * 2**30) // self.layout.row_bytes)
 
@@ -377,6 +403,11 @@ class HostExpertCache:
                 )
             if self._busy:
                 return "a layer call holds rows of the host cache"
+            if self._held:
+                return (
+                    "rows of the host cache are being copied into pinned rows; "
+                    "ask again"
+                )
         return None
 
     def resize(self, num_rows: int) -> None:
@@ -387,7 +418,7 @@ class HostExpertCache:
         if num_rows < 1:
             raise ValueError("the host expert cache needs at least one row")
         with self._lock:
-            if self._filling or self._busy:
+            if self._filling or self._busy or self._held:
                 raise RuntimeError(self.resize_refusal_locked())
             keep = list(self._rows.items())[-num_rows:]  # LRU order: newest last
             new_map = mmap.mmap(-1, num_rows * self.layout.row_bytes)
@@ -407,6 +438,8 @@ class HostExpertCache:
     def resize_refusal_locked(self) -> str:
         if self._filling:
             return f"{len(self._filling)} reads into the host cache are in flight"
+        if self._held:
+            return "rows of the host cache are being copied into pinned rows"
         return "a layer call holds rows of the host cache"
 
 
@@ -437,6 +470,11 @@ class Pending:
     num_tokens: int
     event: Any
     buffers: _Buffers
+    waited: bool = False
+    # The layer's host calls, once listed (by `stage`), and the physical ids
+    # staged to the card, which the CPU leaves out.
+    selection: Any = None
+    staged: np.ndarray | None = None
 
 
 @dataclass
@@ -463,8 +501,13 @@ class CpuExpertStats:
     max_calls: int = 0
     max_experts: int = 0  # most distinct experts one layer call needed
     per_tier: dict[str, int] = field(
-        default_factory=lambda: {"card": 0, "pinned": 0, "cpu": 0}
+        default_factory=lambda: {"card": 0, "pinned": 0, "cpu": 0, "staged": 0}
     )
+    # prefill staging (stage_min_calls): layer calls that staged, experts
+    # staged, calls they carried, host ms copying them into the rows
+    stage_layers: int = 0
+    stage_experts: int = 0
+    stage_ms: float = 0.0
 
 
 class CpuExpertRuntime:
@@ -693,10 +736,77 @@ class CpuExpertRuntime:
         n, b = pending.num_tokens, pending.buffers
         self._wait(pending)
         if not self.compute(
-            pending.tiers, b.ids[:n], b.weights[:n], b.x[:n], b.out[:n]
-        ):
+            pending.tiers, b.ids[:n], b.weights[:n], b.x[:n], b.out[:n],
+            selection=pending.selection, staged=pending.staged,
+        ):  # fmt: skip
             return None
         return b.out[:n].to(device, non_blocking=True)
+
+    def stage(self, pending: Pending, device: torch.device) -> Any:
+        """Prefill staging (``stage_min_calls``): wait for the routing, and
+        copy the CPU-tier experts this layer call routes at least that many
+        tokens to into the staging rows (most calls first, as far as the rows
+        go), with their map. Returns the layer's kernel call over the rows for
+        the caller to run on the card, or None (nothing staged); the CPU then
+        computes only the rest (:meth:`finish`)."""
+        threshold = int(self.config.stage_min_calls)
+        if threshold <= 0:
+            return None
+        n, b = pending.num_tokens, pending.buffers
+        self._wait(pending)
+        tiers = pending.tiers
+        ids = b.ids[:n].numpy()
+        selection = tiers._host_selection(ids)
+        pending.selection = selection
+        keys, tok, k, _ = selection
+        if not keys or len(keys) < threshold:
+            return None
+        start = time.perf_counter()
+        phys = ids[tok, k]
+        uniq, counts = np.unique(phys, return_counts=True)
+        heavy = uniq[counts >= threshold]
+        if heavy.size == 0:
+            return None
+        rows = tiers.stage_rows(device)
+        if heavy.size > rows.num_rows:  # the busiest ones
+            by_calls = counts[counts >= threshold]
+            heavy = heavy[np.argsort(-by_calls, kind="stable")[: rows.num_rows]]
+        assert tiers.slot_logical is not None and tiers.store_binding is not None
+        layer = tiers.store_binding.store_layer
+        heavy_keys = [
+            (layer, int(tiers.slot_logical[tiers._slot_of_global[p]])) for p in heavy
+        ]
+        cache_rows = self.cache.acquire(heavy_keys)
+        try:
+            for i, row in enumerate(cache_rows):
+                src = self.cache.dests(row)
+                for name in UNIT_TENSORS:
+                    rows.rows_u8(name)[i].copy_(src[name])
+        finally:
+            self.cache.release(cache_rows)
+        rows.map_host.fill_(-1)
+        rows.map_host[torch.from_numpy(heavy.astype(np.int64))] = torch.arange(
+            heavy.size, dtype=torch.int32
+        )
+        rows.map.copy_(rows.map_host, non_blocking=True)
+        pending.staged = heavy
+        st = self.stats
+        staged_calls = int(np.isin(phys, heavy).sum())
+        st.stage_layers += 1
+        st.stage_experts += int(heavy.size)
+        st.per_tier["staged"] += staged_calls
+        st.stage_ms += (time.perf_counter() - start) * 1e3
+        logger.info_once(
+            "CPU experts: a large step's CPU-tier experts were staged to the card "
+            "(%s: %d experts with at least %d calls each, %d calls; the CPU "
+            "computes the other %d).",
+            tiers.layer_name,
+            heavy.size,
+            threshold,
+            staged_calls,
+            len(keys) - staged_calls,
+        )
+        return tiers.stage_impl(rows)
 
     def finish_pairs(self, pending: Pending, device: torch.device) -> HostPairs | None:
         """:meth:`finish` for a sum that takes each pair's own row (the
@@ -728,9 +838,12 @@ class CpuExpertRuntime:
     def _wait(self, pending: Pending) -> None:
         from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
+        if pending.waited:
+            return
         start = time.perf_counter()
         with gpu_sync_allowed():
             pending.event.synchronize()
+        pending.waited = True
         self.stats.wait_ms += (time.perf_counter() - start) * 1e3
 
     def compute(
@@ -740,13 +853,28 @@ class CpuExpertRuntime:
         weights: torch.Tensor,
         x: torch.Tensor,
         out: torch.Tensor,
+        *,
+        selection: Any = None,
+        staged: np.ndarray | None = None,
     ) -> bool:
         """On the host: the calls of ``ids`` [T, K] (with ``weights``) that
         this rank computes on the CPU, applied to ``x`` [T, H] and summed per
         token into ``out`` (overwritten). False when there is none (``out``
-        untouched)."""
+        untouched). ``selection``: the layer's host calls if already listed;
+        ``staged``: physical ids the card computes from staging rows, left
+        out here."""
         waited = time.perf_counter()
-        keys, tokens, call_w, by_tier = tiers.host_calls(ids.numpy(), weights.numpy())
+        ids_np = ids.numpy()
+        if selection is None:
+            selection = tiers._host_selection(ids_np)
+        keys, tok, k, by_tier = selection
+        if staged is not None and len(keys):
+            keep = ~np.isin(ids_np[tok, k], staged)
+            by_tier = dict(by_tier, cpu=by_tier["cpu"] - int((~keep).sum()))
+            keys = [key for key, kept in zip(keys, keep) if kept]
+            tok, k = tok[keep], k[keep]
+        tokens = tok.astype(np.int32)
+        call_w = np.ascontiguousarray(weights.numpy()[tok, k], dtype=np.float32)
         return self._run_calls(
             tiers, keys, by_tier, x, out, torch.from_numpy(tokens),
             torch.from_numpy(call_w), ids.shape[0], waited,
@@ -877,10 +1005,15 @@ class CpuExpertRuntime:
             "compute_ms": st.compute_ms,
             "promotions": st.promotions,
             "demotions": st.demotions,
+            "routed_staged": st.per_tier["staged"],
+            "stage_layers": st.stage_layers,
+            "stage_experts": st.stage_experts,
+            "stage_ms": st.stage_ms,
         }
 
     def log_stats(self) -> None:
         s = self.snapshot()
+        self._log_shares_since_last(s)
         routed = max(1, s["routed_card"] + s["routed_pinned"] + s["routed_cpu"])
         layers = max(1, s["layers_with_cpu_calls"])
         logger.info(
@@ -910,6 +1043,29 @@ class CpuExpertRuntime:
             s["demotions"],
         )
 
+    def _log_shares_since_last(self, s: dict[str, float]) -> None:
+        """The share of routed calls per tier since the last line (the main
+        line's shares are since start): the CPU share over time."""
+        keys = ("routed_card", "routed_pinned", "routed_cpu", "routed_staged")
+        last = getattr(self, "_last_snapshot", None)
+        self._last_snapshot = {k: s[k] for k in keys}
+        if last is None:
+            return
+        delta = {k: s[k] - last[k] for k in keys}
+        total = sum(delta.values())
+        if total <= 0:
+            return
+        logger.info(
+            "CPU experts: since the last line the card served %.1f %% of this "
+            "rank's routed calls, pinned rows %.1f %%, the CPU %.1f %%, staging "
+            "rows %.1f %% (%d calls).",
+            100.0 * delta["routed_card"] / total,
+            100.0 * delta["routed_pinned"] / total,
+            100.0 * delta["routed_cpu"] / total,
+            100.0 * delta["routed_staged"] / total,
+            total,
+        )
+
 
 _RUNTIME: CpuExpertRuntime | None = None
 _RUNTIME_LOCK = threading.Lock()
@@ -937,7 +1093,13 @@ def current_runtime() -> CpuExpertRuntime | None:
 
 
 def reset_runtime() -> None:
-    """Forget the process's CPU tier (tests; a new model load)."""
+    """Forget the process's CPU tier (tests; a new model load), with the
+    staging rows that belong to it."""
     global _RUNTIME
     with _RUNTIME_LOCK:
         _RUNTIME = None
+    from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
+        reset_stage_rows,
+    )
+
+    reset_stage_rows()

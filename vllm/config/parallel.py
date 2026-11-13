@@ -184,6 +184,39 @@ class EPLBConfig:
     while it carries more than this times that expert's load, so experts of
     near-equal load do not move back and forth."""
 
+    tier_interval: int = Field(default=0, ge=0)
+    """With expert slots in tiers backed by the expert store: every this many
+    steps, a tier pass: a rearrangement that moves no expert between ranks,
+    only slots of a rank between its card rows, pinned rows and the CPU
+    (`--cpu-offload-pinned-gb`), cut from the same load window by the same
+    plan and committed the same way, one layer per step, at most
+    `tier_max_moves` experts read per layer. 0 (default): tiers change only
+    in full rearrangements. The window records every step while it is on.
+    Changeable while serving (`eplb.set`)."""
+
+    tier_max_moves: int | None = Field(default=None, ge=1)
+    """With `tier_interval`: experts a tier pass reads per layer and rank (a
+    slot entering a pinned row, or a card row from the CPU, is one read);
+    None: the layer's spare rows, the most it can take."""
+
+    tier_hot: float = Field(default=1.5, gt=0)
+    """Readout of the tiers: an expert whose load in the window is at least
+    this many times the mean expert's is hot."""
+
+    tier_warm: float = Field(default=0.5, gt=0)
+    """Readout of the tiers: at least this many times the mean expert's
+    load is warm, below is cold. The classes are thresholds over the same
+    order of experts by load whose cut points (the tiers' capacities) the
+    plan uses; a drop to a lower class waits for `tier_hysteresis`."""
+
+    seed_path: str | None = None
+    """Loads to place the experts (and their tiers) by at start when
+    `state_path` gives none (unset, or no file yet): an EPLB state file
+    (also written from a routing trace by `tools/analyze_expert_trace.py
+    --write-loads`), a rankings file (decoder layer number -> logical
+    experts, hottest first) or a learned-state file (`{"layers": {layer:
+    {expert: score}}}`)."""
+
     decode_token_weight: float = Field(default=1.0, ge=0)
     """Weight of a decode token in the expert load EPLB balances by.
     With `prefill_token_weight`, chooses whose routing the placement
@@ -247,6 +280,11 @@ class EPLBConfig:
                 "trace_keep",
                 "max_moves_per_rank",
                 "tier_hysteresis",
+                "tier_interval",
+                "tier_max_moves",
+                "tier_hot",
+                "tier_warm",
+                "seed_path",
                 "decode_token_weight",
                 "prefill_token_weight",
                 "residency_mask_share",
@@ -261,6 +299,8 @@ class EPLBConfig:
 
     @model_validator(mode="after")
     def _validate_eplb_config(self) -> Self:
+        if self.tier_warm > self.tier_hot:
+            raise ValueError("tier_warm must not be above tier_hot")
         if self.trace_sample is not None and self.trace_sample > self.trace_interval:
             raise ValueError("trace_sample cannot exceed trace_interval")
         if self.use_async and self.policy not in ("default", "incremental"):

@@ -60,6 +60,11 @@ def run_rebalance_experts(
     # Move the global expert load window to CPU for computation.
     with device_stream(stream):
         global_expert_load_window = eplb_stats.global_expert_load_window.cpu()
+    if eplb_stats.tier_only:
+        # A tier pass: every expert stays on its rank and in its slot; the
+        # movers cut their tiers from the window.
+        model_state.plan_load = global_expert_load_window
+        return physical_to_logical_map_cpu.clone()
     # Compute new expert mappings for the model
     new_physical_to_logical_map = eplb_state.policy.rebalance_experts(
         global_expert_load_window,
@@ -185,11 +190,17 @@ def _transfer_cycle(
                 assert model_state.plan_load is not None
                 started = time.perf_counter()
                 try:
+                    config = state.parallel_config.eplb_config
+                    tier_only = bool(
+                        model_state.eplb_stats is not None
+                        and model_state.eplb_stats.tier_only
+                    )
                     prepared = mover.prepare(
                         physical_to_logical_map_cpu[layer_idx].numpy(),
                         new_physical_to_logical_map[layer_idx].numpy(),
                         model_state.plan_load[layer_idx].float().numpy(),
-                        state.parallel_config.eplb_config.tier_hysteresis,
+                        config.tier_hysteresis,
+                        **({"read_budget": config.tier_max_moves} if tier_only else {}),
                     )
                 except Exception:
                     # A rearrangement is optional work: a read that failed or
@@ -273,10 +284,59 @@ def _transfer_cycle(
                 return
             layer_idx += 1
         if ep_rank == 0:
+            tier_only = bool(
+                model_state.eplb_stats is not None and model_state.eplb_stats.tier_only
+            )
             logger.info(
-                "Async EPLB rearranged %d/%d layers of %s in %.2f s.",
+                "Async EPLB %s %d/%d layers of %s in %.2f s.",
+                "tier pass over" if tier_only else "rearranged",
                 layer_idx,
                 num_layers,
                 model_state.model_name,
                 time.perf_counter() - t_start,
             )
+            _log_tier_classes(state, model_state)
+
+
+def _log_tier_classes(state: "EplbState", model_state: "EplbModelState") -> None:
+    """One line after a pass over layers that keep their slots in tiers: per
+    layer of this rank, the experts that are hot, warm and cold by the window
+    the pass planned with, against the rows each tier has."""
+    movers = model_state.movers
+    if not movers or movers[0] is None or not hasattr(movers[0], "class_readout"):
+        return
+    config = state.parallel_config.eplb_config
+    rows = [
+        r
+        for m in movers
+        if m is not None
+        for r in [
+            m.class_readout(config.tier_hot, config.tier_warm, config.tier_hysteresis)
+        ]
+        if r is not None
+    ]
+    if not rows:
+        return
+    n = len(rows)
+
+    def mean(key: str) -> float:
+        return sum(r[key] for r in rows) / n
+
+    logger.info(
+        "EPLB tiers of %s: per layer hot %.1f, warm %.1f, cold %.1f (by the "
+        "window: >= %g and >= %g x the mean expert) against card rows %d and "
+        "pinned rows %d; warm or hot on the CPU %.1f, cold on the card %.1f; "
+        "%d layers short of rows (%d rows in all).",
+        model_state.model_name,
+        mean("hot"),
+        mean("warm"),
+        mean("cold"),
+        config.tier_hot,
+        config.tier_warm,
+        rows[0]["card_rows"],
+        rows[0]["pinned_rows"],
+        mean("warm_or_hot_on_cpu"),
+        mean("cold_on_card"),
+        sum(1 for r in rows if r["rows_short"] > 0),
+        sum(r["rows_short"] for r in rows),
+    )

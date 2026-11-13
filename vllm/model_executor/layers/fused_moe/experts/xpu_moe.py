@@ -929,6 +929,21 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         output.add_(slow_out)
         if pending is not None:
             assert cpu is not None
+            # Prefill staging (stage_min_calls): the CPU-tier experts this call
+            # routes many tokens to go to the card through staging rows; the
+            # CPU computes the rest meanwhile.
+            stage = getattr(cpu, "stage", None)
+            staged = None if stage is None else stage(pending, output.device)
+            if staged is not None:
+                stage_out = torch.empty_like(output)
+                staged.apply(
+                    output=stage_out,
+                    hidden_states=hidden_states,
+                    topk_weights=topk_weights,
+                    topk_ids=topk_ids,
+                    **self.impl_apply_kwargs,
+                )
+                output.add_(stage_out)
             host_out = cpu.finish(pending, output.device)
             if host_out is not None:
                 output.add_(host_out)

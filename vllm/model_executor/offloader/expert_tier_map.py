@@ -250,12 +250,14 @@ def choose_pool_set(
     is_pool: np.ndarray,
     capacity: int,
     hysteresis: float,
+    max_changes: int | None = None,
 ) -> np.ndarray:
     """The slots, among ``candidates`` (the slots off the card after a move),
     that should hold pinned rows: at most ``capacity``, the hottest, keeping
     the current pinned slots (``is_pool``) unless an outside slot carries more
     than ``hysteresis`` times the load of one inside. Free capacity is filled
-    with the hottest outside candidates first."""
+    with the hottest outside candidates first. ``max_changes`` bounds the
+    slots that enter (each is one read); leaving costs nothing."""
     cand = np.asarray(candidates, dtype=bool)
     load = np.asarray(slot_load, dtype=np.float64)
     pool = np.asarray(is_pool, dtype=bool) & cand
@@ -267,15 +269,18 @@ def choose_pool_set(
         inside = inside[np.argsort(-load[inside], kind="stable")]
         pool[inside[capacity:]] = False
         room = 0
-    take = outside[:room]
+    left = len(outside) if max_changes is None else max(0, int(max_changes))
+    take = outside[: min(room, left)]
     pool[take] = True
-    outside = outside[room:]
+    left -= len(take)
+    outside = outside[len(take) :]
     inside = np.flatnonzero(pool)
     inside = inside[np.argsort(load[inside], kind="stable")]
     for s, f in zip(outside, inside):
-        if load[s] <= hysteresis * max(load[f], 0.0):
+        if left <= 0 or load[s] <= hysteresis * max(load[f], 0.0):
             break
         pool[s], pool[f] = True, False
+        left -= 1
     return pool
 
 
@@ -286,6 +291,7 @@ def choose_fast_set(
     *,
     changed: np.ndarray | None = None,
     read_budget: int | None = None,
+    max_swaps: int | None = None,
 ) -> np.ndarray:
     """The slots that should be in fast rows, as a set that does not permute
     slots.
@@ -299,6 +305,7 @@ def choose_fast_set(
     ``changed`` marks the slots whose expert is replaced by this move (their
     new expert is read from the store anyway). Every swap that gives up an
     unchanged fast slot costs one extra read; ``read_budget`` caps those.
+    ``max_swaps`` caps the swaps themselves.
     """
     fast = np.asarray(is_fast, dtype=bool).copy()
     load = np.asarray(slot_load, dtype=np.float64)
@@ -309,6 +316,8 @@ def choose_fast_set(
     cold = fast_idx[np.argsort(load[fast_idx], kind="stable")]
     extra = 0
     for s, f in zip(hot, cold):
+        if max_swaps is not None and len(np.flatnonzero(fast[slow_idx])) >= max_swaps:
+            break
         if load[s] <= hysteresis * max(load[f], 0.0):
             break
         cost = 0 if changed_mask[f] else 1
@@ -477,15 +486,6 @@ class TierPlacement:
         self.num_pinned = pinned
         self.num_host = self.num_slow - pinned
 
-    def promote_host(self, slot: int, row: int) -> None:
-        """Host slot ``slot`` now holds pinned row ``row`` (taken from the
-        free rows and filled by the caller; the caller writes the maps)."""
-        assert self.tier[slot] == HOST, f"slot {slot} is not a host slot"
-        assert row not in self.row[self.tier == POOL], f"row {row} is in use"
-        self.tier[slot] = POOL
-        self.row[slot] = row
-        self.check()
-
     # -- planning ---------------------------------------------------------
 
     def plan(
@@ -496,11 +496,16 @@ class TierPlacement:
         hysteresis: float,
         *,
         tier_moves: bool = True,
+        read_budget: int | None = None,
     ) -> MovePlan:
         """The move from ``old_logical`` to ``new_logical`` (the expert in
         each local slot) with the tier choice for the new placement.
 
         ``slot_load`` is the load of the expert each slot will hold, per slot.
+        ``read_budget`` bounds the experts the move reads (at most the spare
+        rows, the default): a move of the experts alone (EPLB bounds it by the
+        spare rows) always fits, the tier changes take what is left. With
+        ``new_logical`` equal to ``old_logical`` this is EPLB's tier pass.
         """
         old_logical = np.asarray(old_logical)
         new_logical = np.asarray(new_logical)
@@ -511,37 +516,62 @@ class TierPlacement:
                 f"the move replaces {n_changed} experts of the rank and the "
                 f"layer has {self.spare} spare rows"
             )
+        budget = self.spare if read_budget is None else min(read_budget, self.spare)
+        budget = max(budget, n_changed)
         is_fast = self.is_fast()
-        if tier_moves:
-            new_fast = choose_fast_set(
-                slot_load,
-                is_fast,
-                hysteresis,
-                changed=changed_mask,
-                read_budget=self.spare - n_changed,
-            )
-        else:
-            new_fast = is_fast.copy()
         if not self.host_tier:
-            return self.plan_from_set(old_logical, new_logical, new_fast)
-        # Host slots: which off-card slots hold pinned rows is a choice of its
-        # own. Each slot entering a pinned or a fast row from the host is a
-        # read; when the choice reads more than the spare rows take, the
-        # pinned set stays, then the fast set too (a move of the experts
-        # alone always fits: EPLB bounds it by the spare rows).
-        attempts = [(new_fast, True)] if tier_moves else []
-        attempts += [(new_fast, False), (is_fast.copy(), False)]
-        plan = None
-        for fast, pool_moves in attempts:
-            pool = (
-                choose_pool_set(
-                    slot_load, ~fast, self.is_pool(), self.num_pinned, hysteresis
+            new_fast = (
+                choose_fast_set(
+                    slot_load,
+                    is_fast,
+                    hysteresis,
+                    changed=changed_mask,
+                    read_budget=budget - n_changed,
                 )
-                if pool_moves
-                else self._default_pool(fast)
+                if tier_moves
+                else is_fast.copy()
             )
+            return self.plan_from_set(old_logical, new_logical, new_fast)
+        # Host slots: the card set and the pinned set are cut from one order
+        # of the slots by load (the card the hottest, the pinned rows the
+        # next). Each slot entering a pinned row, or a card row from the host,
+        # is a read: the most swaps whose reads fit the budget are taken,
+        # hottest first; the rest wait for the next pass.
+        plan = None
+        if tier_moves:
+
+            def pool_for(fast: np.ndarray, k: int) -> np.ndarray:
+                return choose_pool_set(
+                    slot_load,
+                    ~fast,
+                    self.is_pool(),
+                    self.num_pinned,
+                    hysteresis,
+                    max_changes=k,
+                )
+
+            for k in range(budget, 0, -1):
+                fast_k = choose_fast_set(
+                    slot_load, is_fast, hysteresis, changed=changed_mask, max_swaps=k
+                )
+                # both sets, then the pinned set alone, then the card set alone
+                for fast, pool in (
+                    (fast_k, pool_for(fast_k, k)),
+                    (is_fast, pool_for(is_fast, k)),
+                    (fast_k, self._default_pool(fast_k)),
+                ):
+                    plan = self.plan_from_set(
+                        old_logical, new_logical, fast, pool, check_budget=False
+                    )
+                    if len(plan.reads) <= budget:
+                        return plan
+        for fast in (is_fast.copy(),):
             plan = self.plan_from_set(
-                old_logical, new_logical, fast, pool, check_budget=False
+                old_logical,
+                new_logical,
+                fast,
+                self._default_pool(fast),
+                check_budget=False,
             )
             if len(plan.reads) <= self.spare:
                 return plan

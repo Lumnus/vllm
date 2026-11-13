@@ -98,7 +98,14 @@ def test_the_poller_reads_the_workers_at_its_interval():
         {"only": ["cpu", "tiers"]},
     )
     series = engine.scheduler.expert_tier_stats["0"]
-    assert set(series) == set(EXPERT_TIER_GAUGES)
+    # a reply without the working set's readout or staging counters gives
+    # every other series (those are tested in test_xpu_tier_classes.py)
+    newer = {
+        k
+        for k in EXPERT_TIER_GAUGES
+        if k.startswith(("tier_", "stage_")) or k == "routed_staged"
+    }
+    assert set(series) == set(EXPERT_TIER_GAUGES) - newer
     assert series["cpu_compute_seconds"] == 1.5 and series["slots_cpu"] == 136.0
     now[0] += ExpertTierStatsPoller.INTERVAL_S
     poller.maybe_poll()

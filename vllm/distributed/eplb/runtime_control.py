@@ -36,7 +36,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SETTINGS = ("step_interval", "window_size", "max_moves_per_rank", "policy")
+SETTINGS = (
+    "step_interval",
+    "window_size",
+    "max_moves_per_rank",
+    "policy",
+    "tier_interval",
+    "tier_max_moves",
+    "tier_hot",
+    "tier_warm",
+)
 
 
 # --------------------------------------------------------------------------
@@ -71,6 +80,10 @@ def settings(state: "EplbState") -> dict[str, Any]:
             else config.max_moves_per_rank
         ),
         "policy": config.policy,
+        "tier_interval": config.tier_interval,
+        "tier_max_moves": config.tier_max_moves,
+        "tier_hot": config.tier_hot,
+        "tier_warm": config.tier_warm,
     }
 
 
@@ -144,6 +157,8 @@ def summary(state: "EplbState") -> dict[str, Any]:
         "window_fill": state.window_fill,
         "next_uses_saved_load": state.next_uses_saved_load,
         "rearrangements": state.rearrangements,
+        "tier_passes": getattr(state, "tier_passes", 0),
+        "tier_step": getattr(state, "tier_step", 0),
         "skipped": state.skipped_rearrangements,
         "last_sync_seconds": state.last_rearrange_seconds,
         "in_flight": in_flight(state),
@@ -196,6 +211,31 @@ def check_settings(state: "EplbState", changes: dict[str, Any]) -> str | None:
             value = changes[name]
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 return f"{name} must be a positive integer, got {value!r}"
+    if "tier_interval" in changes:
+        value = changes["tier_interval"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return f"tier_interval must be an integer >= 0, got {value!r}"
+        if value and not any(
+            ms.movers is not None for ms in state.model_states.values()
+        ):
+            return (
+                "tier passes move slots between the tiers of layers backed by "
+                "the expert store; no model here has them"
+            )
+    if "tier_max_moves" in changes:
+        value = changes["tier_max_moves"]
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ):
+            return f"tier_max_moves must be a positive integer or null, got {value!r}"
+    config = state.parallel_config.eplb_config
+    hot = changes.get("tier_hot", config.tier_hot)
+    warm = changes.get("tier_warm", config.tier_warm)
+    for name, value in (("tier_hot", hot), ("tier_warm", warm)):
+        if not isinstance(value, int | float) or isinstance(value, bool) or value <= 0:
+            return f"{name} must be a number > 0, got {value!r}"
+    if warm > hot:
+        return f"tier_warm {warm} is above tier_hot {hot}"
     policy_name = changes.get("policy", state.parallel_config.eplb_config.policy)
     if policy_name not in EPLB_POLICIES:
         return f"unknown policy {policy_name!r}; one of {sorted(EPLB_POLICIES)}"
@@ -255,6 +295,11 @@ def apply_settings(state: "EplbState", changes: dict[str, Any]) -> dict[str, lis
     if "step_interval" in changes:
         state.expert_rearrangement_step_interval = changes["step_interval"]
         config.step_interval = changes["step_interval"]
+    for name in ("tier_interval", "tier_max_moves", "tier_hot", "tier_warm"):
+        if name in changes:
+            setattr(config, name, changes[name])
+    if "tier_interval" in changes:
+        state.tier_step = 0
     # The record flag for the next step follows the new interval and window.
     state._update_layer_should_record(log_stats=config.log_balancedness)
     new = settings(state)

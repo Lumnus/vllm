@@ -117,22 +117,39 @@ class ExpertStoreConfig:
     same results, hundreds of times slower; for tests)."""
 
     host_promote_misses: int = Field(default=0, ge=0)
-    """With ``--cpu-offload-pinned-gb``: promote a host slot to a pinned row
-    between two steps once the CPU has served it in this many layer calls
-    (counts halve every ``host_promote_window`` steps); 0 leaves the pinned
-    set to EPLB's rearrangements alone."""
+    """Removed (0 only): a CPU slot enters a pinned or a card row in EPLB's
+    tier pass (``--eplb-config tier_interval``), planned from its load window,
+    not by a count of its own."""
 
     host_promote_window: int = Field(default=64, ge=1)
-    """Steps per halving of the counts that ``host_promote_misses`` reads."""
+    """Removed with ``host_promote_misses``; accepted and unused."""
 
     host_promote_rows: int = Field(default=4, ge=0)
-    """Pinned rows per layer beyond the spare rows, for those promotions;
-    EPLB's next rearrangement chooses the pinned set again and frees them."""
+    """Pinned rows per layer beyond the bound at load and the spare rows,
+    which a larger pinned bound (``tiers.set host_tier_bound``) may take
+    while serving."""
+
+    stage_min_calls: int = Field(default=0, ge=0)
+    """With ``--cpu-offload-pinned-gb``: an expert of the CPU tier that one
+    layer call routes at least this many tokens to is copied into a staging
+    row of pinned memory and computed by the card from it (as the pinned rows
+    are) instead of on the CPU; 0 (default) keeps every CPU-tier expert on
+    the CPU. A read path for one layer call: it moves no expert and changes
+    no tier. Runtime setting (``cpu.set stage_min_calls``)."""
+
+    stage_rows: int = Field(default=0, ge=0)
+    """Staging rows (pinned, shared by the layers of a rank); 0: as many as
+    a layer has CPU slots."""
 
     @model_validator(mode="after")
     def _check_dirs(self) -> "ExpertStoreConfig":
         if len(set(self.dirs)) != len(self.dirs):
             raise ValueError("expert store dirs must be distinct")
+        if self.host_promote_misses:
+            raise ValueError(
+                "host_promote_misses is removed: CPU slots enter pinned and "
+                "card rows in EPLB's tier pass (--eplb-config tier_interval)"
+            )
         return self
 
     @property
@@ -205,5 +222,8 @@ class ExpertStoreConfig:
                 "host_promote_misses",
                 "host_promote_window",
                 "host_promote_rows",
+                # staging adds a call outside the captured graphs
+                "stage_min_calls",
+                "stage_rows",
             },
         )

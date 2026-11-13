@@ -310,16 +310,25 @@ def _layer_load(tiers, hot):
 
 
 def test_lowering_and_raising_the_pinned_bound(monkeypatch, tmp_path, op):
+    """The bound is a capacity; EPLB's tier pass (here the layer's own
+    prepare with the placement unchanged, as EPLB's worker calls it) moves
+    the slots to it from the window: lowering reads nothing, raising reads
+    the hottest CPU slots (from the host cache where it holds them)."""
     env = _host_env(monkeypatch, tmp_path)
     tiers = env.tiers[0]
     p = tiers.placement
     # card 5 6 7, pinned 4 3, CPU 2 1 0 (hottest first)
-    tiers.fill_to(np.arange(8), _layer_load(tiers, [5, 6, 7, 4, 3, 2, 1, 0]), 1.1)
+    load = _layer_load(tiers, [5, 6, 7, 4, 3, 2, 1, 0])
+    tiers.fill_to(np.arange(8), load, 1.1)
     assert np.flatnonzero(p.tier == POOL).tolist() == [3, 4]
     assert tiers.pinned_bound_range() == (1, 5)  # 8 rows, 2 spares; 5 off the card
-    # lower to 1: the colder pinned slot (3) goes to the CPU, no read
     stats = tiers.set_pinned_bound(1)
-    assert stats["units_read"] == 0 and stats["pinned"] == 1
+    assert stats["bound"] == 1 and stats["pinned_now"] == 2
+    assert tiers.tier_pass_wanted and np.flatnonzero(p.tier == POOL).tolist() == [3, 4]
+    # EPLB's tier pass: the colder pinned slot (3) goes to the CPU, no read
+    move = tiers.prepare(np.arange(8), np.arange(8), load, 1.1)
+    assert not tiers.tier_pass_wanted and move.stats["units"] == 0
+    tiers.commit(move)
     assert np.flatnonzero(p.tier == POOL).tolist() == [4] and p.tier[3] == HOST
     assert p.num_pinned == 1 and p.num_host == 4
     assert tiers.slow_map[3] == -1 and tiers._tier_of_global[3] == HOST
@@ -332,11 +341,12 @@ def test_lowering_and_raising_the_pinned_bound(monkeypatch, tmp_path, op):
         x, _units(env, 0, {3}), [(3, 0, 1.0)], INTER, GROUP
     )
     assert cx.bf16_steps(out, want) <= (1.0 if op else 0.0)
-    # raise to 4: the three hottest host slots (3, 2, 1) get rows, read from
-    # the host cache where it holds them, else the store
+    # raise to 4: the pass reads the three hottest CPU slots (3, 2, 1), two
+    # per pass (the spare rows), so two passes
     _settle(tiers.cpu.cache)
-    stats = tiers.set_pinned_bound(4)
-    assert stats["units_read"] == 3 and stats["pinned"] == 4
+    tiers.set_pinned_bound(4)
+    for _ in range(2):
+        tiers.commit(tiers.prepare(np.arange(8), np.arange(8), load, 1.1))
     assert sorted(np.flatnonzero(p.tier == POOL).tolist()) == [1, 2, 3, 4]
     assert p.tier[0] == HOST and p.num_pinned == 4
     for s in (1, 2, 3, 4):
@@ -346,9 +356,8 @@ def test_lowering_and_raising_the_pinned_bound(monkeypatch, tmp_path, op):
             assert torch.equal(t[p.row[s]].reshape(-1).view(torch.uint8), want)
     summary = tiers.scrub(np.arange(8), full=True)
     assert summary["mismatches"] == 0 and summary["maps_equal"]
-    # the spare rows stay EPLB's
     assert p.pool.free_count >= p.spare
-    # the next rearrangement plans with the new bound: slot 0 is hot now
+    # the next rearrangement plans with the bound: slot 0 is hot now
     load = np.array([90, 1, 1, 1, 1, 100, 100, 100], dtype=float)
     tiers.commit(tiers.prepare(np.arange(8), np.arange(8), load, 1.1))
     assert int((p.tier == POOL).sum()) == 4 and p.tier[0] == POOL
@@ -359,32 +368,12 @@ def test_lowering_and_raising_the_pinned_bound(monkeypatch, tmp_path, op):
 def test_the_bound_waits_for_a_prepared_eplb_move(monkeypatch, tmp_path, op):
     env = _host_env(monkeypatch, tmp_path)
     tiers = env.tiers[0]
-    before = tiers.placement.tier.copy()
     tiers._eplb_pending = True
     assert "EPLB move is prepared" in xt.check_host_tier_bound(1)
     with pytest.raises(RuntimeError, match="EPLB move is prepared"):
         tiers.set_pinned_bound(1)
-    assert np.array_equal(tiers.placement.tier, before)
+    assert tiers.placement.num_pinned == 2 and not tiers.tier_pass_wanted
     tiers._eplb_pending = False
-
-
-def test_promotions_stay_within_the_bound(monkeypatch, tmp_path, op):
-    """With one promotion row: after the bound is lowered to 1, one host slot
-    may be promoted (bound + promotion rows), not two, though rows are free."""
-    env = _host_env(monkeypatch, tmp_path, host_promote_misses=1, host_promote_rows=1)
-    tiers = env.tiers[0]
-    p = tiers.placement
-    tiers.set_pinned_bound(1)
-    x = torch.zeros(2, HIDDEN, dtype=torch.bfloat16)
-    host = np.flatnonzero(p.tier == HOST).tolist()
-    ids = torch.tensor([[host[0], host[1]], [host[2], host[0]]], dtype=torch.int32)
-    for _ in range(3):
-        tiers.cpu.compute(tiers, ids, torch.ones(2, 2), x, torch.empty_like(x))
-        tiers.between_steps()
-        tiers.between_steps()
-    assert int((p.tier == POOL).sum()) == 2  # 1 + 1 promotion row
-    assert p.pool.free_count > p.spare  # rows were free all the same
-    assert tiers.cpu.stats.promotions == 1
 
 
 def test_the_bound_over_the_control_surface(monkeypatch, tmp_path, op):
@@ -404,10 +393,12 @@ def test_the_bound_over_the_control_surface(monkeypatch, tmp_path, op):
     assert reply["ok"], reply
     assert reply["changes"] == {"host_tier_bound": [2, 1]}
     assert all(t.placement.num_pinned == 1 for t in env.tiers)
-    assert reply["result"]["tiers"]["slots_now"]["cpu"] == 8
+    # the slots move in EPLB's next tier pass, not here
+    assert reply["result"]["tiers"]["slots_now"]["pinned"] == 4
+    assert all(t.tier_pass_wanted for t in env.tiers)
     undone = wrc.handle(worker, "restore", "tiers.set")
     assert undone["ok"]
-    assert all(int((t.placement.tier == POOL).sum()) == 2 for t in env.tiers)
+    assert all(t.placement.num_pinned == 2 for t in env.tiers)
     # refused while EPLB rearranges
     worker.model_runner.eplb_state = SimpleNamespace(
         model_states={"m": SimpleNamespace(rebalanced=True)}
@@ -436,7 +427,8 @@ def test_cpu_settings_change_and_go_back(monkeypatch, tmp_path, op):
     _settle(rt.cache)
     for args, refusal in [
         ({"cpu_isa": "avx2"}, "cannot change while serving"),
-        ({"host_promote_rows": 2}, "pinned rows sized at load"),
+        ({"host_promote_rows": 2}, "sized at load"),
+        ({"host_promote_misses": 2}, "EPLB's tier pass"),
         ({"cpu_threads": 0}, "integer >= 1"),
         ({"host_cache_gib": 0}, "number > 0"),
         ({"warp": 1}, "unknown CPU tier setting"),
@@ -450,15 +442,14 @@ def test_cpu_settings_change_and_go_back(monkeypatch, tmp_path, op):
         "cpu.set",
         {
             "cpu_threads": 3,
-            "host_promote_misses": 5,
-            "host_promote_window": 16,
+            "stage_min_calls": 12,
             "host_cache_gib": rt.cache.layout.row_bytes * 2 / 2**30,
         },
     )
     assert reply["ok"], reply
     assert reply["changes"]["cpu_threads"] == [2, 3]
-    assert reply["changes"]["host_promote_misses"] == [0, 5]
-    assert rt.threads == 3 and rt.config.host_promote_window == 16
+    assert reply["changes"]["stage_min_calls"] == [0, 12]
+    assert rt.threads == 3 and rt.config.stage_min_calls == 12
     assert rt.cache.num_rows == 2 and len(rt.cache._rows) == 2
     assert rt.cache.evicted >= held - 2
     # the experts kept are the units of the store, in their new rows
@@ -476,7 +467,7 @@ def test_cpu_settings_change_and_go_back(monkeypatch, tmp_path, op):
         torch.empty_like(x),
     )
     assert wrc.handle(worker, "restore", "cpu.set")["ok"]
-    assert rt.threads == 2 and rt.config.host_promote_misses == 0
+    assert rt.threads == 2 and rt.config.stage_min_calls == 0
     assert rt.cache.num_rows == rt.cache.rows_for_gib(CPU_CFG["host_cache_gib"])
     # a cache smaller than what one layer call needed is refused
     rt.stats.max_experts = 5
@@ -535,6 +526,9 @@ def test_the_cpu_readout_and_its_metric_series(monkeypatch, tmp_path, op):
     assert cpu["settings"]["cpu_threads"] == 2 and cpu["cache"]["rows"] >= 1
     series = expert_tier_series([reply, {"rank": 0, "cpu": None}])
     assert list(series) == ["1"]
-    assert set(series["1"]) == set(EXPERT_TIER_GAUGES)
+    # without EPLB in this harness there are no classes by its window
+    assert set(series["1"]) == {
+        k for k in EXPERT_TIER_GAUGES if not k.startswith("tier_")
+    }
     assert series["1"]["routed_cpu"] == 2.0 and series["1"]["pinned_bound"] == 2.0
     assert series["1"]["slots_cpu"] == 6.0

@@ -149,7 +149,10 @@ def test_the_read_budget_falls_back_to_fewer_tier_changes():
     new[2] = 30  # a pinned slot changes: one read, the whole budget
     load = np.array([5, 5, 1, 1, 1, 9, 9, 9, 0, 0], dtype=float)
     plan = p.plan(old, new, load, 1.1)
-    assert len(plan.reads) <= 1 and plan.reads == {2: 30}
+    # one read: either the changed slot's new expert into its pinned row, or
+    # (the cut by load) the new, cold expert on the CPU and the hot slot 5
+    # into the pinned row instead
+    assert len(plan.reads) <= 1 and plan.reads in ({2: 30}, {5: 5})
     move = p.prepare(plan, _fill)
     _commit(p, move, list(range(10)))
     p.check()
@@ -175,16 +178,6 @@ def test_choose_pool_set():
     assert np.flatnonzero(got).tolist() == [2, 4]
 
 
-def test_promote_host_and_its_refusals():
-    p = TierPlacement(8, 3, spare=2, done=_done, num_pool_slots=2, extra_rows=2)
-    row = p.pool.acquire(1)[0]
-    p.promote_host(6, row)
-    assert p.tier[6] == POOL and p.row[6] == row
-    with pytest.raises(AssertionError):
-        p.promote_host(3, p.pool.acquire(1)[0])  # not a host slot
-    p.check()
-
-
 def test_reset_to_with_host_slots_and_the_invariant():
     p = TierPlacement(6, 2, spare=1, done=_done, num_pool_slots=2)
     tier = np.array([HOST, FAST, POOL, FAST, HOST, POOL], dtype=np.int8)
@@ -202,3 +195,36 @@ def test_reset_to_with_host_slots_and_the_invariant():
             p.is_fast(),
             np.array([1, 0, 1, 0, 1, 1], dtype=bool),
         )
+
+
+def test_tier_passes_sort_the_tiers_within_their_read_budget():
+    """A tier pass is a plan with the experts unchanged: the card set and the
+    pinned set are cut from one order by load, as many swaps as the read
+    budget takes per pass (hottest first), the rest at the next pass, until
+    the order holds: the card the hottest, the pinned rows the next."""
+    p = TierPlacement(16, 4, spare=2, done=_done, num_pool_slots=4)
+    old = np.arange(16)
+    load = np.arange(16, dtype=float)  # by id: the hottest are on the CPU
+    passes = 0
+    for budget in [1] * 4 + [None] * 30:
+        plan = p.plan(old, old, load, 1.1, read_budget=budget)
+        assert len(plan.reads) <= (budget or p.spare)
+        if not plan.reads and np.array_equal(plan.new_fast, p.is_fast()):
+            break
+        _commit(p, p.prepare(plan, _fill), list(range(16)))
+        p.check()
+        passes += 1
+    assert np.flatnonzero(p.tier == FAST).tolist() == [12, 13, 14, 15]
+    assert np.flatnonzero(p.tier == POOL).tolist() == [8, 9, 10, 11]
+    assert passes >= 4  # bounded per pass: more passes, never a larger one
+
+
+def test_a_pass_is_partial_where_the_whole_choice_does_not_fit():
+    """Four hot CPU slots and two spare rows: one pass moves two of them
+    into pinned rows (before, the whole pinned choice fell back to none)."""
+    p = TierPlacement(10, 2, spare=2, done=_done, num_pool_slots=4)
+    old = np.arange(10)
+    load = np.array([9, 9, 1, 1, 1, 1, 8, 8, 8, 8], dtype=float)
+    plan = p.plan(old, old, load, 1.1)
+    assert len(plan.reads) == 2
+    assert int((plan.new_pool & np.isin(np.arange(10), [6, 7, 8, 9])).sum()) == 2

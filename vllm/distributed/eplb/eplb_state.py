@@ -56,7 +56,7 @@ from vllm.v1 import runtime_debug
 from . import fault_injection
 from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
-from .eplb_state_file import read_expert_loads, write_expert_loads
+from .eplb_state_file import read_expert_loads, read_seed_loads, write_expert_loads
 from .eplb_trace import ExpertLoadTracer
 from .eplb_utils import CpuGpuEvent
 from .expert_weights import (
@@ -116,6 +116,10 @@ class EplbStats:
     """
     Number of GPUs.
     """
+    tier_only: bool = False
+    """A tier pass: the placement of experts on ranks stays, the layers
+    choose the tiers of their slots from the window
+    (`EPLBConfig.tier_interval`)."""
 
 
 @dataclass
@@ -416,6 +420,11 @@ class EplbState:
         self.rearrangements: int = 0
         """Rearrangements started (past both agreements; profile runs and
         skipped ones not counted)."""
+        self.tier_passes: int = 0
+        """Tier passes started (`EPLBConfig.tier_interval`, or asked for by a
+        layer whose tier capacity changed)."""
+        self.tier_step: int = 0
+        """Steps since the last tier pass."""
         self.last_rearrange_seconds: float | None = None
         """Wall time of the last synchronous rearrangement on this rank."""
         if self.device.type in ("cuda", "xpu"):
@@ -705,6 +714,41 @@ class EplbState:
         self._add_residency_mask(model_state)
         if self.parallel_config.eplb_config.state_path is not None:
             self._read_saved_load(model_state)
+        if not model_state.has_saved_load and self.has_tier_seed():
+            self._read_seed_load(model_state)
+
+    def has_tier_seed(self) -> bool:
+        """Whether `EPLBConfig.seed_path` is set (configuration: the same on
+        every rank)."""
+        return self.parallel_config.eplb_config.seed_path is not None
+
+    def _read_seed_load(self, model_state: EplbModelState) -> None:
+        """Fill `last_expert_load` from `EPLBConfig.seed_path` when
+        `state_path` gave none: the restore then places the experts, and the
+        layers' tiers, by it."""
+        path = self.parallel_config.eplb_config.seed_path
+        assert path is not None
+        model = model_state.model
+        names = [layer.layer_name for layer in model.moe_layers]
+        seed = read_seed_loads(path, names, model.num_logical_experts)
+        found = 0
+        for layer_idx, name in enumerate(names):
+            loads = seed.get(name)
+            if loads is None:
+                continue
+            model_state.last_expert_load[layer_idx].copy_(
+                torch.tensor(loads, dtype=torch.int64)
+            )
+            found += 1
+        model_state.has_saved_load = found > 0
+        logger.info(
+            "EPLB: no saved expert loads; the seed %s gives loads for %d of "
+            "%d MoE layers of %s: the experts and their tiers start from them.",
+            path,
+            found,
+            model.num_moe_layers,
+            model_state.model_name,
+        )
 
     def _read_saved_load(self, model_state: EplbModelState) -> None:
         """Fill `last_expert_load` from `EPLBConfig.state_path`."""
@@ -989,10 +1033,6 @@ class EplbState:
         if is_profile:
             self.rearrange(is_profile=True)
             return
-        if not is_dummy:
-            for eplb_model_state in self.model_states.values():
-                _movers_between_steps(eplb_model_state)
-
         if log_stats:
             self._maybe_log_balancedness()
         if (
@@ -1111,8 +1151,42 @@ class EplbState:
                 self.next_uses_saved_load = False
                 self.window_fill = 0
                 self.rearrange(use_last_expert_load=use_saved)
+        elif self._tier_pass_due():
+            self.rearrange(tier_only=True)
 
         self._update_layer_should_record(log_stats=log_stats)
+
+    def _tier_pass_due(self) -> bool:
+        """Whether this step starts a tier pass: every `tier_interval` steps
+        (not while paused), or at once when a layer asks for one because a
+        tier's capacity changed. Never while a rearrangement or a pass is in
+        flight. The same on every rank: the counters and the settings are,
+        and a capacity changes on every rank between the same two steps."""
+        if not self.is_async or not any(
+            s.movers is not None for s in self.model_states.values()
+        ):
+            return False
+        interval = self.parallel_config.eplb_config.tier_interval
+        wanted = any(
+            getattr(m, "tier_pass_wanted", False)
+            for s in self.model_states.values()
+            if s.movers is not None
+            for m in s.movers
+            if m is not None
+        )
+        if interval <= 0 and not wanted:
+            return False
+        self.tier_step += 1
+        if any(s.rebalanced for s in self.model_states.values()):
+            return False
+        due = wanted or (
+            interval > 0
+            and self.tier_step >= interval
+            and not self.rearrangements_paused
+        )
+        if due:
+            self.tier_step = 0
+        return due
 
     def _add_residency_mask(self, model_state: EplbModelState) -> None:
         """Create the model's residency mask and hand each MoE layer's router
@@ -1282,7 +1356,10 @@ class EplbState:
         steps_remaining = (
             self.expert_rearrangement_step_interval - self.expert_rearrangement_step
         )
-        should_record_for_rearrange = steps_remaining <= self.expert_load_window_size
+        should_record_for_rearrange = (
+            steps_remaining <= self.expert_load_window_size
+            or self.parallel_config.eplb_config.tier_interval > 0
+        )
 
         if not log_stats:
             return should_record_for_rearrange
@@ -1346,6 +1423,7 @@ class EplbState:
         rank_mapping: dict[int, int] | None = None,
         use_last_expert_load: bool = False,
         blocking: bool = False,
+        tier_only: bool = False,
     ) -> torch.Tensor | None:
         """Rearrange the experts according to the current load.
 
@@ -1357,6 +1435,9 @@ class EplbState:
                 when scaling is done in EEP.
             use_last_expert_load: Use the last reshuffle's logical-expert totals.
             blocking: Move the weights before returning, also in async mode.
+            tier_only: A tier pass (`EPLBConfig.tier_interval`): no expert
+                changes rank; the layers that place their own experts cut
+                their tiers from the window. Async, those models only.
 
         """
         ep_group = get_ep_group().device_group
@@ -1366,7 +1447,11 @@ class EplbState:
         end_event = None
         is_main_rank = ep_rank == 0
         sync = not self.is_async or is_profile or blocking
-        if is_main_rank:
+        if tier_only and sync:
+            return None  # the layers that cut tiers move asynchronously only
+        if is_main_rank and tier_only:
+            logger.debug("EPLB tier pass (async mode)...")
+        elif is_main_rank:
             if sync:
                 start_event = torch.Event(enable_timing=True)
                 end_event = torch.Event(enable_timing=True)
@@ -1417,6 +1502,7 @@ class EplbState:
             and is_main_rank
             and not is_profile
             and not use_last_expert_load
+            and not tier_only
         ):
             self._save_expert_load(global_expert_load_windows)
 
@@ -1463,6 +1549,8 @@ class EplbState:
             for eplb_model_state, global_expert_load_window in zip(
                 self.model_states.values(), global_expert_load_windows
             ):
+                if tier_only and eplb_model_state.movers is None:
+                    continue  # its experts sit in one tier
                 if sync and eplb_model_state.movers is not None:
                     if is_profile or use_last_expert_load:
                         # nothing to reserve; the restore fills these models itself
@@ -1507,10 +1595,12 @@ class EplbState:
 
         # Phase 3: the moves. Collectives with allocations of their own; a
         # failure here is not caught (see `_skip_rearrangement`).
-        if not is_profile:
+        if tier_only:
+            self.tier_passes += 1
+        elif not is_profile:
             self.rearrangements += 1
         for eplb_model_state, global_expert_load_window, plan in plans:
-            if not is_profile:
+            if not is_profile and not tier_only:
                 eplb_model_state.last_expert_load = global_expert_load_window
             if sync:
                 if plan is None:
@@ -1563,6 +1653,7 @@ class EplbState:
                     num_groups=num_groups,
                     num_nodes=num_nodes,
                     num_gpus=num_gpus,
+                    tier_only=tier_only,
                 )
                 eplb_model_state.rebalanced = True
                 eplb_model_state.rearrangement_started = started
@@ -2315,19 +2406,6 @@ def _commit_eplb_maps(
     if PIN_MEMORY:
         src = src.pin_memory()
     dst.copy_(src, non_blocking=True)
-
-
-def _movers_between_steps(model_state: EplbModelState) -> None:
-    """Give the layers that place their own experts the point between two
-    steps (on the thread that enqueues the forward) for work of their own,
-    such as mapping a promotion whose bytes are ready."""
-    movers = model_state.movers
-    if not movers or movers[0] is None:
-        return
-    for mover in movers:
-        hook = getattr(mover, "between_steps", None)
-        if hook is not None:
-            hook()
 
 
 def _scrub_movers(

@@ -231,39 +231,6 @@ def test_fill_to_puts_the_next_hottest_in_pinned_rows(monkeypatch, tmp_path, op)
     tstore.reset_sessions()
 
 
-def test_a_host_slot_served_often_is_promoted_between_steps(monkeypatch, tmp_path, op):
-    env = _host_env(monkeypatch, tmp_path, host_promote_misses=2)
-    tiers = env.tiers[0]
-    rt = tiers.cpu
-    x = torch.zeros(2, HIDDEN, dtype=torch.bfloat16)
-    ids = torch.tensor([[6, 0], [6, 1]], dtype=torch.int32)
-    for _ in range(2):
-        rt.compute(tiers, ids, torch.ones(2, 2), x, torch.empty_like(x))
-    # not while an EPLB move is prepared
-    tiers._eplb_pending = True
-    tiers.between_steps()
-    assert tiers._promotion is None
-    tiers._eplb_pending = False
-    tiers.between_steps()  # starts it (from the host cache: done at once)
-    assert tiers._promotion is not None
-    tiers.between_steps()  # maps it
-    p = tiers.placement
-    assert p.tier[6] == POOL and tiers.slow_map[6] == p.row[6]
-    assert tiers._tier_of_global[6] == POOL
-    for name, t in tiers.slow.items():
-        want = expert_in_store(env, 0, 6)[name].reshape(-1).view(torch.uint8)
-        assert torch.equal(t[p.row[6]].reshape(-1).view(torch.uint8), want)
-    assert rt.stats.promotions == 1
-    # the spare rows stay free for EPLB's next move
-    assert p.pool.free_count >= p.spare
-    # the next rearrangement chooses the pinned set again: back to two
-    load = np.array([9, 9, 9, 5, 5, 0, 1, 0], dtype=float)
-    tiers.commit(tiers.prepare(np.arange(8), np.arange(8), load, 1.1))
-    assert int((p.tier == POOL).sum()) == 2 and p.tier[6] == HOST
-    assert rt.stats.demotions >= 1
-    tstore.reset_sessions()
-
-
 def test_refusals(monkeypatch, tmp_path, op):
     # the store must exist: a start that would build it refuses
     with pytest.raises(ValueError, match="from an existing expert store"):
@@ -488,17 +455,3 @@ def test_the_layer_posts_before_the_card_and_adds_after():
     )  # fmt: skip
     assert order == ["post", "fast", "slow", "finish"]
     assert torch.equal(out, torch.full((2, 4), 111.0))
-
-
-def test_eplb_gives_the_movers_the_point_between_steps():
-    from vllm.distributed.eplb.eplb_state import _movers_between_steps
-
-    calls = []
-    movers = [
-        SimpleNamespace(between_steps=lambda i=i: calls.append(i)) for i in range(3)
-    ]
-    _movers_between_steps(SimpleNamespace(movers=movers))
-    assert calls == [0, 1, 2]
-    _movers_between_steps(SimpleNamespace(movers=None))
-    _movers_between_steps(SimpleNamespace(movers=[None, None]))
-    assert calls == [0, 1, 2]

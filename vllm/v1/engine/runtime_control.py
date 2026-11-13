@@ -843,6 +843,20 @@ EXPERT_TIER_GAUGES = {
     "slots_card": "Slots of every layer on the card now.",
     "slots_pinned": "Slots of every layer in pinned rows now.",
     "slots_cpu": "Slots of every layer computed on the CPU now.",
+    "routed_staged": "Routed calls of CPU-tier experts staged to the card "
+    "(prefill staging, stage_min_calls).",
+    "stage_layer_calls": "MoE layer calls that staged CPU-tier experts.",
+    "stage_experts": "CPU-tier experts staged to the card, summed over calls.",
+    "stage_seconds": "Seconds the host copied experts into staging rows.",
+    "tier_hot": "Hot experts (EPLB's window, tier_hot) over every layer now.",
+    "tier_warm": "Warm experts over every layer now.",
+    "tier_cold": "Cold experts over every layer now.",
+    "tier_warm_or_hot_on_cpu": "Warm or hot experts computed on the CPU now.",
+    "tier_cold_on_card": "Cold experts in card rows now.",
+    "tier_rows_short": "Warm and hot experts beyond the card and pinned rows, "
+    "summed over layers (raise the pinned bound or the card tier).",
+    "tier_card_short": "Hot experts beyond the card rows, summed over layers.",
+    "tier_passes": "EPLB tier passes started (tier_interval).",
 }
 
 
@@ -883,6 +897,25 @@ def expert_tier_series(ranks: list[dict]) -> dict[str, dict[str, float]]:
             for tier in ("card", "pinned", "cpu"):
                 if tier in now:
                     series[f"slots_{tier}"] = now[tier]
+            classes = tiers.get("classes") or {}
+            if classes:
+                t = classes["totals"]
+                for key in (
+                    "hot",
+                    "warm",
+                    "cold",
+                    "warm_or_hot_on_cpu",
+                    "cold_on_card",
+                    "rows_short",
+                    "card_short",
+                ):
+                    series[f"tier_{key}"] = t[key]
+                series["tier_passes"] = classes.get("tier_passes", 0)
+        if "routed_staged" in c:
+            series["routed_staged"] = c["routed_staged"]
+            series["stage_layer_calls"] = c["stage_layers"]
+            series["stage_experts"] = c["stage_experts"]
+            series["stage_seconds"] = c["stage_ms"] / 1e3
         out[str(reply.get("rank", len(out)))] = {k: float(v) for k, v in series.items()}
     return out
 
