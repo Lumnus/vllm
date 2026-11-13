@@ -23,6 +23,7 @@ encoder towers) run here.
 """
 
 import dataclasses
+import time
 from typing import Any
 
 from vllm import envs
@@ -41,6 +42,8 @@ WORKER_OPS = (
     "store.set",
     "store.scrub",
     "tiers.set",
+    "cpu.set",
+    "cpu.stats",
     "kv.set",
     "trace.set",
     "ple.set",
@@ -336,6 +339,115 @@ class RuntimeControl:
             "changes": diff,
             "tower": tower.record(),
         }
+
+
+class ExpertTierStatsPoller:
+    """The CPU expert tier's counters (--cpu-offload-pinned-gb), per rank, for
+    the engine's metrics: read from the workers through the runtime control
+    surface's state (part "cpu" and "tiers") every ``interval_s`` seconds,
+    between two steps of the busy loop, and handed to the scheduler, whose
+    stats carry them to the `vllm:expert_tier_*` gauges. One worker RPC per
+    interval; made only when experts are computed on the CPU and stats are
+    logged."""
+
+    INTERVAL_S = 10.0
+
+    def __init__(self, engine: Any, interval_s: float = INTERVAL_S) -> None:
+        self.engine = engine
+        self.interval_s = interval_s
+        self._next = 0.0
+        self._clock = time.monotonic
+
+    @classmethod
+    def maybe_create(cls, engine: Any) -> "ExpertTierStatsPoller | None":
+        config = engine.vllm_config
+        uva = getattr(getattr(config, "offload_config", None), "uva", None)
+        if uva is None or not uva.host_experts_on():
+            return None
+        if not getattr(engine.scheduler, "log_stats", False):
+            return None
+        return cls(engine)
+
+    def maybe_poll(self) -> None:
+        now = self._clock()
+        if now < self._next:
+            return
+        self._next = now + self.interval_s
+        ranks = self.engine.collective_rpc(
+            "runtime_control",
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            args=("state", "", {"only": ["cpu", "tiers"]}),
+        )
+        self.engine.scheduler.expert_tier_stats = expert_tier_series(ranks)
+
+
+# Series of the CPU expert tier per rank; the keys of
+# SchedulerStats.expert_tier_stats and the `vllm:expert_tier_<key>` gauges.
+EXPERT_TIER_GAUGES = {
+    "routed_card": "Routed (token, expert) calls of this rank on the card's "
+    "own rows since start.",
+    "routed_pinned": "Routed calls of this rank served from pinned host rows.",
+    "routed_cpu": "Routed calls of this rank computed on the CPU.",
+    "cpu_layer_calls": "MoE layer calls with work on the CPU.",
+    "cpu_idle_layer_calls": "MoE layer calls with nothing on the CPU.",
+    "cpu_experts": "Distinct experts per layer call on the CPU, summed.",
+    "cpu_compute_seconds": "Seconds the CPU computed experts.",
+    "cpu_read_seconds": "Seconds layer calls waited for experts from the drive.",
+    "cpu_wait_seconds": "Seconds the host waited for the routing.",
+    "host_cache_hits": "Host cache hits.",
+    "host_cache_drive_reads": "Experts read from the drive while a step waited.",
+    "host_cache_read_ahead": "Experts read into the host cache ahead of use.",
+    "host_cache_evicted": "Experts evicted from the host cache.",
+    "host_cache_rows": "Experts the host cache holds at most.",
+    "promotions": "Slots moved from the CPU into pinned rows.",
+    "demotions": "Slots moved from pinned rows to the CPU.",
+    "cpu_threads": "Threads of the CPU expert op.",
+    "pinned_bound": "Pinned slots per layer (the bound; host_tier_bound).",
+    "slots_card": "Slots of every layer on the card now.",
+    "slots_pinned": "Slots of every layer in pinned rows now.",
+    "slots_cpu": "Slots of every layer computed on the CPU now.",
+}
+
+
+def expert_tier_series(ranks: list[dict]) -> dict[str, dict[str, float]]:
+    """The gauges' values per rank (the rank as text) from the workers'
+    runtime control state; ranks without a CPU tier are left out."""
+    out: dict[str, dict[str, float]] = {}
+    for reply in ranks:
+        cpu = reply.get("cpu")
+        if not cpu:
+            continue
+        c = cpu["counters"]
+        series = {
+            "routed_card": c["routed_card"],
+            "routed_pinned": c["routed_pinned"],
+            "routed_cpu": c["routed_cpu"],
+            "cpu_layer_calls": c["layers_with_cpu_calls"],
+            "cpu_idle_layer_calls": c["layers_without"],
+            "cpu_experts": c["cpu_experts"],
+            "cpu_compute_seconds": c["compute_ms"] / 1e3,
+            "cpu_read_seconds": c["read_ms"] / 1e3,
+            "cpu_wait_seconds": c["wait_ms"] / 1e3,
+            "host_cache_hits": c["cache_hits"],
+            "host_cache_drive_reads": c["cache_misses"],
+            "host_cache_read_ahead": c["cache_prefetched"],
+            "host_cache_evicted": c["cache_evicted"],
+            "host_cache_rows": cpu["cache"]["rows"],
+            "promotions": c["promotions"],
+            "demotions": c["demotions"],
+            "cpu_threads": cpu["cpu_threads"],
+        }
+        tiers = reply.get("tiers") or {}
+        if tiers:
+            bound = tiers.get("settings", {}).get("host_tier_bound")
+            if bound is not None:
+                series["pinned_bound"] = bound
+            now = tiers.get("slots_now", {})
+            for tier in ("card", "pinned", "cpu"):
+                if tier in now:
+                    series[f"slots_{tier}"] = now[tier]
+        out[str(reply.get("rank", len(out)))] = {k: float(v) for k, v in series.items()}
+    return out
 
 
 def _agreement(ranks: list[dict]) -> dict[str, bool]:

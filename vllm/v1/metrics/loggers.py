@@ -670,6 +670,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_fenced_blocks, per_engine_labelvalues
         )
 
+        # Experts computed on the CPU (one series per rank), in the family
+        # of the encoder towers' gauges below.
+        from vllm.v1.engine.runtime_control import EXPERT_TIER_GAUGES
+
+        self.gauge_expert_tier = {
+            key: self._gauge_cls(
+                name=f"vllm:expert_tier_{key}",
+                documentation=documentation,
+                multiprocess_mode="mostrecent",
+                labelnames=[*labelnames, "rank"],
+            )
+            for key, documentation in EXPERT_TIER_GAUGES.items()
+        }
+
         # Encoder towers with residency "dynamic" (one series per tower).
         self.gauge_encoder_tower = {
             key: self._gauge_cls(
@@ -1227,6 +1241,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             for tower, values in scheduler_stats.encoder_tower_stats.items():
                 labels = [*self.per_engine_labelvalues[engine_idx], tower]
                 for key, gauge in self.gauge_encoder_tower.items():
+                    if key in values:
+                        gauge.labels(*labels).set(values[key])
+            for rank, values in scheduler_stats.expert_tier_stats.items():
+                labels = [*self.per_engine_labelvalues[engine_idx], rank]
+                for key, gauge in self.gauge_expert_tier.items():
                     if key in values:
                         gauge.labels(*labels).set(values[key])
 

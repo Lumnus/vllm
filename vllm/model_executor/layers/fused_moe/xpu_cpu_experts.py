@@ -363,6 +363,51 @@ class HostExpertCache:
         with self._lock:
             return self._rows.get(key)
 
+    def rows_for_gib(self, gib: float) -> int:
+        return max(1, int(gib * 2**30) // self.layout.row_bytes)
+
+    def resize_refusal(self) -> str | None:
+        """Why the cache cannot be resized now (None: it can)."""
+        with self._lock:
+            if self._filling:
+                return (
+                    f"{len(self._filling)} reads into the host cache are in "
+                    "flight; ask again when they have landed"
+                )
+            if self._busy:
+                return "a layer call holds rows of the host cache"
+        return None
+
+    def resize(self, num_rows: int) -> None:
+        """A new mapping of ``num_rows`` rows, between two steps (no read in
+        flight, no row held): the most recently used experts are copied over
+        as far as they fit, the rest count as evicted. The old mapping goes
+        when its last view does; both exist while the copy runs."""
+        if num_rows < 1:
+            raise ValueError("the host expert cache needs at least one row")
+        with self._lock:
+            if self._filling or self._busy:
+                raise RuntimeError(self.resize_refusal_locked())
+            keep = list(self._rows.items())[-num_rows:]  # LRU order: newest last
+            new_map = mmap.mmap(-1, num_rows * self.layout.row_bytes)
+            slab = torch.frombuffer(new_map, dtype=torch.uint8).view(
+                num_rows, self.layout.row_bytes
+            )
+            rows: OrderedDict[Key, int] = OrderedDict()
+            for i, (key, row) in enumerate(keep):
+                slab[i].copy_(self.slab[row])
+                rows[key] = i
+            self.evicted += len(self._rows) - len(keep)
+            self._map, self.slab = new_map, slab
+            self._rows = rows
+            self._free = list(range(len(keep), num_rows))
+            self.num_rows = num_rows
+
+    def resize_refusal_locked(self) -> str:
+        if self._filling:
+            return f"{len(self._filling)} reads into the host cache are in flight"
+        return "a layer call holds rows of the host cache"
+
 
 # --------------------------------------------------------------------------
 # The runtime: one per process (one rank per process)
@@ -377,6 +422,10 @@ class _Buffers:
     weights: torch.Tensor
     x: torch.Tensor
     out: torch.Tensor
+    # One output row per (token, top-k) pair the CPU computes, for a sum
+    # that takes each pair's own row (VLLM_XPU_MOE_COMBINE rank/exact);
+    # allocated on first use.
+    pair_rows: torch.Tensor | None = None
 
 
 @dataclass
@@ -387,6 +436,16 @@ class Pending:
     num_tokens: int
     event: Any
     buffers: _Buffers
+
+
+@dataclass
+class HostPairs:
+    """The CPU's part of a layer for a per-pair sum: ``rows`` [n, hidden] on
+    the device, one per pair the CPU computed, and ``row_map`` [tokens,
+    top_k] (int32, -1 where the CPU computed nothing) on the device."""
+
+    rows: torch.Tensor
+    row_map: torch.Tensor
 
 
 @dataclass
@@ -401,6 +460,7 @@ class CpuExpertStats:
     promotions: int = 0
     demotions: int = 0
     max_calls: int = 0
+    max_experts: int = 0  # most distinct experts one layer call needed
     per_tier: dict[str, int] = field(
         default_factory=lambda: {"card": 0, "pinned": 0, "cpu": 0}
     )
@@ -438,7 +498,6 @@ class CpuExpertRuntime:
         self.cache = HostExpertCache(store, layout, rows, config.read_timeout_s)
         self.stats = CpuExpertStats()
         self._buffers: _Buffers | None = None
-        self._stats_interval = float(config.stats_interval_s)
         self._last_stats = time.monotonic()
         self._first_logged = False
         self._self_check()
@@ -451,6 +510,30 @@ class CpuExpertRuntime:
             rows,
             self.cache.gib,
             layout.row_bytes,
+        )
+
+    # -- settings a running engine may change (runtime control: cpu.set) -------
+
+    def set_threads(self, threads: int) -> None:
+        """Threads of the host op from the next call on (the op keeps one
+        pool per thread count)."""
+        if threads < 1:
+            raise ValueError("cpu_threads must be at least 1")
+        self.threads = int(threads)
+        self.config.cpu_threads = int(threads)
+
+    def resize_cache(self, gib: float) -> None:
+        """The host cache to ``gib`` (rows of whole experts), between two
+        steps: the most recently used experts stay as far as they fit."""
+        rows = self.cache.rows_for_gib(gib)
+        old = self.cache.num_rows
+        self.cache.resize(rows)
+        self.config.host_cache_gib = float(gib)
+        logger.info(
+            "CPU experts: host cache %d -> %d experts (%.2f GiB of ordinary memory).",
+            old,
+            rows,
+            self.cache.gib,
         )
 
     # -- the op ---------------------------------------------------------------
@@ -606,18 +689,48 @@ class CpuExpertRuntime:
         """Wait for the routing only, compute the layer's host calls and
         return their summed contribution on the device (None: no host call).
         Raises :class:`CpuExpertError` when an expert cannot be served."""
-        from vllm.utils.gpu_sync_debug import gpu_sync_allowed
-
         n, b = pending.num_tokens, pending.buffers
-        start = time.perf_counter()
-        with gpu_sync_allowed():
-            pending.event.synchronize()
-        self.stats.wait_ms += (time.perf_counter() - start) * 1e3
+        self._wait(pending)
         if not self.compute(
             pending.tiers, b.ids[:n], b.weights[:n], b.x[:n], b.out[:n]
         ):
             return None
         return b.out[:n].to(device, non_blocking=True)
+
+    def finish_pairs(self, pending: Pending, device: torch.device) -> HostPairs | None:
+        """:meth:`finish` for a sum that takes each pair's own row (the
+        combine modes rank and exact): one output row per (token, top-k)
+        pair the CPU computes, with its map. None: no host call."""
+        from vllm.utils.platform_utils import is_pin_memory_available
+
+        n, b = pending.num_tokens, pending.buffers
+        self._wait(pending)
+        topk, hidden = b.ids.shape[1], b.x.shape[1]
+        if b.pair_rows is None or b.pair_rows.shape[0] < n * topk:
+            b.pair_rows = torch.empty(
+                (max(n, b.x.shape[0]) * topk, hidden),
+                dtype=torch.bfloat16,
+                pin_memory=is_pin_memory_available(),
+            )
+        pair = self.compute_pairs(pending.tiers, b.ids[:n], b.x[:n], b.pair_rows)
+        if pair is None:
+            return None
+        row_map = torch.full((n, topk), -1, dtype=torch.int32)
+        row_map.view(-1)[torch.from_numpy(pair)] = torch.arange(
+            len(pair), dtype=torch.int32
+        )
+        return HostPairs(
+            b.pair_rows[: len(pair)].to(device, non_blocking=True),
+            row_map.to(device, non_blocking=True),
+        )
+
+    def _wait(self, pending: Pending) -> None:
+        from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+
+        start = time.perf_counter()
+        with gpu_sync_allowed():
+            pending.event.synchronize()
+        self.stats.wait_ms += (time.perf_counter() - start) * 1e3
 
     def compute(
         self,
@@ -631,10 +744,50 @@ class CpuExpertRuntime:
         this rank computes on the CPU, applied to ``x`` [T, H] and summed per
         token into ``out`` (overwritten). False when there is none (``out``
         untouched)."""
-        n = ids.shape[0]
         waited = time.perf_counter()
-        st = self.stats
         keys, tokens, call_w, by_tier = tiers.host_calls(ids.numpy(), weights.numpy())
+        return self._run_calls(
+            tiers, keys, by_tier, x, out, torch.from_numpy(tokens),
+            torch.from_numpy(call_w), ids.shape[0], waited,
+        )  # fmt: skip
+
+    def compute_pairs(
+        self,
+        tiers: "ExpertTiers",
+        ids: torch.Tensor,
+        x: torch.Tensor,
+        out_rows: torch.Tensor,
+    ) -> np.ndarray | None:
+        """On the host: each call of ``ids`` [T, K] this rank computes on the
+        CPU, as its own row of ``out_rows`` (call ``i`` in row ``i``, the
+        expert's bf16 output without the router weight: a call alone in its
+        row with weight 1 rounds to exactly that). Returns the flat pair
+        index ``token * K + k`` of each call, or None when there is none."""
+        waited = time.perf_counter()
+        keys, pair, by_tier = tiers.host_pairs(ids.numpy())
+        n = len(keys)
+        tokens = torch.from_numpy(pair // ids.shape[1])
+        xs = x.index_select(0, tokens) if n else x[:0]
+        ran = self._run_calls(
+            tiers, keys, by_tier, xs, out_rows[:n],
+            torch.arange(n, dtype=torch.int32), torch.ones(n, dtype=torch.float32),
+            ids.shape[0], waited,
+        )  # fmt: skip
+        return pair if ran else None
+
+    def _run_calls(
+        self,
+        tiers: "ExpertTiers",
+        keys: list[Key],
+        by_tier: dict[str, int],
+        x: torch.Tensor,
+        out: torch.Tensor,
+        tokens: torch.Tensor,
+        call_w: torch.Tensor,
+        n: int,
+        waited: float,
+    ) -> bool:
+        st = self.stats
         for tier, count in by_tier.items():
             st.per_tier[tier] += count
         if not keys:
@@ -649,8 +802,8 @@ class CpuExpertRuntime:
                 x,
                 self.cache.slab,
                 torch.tensor(rows, dtype=torch.int32),
-                torch.from_numpy(tokens),
-                torch.from_numpy(call_w),
+                tokens,
+                call_w,
             )
         finally:
             self.cache.release(rows)
@@ -660,6 +813,7 @@ class CpuExpertRuntime:
         st.max_calls = max(st.max_calls, len(keys))
         distinct = len(set(keys))
         st.experts += distinct
+        st.max_experts = max(st.max_experts, distinct)
         st.read_ms += (read_done - waited) * 1e3
         st.compute_ms += (done - read_done) * 1e3
         if not self._first_logged:
@@ -680,10 +834,12 @@ class CpuExpertRuntime:
         return True
 
     def _maybe_log(self) -> None:
-        if self._stats_interval <= 0:
+        # Read live: the runtime control surface's store.set changes it.
+        interval = float(self.config.stats_interval_s)
+        if interval <= 0:
             return
         now = time.monotonic()
-        if now - self._last_stats < self._stats_interval:
+        if now - self._last_stats < interval:
             return
         self._last_stats = now
         self.log_stats()

@@ -244,6 +244,11 @@ class SchedulerStats:
     # 1 host, 2 accelerators), whether a move is in progress, and counters
     # since start. Empty without such a tower.
     encoder_tower_stats: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Experts computed on the CPU (--cpu-offload-pinned-gb), by rank: the
+    # routed calls per tier, the CPU's time, the host cache and the slots per
+    # tier (keys: vllm/v1/engine/runtime_control.py EXPERT_TIER_GAUGES).
+    # Empty without them.
+    expert_tier_stats: dict[str, dict[str, float]] = field(default_factory=dict)
     iteration_details: SchedulerIterationDetails | None = None
 
     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)

@@ -251,6 +251,8 @@ def test_store_settings_apply_and_undo(monkeypatch):
 
 def test_a_tier_setting_registered_by_a_component(monkeypatch):
     worker = _worker()
+    # none registered (a CPU expert tier in this process would register one)
+    monkeypatch.setattr(wrc, "_TIER_SETTINGS", {})
     monkeypatch.setattr(wrc, "_tiers", lambda: [object()])
     assert (
         "fixed at load"

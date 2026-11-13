@@ -383,6 +383,10 @@ class TierPlacement:
         assert 0 <= pinned <= self.num_slow
         self.num_pinned = pinned  # slots in pinned rows when the tiers are full
         self.num_host = self.num_slow - pinned
+        # Whether this layer has a host tier at all (decided at load): the
+        # pinned capacity may move later (set_pinned_capacity), the planning
+        # rules do not.
+        self.host_tier = self.num_host > 0
         self.spare = spare
         # Rows beyond the spares, for host slots promoted between moves.
         self.extra_rows = extra_rows
@@ -459,6 +463,20 @@ class TierPlacement:
             # a host slot is in neither map: the CPU computes it
         return fast_map, slow_map
 
+    def max_pinned_capacity(self) -> int:
+        """The most slots that may hold pinned rows: every row but the spares
+        (EPLB's), and no more than the slots off the card."""
+        return min(self.num_slow, self.num_pool_rows - self.spare)
+
+    def set_pinned_capacity(self, pinned: int) -> None:
+        """How many slots the pinned rows serve from now on (a layer with a
+        host tier only; its rows were sized at load). Moves nothing: the
+        caller moves the slots, and the next rearrangement plans with it."""
+        assert self.host_tier, "the pinned capacity moves only with a host tier"
+        assert 0 <= pinned <= self.max_pinned_capacity()
+        self.num_pinned = pinned
+        self.num_host = self.num_slow - pinned
+
     def promote_host(self, slot: int, row: int) -> None:
         """Host slot ``slot`` now holds pinned row ``row`` (taken from the
         free rows and filled by the caller; the caller writes the maps)."""
@@ -504,7 +522,7 @@ class TierPlacement:
             )
         else:
             new_fast = is_fast.copy()
-        if self.num_host == 0:
+        if not self.host_tier:
             return self.plan_from_set(old_logical, new_logical, new_fast)
         # Host slots: which off-card slots hold pinned rows is a choice of its
         # own. Each slot entering a pinned or a fast row from the host is a
@@ -570,7 +588,7 @@ class TierPlacement:
         changed = np.flatnonzero(changed_mask).tolist()
         demoted = np.flatnonzero(is_fast & ~new_fast & ~changed_mask).tolist()
         to_fast = np.flatnonzero(new_fast & (changed_mask | ~is_fast)).tolist()
-        if self.num_host == 0:
+        if not self.host_tier:
             pool = None
             reads = {s: int(new_logical[s]) for s in changed}
             reads.update({s: int(old_logical[s]) for s in demoted})

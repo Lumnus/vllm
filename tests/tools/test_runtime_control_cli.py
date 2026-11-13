@@ -27,6 +27,21 @@ from tools.runtime_control import _op_and_args, _parser, _print_state
             {"host_tier_bound": 8},
         ),
         (
+            [
+                "cpu",
+                "set",
+                "--threads",
+                "6",
+                "--cache-gib",
+                "8",
+                "--promote-misses",
+                "4",
+            ],
+            "cpu.set",
+            {"cpu_threads": 6, "host_cache_gib": 8.0, "host_promote_misses": 4},
+        ),  # fmt: skip
+        (["cpu", "stats"], "cpu.stats", {}),
+        (
             ["kv", "resize", "2000", "--deadline", "30", "--preempt"],
             "kv.resize",
             {"num_blocks": 2000, "deadline_s": 30.0, "preempt": True},

@@ -98,7 +98,7 @@ from vllm.v1.engine.kv_cache_resize import (
     KVCacheResizeState,
     grow_message,
 )
-from vllm.v1.engine.runtime_control import RuntimeControl
+from vllm.v1.engine.runtime_control import ExpertTierStatsPoller, RuntimeControl
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.tower_residency import TowerResidencyController
 from vllm.v1.engine.utils import (
@@ -222,6 +222,9 @@ class EngineCore:
         # Encoder towers that move between host memory and the accelerators
         # (residency "dynamic" in --mm-encoder-host-towers); None without one.
         self._tower_residency = TowerResidencyController.maybe_create(self)
+        # The CPU expert tier's counters for the metrics (experts computed on
+        # the CPU, --cpu-offload-pinned-gb, with stats on); None otherwise.
+        self._expert_tier_stats = ExpertTierStatsPoller.maybe_create(self)
 
         kv_connector = self.scheduler.get_kv_connector()
         self._set_kv_connector_handshake_metadata()
@@ -968,6 +971,7 @@ class EngineCore:
     _kv_resize: KVCacheResize | None = None
     _kv_memory_holders: tuple[KVCacheMemoryHolder, ...] = ()
     _tower_residency: TowerResidencyController | None = None
+    _expert_tier_stats: ExpertTierStatsPoller | None = None
     # Seconds between attempts to finish a release a worker failed.
     KV_RESIZE_RETRY_INTERVAL_S = 1.0
     # A shrink's default deadline for the drain, in seconds.
@@ -2231,6 +2235,9 @@ class EngineCoreProc(EngineCore):
             # So do encoder towers moving between host and accelerators.
             if self._tower_residency is not None:
                 self._tower_residency.advance()
+            # And the CPU expert tier's counters, every few seconds.
+            if self._expert_tier_stats is not None:
+                self._poll_expert_tier_stats()
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # Publish request counts before and after GPU step to ensure freshness.
@@ -2262,6 +2269,14 @@ class EngineCoreProc(EngineCore):
     ) -> dict[str, Any]:
         try:
             return super().resize_kv_cache(target_num_blocks, deadline_s, preempt)
+        except TimeoutError:
+            self._fail_kv_resize_executor()
+            raise
+
+    def _poll_expert_tier_stats(self) -> None:
+        assert self._expert_tier_stats is not None
+        try:
+            self._expert_tier_stats.maybe_poll()
         except TimeoutError:
             self._fail_kv_resize_executor()
             raise

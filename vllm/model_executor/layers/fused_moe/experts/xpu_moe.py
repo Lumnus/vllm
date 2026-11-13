@@ -120,18 +120,23 @@ def _pick_rows_kernel(
     a_rows_ptr,
     b_ptr,
     b_rows_ptr,
+    c_ptr,
+    c_rows_ptr,
     hidden,
     HAS_B: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_C: tl.constexpr,
 ):
     """y[i] = a[a_rows[i]] if a_rows[i] >= 0, else b[b_rows[i]] if
-    b_rows[i] >= 0, else zeros; i runs over the (token, top-k) pairs."""
+    b_rows[i] >= 0, else c[c_rows[i]] if c_rows[i] >= 0 (HAS_C: the rows
+    the CPU computed), else zeros; i runs over the (token, top-k) pairs."""
     i = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     m = offs < hidden
     # The row numbers as vectors, so every mask is a full vector.
     ra = tl.zeros([BLOCK], dtype=tl.int32) + tl.load(a_rows_ptr + i)
     in_a = ra >= 0
+    free = ra < 0
     v = tl.load(
         a_ptr + tl.maximum(ra, 0).to(tl.int64) * hidden + offs,
         mask=m & in_a,
@@ -145,6 +150,15 @@ def _pick_rows_kernel(
             other=0.0,
         )
         v = tl.where(in_a, v, vb)
+        free = free & (rb < 0)
+    if HAS_C:
+        rc = tl.zeros([BLOCK], dtype=tl.int32) + tl.load(c_rows_ptr + i)
+        vc = tl.load(
+            c_ptr + tl.maximum(rc, 0).to(tl.int64) * hidden + offs,
+            mask=m & (rc >= 0) & free,
+            other=0.0,
+        )
+        v = tl.where(free, vc, v)
     tl.store(y_ptr + i.to(tl.int64) * hidden + offs, v, mask=m)
 
 
@@ -156,17 +170,20 @@ def _sum_topk_kernel(
     a_rows_ptr,
     b_ptr,
     b_rows_ptr,
+    c_ptr,
+    c_rows_ptr,
     hidden,
     TOPK: tl.constexpr,
     DIRECT: tl.constexpr,
     HAS_B: tl.constexpr,
     BLOCK: tl.constexpr,
+    HAS_C: tl.constexpr,
 ):
     """out[t] = sum over k = 0 .. TOPK-1, in that order, of w[t, k] times the
-    row of (t, k): row t*TOPK+k of a (DIRECT), or a[a_rows] / b[b_rows] as
-    in _pick_rows_kernel. fp32 accumulation, one store in out's dtype. A pair
-    no source holds adds an exact zero, so the order of the others, and the
-    result, do not depend on which source held which pair."""
+    row of (t, k): row t*TOPK+k of a (DIRECT), or a[a_rows] / b[b_rows] /
+    c[c_rows] as in _pick_rows_kernel. fp32 accumulation, one store in out's
+    dtype. A pair no source holds adds an exact zero, so the order of the
+    others, and the result, do not depend on which source held which pair."""
     t = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     m = offs < hidden
@@ -179,6 +196,7 @@ def _sum_topk_kernel(
         else:
             ra = tl.zeros([BLOCK], dtype=tl.int32) + tl.load(a_rows_ptr + i)
             in_a = ra >= 0
+            free = ra < 0
             v = tl.load(
                 a_ptr + tl.maximum(ra, 0).to(tl.int64) * hidden + offs,
                 mask=m & in_a,
@@ -192,6 +210,15 @@ def _sum_topk_kernel(
                     other=0.0,
                 )
                 v = tl.where(in_a, v, vb)
+                free = free & (rb < 0)
+            if HAS_C:
+                rc = tl.zeros([BLOCK], dtype=tl.int32) + tl.load(c_rows_ptr + i)
+                vc = tl.load(
+                    c_ptr + tl.maximum(rc, 0).to(tl.int64) * hidden + offs,
+                    mask=m & (rc >= 0) & free,
+                    other=0.0,
+                )
+                v = tl.where(free, vc, v)
         acc += v.to(tl.float32) * wk
     tl.store(
         out_ptr + t.to(tl.int64) * hidden + offs,
@@ -212,17 +239,16 @@ def sum_topk(
     sources: list[tuple[torch.Tensor, torch.Tensor]],
 ) -> None:
     """``out[t] = sum_k topk_weights[t, k] * row(t, k)`` in k order, fp32
-    accumulation, one rounding to ``out``'s dtype. ``sources`` are one or
-    two ``(rows, row_map)``: the expert-grouped outputs of a fused-MoE call
-    and its ``[tokens, top_k]`` map (-1: not computed there); a pair is taken
-    from the first source that holds it. The sum is the same bits whichever
-    source held which pair."""
+    accumulation, one rounding to ``out``'s dtype. ``sources`` are one to
+    three ``(rows, row_map)``: the expert-grouped outputs of a fused-MoE call
+    and its ``[tokens, top_k]`` map (-1: not computed there), or the rows the
+    CPU computed and theirs; a pair is taken from the first source that
+    holds it. The sum is the same bits whichever source held which pair."""
     num_tokens, top_k = topk_weights.shape
     if num_tokens == 0:
         return
     hidden = out.shape[-1]
-    a, a_rows = sources[0]
-    b, b_rows = sources[1] if len(sources) > 1 else (a, a_rows)
+    (a, a_rows), (b, b_rows), (c, c_rows) = _three(sources)
     grid = (num_tokens, triton.cdiv(hidden, _COMBINE_BLOCK))
     _sum_topk_kernel[grid](
         out,
@@ -231,12 +257,23 @@ def sum_topk(
         a_rows.contiguous(),
         b,
         b_rows.contiguous(),
+        c,
+        c_rows.contiguous(),
         hidden,
         TOPK=top_k,
         DIRECT=False,
         HAS_B=len(sources) > 1,
         BLOCK=_COMBINE_BLOCK,
+        HAS_C=len(sources) > 2,
     )
+
+
+def _three(
+    sources: list[tuple[torch.Tensor, torch.Tensor]],
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """``sources`` padded to three with the first (unread: HAS_B / HAS_C)."""
+    assert 1 <= len(sources) <= 3, "one to three sources"
+    return list(sources) + [sources[0]] * (3 - len(sources))
 
 
 def sum_topk_direct(
@@ -255,11 +292,14 @@ def sum_topk_direct(
         per_k,
         per_k,
         per_k,
+        per_k,
+        per_k,
         hidden,
         TOPK=top_k,
         DIRECT=True,
         HAS_B=False,
         BLOCK=_COMBINE_BLOCK,
+        HAS_C=False,
     )
 
 
@@ -271,8 +311,7 @@ def pick_rows(
     if per_k.shape[0] == 0:
         return
     hidden = per_k.shape[-1]
-    a, a_rows = sources[0]
-    b, b_rows = sources[1] if len(sources) > 1 else (a, a_rows)
+    (a, a_rows), (b, b_rows), (c, c_rows) = _three(sources)
     grid = (per_k.shape[0], triton.cdiv(hidden, _COMBINE_BLOCK))
     _pick_rows_kernel[grid](
         per_k,
@@ -280,9 +319,12 @@ def pick_rows(
         a_rows.contiguous().view(-1),
         b,
         b_rows.contiguous().view(-1),
+        c,
+        c_rows.contiguous().view(-1),
         hidden,
         HAS_B=len(sources) > 1,
         BLOCK=_COMBINE_BLOCK,
+        HAS_C=len(sources) > 2,
     )
 
 
@@ -354,7 +396,8 @@ class PlacementTrace:
     per MoE layer call to ``<prefix>.rank<R>.jsonl``: the layer, the call
     number, and per token and top-k the physical expert id, the router
     weight, and on this rank ``F<row>`` (device tier), ``S<row>`` (host
-    tier) or ``-`` (another rank), plus the logical expert where this rank
+    tier), ``C`` (computed on this rank's CPU, --cpu-offload-pinned-gb) or
+    ``-`` (another rank), plus the logical expert where this rank
     knows it (expert store on). Graph replays run no Python, so only eager
     steps are traced (boot with --enforce-eager for a full trace)."""
 
@@ -404,6 +447,13 @@ class PlacementTrace:
         fast_row = torch.where(valid, fast_map[safe].long(), -1)
         slow_row = torch.where(valid, slow_map[safe].long(), -1)
         logical = tiers.slot_logical
+        # This rank's tier per physical id when slots are computed on the CPU
+        # (neither map holds those: they would read as another rank's).
+        cpu_tier = (
+            getattr(tiers, "_tier_of_global", None)
+            if getattr(tiers, "cpu", None) is not None
+            else None
+        )
         where: list[list[str]] = []
         experts: list[list[int]] = []
         for t in range(ids.shape[0]):
@@ -414,6 +464,14 @@ class PlacementTrace:
                     row_where.append(f"F{int(fast_row[t, k])}")
                 elif slow_row[t, k] >= 0:
                     row_where.append(f"S{int(slow_row[t, k])}")
+                elif (
+                    cpu_tier is not None
+                    and 0 <= g < len(cpu_tier)
+                    and (
+                        int(cpu_tier[g]) == 2  # expert_tier_map.HOST
+                    )
+                ):
+                    row_where.append("C")
                 else:
                     row_where.append("-")
                 slot = tiers.local_of.get(g, -1) if logical is not None else -1
@@ -804,12 +862,22 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             self.placement_trace.record(tiers, topk_ids, topk_weights)
         mode = self._combine_mode()
         cpu = getattr(tiers, "cpu", None)
+        pending = (
+            None
+            if cpu is None
+            else cpu.post(tiers, hidden_states, topk_ids, topk_weights)
+        )
         if mode != "split":
             if cpu is not None:
-                raise ValueError(
-                    f"VLLM_XPU_MOE_COMBINE={mode}: not available with experts "
-                    "computed on the CPU (--cpu-offload-pinned-gb): the CPU's "
-                    "contribution would not be in the sum"
+                logger.warning_once(
+                    "XPU MoE combine %s with experts computed on the CPU: the "
+                    "CPU computes each of its pairs as its own row, summed with "
+                    "the card's rows in top-k order. The sum does not depend on "
+                    "the rank or the card tier of any expert; an expert that "
+                    "moves between the CPU and the card can change its own row "
+                    "in the last bit of some values (the CPU kernel adds its "
+                    "fp32 partial sums in another order than the card's).",
+                    mode,
                 )
             captured = (_Captured(), _Captured())
             fast.apply(
@@ -831,16 +899,16 @@ class XPUExperts(mk.FusedMoEExpertsModular):
                 **self.impl_apply_kwargs,
             )
             sources = [c.source() for c in captured]
+            if pending is not None:
+                assert cpu is not None
+                host = cpu.finish_pairs(pending, output.device)
+                if host is not None:
+                    sources.append((host.rows, host.row_map))
             if mode == "rank":
                 sum_topk(output, topk_weights, sources)
             else:
                 self._combine_exact(output, topk_weights, sources)
             return
-        pending = (
-            None
-            if cpu is None
-            else cpu.post(tiers, hidden_states, topk_ids, topk_weights)
-        )
         fast.apply(
             output=output,
             hidden_states=hidden_states,

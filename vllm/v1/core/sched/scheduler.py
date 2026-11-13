@@ -84,6 +84,11 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # The CPU expert tier's series per rank, set by the engine core's poller
+    # (vllm/v1/engine/runtime_control.py ExpertTierStatsPoller); None
+    # without experts computed on the CPU.
+    expert_tier_stats: dict[str, dict[str, float]] | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -3474,6 +3479,7 @@ class Scheduler(SchedulerInterface):
             num_gpu_blocks=self.kv_cache_manager.block_pool.num_gpu_blocks,
             num_fenced_gpu_blocks=self.kv_cache_manager.block_pool.num_fenced_blocks,
             encoder_tower_stats=self._encoder_tower_stats(),
+            expert_tier_stats=self.expert_tier_stats or {},
             prefix_cache_stats=prefix_cache_stats,
             connector_prefix_cache_stats=connector_prefix_cache_stats,
             kv_cache_eviction_events=eviction_events,

@@ -99,6 +99,13 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
     if group == "tiers":
         _set(a, "host_tier_bound", ns.host_tier_bound)
         return "tiers.set", a
+    if group == "cpu":
+        if verb == "set":
+            _set(a, "cpu_threads", ns.threads)
+            _set(a, "host_cache_gib", ns.cache_gib)
+            _set(a, "host_promote_misses", ns.promote_misses)
+            _set(a, "host_promote_window", ns.promote_window)
+        return f"cpu.{verb}", a
     if group == "kv":
         if verb == "resize":
             a["num_blocks"] = ns.num_blocks
@@ -190,11 +197,31 @@ def _print_state(state: dict) -> None:
                 )
         tiers = rank.get("tiers")
         if tiers:
+            now = tiers.get("slots_now", {})
             print(
                 f"{head} tiers: {tiers['layers']} layers, fast "
                 f"{tiers['fast_slots_per_layer']} host {tiers['host_slots_per_layer']}"
-                f" per layer, pool rows {tiers['pool_rows_per_layer']}, pinned "
-                f"{tiers['pinned_gib']} GiB, moves {tiers['moves_committed']}"
+                f" (pinned bound {tiers.get('pinned_slots_per_layer')}, CPU "
+                f"{tiers.get('cpu_slots_per_layer')}) per layer, pool rows "
+                f"{tiers['pool_rows_per_layer']}, pinned {tiers['pinned_gib']} GiB, "
+                f"moves {tiers['moves_committed']}; slots now card "
+                f"{now.get('card', '-')} pinned {now.get('pinned', '-')} CPU "
+                f"{now.get('cpu', '-')}"
+            )
+        cpu = rank.get("cpu")
+        if cpu:
+            c, s = cpu["counters"], cpu["settings"]
+            routed = max(1, c["routed_card"] + c["routed_pinned"] + c["routed_cpu"])
+            print(
+                f"{head} CPU experts: {cpu['cpu_threads']} threads, host cache "
+                f"{cpu['cache']['experts_held']} of {cpu['cache']['rows']} experts "
+                f"({cpu['cache']['gib']} GiB); routed card "
+                f"{100 * c['routed_card'] / routed:.1f} % pinned "
+                f"{100 * c['routed_pinned'] / routed:.1f} % CPU "
+                f"{100 * c['routed_cpu'] / routed:.1f} %; drive reads "
+                f"{c['cache_misses']}, promotions {c['promotions']} demotions "
+                f"{c['demotions']}; promote after {s['host_promote_misses']} "
+                f"misses per {s['host_promote_window']} steps"
             )
         for store in rank.get("store") or []:
             st = store.get("stats", {})
@@ -269,6 +296,14 @@ def _parser() -> argparse.ArgumentParser:
 
     ti = groups.add_parser("tiers").add_subparsers(dest="verb", required=True)
     ti.add_parser("set").add_argument("--host-tier-bound", type=int, required=True)
+
+    cp = groups.add_parser("cpu").add_subparsers(dest="verb", required=True)
+    cs = cp.add_parser("set")
+    cs.add_argument("--threads", type=int)
+    cs.add_argument("--cache-gib", type=float)
+    cs.add_argument("--promote-misses", type=int)
+    cs.add_argument("--promote-window", type=int)
+    cp.add_parser("stats")
 
     kv = groups.add_parser("kv").add_subparsers(dest="verb", required=True)
     kr = kv.add_parser("resize")

@@ -48,13 +48,17 @@ class RuntimeSetting:
 
 _TIER_SETTINGS: dict[str, RuntimeSetting] = {}
 
-# Why the expert tiers' sizes are fixed in this tree (see the readout).
+# Why the expert tiers' sizes are fixed (see the readout). The pinned bound
+# (host_tier_bound) moves at run time in an engine started with experts
+# computed on the CPU, which registers it; the fast tier never does.
 TIER_RESIZE_BLOCKED = (
-    "the tier sizes are fixed at load: the fast tier is each layer's own "
-    "device parameter of num_fast rows (its storage is what the kernels and "
-    "any captured graph read), TierPlacement's row pools are sized once, and "
-    "the device memory a larger fast tier needs is not taken from the KV "
-    "cache by any path yet"
+    "the tier sizes are fixed at load in this engine: the fast tier is each "
+    "layer's own device parameter of num_fast rows (its storage is what the "
+    "kernels and any captured graph read) and the device memory a larger fast "
+    "tier needs is not taken from the KV cache by any path; the pinned bound "
+    "moves at run time only when the engine started with "
+    "--cpu-offload-pinned-gb, because slots served on the CPU need the MoE op "
+    "outside the captured graphs, which is decided at start"
 )
 
 
@@ -150,10 +154,31 @@ def _tiers_state() -> dict[str, Any] | None:
         pinned_arena_gib,
     )
 
+    def count(tier: int) -> int:
+        # slots of every layer in the tier now (moves and promotions included)
+        return sum(
+            int((t.placement.tier == tier).sum())
+            if t.placement is not None
+            else (t.num_fast if tier == 0 else t.num_slow if tier == 1 else 0)
+            for t in tiers
+        )
+
     return {
         "layers": len(tiers),
         "fast_slots_per_layer": sorted({t.num_fast for t in tiers}),
+        # every slot off the card (pinned rows and the CPU together)
         "host_slots_per_layer": sorted({t.num_slow for t in tiers}),
+        # the bound on the slots in pinned rows, and the rest on the CPU
+        "pinned_slots_per_layer": sorted(
+            {
+                t.placement.num_pinned if t.placement is not None else t.num_slow
+                for t in tiers
+            }
+        ),
+        "cpu_slots_per_layer": sorted(
+            {t.placement.num_host if t.placement is not None else 0 for t in tiers}
+        ),
+        "slots_now": {"card": count(0), "pinned": count(1), "cpu": count(2)},
         "pool_rows_per_layer": sorted({t.num_pool_rows for t in tiers}),
         "expert_bytes": tiers[0].slot_bytes() if tiers[0].slow else None,
         "store_backed_layers": sum(t.store_binding is not None for t in tiers),
@@ -164,6 +189,42 @@ def _tiers_state() -> dict[str, Any] | None:
         "resize_blocked": (
             None if "host_tier_bound" in _TIER_SETTINGS else TIER_RESIZE_BLOCKED
         ),
+    }
+
+
+def _cpu_runtime() -> Any:
+    """The process's CPU expert tier (--cpu-offload-pinned-gb), or None."""
+    try:
+        from vllm.model_executor.layers.fused_moe.xpu_cpu_experts import (
+            current_runtime,
+        )
+    except ImportError:
+        return None
+    return current_runtime()
+
+
+def _cpu_state() -> dict[str, Any] | None:
+    """The CPU expert tier: its settings, its host cache and its counters
+    since start (the ones its periodic log line prints)."""
+    rt = _cpu_runtime()
+    if rt is None:
+        return None
+    cfg = rt.config
+    cache = rt.cache
+    with cache._lock:
+        cached = len(cache._rows)
+    return {
+        "isa": rt.isa,
+        "settings": {name: getattr(cfg, name) for name in _CPU_SETTINGS},
+        "cpu_threads": rt.threads,
+        "cache": {
+            "rows": cache.num_rows,
+            "gib": round(cache.gib, 3),
+            "row_bytes": cache.layout.row_bytes,
+            "experts_held": cached,
+        },
+        "counters": rt.snapshot(),
+        "max_experts_per_layer_call": rt.stats.max_experts,
     }
 
 
@@ -287,6 +348,7 @@ def state(worker: Any, only: list[str] | None = None) -> dict[str, Any]:
     parts: dict[str, Callable[[], Any]] = {
         "eplb": eplb_summary,
         "tiers": _tiers_state,
+        "cpu": _cpu_state,
         "store": _store_state,
         "kv": lambda: _kv_state(worker),
         "trace": lambda: _trace_state(eplb),
@@ -526,6 +588,14 @@ def _apply_scrub(worker: Any, args: dict) -> tuple[dict, dict, Any]:
 def _check_tiers_set(worker: Any, args: dict) -> str | None:
     if not _tiers():
         return "no expert layer keeps its slots in tiers (--cpu-offload-per-expert)"
+    eplb = _eplb(worker)
+    if eplb is not None and any(
+        ms.rebalanced for ms in getattr(eplb, "model_states", {}).values()
+    ):
+        return (
+            "an EPLB rearrangement is in flight (its layers are being prepared "
+            "and committed one by one); ask after it completes"
+        )
     for name, value in args.items():
         setting = _TIER_SETTINGS.get(name)
         if setting is None:
@@ -556,6 +626,101 @@ def _apply_tiers_set(worker: Any, args: dict) -> tuple[dict, dict, Any]:
 def _restore_tiers_set(worker: Any, undo: dict) -> None:
     for name, value in undo.items():
         _TIER_SETTINGS[name].apply(value)
+
+
+# ---- the CPU expert tier (--cpu-offload-pinned-gb)
+
+# What a running engine may change, with its type and lower bound; the
+# promotion settings are read by every between-steps call, the threads by
+# every host op call, the cache size by a resize of the host cache.
+_CPU_SETTINGS: dict[str, tuple[type, float]] = {
+    "cpu_threads": (int, 1),
+    "host_cache_gib": (float, 0.0),
+    "host_promote_misses": (int, 0),
+    "host_promote_window": (int, 1),
+}
+_NO_CPU_TIER = (
+    "no experts are computed on the CPU in this engine (--cpu-offload-pinned-gb)"
+)
+# Fixed at start, and why.
+_CPU_FIXED = {
+    "cpu_isa": "the self-check against the card's arithmetic runs at start "
+    "for the chosen code",
+    "host_promote_rows": "the promotion rows are pinned rows sized at load",
+    "read_timeout_s": "an expert store setting; not part of the CPU tier",
+}
+
+
+def _check_cpu_set(worker: Any, args: dict) -> str | None:
+    rt = _cpu_runtime()
+    if rt is None:
+        return _NO_CPU_TIER
+    for name, value in args.items():
+        if name in _CPU_FIXED:
+            return f"{name} cannot change while serving: {_CPU_FIXED[name]}"
+        spec = _CPU_SETTINGS.get(name)
+        if spec is None:
+            return f"unknown CPU tier setting {name!r}; known: {sorted(_CPU_SETTINGS)}"
+        kind, low = spec
+        number = isinstance(value, int | float) and not isinstance(value, bool)
+        if kind is int and not (number and isinstance(value, int) and value >= low):
+            return f"{name} must be an integer >= {low:g}, got {value!r}"
+        if kind is float and not (number and value > low):
+            return f"{name} must be a number > {low:g}, got {value!r}"
+        if name == "cpu_threads" and value > 1024:
+            return "cpu_threads must be at most 1024"
+    if "host_cache_gib" in args:
+        rows = rt.cache.rows_for_gib(float(args["host_cache_gib"]))
+        need = max(1, rt.stats.max_experts)
+        if rows < need:
+            return (
+                f"host_cache_gib {args['host_cache_gib']} holds {rows} experts; "
+                f"one layer call has already needed {need} at once"
+            )
+        refusal = rt.cache.resize_refusal()
+        if refusal:
+            return refusal
+    return None
+
+
+def _cpu_values(rt: Any) -> dict[str, Any]:
+    return {name: getattr(rt.config, name) for name in _CPU_SETTINGS}
+
+
+def _set_cpu(rt: Any, values: dict[str, Any]) -> None:
+    for name, value in values.items():
+        if name == "host_cache_gib":
+            rt.resize_cache(float(value))
+        elif name == "cpu_threads":
+            rt.set_threads(int(value))
+        else:
+            setattr(rt.config, name, int(value))
+
+
+def _apply_cpu_set(worker: Any, args: dict) -> tuple[dict, dict, Any]:
+    rt = _cpu_runtime()
+    before = _cpu_values(rt)
+    _set_cpu(rt, args)
+    after = _cpu_values(rt)
+    changes = {k: [before[k], after[k]] for k in args if before[k] != after[k]}
+    return changes, {"cpu": _cpu_state()}, {k: before[k] for k in args}
+
+
+def _restore_cpu_set(worker: Any, before: dict) -> None:
+    _set_cpu(_cpu_runtime(), before)
+
+
+def _check_cpu_stats(worker: Any, args: dict) -> str | None:
+    if _cpu_runtime() is None:
+        return _NO_CPU_TIER
+    return None
+
+
+def _apply_cpu_stats(worker: Any, args: dict) -> tuple[dict, dict, Any]:
+    """Log the CPU tier's line now and return its counters."""
+    rt = _cpu_runtime()
+    rt.log_stats()
+    return {}, {"cpu": _cpu_state()}, None
 
 
 # ---- KV cache
@@ -830,6 +995,8 @@ OPS: dict[str, _Op] = {
     "store.set": _Op(_check_store_set, _apply_store_set, _restore_store_set),
     "store.scrub": _Op(_check_scrub, _apply_scrub),
     "tiers.set": _Op(_check_tiers_set, _apply_tiers_set, _restore_tiers_set),
+    "cpu.set": _Op(_check_cpu_set, _apply_cpu_set, _restore_cpu_set),
+    "cpu.stats": _Op(_check_cpu_stats, _apply_cpu_stats),
     "kv.set": _Op(_check_kv_set, _apply_kv_set, _restore_kv_set),
     "trace.set": _Op(_check_trace_set, _apply_trace_set, _restore_trace_set),
     "ple.set": _Op(_check_ple_set, _apply_ple_set, _restore_ple_set),
