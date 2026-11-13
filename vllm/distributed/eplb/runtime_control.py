@@ -442,3 +442,38 @@ def unload(state: "EplbState", undo: dict[str, Any]) -> None:
         for model_state, loads in zip(state.model_states.values(), undo["loads"]):
             model_state.last_expert_load = loads
     untrigger(state, undo["step"])
+
+
+# --------------------------------------------------------------------------
+# The card tier's size (runtime control tiers.fast)
+# --------------------------------------------------------------------------
+
+
+def check_card_tier(state: "EplbState | None", rows: Any) -> str | None:
+    """Why the card tier of the expert tiers cannot move to ``rows`` card
+    rows per layer now, or None. EPLB owns the placement: no resize while a
+    rearrangement of its is in flight; the tiers say the rest."""
+    from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+
+    if state is not None:
+        why = in_flight(state)
+        if why is not None:
+            return f"{why}; ask after it completes"
+    return xpu_fast_tier.check(rows)
+
+
+def resize_card_tier(state: "EplbState | None", rows: int) -> dict[str, Any]:
+    """Change the card tier's capacity to ``rows`` rows per layer and let
+    EPLB's movers (the layers' tiers) fill or vacate them: the rows' memory
+    is mapped or released by the tiers, which slots enter or leave is the
+    placement's tier choice by EPLB's load (``TierPlacement.plan_card_round``,
+    ``plan_pinned_refill``), and every move is committed through the path a
+    rearrangement commits through (``ExpertTiers.commit_move``). Called only
+    by the runtime control surface, between two steps; never by EPLB's own
+    step (the size of the card tier is decided outside the engine)."""
+    from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+
+    why = check_card_tier(state, rows)
+    if why is not None:
+        raise RuntimeError(why)
+    return xpu_fast_tier.apply(rows)

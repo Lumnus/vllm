@@ -170,6 +170,19 @@ def rows_range() -> tuple[int, int] | None:
     return max(lo for lo, _ in ranges), min(hi for _, hi in ranges)
 
 
+def placement_digest() -> str:
+    """Eight hex digits over the tier (card, pinned, CPU) of every slot of
+    every layer: two equal digests mean the same placement, so the same
+    sums (a resize and its reverse with EPLB paused can be compared)."""
+    import hashlib
+
+    h = hashlib.sha1(usedforsecurity=False)
+    for t in resizable_tiers():
+        h.update(t.layer_name.encode())
+        h.update(t.placement.tier.tobytes())  # type: ignore[union-attr]
+    return h.hexdigest()[:8]
+
+
 def bytes_to(rows: int) -> int:
     """Device bytes every layer together maps for ``rows`` rows."""
     return sum(t.fast_rows.bytes_to(rows) for t in resizable_tiers())
@@ -194,6 +207,7 @@ def state(targets: Sequence[int] = ()) -> dict[str, Any] | None:
         "chunk_bytes": first.buffer.max_chunk_bytes,
         "row_bytes_all_layers": sum(sum(t.fast_rows.row_bytes) for t in tiers),
         "bytes_to": {str(int(r)): bytes_to(int(r)) for r in targets},
+        "placement": placement_digest(),
         "last": tiers[-1].move_log[-1] if tiers[-1].move_log else None,
     }
 
@@ -260,6 +274,7 @@ def apply(rows: int) -> dict[str, Any]:
     assert old is not None
     start = time.perf_counter()
     before = mapped_bytes()
+    digest_before = placement_digest()
     totals: dict[str, float] = {}
     if rows > old:
         committed: list[ExpertTiers] = []
@@ -292,11 +307,12 @@ def apply(rows: int) -> dict[str, Any]:
                 t.fast_rows.release_to(old)
         raise
     after = mapped_bytes()
+    digest = placement_digest()
     seconds = time.perf_counter() - start
     logger.info(
         "Fast tier: card rows per layer %d -> %d on %d layers in %.2f s: %d "
         "slots onto the card, %d off it, %d moved down, %d units read; %.2f "
-        "GiB mapped (%+.2f GiB).",
+        "GiB mapped (%+.2f GiB); placement %s -> %s.",
         old,
         rows,
         len(tiers),
@@ -307,9 +323,12 @@ def apply(rows: int) -> dict[str, Any]:
         int(totals.get("units_read", 0)),
         after / 2**30,
         (after - before) / 2**30,
+        digest_before,
+        digest,
     )
     return {
         "rows": [old, rows],
+        "placement": [digest_before, digest],
         "mapped_before": before,
         "mapped_after": after,
         "released_bytes": max(before - after, 0),

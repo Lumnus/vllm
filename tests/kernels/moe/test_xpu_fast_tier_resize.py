@@ -147,8 +147,11 @@ def test_grow_and_shrink_back_keep_the_sets_for_the_same_load(monkeypatch, tmp_p
     for tiers in env.tiers:
         tiers.fill_to(np.arange(E), _load(tiers, [5, 6, 7, 4, 3, 2, 1, 0]), 1.1)
     before = [t.placement.tier.copy() for t in env.tiers]
-    ft.apply(6)
-    ft.apply(LOAD_FAST)
+    grown = ft.apply(6)
+    back = ft.apply(LOAD_FAST)
+    # the digest the card run compares: equal before the grow and after
+    assert grown["placement"][0] != grown["placement"][1]
+    assert back["placement"][1] == grown["placement"][0]
     for tiers, tier in zip(env.tiers, before):
         assert np.array_equal(tiers.placement.tier, tier)
         _assert_serves_the_store(env, tiers)
@@ -367,7 +370,14 @@ def test_the_control_surface_moves_the_card_tier(monkeypatch, tmp_path):
     assert "KV cache must give them back first" in refusal
     # refused while EPLB rearranges
     worker.model_runner.eplb_state = SimpleNamespace(
-        model_states={"m": SimpleNamespace(rebalanced=True)}
+        model_states={
+            "m": SimpleNamespace(
+                rebalanced=True,
+                pending_result=None,
+                model_name="m",
+                model=SimpleNamespace(num_moe_layers=2),
+            )
+        }
     )
     refusal = wrc.handle(worker, "check", "tiers.fast", {"rows": 4})["refusal"]
     assert "in flight" in refusal
@@ -466,3 +476,95 @@ def test_expert_in_store_is_what_the_card_rows_hold(monkeypatch, tmp_path):
         for impl_field, key in xt._TIER_FIELDS:
             got = xt._u8(getattr(fast, impl_field))[p.row[s]]
             assert torch.equal(got, unit[key].reshape(-1).view(torch.uint8))
+
+
+# -- who chooses and who writes ---------------------------------------------------
+
+
+def test_the_placement_chooses_the_slots_by_eplbs_load():
+    """The card change's tier choice is the placement's (EPLB's tier-choice
+    module), by the heat order it is given, bounded by the reads allowed."""
+    from vllm.model_executor.offloader.expert_tier_map import TierPlacement
+
+    # 8 slots: card 0 1 2, pinned 3 4, CPU 5 6 7; slot 7 hottest
+    p = TierPlacement(8, 3, 2, lambda e: True, num_pool_slots=2)
+    rank = np.arange(8)
+    p.grow_fast_rows(5)
+    new_fast, new_pool = p.plan_card_round(rank, 5, budget=1)
+    # the two hottest are CPU slots (a read each): one fits the budget
+    assert np.flatnonzero(new_fast).tolist() == [0, 1, 2, 7]
+    assert np.array_equal(new_pool, p.is_pool())
+    assert p.plan_card_round(rank, 5, budget=0) is None
+    # shrink toward 2 card slots from 0 1 2: the coldest (0) leaves; colder
+    # than every pinned slot, it goes to the CPU with nothing read
+    p2 = TierPlacement(8, 3, 2, lambda e: True, num_pool_slots=2)
+    new_fast, new_pool = p2.plan_card_round(rank, 2, budget=0)
+    assert np.flatnonzero(new_fast).tolist() == [1, 2]
+    assert np.array_equal(new_pool, p2.is_pool())
+    # the pinned rows refill with the hottest CPU slots, bounded by the reads
+    p3 = TierPlacement(8, 3, 2, lambda e: True, num_pool_slots=2)
+    p3.tier[3] = HOST  # one pinned row left empty
+    p3.row[3] = -1
+    want = p3.plan_pinned_refill(rank, budget=1)
+    assert np.flatnonzero(want).tolist() == [4, 7]
+    assert p3.plan_pinned_refill(rank, budget=0) is None
+
+
+def test_every_move_of_a_resize_is_a_commit_on_eplbs_path(monkeypatch, tmp_path):
+    """A resize writes maps and rows through ExpertTiers.commit_move (the
+    commit EPLB's rearrangements use) and, for the slots moved down before
+    rows are dropped, TierPlacement.compact_fast; nothing else writes."""
+    env = _env(monkeypatch, tmp_path)
+    tiers = env.tiers[0]
+    tiers.fill_to(np.arange(E), _load(tiers, [5, 6, 7, 4, 3, 2, 1, 0]), 1.1)
+    commits, compacts = [], []
+    real_commit = xt.ExpertTiers.commit_move
+    real_compact = type(tiers.placement).compact_fast
+
+    def commit(self, move):
+        commits.append(move.plan.to_fast)
+        return real_commit(self, move)
+
+    def compact(self, *a, **kw):
+        compacts.append(a[0])
+        return real_compact(self, *a, **kw)
+
+    monkeypatch.setattr(xt.ExpertTiers, "commit_move", commit)
+    monkeypatch.setattr(type(tiers.placement), "compact_fast", compact)
+    writes = []
+    real_write = tiers.ops.compute_write
+
+    def write(dst, values):
+        writes.append((len(commits), len(compacts)))
+        return real_write(dst, values)
+
+    monkeypatch.setattr(tiers.ops, "compute_write", write)
+    tiers.resize_fast(5)
+    tiers.resize_fast(LOAD_FAST)
+    assert commits and compacts == [LOAD_FAST]
+    # each map write happened inside a commit or a compaction
+    assert all(c > 0 for c, _ in writes)
+    _assert_serves_the_store(env, tiers)
+
+
+def test_the_entry_is_eplbs_and_waits_for_its_rearrangement(monkeypatch, tmp_path):
+    from vllm.distributed.eplb import runtime_control as erc
+
+    env = _env(monkeypatch, tmp_path)
+    busy = SimpleNamespace(
+        model_states={
+            "m": SimpleNamespace(
+                rebalanced=True,
+                pending_result=None,
+                model_name="m",
+                model=SimpleNamespace(num_moe_layers=2),
+            )
+        }
+    )
+    with pytest.raises(RuntimeError, match="in flight"):
+        erc.resize_card_tier(busy, 5)
+    assert ft.rows_now() == LOAD_FAST
+    idle = SimpleNamespace(model_states={})
+    monkeypatch.setattr(ft, "_free_device_bytes", lambda device: 1 << 40)
+    assert erc.resize_card_tier(idle, 5)["rows"] == [LOAD_FAST, 5]
+    assert all(t.placement.num_fast == 5 for t in env.tiers)

@@ -165,6 +165,9 @@ class RuntimeControl:
         }
         if kv["extensible"]:
             kv["resize"] = engine.get_kv_cache_resize_state()
+        if only and "fast" in only and "tiers" not in only:
+            # the card tier is part of each rank's tiers readout
+            only = [*only, "tiers"]
         ranks = self._rpc("state", "", {"only": only} if only else None)
         out = {
             "dev_mode": bool(envs.VLLM_SERVER_DEV_MODE),

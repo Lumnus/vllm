@@ -515,6 +515,89 @@ class TierPlacement:
         self._set_num_fast(num_fast)
         self.check()
 
+    def plan_card_round(
+        self, rank: np.ndarray, target: int, budget: int
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """The tier choice for a change of the card tier's size (the one
+        place it is made; the caller only commits it through
+        :meth:`plan_from_set`, :meth:`prepare` and :meth:`commit`, the path
+        EPLB's moves take). ``rank`` orders the slots by EPLB's load (0
+        coldest). The next step toward ``target`` card slots that reads at
+        most ``budget`` units into pinned rows:
+
+        - grow: the hottest slots off the card enter free card rows (a pinned
+          slot by a copy, a CPU slot through a read);
+        - shrink: the coldest card slots leave, into a pinned row (a read; the
+          card is never read back) where one is free or the slot is hotter
+          than the coldest pinned slot, which then goes to the CPU; else to
+          the CPU. Without host slots every leaving slot takes a pinned row.
+
+        Returns (card set, pinned set), or None when nothing fits."""
+        fast, pool, host = self.is_fast(), self.is_pool(), self.is_host()
+        new_fast, new_pool = fast.copy(), pool.copy()
+        n = int(fast.sum())
+        reads = 0
+        changed = False
+        if n < target:
+            room = min(target - n, len(self.fast_free))
+            outside = np.flatnonzero(~fast)
+            for s in outside[np.argsort(-rank[outside], kind="stable")][:room]:
+                cost = 1 if host[s] else 0
+                if reads + cost > budget:
+                    break
+                new_fast[s], new_pool[s] = True, False
+                reads += cost
+                changed = True
+        elif n > target:
+            inside = np.flatnonzero(fast)
+            leaving = inside[np.argsort(rank[inside], kind="stable")][: n - target]
+            cap = int(self.num_pinned)
+            for s in leaving:
+                if not self.host_tier:
+                    if reads + 1 > budget:
+                        break
+                    new_fast[s], new_pool[s] = False, True
+                    reads += 1
+                    changed = True
+                    continue
+                in_pool = np.flatnonzero(new_pool)
+                coldest = (
+                    int(in_pool[np.argmin(rank[in_pool])]) if in_pool.size else None
+                )
+                if in_pool.size < cap or (
+                    coldest is not None and rank[s] > rank[coldest]
+                ):
+                    if reads + 1 > budget:
+                        break
+                    if in_pool.size >= cap and coldest is not None:
+                        new_pool[coldest] = False  # to the CPU, nothing read
+                    new_pool[s] = True
+                    reads += 1
+                new_fast[s] = False
+                changed = True
+        return (new_fast, new_pool) if changed else None
+
+    def plan_pinned_refill(self, rank: np.ndarray, budget: int) -> np.ndarray | None:
+        """With host slots, after a change of the card tier: the pinned set
+        for the bound by EPLB's own pinned-set rule (:func:`choose_pool_set`:
+        over the bound the coldest leave, under it the hottest CPU slots
+        enter), without its swaps (those are the next rearrangement's, by
+        its hysteresis), the units read bounded by ``budget``. None when the
+        pinned set stays."""
+        if not self.host_tier:
+            return None
+        pool = self.is_pool()
+        cap = int(self.num_pinned)
+        count = int(pool.sum())
+        if count < cap:
+            cap = count + min(cap - count, budget)
+        # heat from 1 and an infinite hysteresis: fill and trim, no swaps
+        heat = rank.astype(np.float64) + 1.0
+        want = choose_pool_set(heat, ~self.is_fast(), pool, cap, float("inf"))
+        if np.array_equal(want, pool):
+            return None
+        return want
+
     def compact_fast(
         self,
         limit: int,

@@ -1008,20 +1008,12 @@ def _apply_fault_clear(worker: Any, args: dict) -> tuple[dict, dict, Any]:
 
 
 def _check_tiers_fast(worker: Any, args: dict) -> str | None:
-    from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+    from vllm.distributed.eplb.runtime_control import check_card_tier
 
     unknown = sorted(set(args) - {"rows"})
     if unknown:
         return f"unknown arguments {unknown}; tiers.fast takes rows"
-    eplb = _eplb(worker)
-    if eplb is not None and any(
-        ms.rebalanced for ms in getattr(eplb, "model_states", {}).values()
-    ):
-        return (
-            "an EPLB rearrangement is in flight (its layers are being prepared "
-            "and committed one by one); ask after it completes"
-        )
-    return xpu_fast_tier.check(args.get("rows"))
+    return check_card_tier(_eplb(worker), args.get("rows"))
 
 
 def _after_fast_change(worker: Any) -> None:
@@ -1047,10 +1039,13 @@ def _apply_tiers_fast(worker: Any, args: dict) -> tuple[dict, dict, Any]:
     if kv_cache is not None:
         # The baseline of the cap's accounting is the size before this change.
         xpu_fast_tier.register_with_kv_cache(kv_cache)
+    from vllm.distributed.eplb.runtime_control import resize_card_tier
+
     old = xpu_fast_tier.rows_now()
     rows = int(args["rows"])
     try:
-        result = xpu_fast_tier.apply(rows)
+        # EPLB's facility: it holds the placement, its movers fill or vacate
+        result = resize_card_tier(_eplb(worker), rows)
     finally:
         _after_fast_change(worker)
     changes = {"fast_rows": [old, rows]} if old != rows else {}
@@ -1058,10 +1053,10 @@ def _apply_tiers_fast(worker: Any, args: dict) -> tuple[dict, dict, Any]:
 
 
 def _restore_tiers_fast(worker: Any, old: int) -> None:
-    from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+    from vllm.distributed.eplb.runtime_control import resize_card_tier
 
     try:
-        xpu_fast_tier.apply(int(old))
+        resize_card_tier(_eplb(worker), int(old))
     finally:
         _after_fast_change(worker)
 

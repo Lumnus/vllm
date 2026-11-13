@@ -270,6 +270,8 @@ def test_the_surface_routes_the_verb_and_reports_the_tier():
     assert state["fast_tier"]["rows"] == 4 and state["fast_tier"]["range"] == [1, 24]
     assert state["fast_tier"]["record"]["to_rows"] == 4
     assert state["fast_tier"]["ranks_agree"]
+    # GET /runtime_control?only=fast reads the ranks' tiers part for it
+    assert control.state(["fast"])["fast_tier"]["rows"] == 4
 
 
 def test_the_engine_core_has_no_card_tier_resize_by_default():

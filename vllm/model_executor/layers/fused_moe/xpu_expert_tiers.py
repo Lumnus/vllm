@@ -1244,70 +1244,17 @@ class ExpertTiers:
         stats["to_card"] += len(plan.to_fast)
         stats["off_card"] += len(plan.demoted)
 
-    def _fast_round(self, target: int) -> tuple[np.ndarray, np.ndarray] | None:
-        """The next move toward ``target`` slots on the card, within the
-        pinned rows that are free or about to be (each unit read takes one).
-        A grow puts the hottest slots off the card into free card rows (from
-        a pinned row by a copy, from the CPU through a read). A shrink takes
-        the coldest slots off the card: into a pinned row (read from the host
-        cache or the store; the card is never read back) when it is hotter
-        than the coldest pinned slot or a pinned row is free, the coldest
-        pinned slot then going to the CPU; else straight to the CPU. None
-        when nothing can move."""
-        placement = self.placement
-        assert placement is not None
-        rank = self._heat_rank()
-        fast, pool, host = placement.is_fast(), placement.is_pool(), placement.is_host()
-        budget = placement.pool.free_count + placement.pool.quarantined
-        new_fast, new_pool = fast.copy(), pool.copy()
-        n = int(fast.sum())
-        reads = 0
-        changed = False
-        if n < target:
-            room = min(target - n, len(placement.fast_free))
-            outside = np.flatnonzero(~fast)
-            for s in outside[np.argsort(-rank[outside], kind="stable")][:room]:
-                cost = 1 if host[s] else 0
-                if reads + cost > budget:
-                    break
-                new_fast[s], new_pool[s] = True, False
-                reads += cost
-                changed = True
-        elif n > target:
-            inside = np.flatnonzero(fast)
-            leaving = inside[np.argsort(rank[inside], kind="stable")][: n - target]
-            cap = int(placement.num_pinned)
-            for s in leaving:
-                if not self._host_tier:
-                    if reads + 1 > budget:
-                        break
-                    new_fast[s], new_pool[s] = False, True
-                    reads += 1
-                    changed = True
-                    continue
-                in_pool = np.flatnonzero(new_pool)
-                coldest = (
-                    int(in_pool[np.argmin(rank[in_pool])]) if in_pool.size else None
-                )
-                to_pinned = in_pool.size < cap or (
-                    coldest is not None and rank[s] > rank[coldest]
-                )
-                if to_pinned:
-                    if reads + 1 > budget:
-                        break
-                    if in_pool.size >= cap and coldest is not None:
-                        new_pool[coldest] = False  # to the CPU, nothing read
-                    new_pool[s] = True
-                    reads += 1
-                new_fast[s] = False
-                changed = True
-        return (new_fast, new_pool) if changed else None
-
     def _fast_rounds(self, target: int, timeout: float, stats: dict) -> None:
         placement = self.placement
         assert placement is not None
         while int(placement.is_fast().sum()) != target:
-            sets = self._fast_round(target)
+            # The choice is the placement's (the tier-choice rules EPLB's
+            # moves use), by EPLB's load; this method only commits it.
+            sets = placement.plan_card_round(
+                self._heat_rank(),
+                target,
+                placement.pool.free_count + placement.pool.quarantined,
+            )
             if sets is None:
                 from vllm.model_executor.offloader.expert_tier_map import (
                     RowsUnavailable,
@@ -1329,26 +1276,11 @@ class ExpertTiers:
         if not self._host_tier:
             return
         while True:
-            rank = self._heat_rank()
-            pool, host = placement.is_pool(), placement.is_host()
-            cap = int(placement.num_pinned)
-            count = int(pool.sum())
-            new_pool = pool.copy()
-            if count > cap:
-                inside = np.flatnonzero(pool)
-                new_pool[
-                    inside[np.argsort(rank[inside], kind="stable")][: count - cap]
-                ] = False
-            elif count < cap and host.any():
-                budget = placement.pool.free_count + placement.pool.quarantined
-                take = min(cap - count, budget)
-                if take <= 0:
-                    return
-                outside = np.flatnonzero(host)
-                new_pool[outside[np.argsort(-rank[outside], kind="stable")][:take]] = (
-                    True
-                )
-            else:
+            new_pool = placement.plan_pinned_refill(
+                self._heat_rank(),
+                placement.pool.free_count + placement.pool.quarantined,
+            )
+            if new_pool is None:
                 return
             self._apply_sets(placement.is_fast(), new_pool, timeout, stats)
 
