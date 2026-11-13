@@ -17,11 +17,13 @@ Qwen3Next MTP):
   * the final output norm is the top-level ``hyper_connection_mixer``
     (a ``HyperConnection`` with ``has_inject=False``).
 
-All MTP weights live under the ``mtp.`` prefix. They follow the checkpoint's
-quantization config like the target: in the FP8 checkpoint only the MTP routed
-experts are FP8, the rest stays BF16. The MTP layer is sparse (QSA) when the
-target is, and dense otherwise. The fc projections stay BF16: the draft has no
-quant config of its own here. The speculative decoding framework replaces the
+All MTP weights live under the ``mtp.`` prefix. The drafter is built with the
+target's ``VllmConfig``, so it uses the target's quantization config object:
+the checkpoint's config (e.g. compressed-tensors schemes that name ``mtp.*``,
+``fc_embedding`` and ``fc_hidden`` included) together with any serve-time
+``--quantization-config`` attached to it. Each part therefore runs BF16 or
+quantized as the checkpoint stores it. The MTP layer is sparse (QSA) when the
+target is, and dense otherwise. The speculative decoding framework replaces the
 draft's token embedding and LM head with the target's after loading.
 
 The target model exposes the wide residual via ``get_mtp_target_hidden_states``
@@ -109,8 +111,8 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         )
 
         # fc stage: two separate projections. They take the quantization config
-        # like the MTP decoder layer; the checkpoints keep them BF16, so they are
-        # quantized only by an online config that names them.
+        # like the MTP decoder layer: BF16 when the checkpoint stores them BF16
+        # (unless an online config names them), W8A8 when it stores them int8.
         self.pre_fc_norm_embedding = HyperConnectionRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -334,9 +336,13 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
 
+        # Replaced by the target's head after loading; until then it takes the
+        # checkpoint's form, so a quantized head (`weight` + `weight_scale`)
+        # loads as well as a BF16 one.
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
