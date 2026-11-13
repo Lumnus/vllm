@@ -147,6 +147,8 @@ class Env:
         rank=0,
         ep_size=1,
         reset=True,
+        pinned=None,
+        store_extra=None,
     ):
         self.mp = monkeypatch
         self.fast = fast
@@ -158,7 +160,7 @@ class Env:
             pathlib.Path(d).mkdir(parents=True, exist_ok=True)
         self.store_cfg = ExpertStoreConfig(
             dirs=dirs if store else [], pool_gib=0.01, io_threads=4, build=build,
-            direct=False, spare_rows=spare,
+            direct=False, spare_rows=spare, **(store_extra or {}),
         )  # fmt: skip
         bytes_each = xt.expert_bytes(
             _GPTQ(),
@@ -171,6 +173,11 @@ class Env:
             uva=UVAOffloadConfig(
                 cpu_offload_gb=(LAYERS * slow * bytes_each + bytes_each // 2) / 2**30,
                 cpu_offload_per_expert=True,
+                # pinned slots per layer below the slots off the card: the
+                # rest are computed on the CPU
+                cpu_offload_pinned_gb=None
+                if pinned is None
+                else (LAYERS * pinned * bytes_each + bytes_each // 2) / 2**30,
             )
         )
         parallel = SimpleNamespace(

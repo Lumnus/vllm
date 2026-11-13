@@ -393,7 +393,10 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> None:
-        """Experts in the fast slots plus experts in the slow slots, summed."""
+        """Experts in the fast slots plus experts in the slow slots, summed;
+        with host slots, plus the experts the CPU computes (their inputs go
+        to the host before the card's experts are enqueued, and the host
+        waits for those inputs only, so the CPU works while the card does)."""
         tiers = self.tiers
         assert tiers is not None
         fast, slow = self._tier_impls(w1, w2, topk_ids.size(-1))
@@ -401,6 +404,12 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             topk_ids = remap_unrouted(
                 topk_ids, tiers.num_global, self.moe_config.ep_rank
             )
+        cpu = tiers.cpu
+        pending = (
+            None
+            if cpu is None
+            else cpu.post(tiers, hidden_states, topk_ids, topk_weights)
+        )
         fast.apply(
             output=output,
             hidden_states=hidden_states,
@@ -419,6 +428,11 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             **self.impl_apply_kwargs,
         )
         output.add_(slow_out)
+        if pending is not None:
+            assert cpu is not None
+            host_out = cpu.finish(pending, output.device)
+            if host_out is not None:
+                output.add_(host_out)
 
 
 class XPUExpertsFp8(XPUExperts):

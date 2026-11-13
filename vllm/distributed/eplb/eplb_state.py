@@ -963,6 +963,9 @@ class EplbState:
         if is_profile:
             self.rearrange(is_profile=True)
             return
+        if not is_dummy:
+            for eplb_model_state in self.model_states.values():
+                _movers_between_steps(eplb_model_state)
 
         if log_stats:
             self._maybe_log_balancedness()
@@ -2241,6 +2244,19 @@ def _commit_eplb_maps(
     if PIN_MEMORY:
         src = src.pin_memory()
     dst.copy_(src, non_blocking=True)
+
+
+def _movers_between_steps(model_state: EplbModelState) -> None:
+    """Give the layers that place their own experts the point between two
+    steps (on the thread that enqueues the forward) for work of their own,
+    such as mapping a promotion whose bytes are ready."""
+    movers = model_state.movers
+    if not movers or movers[0] is None:
+        return
+    for mover in movers:
+        hook = getattr(mover, "between_steps", None)
+        if hook is not None:
+            hook()
 
 
 def _scrub_movers(
