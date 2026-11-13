@@ -264,6 +264,9 @@ def apply_host_tier_bound(value: int) -> None:
     failure the layers already changed go back to the old bound."""
     tiers = _cpu_tiers()
     old = host_tier_bound()
+    if tiers and tiers[0].pinned_release:
+        _apply_bound_releasing(tiers, int(value), int(old))  # type: ignore[arg-type]
+        return
     done: list[ExpertTiers] = []
     try:
         for t in tiers:
@@ -283,6 +286,71 @@ def apply_host_tier_bound(value: int) -> None:
             old,
             tiers[0].num_slow - int(value),
         )
+
+
+def _set_bound_and_rows(t: "ExpertTiers", bound: int, arena: "_PinnedArena") -> None:
+    """One layer to ``bound`` pinned slots with its pinned rows laid out
+    for it: lowering moves the slots first and then lays out fewer rows;
+    raising lays out more rows first and then reads the slots into them."""
+    assert t.placement is not None
+    rows = t.pool_rows_for(bound)
+    if bound <= int(t.placement.num_pinned):
+        t.set_pinned_bound(bound)
+        if rows != t.num_pool_rows:
+            t.relayout_pool_rows(rows, arena)
+    else:
+        if rows != t.num_pool_rows:
+            t.relayout_pool_rows(rows, arena)
+        t.set_pinned_bound(bound)
+
+
+def _apply_bound_releasing(tiers: list["ExpertTiers"], value: int, old: int) -> None:
+    """``apply_host_tier_bound`` with ``pinned_release``: every layer's
+    pinned rows are laid out again, layer by layer, in a fresh arena; the
+    old arena's chunks go back to the system as soon as no layer holds rows
+    in them (torch's pinned cache is emptied after each layer). On a failure
+    the layers already changed (and the failing one) go back to ``old``."""
+    global _ARENA
+    old_gib = _ARENA.gib
+    old_arena = _ARENA
+    arena = type(old_arena)()
+    _ARENA = arena
+    # From here the old chunks live as long as some layer's rows do.
+    for name in ("chunks", "used"):
+        held = getattr(old_arena, name, None)
+        if held is not None:
+            held.clear()
+    start = time.perf_counter()
+    done: list[ExpertTiers] = []
+    try:
+        for t in tiers:
+            done.append(t)
+            _set_bound_and_rows(t, value, arena)
+            _empty_host_cache()
+    except BaseException:
+        for t in reversed(done):
+            try:
+                _set_bound_and_rows(t, old, arena)
+            except Exception:  # noqa: BLE001 - the first error is raised
+                logger.exception(
+                    "%s: could not go back to %d pinned slots", t.layer_name, old
+                )
+        _empty_host_cache()
+        raise
+    logger.info(
+        "CPU experts: %d of the %d slots per layer per rank that are off the "
+        "card now hold pinned rows (was %d); the other %d are computed on the "
+        "CPU. Pinned rows laid out again: %d per layer, pinned host memory "
+        "%.2f -> %.2f GiB in %.2f s.",
+        value,
+        tiers[0].num_slow,
+        old,
+        tiers[0].num_slow - value,
+        tiers[0].num_pool_rows,
+        old_gib,
+        arena.gib,
+        time.perf_counter() - start,
+    )
 
 
 _RUNTIME_SETTINGS_REGISTERED = False
@@ -457,6 +525,29 @@ class ExpertTiers:
         self.move_log: list[dict[str, float]] = []
         # Slots whose row or expert changed since the last scrub.
         self._touched: set[int] = set()
+        # Whether the layer has host slots (computed on the CPU), decided at
+        # load; the slot counts may move later, this does not.
+        self._host_tier = pinned < num_local - num_fast
+        # The card tier's rows in a reserved device range (fast_rows_max):
+        # None while the card tier is fixed. See :meth:`resize_fast`.
+        self.fast_rows: Any = None
+        self._num_fast_at_load = num_fast
+        self._fast_capacity = 0
+        # Pinned rows per layer laid out again at run time (pinned_release);
+        # None: the rows sized at load.
+        self._pool_rows: int | None = None
+        # Pinned rows beyond the spares that let the card tier shrink below
+        # its size at load in a layer without host slots (fast_rows_min).
+        self._extra_pool_rows = 0
+        self._layer_ref: Any = None
+        # EPLB's store-backed weights made from this layer (eplb_weights).
+        self._eplb_parts: list[Any] = []
+        cfg = None if store is None else getattr(store.session, "config", None)
+        if cfg is not None and int(getattr(cfg, "fast_rows_max", 0) or 0) > 0:
+            self._fast_capacity = max(num_fast, min(int(cfg.fast_rows_max), num_local))
+            floor = getattr(cfg, "fast_rows_min", None)
+            if not self._host_tier and floor is not None and floor < num_fast:
+                self._extra_pool_rows = num_fast - int(floor)
 
     @property
     def num_slow(self) -> int:
@@ -464,23 +555,29 @@ class ExpertTiers:
 
     @property
     def num_host(self) -> int:
-        """Slots computed on the CPU (no row the kernels read)."""
+        """Slots computed on the CPU (no row the kernels read) when every
+        pinned row the bound allows is used."""
+        if self.placement is not None:
+            return int(self.placement.num_host)
         return self.num_slow - self.num_pinned
 
     @property
     def promote_rows(self) -> int:
         """Pinned rows beyond the spares for promotions of host slots between
         rearrangements."""
-        if self.num_host == 0 or self.store_binding is None:
+        if not self._host_tier or self.store_binding is None:
             return 0
         return int(self.store_binding.session.config.host_promote_rows)
 
     @property
     def num_pool_rows(self) -> int:
         """Rows of each pinned tensor: the pinned slots, the spares, and the
-        rows for promotions of host slots."""
+        rows for promotions of host slots (and, without host slots, the rows
+        a card tier that shrinks below its load size needs)."""
+        if self._pool_rows is not None:
+            return self._pool_rows
         spare = 0 if self.store_binding is None else self.store_binding.spare_rows
-        return self.num_pinned + spare + self.promote_rows
+        return self.num_pinned + spare + self.promote_rows + self._extra_pool_rows
 
     @property
     def fills_from_store(self) -> bool:
@@ -552,6 +649,12 @@ class ExpertTiers:
                 f"{type(experts).__name__}"
             )
         twins, self.twins, self._param_names = self.twins, {}, {}
+        # For the card tier's move into a reserved range (impls): the layer's
+        # parameters that hold its rows.
+        try:
+            self._layer_ref = weakref.ref(layer)
+        except TypeError:  # a test's stand-in layer
+            self._layer_ref = None
         device: torch.device = getattr(layer, "w13_weight").device  # noqa: B009
         binding = self.store_binding
         rows = self.num_pool_rows if binding is not None else None
@@ -600,7 +703,7 @@ class ExpertTiers:
                 binding.spare_rows,
                 lambda event: self.ops.done(event),  # type: ignore[union-attr]
                 num_pool_slots=self.num_pinned,
-                extra_rows=self.promote_rows,
+                extra_rows=self.promote_rows + self._extra_pool_rows,
             )
             binding.session.note_pool(
                 self.num_pool_rows, self.slot_bytes(), self.num_pinned
@@ -851,7 +954,118 @@ class ExpertTiers:
         one, at most every pool row but EPLB's spares (the rows were sized at
         load: the load-time bound plus ``host_promote_rows``)."""
         assert self.placement is not None
+        if self.pinned_release:
+            # the rows are laid out again for the bound (relayout_pool_rows)
+            return 1, max(1, int(self.placement.num_slow))
         return 1, self.placement.max_pinned_capacity()
+
+    @property
+    def pinned_release(self) -> bool:
+        """The pinned rows follow the bound (``pinned_release``): a lower
+        bound gives their host memory back, a higher one lays out more."""
+        b = self.store_binding
+        return (
+            self._host_tier
+            and b is not None
+            and bool(getattr(b.session.config, "pinned_release", False))
+        )
+
+    def pool_rows_for(self, bound: int) -> int:
+        """Pinned rows per layer that serve ``bound`` slots: the bound, EPLB's
+        spare rows and the promotion rows."""
+        assert self.store_binding is not None
+        return int(bound) + self.store_binding.spare_rows + self.promote_rows
+
+    def relayout_pool_rows(self, num_rows: int, arena: "_PinnedArena") -> dict:
+        """Between two steps, on the thread that enqueues the forward, in a
+        layer with host slots (the MoE op then runs outside the captured
+        graphs, so the slow kernel's tensors may move): lay the pinned rows
+        out again in ``num_rows`` rows of ``arena``. The rows that serve
+        slots are copied (host to host) to rows ``0..k-1``; the slow kernel,
+        its device views and the slow map are switched to the new rows; the
+        device finishes every kernel that read the old rows before this
+        returns, and the old rows are dropped (their chunk goes back to the
+        system once no layer holds rows in it). Raises, with the layer as it
+        was, when the rows in use do not fit."""
+        from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+        _, placement, ops = self._require_store()
+        assert self._impls is not None and self.slow_map is not None
+        start = time.perf_counter()
+        old_rows = self.num_pool_rows
+        with self._move_lock:
+            if self._eplb_pending:
+                raise RuntimeError(
+                    f"{self.layer_name}: an EPLB move is prepared; the pinned "
+                    "rows can be laid out again once it is committed"
+                )
+            self._drop_promotion()
+            # Rows in quarantine may still be read by the device or written
+            # by a host read; both finish before the rows move.
+            deadline = time.monotonic() + 30.0
+            while _quarantined(placement) and time.monotonic() < deadline:
+                time.sleep(0.001)
+            if _quarantined(placement):
+                raise RuntimeError(
+                    f"{self.layer_name}: pinned rows still in use after 30 s"
+                )
+            saved = (placement.row.copy(), placement.pool, placement.num_pool_rows)
+            saved_extra = placement.extra_rows
+            moved = placement.relayout_pool(num_rows)
+            try:
+                new: dict[str, torch.Tensor] = {}
+                for key, old in self.slow.items():
+                    t = arena.empty((num_rows, *old.shape[1:]), old.dtype)
+                    t.zero_()
+                    for src, dst in moved.items():
+                        t[dst].copy_(old[src])
+                    new[key] = t
+                views = {}
+                for key, t in new.items():
+                    view = get_accelerator_view_from_cpu_tensor(t)
+                    view._vllm_is_uva_offloaded = True  # type: ignore[attr-defined]
+                    views[key] = view
+            except BaseException:
+                placement.row, placement.pool, placement.num_pool_rows = saved
+                placement.extra_rows = saved_extra
+                raise
+            old_slow = self.slow
+            self.slow, self.slow_views = new, views
+            self._pool_rows = num_rows
+            slow = self._impls[1]
+            sw13, sw2 = views["w13"], views["w2"]
+            slow.w13, slow.w2 = sw13.view(torch.int8), sw2.view(torch.int8)
+            slow.w13._vllm_is_uva_offloaded = True
+            slow.w2._vllm_is_uva_offloaded = True
+            slow.gemm1_wei_scales = views["w13_scales"]
+            slow.gemm2_wei_scales = views["w2_scales"]
+            slow.num_experts = num_rows
+            slow.local_experts_num = num_rows
+            _, slow_np = placement.maps(self.slot_global, self.num_global)
+            ops.compute_write(self.slow_map, slow_np)
+            self._check_views_alias()
+            self.on_rows_written([])
+            _forget_staged_slow()
+            # EPLB reads only the shapes of a store-backed layer's weights;
+            # their pinned part must not keep the old rows alive.
+            for ref in self._eplb_parts:
+                weight = ref()
+                if weight is None or len(weight.parts) < 2:
+                    continue
+                part = weight.parts[1]
+                weight.parts = (
+                    weight.parts[0],
+                    torch.empty(part.shape, dtype=part.dtype, device="meta"),
+                    *weight.parts[2:],
+                )
+            # Nothing reads the old rows once the device is past this point.
+            _device_sync()
+            del old_slow
+        return {
+            "rows_from": float(old_rows),
+            "rows_to": float(num_rows),
+            "ms": (time.perf_counter() - start) * 1e3,
+        }
 
     def _drop_promotion(self) -> None:
         """Forget a promotion being read: its row goes back once the read
@@ -964,6 +1178,253 @@ class ExpertTiers:
         move.stats.update(stats)
         return stats
 
+    # -- the card tier's size while serving (fast_rows_max) -----------------
+
+    def fast_range(self) -> tuple[int, int]:
+        """The card rows per layer a running engine may move to. At most the
+        reserved rows. At least one with host slots (a slot leaving the card
+        can go to the CPU), else as many as keep every slot off the card in a
+        pinned row with EPLB's spare rows still free."""
+        assert self.placement is not None
+        cfg = None if self.store_binding is None else self.store_binding.session.config
+        floor = None if cfg is None else getattr(cfg, "fast_rows_min", None)
+        if self._host_tier:
+            lo = int(floor) if floor else 1
+        else:
+            p = self.placement
+            lo = max(
+                int(floor) if floor else self._num_fast_at_load,
+                self.num_local - (p.num_pool_rows - p.spare),
+                1,
+            )
+        return min(lo, self._fast_capacity), self._fast_capacity
+
+    def _heat_rank(self) -> np.ndarray:
+        """Each slot's place in the heat order (0 coldest): by the load of the
+        last rearrangement (or fill), then by how often the CPU served it."""
+        load = np.zeros(self.num_local) if self._slot_load is None else self._slot_load
+        rank = np.empty(self.num_local, dtype=np.int64)
+        rank[np.lexsort((self._host_count, load))] = np.arange(self.num_local)
+        return rank
+
+    def _copy_fast(self, src: int, dst: int) -> None:
+        """Enqueue the copy of one card row into another on the side stream."""
+        _, _, ops = self._require_store()
+        assert self._impls is not None
+        fast = self._impls[0]
+        for impl_field, _ in _TIER_FIELDS:
+            rows = _u8(getattr(fast, impl_field))
+            ops.side_copy(rows[dst], rows[src])
+
+    def _apply_sets(
+        self,
+        new_fast: np.ndarray,
+        new_pool: np.ndarray,
+        timeout: float,
+        stats: dict[str, float],
+    ) -> None:
+        """One move to the tier sets given (the experts stay in their
+        slots): units read from the host cache or the store into pinned rows,
+        pinned rows copied to card rows, the maps switched; see
+        :meth:`commit_move`."""
+        placement = self.placement
+        assert placement is not None and self.slot_logical is not None
+        plan = placement.plan_from_set(
+            self.slot_logical,
+            self.slot_logical,
+            new_fast,
+            new_pool,
+            check_budget=False,
+        )
+        move = placement.prepare(plan, self._fill_rows_cached, timeout=timeout)
+        move.stats = {"units": float(len(plan.reads))}
+        self.commit_move(move)
+        stats["units_read"] += len(plan.reads)
+        stats["commits"] += 1
+        stats["to_card"] += len(plan.to_fast)
+        stats["off_card"] += len(plan.demoted)
+
+    def _fast_round(self, target: int) -> tuple[np.ndarray, np.ndarray] | None:
+        """The next move toward ``target`` slots on the card, within the
+        pinned rows that are free or about to be (each unit read takes one).
+        A grow puts the hottest slots off the card into free card rows (from
+        a pinned row by a copy, from the CPU through a read). A shrink takes
+        the coldest slots off the card: into a pinned row (read from the host
+        cache or the store; the card is never read back) when it is hotter
+        than the coldest pinned slot or a pinned row is free, the coldest
+        pinned slot then going to the CPU; else straight to the CPU. None
+        when nothing can move."""
+        placement = self.placement
+        assert placement is not None
+        rank = self._heat_rank()
+        fast, pool, host = placement.is_fast(), placement.is_pool(), placement.is_host()
+        budget = placement.pool.free_count + placement.pool.quarantined
+        new_fast, new_pool = fast.copy(), pool.copy()
+        n = int(fast.sum())
+        reads = 0
+        changed = False
+        if n < target:
+            room = min(target - n, len(placement.fast_free))
+            outside = np.flatnonzero(~fast)
+            for s in outside[np.argsort(-rank[outside], kind="stable")][:room]:
+                cost = 1 if host[s] else 0
+                if reads + cost > budget:
+                    break
+                new_fast[s], new_pool[s] = True, False
+                reads += cost
+                changed = True
+        elif n > target:
+            inside = np.flatnonzero(fast)
+            leaving = inside[np.argsort(rank[inside], kind="stable")][: n - target]
+            cap = int(placement.num_pinned)
+            for s in leaving:
+                if not self._host_tier:
+                    if reads + 1 > budget:
+                        break
+                    new_fast[s], new_pool[s] = False, True
+                    reads += 1
+                    changed = True
+                    continue
+                in_pool = np.flatnonzero(new_pool)
+                coldest = (
+                    int(in_pool[np.argmin(rank[in_pool])]) if in_pool.size else None
+                )
+                to_pinned = in_pool.size < cap or (
+                    coldest is not None and rank[s] > rank[coldest]
+                )
+                if to_pinned:
+                    if reads + 1 > budget:
+                        break
+                    if in_pool.size >= cap and coldest is not None:
+                        new_pool[coldest] = False  # to the CPU, nothing read
+                    new_pool[s] = True
+                    reads += 1
+                new_fast[s] = False
+                changed = True
+        return (new_fast, new_pool) if changed else None
+
+    def _fast_rounds(self, target: int, timeout: float, stats: dict) -> None:
+        placement = self.placement
+        assert placement is not None
+        while int(placement.is_fast().sum()) != target:
+            sets = self._fast_round(target)
+            if sets is None:
+                from vllm.model_executor.offloader.expert_tier_map import (
+                    RowsUnavailable,
+                )
+
+                raise RowsUnavailable(
+                    f"{self.layer_name}: no move toward {target} card slots "
+                    f"fits the free pinned rows ({placement.pool.free_count} "
+                    f"free, {placement.pool.quarantined} in quarantine)"
+                )
+            self._apply_sets(*sets, timeout, stats)
+
+    def _pool_rounds(self, timeout: float, stats: dict) -> None:
+        """With host slots: the pinned rows serve the bound's number of slots
+        again, the hottest off the card (a grow took some pinned slots to the
+        card; a shrink may have left fewer than the bound)."""
+        placement = self.placement
+        assert placement is not None
+        if not self._host_tier:
+            return
+        while True:
+            rank = self._heat_rank()
+            pool, host = placement.is_pool(), placement.is_host()
+            cap = int(placement.num_pinned)
+            count = int(pool.sum())
+            new_pool = pool.copy()
+            if count > cap:
+                inside = np.flatnonzero(pool)
+                new_pool[
+                    inside[np.argsort(rank[inside], kind="stable")][: count - cap]
+                ] = False
+            elif count < cap and host.any():
+                budget = placement.pool.free_count + placement.pool.quarantined
+                take = min(cap - count, budget)
+                if take <= 0:
+                    return
+                outside = np.flatnonzero(host)
+                new_pool[outside[np.argsort(-rank[outside], kind="stable")][:take]] = (
+                    True
+                )
+            else:
+                return
+            self._apply_sets(placement.is_fast(), new_pool, timeout, stats)
+
+    def resize_fast(self, target: int, *, timeout: float | None = None) -> dict:
+        """Between two steps, on the thread that enqueues the forward: hold
+        ``target`` of this layer's slots in card rows. A grow maps the rows'
+        memory (``FastRows.commit``; the caller has made room for it) and
+        moves the hottest slots off the card in; a shrink moves the coldest
+        out, moves the slots left in rows at or above ``target`` down
+        (card-to-card copies), drops those rows and releases their memory to
+        the device (whole objects, after the device has finished every
+        kernel that read them). Bytes enter card rows only from pinned rows
+        or the store. Raises while an EPLB move is prepared; on a failure
+        part-way the caller asks for the old size again (moves are whole:
+        every committed move left the maps and the rows consistent)."""
+        binding, placement, ops = self._require_store()
+        rows = self.fast_rows
+        if rows is None:
+            raise RuntimeError(
+                f"{self.layer_name}: the card tier is fixed in this engine "
+                "(--expert-store-config fast_rows_max)"
+            )
+        lo, hi = self.fast_range()
+        if not lo <= target <= hi:
+            raise ValueError(
+                f"{self.layer_name}: card rows per layer must be {lo}..{hi}, "
+                f"got {target}"
+            )
+        if timeout is None:
+            timeout = float(binding.session.config.read_timeout_s)
+        assert self.fast_map is not None
+        start = time.perf_counter()
+        stats: dict[str, float] = dict.fromkeys(
+            ("units_read", "commits", "to_card", "off_card", "relocated"), 0.0
+        )
+        with self._move_lock:
+            if self._eplb_pending:
+                raise RuntimeError(
+                    f"{self.layer_name}: an EPLB move is prepared; the card "
+                    "tier can change once it is committed"
+                )
+            self._drop_promotion()
+            old = int(placement.num_fast)
+            mapped_before = rows.mapped_bytes
+            if target > old:
+                rows.commit(target)
+                placement.grow_fast_rows(target)
+                self.num_fast = target
+                self._fast_rounds(target, timeout, stats)
+                self._pool_rounds(timeout, stats)
+            elif target < old or int(placement.is_fast().sum()) != target:
+                self._fast_rounds(target, timeout, stats)
+                stats["relocated"] = placement.compact_fast(
+                    target,
+                    ops,
+                    slot_global=self.slot_global,
+                    num_global=self.num_global,
+                    fast_map=self.fast_map,
+                    copy_fast=self._copy_fast,
+                )
+                placement.shrink_fast_rows(target)
+                self.num_fast = target
+                # Waits for the device: the rows dropped were read last by
+                # kernels enqueued before the map writes above.
+                rows.release_to(target)
+                self._pool_rounds(timeout, stats)
+        stats.update(
+            rows_from=float(old),
+            rows_to=float(target),
+            mapped_before=float(mapped_before),
+            mapped_after=float(rows.mapped_bytes),
+            ms=(time.perf_counter() - start) * 1e3,
+        )
+        self.move_log.append(dict(stats))
+        return stats
+
     def _check_views_alias(self) -> None:
         """With a store, host threads write the pool rows into the pinned
         tensors and the kernels read them through the device views: the two
@@ -1023,7 +1484,7 @@ class ExpertTiers:
         assert binding is not None and self._impls is not None
         fast = self._impls[0]
         host_fast = {
-            key: _u8(getattr(fast, impl_field)).cpu()
+            key: _u8(getattr(fast, impl_field))[: self.num_fast].cpu()
             for impl_field, key in _TIER_FIELDS
         }
         units = []
@@ -1135,8 +1596,59 @@ class ExpertTiers:
             slow.w13._vllm_is_uva_offloaded = True
             slow.w2._vllm_is_uva_offloaded = True
             self._impls = (fast, slow)
+            if self._fast_capacity:
+                self._adopt_fast_rows(fast)
             self._after_impls()
         return self._impls
+
+    def _adopt_fast_rows(self, fast: Any) -> None:
+        """Move the card tier's rows into a device range reserved for
+        ``fast_rows_max`` rows (``FastRows``) and point the fast kernel at the
+        whole range: its ``num_experts`` is the capacity from here on, so the
+        graphs captured later stay valid whatever the number of rows in use.
+        Rows above the ones in use have no memory behind them and no map entry
+        points at them; the kernels read an expert's weights only for experts
+        with routed rows. The tensors keep their identity (their ``data`` is
+        rebound), so the layer's parameters and the kernel see the new rows."""
+        from vllm.model_executor.layers.fused_moe.xpu_fast_tier import FastRows
+
+        assert self.store_binding is not None, "a movable card tier needs the store"
+        cfg = self.store_binding.session.config
+        tensors = [getattr(fast, impl_field) for impl_field, _ in _TIER_FIELDS]
+        rows = FastRows(tensors, self._fast_capacity, int(cfg.fast_chunk_mib) << 20)
+        rows.commit(self.num_fast)
+        views = rows.views(tensors)
+        old = {}
+        for tensor, view in zip(tensors, views):
+            view[: self.num_fast].copy_(tensor)
+            old[tensor.data_ptr()] = view
+        layer = None if self._layer_ref is None else self._layer_ref()
+        others = [] if layer is None else list(layer.parameters(recurse=False))
+        for tensor in [*tensors, *others]:
+            view = old.get(tensor.data_ptr())
+            if view is not None and tensor.shape[0] == self.num_fast:
+                rows_u8 = view.view(torch.uint8).view(view.shape[0], -1)
+                tensor.data = rows_u8.view(tensor.dtype).view(
+                    view.shape[0], *tensor.shape[1:]
+                )
+        fast.num_experts = self._fast_capacity
+        fast.local_experts_num = self._fast_capacity
+        _device_sync()
+        # The rows' old storage goes back to the device.
+        if torch.accelerator.is_available():
+            torch.accelerator.empty_cache()
+        self.fast_rows = rows
+        logger.info_once(
+            "Expert tiers: the card tier of each layer sits in a device range "
+            "reserved for %d rows (%d in use, %.2f GiB mapped per layer); it "
+            "grows and shrinks while serving (runtime control tiers.fast) "
+            "between %d and %d rows.",
+            self._fast_capacity,
+            self.num_fast,
+            rows.mapped_bytes / 2**30,
+            self.fast_range()[0],
+            self._fast_capacity,
+        )
 
     def eplb_weights(self) -> list[TieredExpertWeight]:
         """The tensors the two impls read, as EPLB's per-slot rows."""
@@ -1146,18 +1658,28 @@ class ExpertTiers:
         for impl_field, _ in _TIER_FIELDS:
             parts = [getattr(impl, impl_field) for impl in (fast, slow)]
             # The spare rows beyond the pinned slots are not EPLB's; the host
-            # slots have no row (they count as slots without a tensor).
-            parts[1] = parts[1][: self.num_pinned]
+            # slots have no row (they count as slots without a tensor). A
+            # card tier in a reserved range has rows beyond the ones in use.
+            pinned = (
+                self.num_pinned if self.placement is None else self.placement.num_pinned
+            )
+            parts[0] = parts[0][: self.num_fast]
+            parts[1] = parts[1][:pinned]
             parts = [p.view(p.shape[0], -1) for p in parts]
             if parts[0].dtype != parts[1].dtype:  # packed int4: int8 vs uint8
                 parts = [p.view(torch.uint8) for p in parts]
             if self.store_binding is not None:
                 # placed by this object, through the expert store
-                weights.append(
-                    StoreBackedWeight(
-                        parts, self.on_rows_written, self, unbacked=self.num_host
-                    )
+                weight = StoreBackedWeight(
+                    parts,
+                    self.on_rows_written,
+                    self,
+                    unbacked=self.num_local - self.num_fast - pinned,
                 )
+                # Its pinned part holds the rows' host memory (the device
+                # view owns the host tensor): a relayout swaps it out.
+                self._eplb_parts.append(weakref.ref(weight))
+                weights.append(weight)
             else:
                 weights.append(TieredExpertWeight(parts, self.on_rows_written))
         return weights
@@ -1508,7 +2030,10 @@ class ExpertTiers:
         whole: dict[tuple[int, str], torch.Tensor] = {}
         if full:  # one device read per tensor instead of one per row
             for impl_field, key in _TIER_FIELDS:
-                whole[(FAST, key)] = _u8(getattr(fast, impl_field)).cpu()
+                # the rows in use: a reserved range has no memory above them
+                whole[(FAST, key)] = _u8(getattr(fast, impl_field))[
+                    : placement.num_fast
+                ].cpu()
                 whole[(POOL, key)] = _u8(self.slow_views[key]).cpu()
         from vllm.model_executor.offloader.expert_tier_map import HOST
 
@@ -1599,6 +2124,39 @@ class ExpertTiers:
         from vllm.model_executor.offloader.base import get_offloader
 
         get_offloader().invalidate_staged()
+
+
+def _device_sync() -> None:
+    """Wait for the accelerator (nothing to wait for without one)."""
+    if torch.accelerator.is_available():
+        torch.accelerator.synchronize()
+
+
+def _empty_host_cache() -> None:
+    """Give the pinned host memory torch caches and no tensor holds back to
+    the system (torch.accelerator.empty_host_cache, where torch has it)."""
+    empty = getattr(torch.accelerator, "empty_host_cache", None)
+    if empty is not None and torch.accelerator.is_available():
+        empty()
+
+
+def _quarantined(placement: "TierPlacement") -> int:
+    placement.pool.free_count  # noqa: B018 - reaps the rows whose event is done
+    return placement.pool.quarantined
+
+
+def _forget_staged_slow() -> None:
+    """Drop the stager's device copies of the slow tier: their shape was the
+    old row count (a new one is made for the next large step)."""
+    from vllm.model_executor.offloader.base import get_offloader
+
+    stager = getattr(get_offloader(), "expert_stager", None)
+    for name in ("_buffers", "_rings"):
+        table = getattr(stager, name, None)
+        if not isinstance(table, dict):
+            continue
+        for key in [k for k in table if str(k[0]).startswith("slow.")]:
+            del table[key]
 
 
 def remap_unrouted(

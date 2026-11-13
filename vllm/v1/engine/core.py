@@ -972,6 +972,9 @@ class EngineCore:
     _kv_memory_holders: tuple[KVCacheMemoryHolder, ...] = ()
     _tower_residency: TowerResidencyController | None = None
     _expert_tier_stats: ExpertTierStatsPoller | None = None
+    # A resize of the expert tiers' card tier (runtime control tiers.fast,
+    # vllm/v1/engine/fast_tier.py), made on first use.
+    _fast_tier: Any = None
     # Seconds between attempts to finish a release a worker failed.
     KV_RESIZE_RETRY_INTERVAL_S = 1.0
     # A shrink's default deadline for the drain, in seconds.
@@ -2232,6 +2235,10 @@ class EngineCoreProc(EngineCore):
         while self._handle_shutdown():
             # A KV cache shrink moves on between steps, like a utility.
             self._advance_kv_resize()
+            # A card tier grow takes the memory a shrink just released, in the
+            # same iteration, before a step can.
+            if self._fast_tier is not None:
+                self._advance_fast_tier()
             # So do encoder towers moving between host and accelerators.
             if self._tower_residency is not None:
                 self._tower_residency.advance()
@@ -2280,6 +2287,21 @@ class EngineCoreProc(EngineCore):
         except TimeoutError:
             self._fail_kv_resize_executor()
             raise
+
+    def _advance_fast_tier(self) -> None:
+        """Move a card tier resize on; a failure ends the resize, never the
+        engine (a worker RPC that times out fails the executor, as a KV
+        resize's does)."""
+        try:
+            self._fast_tier.advance()
+        except TimeoutError:
+            self._fail_kv_resize_executor()
+            raise
+        except Exception as e:  # noqa: BLE001 - reported in the resize's record
+            logger.exception("The card tier resize could not move on.")
+            resize = self._fast_tier.resize
+            if resize is not None and resize.state.active:
+                self._fast_tier._fail(resize, f"{type(e).__name__}: {e}")
 
     def _fail_kv_resize_executor(self) -> None:
         # The workers may still answer, and their replies would be read as

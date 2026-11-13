@@ -50,13 +50,14 @@ _TIER_SETTINGS: dict[str, RuntimeSetting] = {}
 
 # Why the expert tiers' sizes are fixed (see the readout). The pinned bound
 # (host_tier_bound) moves at run time in an engine started with experts
-# computed on the CPU, which registers it; the fast tier never does.
+# computed on the CPU, which registers it; the card tier moves (tiers.fast)
+# in an engine started with --expert-store-config fast_rows_max.
 TIER_RESIZE_BLOCKED = (
-    "the tier sizes are fixed at load in this engine: the fast tier is each "
-    "layer's own device parameter of num_fast rows (its storage is what the "
-    "kernels and any captured graph read) and the device memory a larger fast "
-    "tier needs is not taken from the KV cache by any path; the pinned bound "
-    "moves at run time only when the engine started with "
+    "the tier sizes are fixed at load in this engine: the card tier moves at "
+    "run time (tiers.fast) only when the engine started with "
+    "--expert-store-config fast_rows_max, which reserves the device range "
+    "the kernels and the captured graphs read for that many rows; the pinned "
+    "bound moves at run time only when the engine started with "
     "--cpu-offload-pinned-gb, because slots served on the CPU need the MoE op "
     "outside the captured graphs, which is decided at start"
 )
@@ -146,13 +147,24 @@ def _tiers() -> list[Any]:
 # --------------------------------------------------------------------------
 
 
-def _tiers_state() -> dict[str, Any] | None:
+def _fast_state(targets: list[int] | None = None) -> dict[str, Any] | None:
+    """The movable card tier (fast_rows_max), or None when it is fixed."""
+    try:
+        from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+    except ImportError:
+        return None
+    return xpu_fast_tier.state(targets or ())
+
+
+def _tiers_state(fast_targets: list[int] | None = None) -> dict[str, Any] | None:
     tiers = _tiers()
     if not tiers:
         return None
     from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
         pinned_arena_gib,
     )
+
+    fast = _fast_state(fast_targets)
 
     def count(tier: int) -> int:
         # slots of every layer in the tier now (moves and promotions included)
@@ -185,10 +197,13 @@ def _tiers_state() -> dict[str, Any] | None:
         "moves_committed": sum(len(t.move_log) for t in tiers),
         "pinned_gib": round(pinned_arena_gib(), 3),
         "settings": {name: s.get() for name, s in _TIER_SETTINGS.items()},
-        "resizable": "host_tier_bound" in _TIER_SETTINGS,
+        "resizable": "host_tier_bound" in _TIER_SETTINGS or fast is not None,
         "resize_blocked": (
-            None if "host_tier_bound" in _TIER_SETTINGS else TIER_RESIZE_BLOCKED
+            None
+            if "host_tier_bound" in _TIER_SETTINGS or fast is not None
+            else TIER_RESIZE_BLOCKED
         ),
+        "fast": fast,
     }
 
 
@@ -332,8 +347,12 @@ def _ple_state(worker: Any) -> list[dict[str, Any]]:
     return out
 
 
-def state(worker: Any, only: list[str] | None = None) -> dict[str, Any]:
-    """This rank's readout; `only` names the parts wanted (all by default)."""
+def state(
+    worker: Any, only: list[str] | None = None, fast_rows: list[int] | None = None
+) -> dict[str, Any]:
+    """This rank's readout; `only` names the parts wanted (all by default);
+    `fast_rows` the card tier sizes whose mapped bytes `tiers.fast.bytes_to`
+    reports."""
     from vllm.distributed.eplb import fault_injection
 
     eplb = _eplb(worker)
@@ -347,7 +366,7 @@ def state(worker: Any, only: list[str] | None = None) -> dict[str, Any]:
 
     parts: dict[str, Callable[[], Any]] = {
         "eplb": eplb_summary,
-        "tiers": _tiers_state,
+        "tiers": lambda: _tiers_state(fast_rows),
         "cpu": _cpu_state,
         "store": _store_state,
         "kv": lambda: _kv_state(worker),
@@ -985,6 +1004,68 @@ def _apply_fault_clear(worker: Any, args: dict) -> tuple[dict, dict, Any]:
     return changes, {"armed": after}, before
 
 
+# ---- the card tier's size (fast_rows_max)
+
+
+def _check_tiers_fast(worker: Any, args: dict) -> str | None:
+    from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+
+    unknown = sorted(set(args) - {"rows"})
+    if unknown:
+        return f"unknown arguments {unknown}; tiers.fast takes rows"
+    eplb = _eplb(worker)
+    if eplb is not None and any(
+        ms.rebalanced for ms in getattr(eplb, "model_states", {}).values()
+    ):
+        return (
+            "an EPLB rearrangement is in flight (its layers are being prepared "
+            "and committed one by one); ask after it completes"
+        )
+    return xpu_fast_tier.check(args.get("rows"))
+
+
+def _after_fast_change(worker: Any) -> None:
+    """The KV cache's torch cap leaves out what the card tier maps now."""
+    import torch
+
+    from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+
+    kv_cache = _kv_cache(worker)
+    if kv_cache is None:
+        return
+    xpu_fast_tier.register_with_kv_cache(kv_cache)
+    limit = kv_cache.refresh_torch_memory_limit()
+    device = kv_cache.buffer.device
+    if limit is not None and torch.accelerator.memory_reserved(device) > limit:
+        torch.accelerator.empty_cache()
+
+
+def _apply_tiers_fast(worker: Any, args: dict) -> tuple[dict, dict, Any]:
+    from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+
+    kv_cache = _kv_cache(worker)
+    if kv_cache is not None:
+        # The baseline of the cap's accounting is the size before this change.
+        xpu_fast_tier.register_with_kv_cache(kv_cache)
+    old = xpu_fast_tier.rows_now()
+    rows = int(args["rows"])
+    try:
+        result = xpu_fast_tier.apply(rows)
+    finally:
+        _after_fast_change(worker)
+    changes = {"fast_rows": [old, rows]} if old != rows else {}
+    return changes, {"fast": result, "tiers": _tiers_state()}, old
+
+
+def _restore_tiers_fast(worker: Any, old: int) -> None:
+    from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+
+    try:
+        xpu_fast_tier.apply(int(old))
+    finally:
+        _after_fast_change(worker)
+
+
 OPS: dict[str, _Op] = {
     "eplb.set": _Op(_check_eplb_set, _apply_eplb_set, _restore_eplb_set),
     "eplb.pause": _Op(lambda w, a: _need_eplb(w), _apply_pause(True), _restore_pause),
@@ -995,6 +1076,7 @@ OPS: dict[str, _Op] = {
     "store.set": _Op(_check_store_set, _apply_store_set, _restore_store_set),
     "store.scrub": _Op(_check_scrub, _apply_scrub),
     "tiers.set": _Op(_check_tiers_set, _apply_tiers_set, _restore_tiers_set),
+    "tiers.fast": _Op(_check_tiers_fast, _apply_tiers_fast, _restore_tiers_fast),
     "cpu.set": _Op(_check_cpu_set, _apply_cpu_set, _restore_cpu_set),
     "cpu.stats": _Op(_check_cpu_stats, _apply_cpu_stats),
     "kv.set": _Op(_check_kv_set, _apply_kv_set, _restore_kv_set),
@@ -1040,7 +1122,7 @@ def _plain(reply: dict[str, Any]) -> dict[str, Any]:
 def _handle(worker: Any, phase: str, op: str, args: dict) -> dict[str, Any]:
     rank = _rank(worker)
     if phase == "state":
-        return state(worker, args.get("only"))
+        return state(worker, args.get("only"), args.get("fast_rows"))
     if phase == "check":
         try:
             refusal = _check(worker, op, args)

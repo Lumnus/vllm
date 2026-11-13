@@ -57,6 +57,10 @@ ENGINE_OPS = (
     "tower.promote",
     "tower.demote",
     "tower.set",
+    # the card tier's size, with the KV cache giving or taking the memory
+    # (vllm/v1/engine/fast_tier.py); the workers' side is the worker op of
+    # the same name
+    "tiers.fast",
 )
 DEV_ONLY_OPS = ("fault.arm", "fault.clear")
 
@@ -162,13 +166,36 @@ class RuntimeControl:
         if kv["extensible"]:
             kv["resize"] = engine.get_kv_cache_resize_state()
         ranks = self._rpc("state", "", {"only": only} if only else None)
-        return {
+        out = {
             "dev_mode": bool(envs.VLLM_SERVER_DEV_MODE),
             "operations": sorted(WORKER_OPS + ENGINE_OPS),
             "kv": kv,
             "towers": self._towers_state(),
             "ranks": ranks,
             "ranks_agree": _agreement(ranks),
+        }
+        if only is None or "fast" in only or "tiers" in only:
+            out["fast_tier"] = self._fast_tier_state(ranks)
+        return out
+
+    def _fast_tier_state(self, ranks: list[dict]) -> dict[str, Any]:
+        """The card tier's size on every rank and the current or last resize
+        (no RPC of its own: the ranks' readout is at hand)."""
+        fast = [(r.get("tiers") or {}).get("fast") for r in ranks]
+        resizable = bool(fast) and all(f is not None for f in fast)
+        rows = fast[0]["rows"] if resizable else None
+        controller = getattr(self.engine, "_fast_tier", None)
+        resize = None if controller is None else controller.resize
+        return {
+            "resizable": resizable,
+            "rows": rows,
+            "ranks_agree": resizable and all(f["rows"] == rows for f in fast),
+            "range": (
+                [max(f["min"] for f in fast), min(f["max"] for f in fast)]
+                if resizable
+                else None
+            ),
+            "record": None if resize is None else resize.record(rows),
         }
 
     def _towers_state(self) -> dict[str, Any]:
@@ -217,6 +244,8 @@ class RuntimeControl:
             return reply
         if op in WORKER_OPS:
             return self._worker_op(op, args)
+        if op == "tiers.fast":
+            return self._fast_tier().start(args)
         if op == "kv.resize":
             num_blocks = args.get("num_blocks")
             if not isinstance(num_blocks, int) or num_blocks <= 0:
@@ -237,6 +266,17 @@ class RuntimeControl:
         raise ControlRefused(
             f"unknown operation {op!r}; one of {sorted(WORKER_OPS + ENGINE_OPS)}"
         )
+
+    def _fast_tier(self) -> Any:
+        """The card tier's resize controller, made on first use and handed
+        to the engine core, whose busy loop advances it."""
+        from vllm.v1.engine.fast_tier import FastTierController
+
+        controller = getattr(self.engine, "_fast_tier", None)
+        if controller is None:
+            controller = FastTierController(self.engine, self)
+            self.engine._fast_tier = controller
+        return controller
 
     def _kv_fit(self) -> dict[str, Any]:
         """Grow toward the reserved capacity: every rank votes the most its

@@ -129,6 +129,40 @@ class ExpertStoreConfig:
     """Pinned rows per layer beyond the spare rows, for those promotions;
     EPLB's next rearrangement chooses the pinned set again and frees them."""
 
+    fast_rows_max: int = Field(default=0, ge=0)
+    """0 (default): the card tier of each layer is fixed at load, as many rows
+    as ``--cpu-offload-gb`` leaves on the card. N: the card tier can grow and
+    shrink while serving (runtime control ``tiers.fast``), up to N rows per
+    layer per rank (at most every local slot): its rows sit in a device
+    address range reserved for N rows, physical memory is mapped for the
+    rows in use only, and the kernels and the captured graphs see the N-row
+    range, so a resize recaptures nothing. A grow takes its device memory
+    from the KV cache (a shrink of the pool that drains), a shrink gives it
+    back."""
+
+    fast_rows_min: int | None = Field(default=None, ge=1)
+    """With ``fast_rows_max``: the fewest card rows per layer a shrink may
+    leave. None: one with experts computed on the CPU
+    (``--cpu-offload-pinned-gb``), where a slot leaving the card can go to
+    the CPU; otherwise the rows at load, since every slot off the card then
+    needs a pinned row: a lower floor allocates that many more pinned rows per
+    layer at load."""
+
+    fast_chunk_mib: int = Field(default=2, ge=1)
+    """With ``fast_rows_max``: MiB per physical object of the card tier's
+    memory (rounded to the device's granularity). A shrink gives back the
+    objects wholly above the rows that stay; smaller objects free memory row
+    by row, larger ones need fewer driver allocations."""
+
+    pinned_release: bool = False
+    """With ``--cpu-offload-pinned-gb``: lowering the pinned bound at run
+    time (``tiers.set host_tier_bound``) also gives the pinned host memory of
+    the rows no longer needed back to the system, layer by layer (each
+    layer's pinned rows are laid out again, smaller, and a chunk of pinned
+    memory is freed once no layer holds rows in it), and raising it lays the
+    rows out larger, up to every slot off the card. Off: the rows stay
+    allocated and the bound stays within the rows sized at load."""
+
     @model_validator(mode="after")
     def _check_dirs(self) -> "ExpertStoreConfig":
         if len(set(self.dirs)) != len(self.dirs):
@@ -175,12 +209,34 @@ class ExpertStoreConfig:
                 f"spare_rows={self.spare_rows} is below max_moves_per_rank="
                 f"{eplb.max_moves_per_rank}: one rearrangement could not land"
             )
+        if (
+            self.fast_rows_min is not None
+            and self.fast_rows_max
+            and self.fast_rows_min > self.fast_rows_max
+        ):
+            raise ValueError(
+                f"fast_rows_min={self.fast_rows_min} is above fast_rows_max="
+                f"{self.fast_rows_max}"
+            )
 
     def spare_rows_for(self, max_moves_per_rank: int) -> int:
         return max_moves_per_rank if self.spare_rows is None else self.spare_rows
 
+    @property
+    def fast_tier_resizable(self) -> bool:
+        return self.enabled and self.fast_rows_max > 0
+
     def compile_factors(self) -> CompileFactors:
-        """Only what changes the shapes the kernels are launched with."""
+        """Only what changes the shapes the kernels are launched with: of the
+        card tier's settings, its capacity, and only when it is set (the
+        hash of an engine without it is the one before the setting
+        existed)."""
+        factors = self._base_compile_factors()
+        if self.fast_rows_max:
+            factors["fast_rows_max"] = self.fast_rows_max
+        return factors
+
+    def _base_compile_factors(self) -> CompileFactors:
         return get_compile_factors(
             self,
             {
@@ -205,5 +261,11 @@ class ExpertStoreConfig:
                 "host_promote_misses",
                 "host_promote_window",
                 "host_promote_rows",
+                # the card tier's run-time settings (fast_rows_max is added
+                # by compile_factors when set)
+                "fast_rows_max",
+                "fast_rows_min",
+                "fast_chunk_mib",
+                "pinned_release",
             },
         )
