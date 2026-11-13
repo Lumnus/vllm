@@ -344,6 +344,8 @@ if TYPE_CHECKING:
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
+    VLLM_XPU_MOE_COMBINE: Literal["split", "rank", "exact"] = "split"
+    VLLM_XPU_MOE_PLACEMENT_TRACE: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -2368,6 +2370,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_INC_WNA16_BACKEND": env_with_choices(
         "VLLM_XPU_INC_WNA16_BACKEND", "auto", ["auto", "ark", "w4a16", "w4a8"]
     ),
+    # How the XPU fused MoE sums a token's routed experts when they are
+    # computed in pieces (expert slots in device and host tiers, expert
+    # parallelism). "split": each piece is summed and rounded to the output
+    # dtype on its own, then the pieces are added (the bits depend on which
+    # rank and tier holds each expert, so they change when EPLB moves
+    # experts). "rank": one sum over both tiers of a rank (independent of the
+    # tiers, still of the ranks). "exact": the per-expert outputs are
+    # exchanged between the expert-parallel ranks and summed once in a fixed
+    # order, so the result does not depend on where any expert sits; it costs
+    # one all-reduce of top_k x hidden values per token and layer.
+    "VLLM_XPU_MOE_COMBINE": env_with_choices(
+        "VLLM_XPU_MOE_COMBINE", "split", ["split", "rank", "exact"]
+    ),
+    # Debug: path prefix of a trace of where each routed expert of every token
+    # was computed (expert-parallel rank, device or host tier, row), written
+    # per rank to <prefix>.rank<R>.jsonl while the file <prefix>.on exists.
+    # Eager steps only: a CUDA/XPU graph replay runs no Python.
+    "VLLM_XPU_MOE_PLACEMENT_TRACE": lambda: os.getenv(
+        "VLLM_XPU_MOE_PLACEMENT_TRACE", ""
+    ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
@@ -2580,6 +2602,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_SKIP_VERSION_SUFFIX",
         "FORCE_COLOR",
         "VLLM_REQUEST_BODY_LOG_LEVEL",
+        # Read inside the fused MoE custom op, which the compiled graph calls
+        # as an opaque op.
+        "VLLM_XPU_MOE_COMBINE",
+        "VLLM_XPU_MOE_PLACEMENT_TRACE",
     }
 
     from vllm.config.utils import normalize_value
