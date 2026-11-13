@@ -216,6 +216,18 @@ class EngineClient(ABC):
         """The record of the current or last KV cache resize."""
         raise NotImplementedError
 
+    async def runtime_control(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Apply one operation of the runtime control surface in the running
+        engine, between two steps, on every rank or none
+        (`vllm/v1/engine/runtime_control.py`)."""
+        raise NotImplementedError
+
+    async def get_runtime_control_state(
+        self, only: list[str] | None = None
+    ) -> dict[str, Any]:
+        """The state of the engine's dynamic subsystems, per rank."""
+        raise NotImplementedError
+
     @abstractmethod
     async def sleep(
         self, level: int = 1, mode: "PauseMode" = "abort", reset_connector: bool = True

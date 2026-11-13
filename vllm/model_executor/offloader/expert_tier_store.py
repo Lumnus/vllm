@@ -358,6 +358,19 @@ class StoreSession:
         )
         self.open_reader()
 
+    def set_stats_interval(self, interval_s: float) -> None:
+        """Change the seconds between the store's log lines while it serves
+        (0: none): the old line thread stops, a new one starts."""
+        if interval_s < 0:
+            raise ValueError("stats_interval_s must be >= 0")
+        with self._lock:
+            if self._stats_stop is not None:
+                self._stats_stop.set()
+                self._stats_stop = None
+            self.config.stats_interval_s = float(interval_s)
+            if self._store is not None:
+                self._start_stats_thread()
+
     def close(self) -> None:
         with self._lock:
             if self._stats_stop is not None:
@@ -384,6 +397,12 @@ def get_session(
         if session is None:
             session = _SESSIONS[key] = make()
         return session
+
+
+def sessions() -> list[StoreSession]:
+    """The store sessions of this process."""
+    with _SESSIONS_LOCK:
+        return list(_SESSIONS.values())
 
 
 def reset_sessions() -> None:

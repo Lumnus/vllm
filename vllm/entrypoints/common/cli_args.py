@@ -214,6 +214,13 @@ class BaseFrontendArgs:
     If set to True, only enable the Tokens In<>Out endpoint.
     This is intended for use in a Disaggregated Everything setup.
     """
+    enable_runtime_control: bool = False
+    """If set to True, register the runtime control routes
+    (`GET /runtime_control`, `POST /runtime_control/{op}`) that read and change
+    the dynamic subsystems of the running engine (EPLB, expert tiers and store,
+    KV pool, encoder towers, routing trace), without the other development
+    routes. They are registered with those anyway when `VLLM_SERVER_DEV_MODE`
+    is set. They ask for the API key when the server has one."""
     enable_scale_out: bool = envs.VLLM_SERVER_DEV_MODE
     """
     If set to True, register the scale-out endpoints (`/render`, `/derender`,

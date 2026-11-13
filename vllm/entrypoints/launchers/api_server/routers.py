@@ -9,6 +9,22 @@ from vllm.config import ModelConfig
 from vllm.tasks import POOLING_TASKS, SupportedTask
 
 
+def register_runtime_control_router(args: Namespace, app: FastAPI) -> bool:
+    """The runtime control routes: with the development routes, or alone
+    (without /collective_rpc and the rest of that family) with
+    --enable-runtime-control. They take the server's API key when it has
+    one. Returns whether they were registered."""
+    if not (
+        envs.VLLM_SERVER_DEV_MODE or getattr(args, "enable_runtime_control", False)
+    ):
+        return False
+    from vllm.entrypoints.serve.dev.control.api_router import attach_router
+
+    keys = getattr(args, "api_key", None) or [envs.VLLM_API_KEY]
+    attach_router(app, [k for k in keys if k])
+    return True
+
+
 def register_api_routers(
     args: Namespace,
     app: FastAPI,
@@ -51,6 +67,8 @@ def register_api_routers(
         from vllm.entrypoints.rl.factories import register_rl_api_routers
 
         register_rl_api_routers(app)
+
+    register_runtime_control_router(args, app)
 
     if "generate" in supported_tasks:
         from vllm.entrypoints.generate.api_router import (

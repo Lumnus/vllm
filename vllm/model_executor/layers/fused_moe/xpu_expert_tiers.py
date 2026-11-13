@@ -29,6 +29,7 @@ card, in a pinned row or on the CPU, or the step fails.
 
 import threading
 import time
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -209,6 +210,20 @@ class _PinnedArena:
 
 
 _ARENA = _PinnedArena()
+
+# The layers' tiers in this process once wired to their kernels, for the
+# runtime control surface's readout (`live_tiers`).
+_LIVE_TIERS: "weakref.WeakSet[ExpertTiers]" = weakref.WeakSet()
+
+
+def live_tiers() -> list["ExpertTiers"]:
+    """The tiered expert layers of this process, in layer name order."""
+    return sorted(_LIVE_TIERS, key=lambda t: t.layer_name)
+
+
+def pinned_arena_gib() -> float:
+    """Pinned host memory the tiers' arena holds in this process."""
+    return _ARENA.gib
 
 
 def _repack_int4_pinned(
@@ -516,6 +531,7 @@ class ExpertTiers:
             if self.num_host:
                 self._start_cpu_tier(experts)
         experts.tiers = self
+        _LIVE_TIERS.add(self)
 
     # -- the CPU tier ---------------------------------------------------------
 

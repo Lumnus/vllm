@@ -98,6 +98,7 @@ from vllm.v1.engine.kv_cache_resize import (
     KVCacheResizeState,
     grow_message,
 )
+from vllm.v1.engine.runtime_control import RuntimeControl
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.tower_residency import TowerResidencyController
 from vllm.v1.engine.utils import (
@@ -1325,6 +1326,37 @@ class EngineCore:
             )
         num_blocks = self.vllm_config.cache_config.num_gpu_blocks - max(counts)
         return self.resize_kv_cache(num_blocks, deadline_s=deadline_s, preempt=urgent)
+
+    # The runtime control surface (vllm/v1/engine/runtime_control.py), made
+    # on first use: an engine nobody controls never builds it.
+    _runtime_control: RuntimeControl | None = None
+
+    def _control(self) -> RuntimeControl:
+        if self._runtime_control is None:
+            self._runtime_control = RuntimeControl(self)
+        return self._runtime_control
+
+    def runtime_control_state(self, only: list[str] | None = None) -> dict[str, Any]:
+        """The state of every dynamic subsystem, engine core and every rank.
+        A utility: runs between two steps."""
+        try:
+            return self._control().state(only)
+        except TimeoutError:
+            self._fail_kv_resize_executor()
+            raise
+
+    def runtime_control(
+        self, op: str, args: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Apply one operation of the runtime control surface between two
+        steps, on every rank or on none (`RuntimeControl.apply`). Raises
+        `ControlRefused` (nothing changed) with the reason."""
+        try:
+            return self._control().apply(op, dict(args or {}))
+        except TimeoutError:
+            # Late worker replies would be read as the next call's.
+            self._fail_kv_resize_executor()
+            raise
 
     def reset_encoder_cache(self) -> None:
         """Reset the encoder cache to invalidate all cached encoder outputs.
