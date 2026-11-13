@@ -952,7 +952,9 @@ class _Chunk:
         if pin:
             import torch
 
-            self.torch = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+            self.torch = torch.empty(
+                nbytes, dtype=torch.uint8, device="cpu", pin_memory=True
+            )
             self._owner = self.torch
             self.array = self.torch.numpy()
         else:

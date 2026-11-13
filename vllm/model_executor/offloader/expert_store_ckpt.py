@@ -145,7 +145,8 @@ def load_kernels_transform(src: str | None = None) -> Any:
         ast.Module(body=[node], type_ignores=[]), path, "exec"
     )  # keeps the kernels' own file and line numbers in tracebacks
     exec(code, module.__dict__)
-    probe = module.implement_zp(torch.arange(256, dtype=torch.uint8))
+    with torch.device("cpu"):
+        probe = module.implement_zp(torch.arange(256, dtype=torch.uint8, device="cpu"))
     if probe.dtype != torch.uint8 or probe.shape != (256,):
         raise ImportError(f"{path}: implement_zp gave {probe.dtype} {probe.shape}")
     if "vllm_xpu_kernels" not in sys.modules:

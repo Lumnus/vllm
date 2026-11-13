@@ -175,7 +175,7 @@ class _PinnedArena:
         self.total = 0
 
     def empty(self, shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
-        nbytes = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
+        nbytes = torch.Size(shape).numel() * dtype.itemsize
         for i, used in enumerate(self.used):
             if used + nbytes <= self.chunks[i].numel():
                 break
@@ -183,7 +183,9 @@ class _PinnedArena:
             size = (
                 self.CHUNK if nbytes <= self.CHUNK else 1 << (nbytes - 1).bit_length()
             )
-            self.chunks.append(torch.empty(size, dtype=torch.uint8, pin_memory=True))
+            self.chunks.append(
+                torch.empty(size, dtype=torch.uint8, device="cpu", pin_memory=True)
+            )
             self.used.append(0)
             self.total += size
             i, used = len(self.chunks) - 1, 0
@@ -241,8 +243,9 @@ def _slot_maps(
     local_of: dict[int, int], num_global: int, num_fast: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Physical expert id -> row of the fast and of the slow tier, -1 elsewhere."""
-    fast_map = torch.full((num_global,), -1, dtype=torch.int32)
-    slow_map = torch.full((num_global,), -1, dtype=torch.int32)
+    # explicit CPU: filled element by element here, moved to the device after
+    fast_map = torch.full((num_global,), -1, dtype=torch.int32, device="cpu")
+    slow_map = torch.full((num_global,), -1, dtype=torch.int32, device="cpu")
     for g, slot in local_of.items():
         if slot < 0:
             continue
@@ -1099,13 +1102,20 @@ def _layout_fingerprint() -> str:
     another identity, whatever its version string says. A change of the row
     layout that this probe cannot see is caught at load, when a store that
     fills the host tier is compared with the rows this boot laid out
-    (``ExpertTiers._check_store_against_this_boot``)."""
+    (``ExpertTiers._check_store_against_this_boot``).
+
+    Computed on the host whatever the default device: the engine calls it
+    while the model is built under the accelerator's default-device context,
+    the store's build tool calls it on a host without one, and both must get
+    the same bytes. The ``torch.device("cpu")`` context also covers any
+    tensor the kernels' function creates without a device."""
     import hashlib
 
     from vllm_xpu_kernels.fused_moe_interface import implement_zp
 
-    probe = implement_zp(torch.arange(256, dtype=torch.uint8))
-    raw = probe.contiguous().view(torch.uint8).numpy().tobytes()
+    with torch.device("cpu"):
+        probe = implement_zp(torch.arange(256, dtype=torch.uint8, device="cpu"))
+        raw = probe.contiguous().view(torch.uint8).cpu().numpy().tobytes()
     return hashlib.sha256(raw).hexdigest()[:16]
 
 

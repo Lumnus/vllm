@@ -524,7 +524,8 @@ def allocate_host(
 
     if not pin:
         return {
-            s.name: torch.empty(s.shape, dtype=_torch_dtype(s.dtype)) for s in specs
+            s.name: torch.empty(s.shape, dtype=_torch_dtype(s.dtype), device="cpu")
+            for s in specs
         }, []
     chunks: list[list[tuple[TensorSpec, int]]] = [[]]
     used = 0
@@ -547,7 +548,9 @@ def allocate_host(
             continue
         end = max(start + s.nbytes for s, start in members)
         size = max(PAGE, 1 << (end - 1).bit_length())
-        base = torch.empty(min(size, CHUNK_BYTES), dtype=torch.uint8, pin_memory=True)
+        base = torch.empty(
+            min(size, CHUNK_BYTES), dtype=torch.uint8, device="cpu", pin_memory=True
+        )
         owners.append(base)
         for s, start in members:
             flat = base[start : start + s.nbytes].view(_torch_dtype(s.dtype))

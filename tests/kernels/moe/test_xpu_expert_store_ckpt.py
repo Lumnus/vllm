@@ -285,9 +285,18 @@ class CkptEnv(Env):
                 tiers.ops = ImmediateOps()
 
 
-def engine_run(monkeypatch, tmp_path, ck, kernels_src, build="auto") -> CkptEnv:
+def engine_run(
+    monkeypatch, tmp_path, ck, kernels_src, build="auto", construct_device=None
+) -> CkptEnv:
+    """``construct_device``: build the layers under that default-device
+    context, as the model loader builds the model under the accelerator's
+    (loading and the post-load step run outside it, as there)."""
     env = CkptEnv(monkeypatch, tmp_path, ck, kernels_src, store=True, build=build)
-    env.construct()
+    if construct_device is None:
+        env.construct()
+    else:
+        with torch.device(construct_device):
+            env.construct()
     env.load()
     env.process()
     return env
@@ -451,6 +460,55 @@ def test_the_recorded_example_of_the_kernels_transform(real_transform):
         hashlib.sha256(probe.numpy().tobytes()).hexdigest()[:16] == "8d38fff6efe34092"
     )
     assert xt._layout_fingerprint() == "8d38fff6efe34092"
+
+
+def test_the_fingerprint_is_taken_on_the_host_under_a_default_device(
+    real_transform, tmp_path, kernels_src
+):
+    """The engine takes the fingerprint while the model is built under the
+    accelerator's default-device context; a probe made on that device could
+    not be read on the host (``TypeError: can't convert ... device type tensor
+    to numpy``). The meta device stands in for the accelerator here: a tensor
+    created there cannot be read on the host either, through the same
+    default-device mode. The value equals the build tool's, taken without a
+    context."""
+    ck = small(tmp_path / "ckpt", layers=1, experts=2)
+    source = source_for(ck, kernels_src)
+    tool_side = source.transform_fingerprint
+    source.close()
+    with torch.device("meta"):
+        assert torch.empty(1).device.type == "meta"  # the context is on
+        engine_side = xt._layout_fingerprint()
+    assert engine_side == tool_side == "8d38fff6efe34092"
+
+
+def test_a_tool_built_store_binds_when_the_model_is_built_under_a_default_device(
+    monkeypatch, tmp_path, kernels_src
+):
+    """The boot's order: the layers are constructed under a default-device
+    context (the store is bound there), loaded and post-processed outside it.
+    A store the tool built is accepted (same identity) and filled from."""
+    ck = make_checkpoint(
+        tmp_path / "ckpt", layers=LAYERS, experts=E, hidden=HIDDEN, inter=INTER,
+        group=GROUP,
+    )  # fmt: skip
+    dirs = [str(tmp_path / "eng" / "d0"), str(tmp_path / "eng" / "d1")]
+    for d in dirs:
+        pathlib.Path(d).mkdir(parents=True)
+    source = source_for(ck, kernels_src)
+    ebuild.build_source(dirs, source, workers=2)
+    ebuild.finalize_store(dirs)
+    tool_identity = source.identity
+    source.close()
+    env = engine_run(
+        monkeypatch, tmp_path / "eng", ck, kernels_src, construct_device="meta"
+    )
+    session = env.tiers[0].store_binding.session
+    assert session.identity == tool_identity
+    assert session.status == "complete"
+    assert session.mode == "fill"
+    assert all(t.fills_from_store for t in env.tiers)
+    tstore.reset_sessions()
 
 
 # --------------------------------------------------------------------------
