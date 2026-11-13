@@ -154,6 +154,10 @@ class StoreBackedWeight(TieredExpertWeight):
     or writing a row through this object would silently touch another
     expert. Every by-slot access therefore raises; EPLB's transfer paths
     (which index weights by slot) must not be reached for these layers.
+
+    ``unbacked`` slots beyond the parts have no row at all (a layer that
+    computes some experts on the CPU from the store): they count in the
+    shape and as a last tier, with no tensor behind them.
     """
 
     def __init__(
@@ -161,13 +165,31 @@ class StoreBackedWeight(TieredExpertWeight):
         parts: Sequence[torch.Tensor],
         on_rows_written: Callable[[list[int]], None] | None,
         mover: ExpertMover,
+        unbacked: int = 0,
     ):
         super().__init__(parts, on_rows_written)
         self.mover = mover
+        assert unbacked >= 0
+        self.unbacked = unbacked
+
+    @property
+    def tier_sizes(self) -> tuple[int, ...]:
+        sizes = super().tier_sizes
+        return sizes + (self.unbacked,) if self.unbacked else sizes
+
+    @property
+    def shape(self) -> torch.Size:
+        return torch.Size((len(self), self.parts[0].shape[1]))
+
+    def __len__(self) -> int:
+        return int(self._starts[-1]) + self.unbacked
 
     def view(self, dtype: torch.dtype) -> "StoreBackedWeight":
         return StoreBackedWeight(
-            [p.view(dtype) for p in self.parts], self.on_rows_written, self.mover
+            [p.view(dtype) for p in self.parts],
+            self.on_rows_written,
+            self.mover,
+            self.unbacked,
         )
 
     def _by_slot(self, what: str) -> RuntimeError:
