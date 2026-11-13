@@ -11,6 +11,8 @@ server has one, is read from `VLLM_API_KEY`.
     runtime_control.py eplb pause | resume | rearrange
     runtime_control.py eplb set [--step-interval N] [--window-size N]
                                 [--max-moves N] [--policy default|incremental]
+                                [--tier-interval N] [--tier-max-moves N]
+                                [--tier-hot X] [--tier-warm X]
     runtime_control.py eplb save [--path P] [--source last|window]
     runtime_control.py eplb load [--path P]
     runtime_control.py store scrub [--moved-only]
@@ -82,6 +84,10 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
             _set(a, "window_size", ns.window_size)
             _set(a, "max_moves_per_rank", ns.max_moves)
             _set(a, "policy", ns.policy)
+            _set(a, "tier_interval", ns.tier_interval)
+            _set(a, "tier_max_moves", ns.tier_max_moves)
+            _set(a, "tier_hot", ns.tier_hot)
+            _set(a, "tier_warm", ns.tier_warm)
         elif verb == "save":
             _set(a, "path", ns.path)
             a["source"] = ns.source
@@ -98,23 +104,12 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
         return f"store.{verb}", a
     if group == "tiers":
         _set(a, "host_tier_bound", ns.host_tier_bound)
-        for item in getattr(ns, "tier_settings", None) or []:
-            name, sep, value = item.partition("=")
-            if not sep:
-                raise SystemExit(f"--set takes NAME=VALUE, got {item!r}")
-            try:
-                a[name] = json.loads(value)
-            except ValueError:
-                a[name] = value
-        if not a:
-            raise SystemExit("tiers set: give --host-tier-bound or --set NAME=VALUE")
         return "tiers.set", a
     if group == "cpu":
         if verb == "set":
             _set(a, "cpu_threads", ns.threads)
             _set(a, "host_cache_gib", ns.cache_gib)
-            _set(a, "host_promote_misses", ns.promote_misses)
-            _set(a, "host_promote_window", ns.promote_window)
+            _set(a, "stage_min_calls", ns.stage_min_calls)
         return f"cpu.{verb}", a
     if group == "kv":
         if verb == "resize":
@@ -194,7 +189,9 @@ def _print_state(state: dict) -> None:
                 f"moves {s['max_moves_per_rank']}; step {eplb['step']}, next in "
                 f"{eplb['steps_until_next']}; {'PAUSED; ' if eplb['paused'] else ''}"
                 f"rearrangements {eplb['rearrangements']}, skipped "
-                f"{eplb['skipped']}, in flight: {eplb['in_flight'] or 'no'}"
+                f"{eplb['skipped']}, in flight: {eplb['in_flight'] or 'no'}; tier "
+                f"pass every {s.get('tier_interval') or '-'} steps "
+                f"({eplb.get('tier_passes', 0)} so far)"
             )
             for m in eplb["models"]:
                 bal = m["balancedness"]
@@ -218,23 +215,20 @@ def _print_state(state: dict) -> None:
                 f"{now.get('card', '-')} pinned {now.get('pinned', '-')} CPU "
                 f"{now.get('cpu', '-')}"
             )
-            ws = tiers.get("working_set")
-            if ws:
-                s, t, c = ws["settings"], ws["totals"], ws["counters"]
-                n = max(1, ws["layers"])
+            cl = tiers.get("classes")
+            if cl:
+                th, t = cl["thresholds"], cl["totals"]
+                n = max(1, cl["layers"])
                 print(
-                    f"{head} working set {'on' if s['working_set'] else 'off'}"
-                    f" (hot >= {s['ws_hot']}, warm >= {s['ws_warm']}, hysteresis "
-                    f"{s['ws_hysteresis']}, half-life {s['ws_halflife_steps']} "
-                    f"steps; staging from {s['stage_min_calls'] or '-'} calls): per "
-                    f"layer hot {t['hot'] / n:.1f} warm {t['warm'] / n:.1f} cold "
-                    f"{t['cold'] / n:.1f} against card {ws['card_rows']} + pinned "
-                    f"{ws['pinned_rows']} rows; warm/hot on the CPU "
+                    f"{head} classes by EPLB's window (hot >= {th['hot']}, warm >= "
+                    f"{th['warm']} x the mean expert): per layer hot "
+                    f"{t['hot'] / n:.1f} warm {t['warm'] / n:.1f} cold "
+                    f"{t['cold'] / n:.1f} against card {cl['card_rows']} + pinned "
+                    f"{cl['pinned_rows']} rows; warm/hot on the CPU "
                     f"{t['warm_or_hot_on_cpu'] / n:.1f}, cold on the card "
                     f"{t['cold_on_card'] / n:.1f}; short of rows in "
-                    f"{ws['layers_short']} layers ({t['rows_short']} rows); "
-                    f"batches {c['batches']} committed {c['committed']} dropped "
-                    f"{c['dropped']}, swaps {c['swaps']}"
+                    f"{cl['layers_short']} layers ({t['rows_short']} rows); tier "
+                    f"passes {cl['tier_passes']}"
                 )
         cpu = rank.get("cpu")
         if cpu:
@@ -248,8 +242,8 @@ def _print_state(state: dict) -> None:
                 f"{100 * c['routed_pinned'] / routed:.1f} % CPU "
                 f"{100 * c['routed_cpu'] / routed:.1f} %; drive reads "
                 f"{c['cache_misses']}, promotions {c['promotions']} demotions "
-                f"{c['demotions']}; promote after {s['host_promote_misses']} "
-                f"misses per {s['host_promote_window']} steps"
+                f"{c['demotions']}; staging from "
+                f"{s.get('stage_min_calls') or '-'} calls per expert"
             )
         for store in rank.get("store") or []:
             st = store.get("stats", {})
@@ -308,6 +302,10 @@ def _parser() -> argparse.ArgumentParser:
     es.add_argument("--window-size", type=int)
     es.add_argument("--max-moves", type=int)
     es.add_argument("--policy", choices=("default", "incremental"))
+    es.add_argument("--tier-interval", type=int, help="steps between tier passes")
+    es.add_argument("--tier-max-moves", type=int, help="reads per layer per pass")
+    es.add_argument("--tier-hot", type=float)
+    es.add_argument("--tier-warm", type=float)
     sv = e.add_parser("save")
     sv.add_argument("--path")
     sv.add_argument("--source", choices=("last", "window"), default="last")
@@ -323,24 +321,13 @@ def _parser() -> argparse.ArgumentParser:
     ss.add_argument("--stats-interval", type=float)
 
     ti = groups.add_parser("tiers").add_subparsers(dest="verb", required=True)
-    ts = ti.add_parser("set")
-    ts.add_argument("--host-tier-bound", type=int)
-    ts.add_argument(
-        "--set",
-        dest="tier_settings",
-        action="append",
-        default=[],
-        metavar="NAME=VALUE",
-        help="any tier setting, value as JSON (e.g. working_set=true, "
-        "ws_warm=0.5, stage_min_calls=12); repeatable",
-    )
+    ti.add_parser("set").add_argument("--host-tier-bound", type=int, required=True)
 
     cp = groups.add_parser("cpu").add_subparsers(dest="verb", required=True)
     cs = cp.add_parser("set")
     cs.add_argument("--threads", type=int)
     cs.add_argument("--cache-gib", type=float)
-    cs.add_argument("--promote-misses", type=int)
-    cs.add_argument("--promote-window", type=int)
+    cs.add_argument("--stage-min-calls", type=int)
     cp.add_parser("stats")
 
     kv = groups.add_parser("kv").add_subparsers(dest="verb", required=True)

@@ -146,7 +146,7 @@ def _tiers() -> list[Any]:
 # --------------------------------------------------------------------------
 
 
-def _tiers_state() -> dict[str, Any] | None:
+def _tiers_state(eplb: Any = None) -> dict[str, Any] | None:
     tiers = _tiers()
     if not tiers:
         return None
@@ -185,7 +185,7 @@ def _tiers_state() -> dict[str, Any] | None:
         "moves_committed": sum(
             getattr(t, "moves_committed", len(t.move_log)) for t in tiers
         ),
-        "working_set": _working_set_state(),
+        "classes": _tier_classes(eplb),
         "pinned_gib": round(pinned_arena_gib(), 3),
         "settings": {name: s.get() for name, s in _TIER_SETTINGS.items()},
         "resizable": "host_tier_bound" in _TIER_SETTINGS,
@@ -195,20 +195,27 @@ def _tiers_state() -> dict[str, Any] | None:
     }
 
 
-def _working_set_state() -> dict[str, Any] | None:
-    """The working set's readout (classes against rows), without the
-    per-layer table (`tiers` state stays small; `cpu stats` logs it)."""
+def _tier_classes(eplb: Any) -> dict[str, Any] | None:
+    """Hot, warm and cold experts by EPLB's window against the rows of each
+    tier (thresholds `tier_hot`, `tier_warm`, `tier_hysteresis` of the EPLB
+    config), without the per-layer table."""
+    if eplb is None:
+        return None
     try:
         from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
-            working_set_state,
+            tier_classes_state,
         )
     except ImportError:
         return None
-    state = working_set_state()
+    config = eplb.parallel_config.eplb_config
+    state = tier_classes_state(
+        config.tier_hot, config.tier_warm, config.tier_hysteresis
+    )
     if state is None:
         return None
     state = dict(state)
     state.pop("per_layer", None)
+    state["tier_passes"] = int(getattr(eplb, "tier_passes", 0))
     return state
 
 
@@ -367,7 +374,7 @@ def state(worker: Any, only: list[str] | None = None) -> dict[str, Any]:
 
     parts: dict[str, Callable[[], Any]] = {
         "eplb": eplb_summary,
-        "tiers": _tiers_state,
+        "tiers": lambda: _tiers_state(eplb),
         "cpu": _cpu_state,
         "store": _store_state,
         "kv": lambda: _kv_state(worker),
@@ -656,8 +663,7 @@ def _restore_tiers_set(worker: Any, undo: dict) -> None:
 _CPU_SETTINGS: dict[str, tuple[type, float]] = {
     "cpu_threads": (int, 1),
     "host_cache_gib": (float, 0.0),
-    "host_promote_misses": (int, 0),
-    "host_promote_window": (int, 1),
+    "stage_min_calls": (int, 0),
 }
 _NO_CPU_TIER = (
     "no experts are computed on the CPU in this engine (--cpu-offload-pinned-gb)"
@@ -666,7 +672,11 @@ _NO_CPU_TIER = (
 _CPU_FIXED = {
     "cpu_isa": "the self-check against the card's arithmetic runs at start "
     "for the chosen code",
-    "host_promote_rows": "the promotion rows are pinned rows sized at load",
+    "host_promote_rows": "the pinned rows beyond the bound are sized at load",
+    "host_promote_misses": "removed: CPU slots enter pinned and card rows in "
+    "EPLB's tier pass (eplb.set tier_interval)",
+    "host_promote_window": "removed with host_promote_misses",
+    "stage_rows": "the staging rows are pinned memory allocated at first use",
     "read_timeout_s": "an expert store setting; not part of the CPU tier",
 }
 

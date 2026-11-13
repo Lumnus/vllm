@@ -117,74 +117,25 @@ class ExpertStoreConfig:
     same results, hundreds of times slower; for tests)."""
 
     host_promote_misses: int = Field(default=0, ge=0)
-    """With ``--cpu-offload-pinned-gb``: promote a host slot to a pinned row
-    between two steps once the CPU has served it in this many layer calls
-    (counts halve every ``host_promote_window`` steps); 0 leaves the pinned
-    set to EPLB's rearrangements alone."""
+    """Removed (0 only): a CPU slot enters a pinned or a card row in EPLB's
+    tier pass (``--eplb-config tier_interval``), planned from its load window,
+    not by a count of its own."""
 
     host_promote_window: int = Field(default=64, ge=1)
-    """Steps per halving of the counts that ``host_promote_misses`` reads."""
+    """Removed with ``host_promote_misses``; accepted and unused."""
 
     host_promote_rows: int = Field(default=4, ge=0)
-    """Pinned rows per layer beyond the spare rows, for those promotions;
-    EPLB's next rearrangement chooses the pinned set again and frees them."""
-
-    tier_seed: str | None = None
-    """Loads to place the experts by at start when EPLB has none of its own
-    (no ``state_path``, or no file there yet): the hottest slots of each rank
-    go to the card, the next ones to the pinned rows, the rest to the CPU,
-    and EPLB's policy balances the ranks by them. The file is an EPLB state
-    file (layer name -> load per logical expert; also what
-    ``tools/analyze_expert_trace.py --write-loads`` writes from a routing
-    trace), a rankings file (decoder layer number -> logical experts hottest
-    first) or a learned-state file (``{"layers": {layer: {expert:
-    score}}}``)."""
-
-    working_set: bool = False
-    """With ``--cpu-offload-pinned-gb``: choose which slots of a layer are on
-    the card, in pinned rows and on the CPU from each slot's temperature
-    (decayed call rate) while serving, between two steps, in budgeted
-    batches read in the background; EPLB's rearrangements then move experts
-    between ranks only. Runtime setting (``tiers.set working_set``)."""
-
-    ws_halflife_steps: float = Field(default=64.0, gt=0)
-    """Steps per half-life of a slot's temperature."""
-
-    ws_hot: float = Field(default=1.5, gt=0)
-    """Temperature (calls per token over the mean expert's) at or above which
-    a slot is hot."""
-
-    ws_warm: float = Field(default=0.5, gt=0)
-    """Temperature at or above which a slot is warm; below it is cold. Only
-    warm and hot slots are moved into a faster tier."""
-
-    ws_hysteresis: float = Field(default=1.25, ge=1.0)
-    """A slot keeps its class until its temperature is below the class's
-    threshold divided by this; a swap within a class needs this ratio."""
-
-    ws_batch: int = Field(default=4, ge=1)
-    """Experts read per layer batch (each swap reads one)."""
-
-    ws_units_per_step: int = Field(default=16, ge=1)
-    """Experts read per step over all layers of a rank."""
-
-    ws_cpu_call_us: float = Field(default=110.0, gt=0)
-    """Cost model: one expert computed on the CPU at a few tokens."""
-
-    ws_pinned_call_us: float = Field(default=28.0, ge=0)
-    """Cost model: one expert read by the card from a pinned row, over a card
-    row."""
-
-    ws_move_us: float = Field(default=250.0, ge=0)
-    """Cost model: one expert copied into a row (a swap pays when its gain
-    over one half-life is at least this)."""
+    """Pinned rows per layer beyond the bound at load and the spare rows,
+    which a larger pinned bound (``tiers.set host_tier_bound``) may take
+    while serving."""
 
     stage_min_calls: int = Field(default=0, ge=0)
     """With ``--cpu-offload-pinned-gb``: an expert of the CPU tier that one
-    layer call routes this many tokens to is copied into a staging row of
-    pinned memory and computed by the card (as the pinned rows are) instead
-    of on the CPU; 0 keeps every CPU-tier expert on the CPU. Runtime
-    setting."""
+    layer call routes at least this many tokens to is copied into a staging
+    row of pinned memory and computed by the card from it (as the pinned rows
+    are) instead of on the CPU; 0 (default) keeps every CPU-tier expert on
+    the CPU. A read path for one layer call: it moves no expert and changes
+    no tier. Runtime setting (``cpu.set stage_min_calls``)."""
 
     stage_rows: int = Field(default=0, ge=0)
     """Staging rows (pinned, shared by the layers of a rank); 0: as many as
@@ -194,8 +145,11 @@ class ExpertStoreConfig:
     def _check_dirs(self) -> "ExpertStoreConfig":
         if len(set(self.dirs)) != len(self.dirs):
             raise ValueError("expert store dirs must be distinct")
-        if self.ws_warm > self.ws_hot:
-            raise ValueError("ws_warm must not be above ws_hot")
+        if self.host_promote_misses:
+            raise ValueError(
+                "host_promote_misses is removed: CPU slots enter pinned and "
+                "card rows in EPLB's tier pass (--eplb-config tier_interval)"
+            )
         return self
 
     @property
@@ -268,19 +222,7 @@ class ExpertStoreConfig:
                 "host_promote_misses",
                 "host_promote_window",
                 "host_promote_rows",
-                # the working set and the seed only choose which slot is in
-                # which tier; staging adds a call outside the captured graphs
-                "tier_seed",
-                "working_set",
-                "ws_halflife_steps",
-                "ws_hot",
-                "ws_warm",
-                "ws_hysteresis",
-                "ws_batch",
-                "ws_units_per_step",
-                "ws_cpu_call_us",
-                "ws_pinned_call_us",
-                "ws_move_us",
+                # staging adds a call outside the captured graphs
                 "stage_min_calls",
                 "stage_rows",
             },

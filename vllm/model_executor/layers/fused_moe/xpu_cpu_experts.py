@@ -366,40 +366,28 @@ class HostExpertCache:
         with self._lock:
             return self._rows.get(key)
 
-    def copy_out_async(
-        self, key: Key, dests: Mapping[str, torch.Tensor], executor: Any
-    ) -> Future | None:
+    def copy_unit_out(self, key: Key, dests: Mapping[str, torch.Tensor]) -> bool:
         """Copy the unit of ``key`` from its row into ``dests`` (the four
-        tensors of a pinned row) on ``executor``; the row is not evicted until
-        the copy is done. None when the cache does not hold ``key``."""
+        tensors of a pinned row), from any thread: the row is held, so not
+        evicted, while it is copied. False when the cache does not hold it."""
         with self._lock:
             row = self._rows.get(key)
             if row is None:
-                return None
+                return False
             self._rows.move_to_end(key)
             self._held[row] = self._held.get(row, 0) + 1
-        src = self.dests(row)
-
-        def copy() -> str:
+        try:
+            src = self.dests(row)
             for name, dst in dests.items():
                 dst.copy_(src[name])
-            return "host cache"
-
-        def unhold(_: Future) -> None:
+        finally:
             with self._lock:
                 left = self._held.get(row, 1) - 1
                 if left > 0:
                     self._held[row] = left
                 else:
                     self._held.pop(row, None)
-
-        try:
-            future = executor.submit(copy)
-        except BaseException:
-            unhold(Future())
-            raise
-        future.add_done_callback(unhold)
-        return future
+        return True
 
     def rows_for_gib(self, gib: float) -> int:
         return max(1, int(gib * 2**30) // self.layout.row_bytes)
@@ -760,12 +748,7 @@ class CpuExpertRuntime:
         go), with their map. Returns the layer's kernel call over the rows for
         the caller to run on the card, or None (nothing staged); the CPU then
         computes only the rest (:meth:`finish`)."""
-        from vllm.model_executor.layers.fused_moe.xpu_working_set import (
-            current_working_set,
-        )
-
-        ws = current_working_set()
-        threshold = 0 if ws is None else int(ws.settings.stage_min_calls)
+        threshold = int(self.config.stage_min_calls)
         if threshold <= 0:
             return None
         n, b = pending.num_tokens, pending.buffers
@@ -1016,7 +999,7 @@ class CpuExpertRuntime:
 
     def log_stats(self) -> None:
         s = self.snapshot()
-        self._log_working_set(s)
+        self._log_shares_since_last(s)
         routed = max(1, s["routed_card"] + s["routed_pinned"] + s["routed_cpu"])
         layers = max(1, s["layers_with_cpu_calls"])
         logger.info(
@@ -1046,57 +1029,27 @@ class CpuExpertRuntime:
             s["demotions"],
         )
 
-    def _log_working_set(self, s: dict[str, float]) -> None:
-        """The share of routed calls per tier since the last line (the line
-        above is since start), and the working set's line when it or prefill
-        staging is on: classes against rows, batches, swaps."""
-        from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
-            working_set_state,
-        )
-
+    def _log_shares_since_last(self, s: dict[str, float]) -> None:
+        """The share of routed calls per tier since the last line (the main
+        line's shares are since start): the CPU share over time."""
         keys = ("routed_card", "routed_pinned", "routed_cpu", "routed_staged")
-        last = getattr(self, "_last_snapshot", None) or {k: 0 for k in keys}
-        delta = {k: s[k] - last.get(k, 0) for k in keys}
+        last = getattr(self, "_last_snapshot", None)
         self._last_snapshot = {k: s[k] for k in keys}
-        total = max(1, sum(delta.values()))
-        state = working_set_state()
-        on = state is not None and (
-            state["settings"]["working_set"] or state["settings"]["stage_min_calls"]
-        )
-        if not on:
+        if last is None:
             return
-        assert state is not None
-        t, c = state["totals"], state["counters"]
-        layers = max(1, state["layers"])
+        delta = {k: s[k] - last[k] for k in keys}
+        total = sum(delta.values())
+        if total <= 0:
+            return
         logger.info(
-            "Expert working set: since the last line the card served %.1f %% of "
-            "this rank's routed calls, pinned rows %.1f %%, the CPU %.1f %%, "
-            "staged rows %.1f %%; per layer hot %.1f, warm %.1f, cold %.1f "
-            "(card rows %d, pinned rows %d; warm or hot on the CPU %.1f, cold on "
-            "the card %.1f; layers short of rows %d, rows short %d); batches %d "
-            "(committed %d, dropped %d, failed %d), swaps %s, experts read from "
-            "the host cache %d, from the drive %d; %.1f tokens per layer call.",
+            "CPU experts: since the last line the card served %.1f %% of this "
+            "rank's routed calls, pinned rows %.1f %%, the CPU %.1f %%, staging "
+            "rows %.1f %% (%d calls).",
             100.0 * delta["routed_card"] / total,
             100.0 * delta["routed_pinned"] / total,
             100.0 * delta["routed_cpu"] / total,
             100.0 * delta["routed_staged"] / total,
-            t["hot"] / layers,
-            t["warm"] / layers,
-            t["cold"] / layers,
-            state["card_rows"],
-            state["pinned_rows"],
-            t["warm_or_hot_on_cpu"] / layers,
-            t["cold_on_card"] / layers,
-            state["layers_short"],
-            t["rows_short"],
-            c["batches"],
-            c["committed"],
-            c["dropped"],
-            c["failed"],
-            c["swaps"],
-            c["units_cache"],
-            c["units_drive"],
-            c["tokens_per_call"],
+            total,
         )
 
 
@@ -1127,16 +1080,12 @@ def current_runtime() -> CpuExpertRuntime | None:
 
 def reset_runtime() -> None:
     """Forget the process's CPU tier (tests; a new model load), with the
-    working set and the staging rows that belong to it."""
+    staging rows that belong to it."""
     global _RUNTIME
     with _RUNTIME_LOCK:
         _RUNTIME = None
     from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
         reset_stage_rows,
     )
-    from vllm.model_executor.layers.fused_moe.xpu_working_set import (
-        reset_working_set,
-    )
 
-    reset_working_set()
     reset_stage_rows()

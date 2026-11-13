@@ -411,20 +411,15 @@ EXPERT_TIER_GAUGES = {
     "stage_layer_calls": "MoE layer calls that staged CPU-tier experts.",
     "stage_experts": "CPU-tier experts staged to the card, summed over calls.",
     "stage_seconds": "Seconds the host copied experts into staging rows.",
-    "ws_hot": "Hot experts (working set classes) over every layer now.",
-    "ws_warm": "Warm experts over every layer now.",
-    "ws_cold": "Cold experts over every layer now.",
-    "ws_warm_or_hot_on_cpu": "Warm or hot experts computed on the CPU now.",
-    "ws_cold_on_card": "Cold experts in card rows now.",
-    "ws_rows_short": "Warm and hot experts beyond the card and pinned rows, "
+    "tier_hot": "Hot experts (EPLB's window, tier_hot) over every layer now.",
+    "tier_warm": "Warm experts over every layer now.",
+    "tier_cold": "Cold experts over every layer now.",
+    "tier_warm_or_hot_on_cpu": "Warm or hot experts computed on the CPU now.",
+    "tier_cold_on_card": "Cold experts in card rows now.",
+    "tier_rows_short": "Warm and hot experts beyond the card and pinned rows, "
     "summed over layers (raise the pinned bound or the card tier).",
-    "ws_card_short": "Hot experts beyond the card rows, summed over layers.",
-    "ws_batches": "Working-set batches started.",
-    "ws_committed": "Working-set batches committed.",
-    "ws_dropped": "Working-set batches dropped (outrun by a move).",
-    "ws_swaps_cpu_card": "Experts reinjected from the CPU to a card row.",
-    "ws_swaps_pinned_card": "Experts moved from a pinned row to a card row.",
-    "ws_swaps_cpu_pinned": "Experts moved from the CPU to a pinned row.",
+    "tier_card_short": "Hot experts beyond the card rows, summed over layers.",
+    "tier_passes": "EPLB tier passes started (tier_interval).",
 }
 
 
@@ -465,20 +460,20 @@ def expert_tier_series(ranks: list[dict]) -> dict[str, dict[str, float]]:
             for tier in ("card", "pinned", "cpu"):
                 if tier in now:
                     series[f"slots_{tier}"] = now[tier]
-            ws = tiers.get("working_set") or {}
-            if ws:
-                t, wc = ws["totals"], ws["counters"]
-                for key in ("hot", "warm", "cold", "warm_or_hot_on_cpu"):
-                    series[f"ws_{key}"] = t[key]
-                series["ws_cold_on_card"] = t["cold_on_card"]
-                series["ws_rows_short"] = t["rows_short"]
-                series["ws_card_short"] = t["card_short"]
-                series["ws_batches"] = wc["batches"]
-                series["ws_committed"] = wc["committed"]
-                series["ws_dropped"] = wc["dropped"]
-                series["ws_swaps_cpu_card"] = wc["swaps"]["cpu>card"]
-                series["ws_swaps_pinned_card"] = wc["swaps"]["pinned>card"]
-                series["ws_swaps_cpu_pinned"] = wc["swaps"]["cpu>pinned"]
+            classes = tiers.get("classes") or {}
+            if classes:
+                t = classes["totals"]
+                for key in (
+                    "hot",
+                    "warm",
+                    "cold",
+                    "warm_or_hot_on_cpu",
+                    "cold_on_card",
+                    "rows_short",
+                    "card_short",
+                ):
+                    series[f"tier_{key}"] = t[key]
+                series["tier_passes"] = classes.get("tier_passes", 0)
         if "routed_staged" in c:
             series["routed_staged"] = c["routed_staged"]
             series["stage_layer_calls"] = c["stage_layers"]

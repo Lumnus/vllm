@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """EPLB's runtime controls over layers with experts computed on the CPU
-(--cpu-offload-pinned-gb): pause, a rearrangement on demand and injected
-allocation failures meet the CPU tier's choice of the pinned set and its
-promotions between steps.
+(--cpu-offload-pinned-gb): pause, a rearrangement on demand, injected
+allocation failures, the pinned bound, EPLB's tier passes and its seed. EPLB
+is the one writer of the placement: every tier change below happens in its
+rearrangements and tier passes.
 
 A one-rank ``EplbState`` over real ``ExpertTiers`` with host slots and a real
 store (see ``xpu_store_harness``); the host op is the torch reference."""
@@ -51,7 +52,7 @@ def _isolated(monkeypatch):
     tstore.reset_sessions()
 
 
-def _build(monkeypatch, tmp_path, **cpu_extra):
+def _build(monkeypatch, tmp_path, eplb_extra=None, **cpu_extra):
     """Store built at a first start; the second start has 2 pinned slots
     and 3 host slots per layer (of 5 off the card), 2 spare rows."""
     run(monkeypatch, tmp_path, store=True, spare=2)
@@ -67,13 +68,13 @@ def _build(monkeypatch, tmp_path, **cpu_extra):
     model = FakeMoEModel(
         LAYERS, E, weights=[tiers.eplb_weights() for tiers in env.tiers]
     )
+    eplb = {"step_interval": 10, "window_size": 4, **(eplb_extra or {})}
     state = single_rank_eplb(
         monkeypatch,
         use_async=True,
         policy="incremental",
         max_moves_per_rank=2,
-        step_interval=10,
-        window_size=4,
+        **eplb,
     )
     group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
     monkeypatch.setattr(
@@ -157,48 +158,45 @@ def _hot(model_state):
     window.copy_(per_slot.to(window.dtype).expand_as(window))
 
 
-def test_paused_eplb_keeps_the_cpu_tier_serving_and_promoting(monkeypatch, tmp_path):
-    """Paused, the intervals end without a rearrangement and the placement
-    EPLB chose stays; the CPU tier still serves its slots and still promotes
-    a slot it serves often between steps (its own policy, not EPLB's)."""
-    env, state, model_state = _build(monkeypatch, tmp_path, host_promote_misses=2)
+def test_paused_eplb_keeps_the_cpu_tier_serving(monkeypatch, tmp_path):
+    """Paused, the intervals end without a rearrangement or a tier pass and
+    the placement stays; the CPU tier still serves its slots."""
+    env, state, model_state = _build(
+        monkeypatch, tmp_path, eplb_extra={"tier_interval": 3}
+    )
     tiers = env.tiers[0]
     p = tiers.placement
+    tier = p.tier.copy()
     p2l = model_state.physical_to_logical_map.clone()
     state.rearrangements_paused = True
-    hot = _serve_host(env)
+    _serve_host(env)
     for _ in range(25):
         _hot(model_state)
         state.step()
     assert state.paused_intervals >= 2 and state.rearrangements == 0
+    assert state.tier_passes == 0
     assert torch.equal(model_state.physical_to_logical_map, p2l)
-    assert p.tier[hot] == POOL and tiers.slow_map[hot] == p.row[hot]
-    # every host slot served often enough, one per two steps, while rows
-    # beyond the spares were free
-    assert tiers.cpu.stats.promotions == 3
-    assert int((p.tier == POOL).sum()) == 5 and p.pool.free_count >= p.spare
+    assert np.array_equal(p.tier, tier)
+    assert tiers.cpu.stats.per_tier["cpu"] > 0
     tstore.reset_sessions()
 
 
-def test_a_rearrangement_on_demand_chooses_the_pinned_set_again(monkeypatch, tmp_path):
-    """eplb.rearrange at a step: the cycle that follows plans the pinned set
-    from the window (the hot experts leave the CPU) and takes the promotion
-    rows back."""
-    env, state, model_state = _build(monkeypatch, tmp_path, host_promote_misses=2)
+def test_a_rearrangement_on_demand_cuts_the_tiers_from_the_window(
+    monkeypatch, tmp_path
+):
+    """eplb.rearrange at a step: the cycle that follows cuts the tiers from
+    the window (the hot experts leave the CPU), within the pinned bound."""
+    env, state, model_state = _build(monkeypatch, tmp_path)
     tiers = env.tiers[0]
     p = tiers.placement
-    _serve_host(env)
-    tiers.between_steps()
-    tiers.between_steps()
-    assert int((p.tier == POOL).sum()) == 3  # 2 pinned + 1 promoted
     state.expert_rearrangement_step = 0
     assert control.check_trigger(state) is None
     control.trigger(state)
     _hot(model_state)
     _cycle(state, model_state, state.step)
     assert state.rearrangements == 1
-    assert int((p.tier == POOL).sum()) == 2  # back to the bound
-    assert set(np.flatnonzero(p.tier != HOST).tolist()) >= {6, 7}
+    assert int((p.tier == POOL).sum()) == 2
+    assert set(tiers.slot_logical[p.tier != HOST].tolist()) >= {6, 7}
     for t in env.tiers:
         t.placement.check()
         fm, sm = t.placement.maps(t.slot_global, t.num_global)
@@ -216,10 +214,10 @@ def test_an_injected_failure_leaves_the_cpu_tier_as_it_was(
 ):
     """An allocation failure injected at the rearrangement (fault.arm): the
     rearrangement is skipped before any layer is prepared, so no layer is
-    left waiting for a move (promotions and bound changes go on), the
-    placement and the maps are unchanged, the CPU still computes its slots,
-    and the next rearrangement runs."""
-    env, state, model_state = _build(monkeypatch, tmp_path, host_promote_misses=2)
+    left waiting for a move (bound changes go on), the placement and the
+    maps are unchanged, the CPU still computes its slots, and the next
+    rearrangement runs."""
+    env, state, model_state = _build(monkeypatch, tmp_path)
     before = [(t.placement.tier.copy(), t.slow_map.clone()) for t in env.tiers]
     fault_injection.arm(stage, 1)
     _hot(model_state)
@@ -230,19 +228,20 @@ def test_an_injected_failure_leaves_the_cpu_tier_as_it_was(
         assert torch.equal(t.slow_map, slow_map)
         assert not t._eplb_pending
     assert xt.check_host_tier_bound(1) is None
-    hot = _serve_host(env)
-    tiers = env.tiers[0]
-    tiers.between_steps()
-    tiers.between_steps()
-    assert tiers.placement.tier[hot] == POOL  # promotions go on
+    _serve_host(env)
     _hot(model_state)
     _cycle(state, model_state, state.rearrange)  # disarmed: runs
     assert state.skipped_rearrangements == 1 and state.rearrangements == 1
+    tiers = env.tiers[0]
     assert int((tiers.placement.tier == POOL).sum()) == 2
+    assert set(tiers.slot_logical[tiers.placement.tier != HOST].tolist()) >= {6, 7}
     tstore.reset_sessions()
 
 
-def test_the_bound_is_refused_while_a_rearrangement_is_in_flight(monkeypatch, tmp_path):
+def test_the_bound_moves_the_slots_in_eplbs_next_tier_pass(monkeypatch, tmp_path):
+    """tiers.set host_tier_bound changes the capacity only; EPLB's next step
+    runs a tier pass that moves the slots to it (EPLB is the one writer).
+    Refused while a rearrangement is in flight."""
     env, state, model_state = _build(monkeypatch, tmp_path)
     worker = SimpleNamespace(rank=0, model_runner=SimpleNamespace(eplb_state=state))
     monkeypatch.setattr(wrc, "_ep_rank", lambda w: 0)
@@ -251,28 +250,83 @@ def test_the_bound_is_refused_while_a_rearrangement_is_in_flight(monkeypatch, tm
     assert model_state.rebalanced
     refusal = wrc.handle(worker, "check", "tiers.set", {"host_tier_bound": 1})
     assert "in flight" in refusal["refusal"]
-    # the cycle finishes; then the bound moves, and the next cycle keeps it
     _cycle(state, model_state, lambda: None)
+    pinned = [int((t.placement.tier == POOL).sum()) for t in env.tiers]
     reply = wrc.handle(worker, "apply", "tiers.set", {"host_tier_bound": 1})
     assert reply["ok"], reply
+    # nothing moved yet: the layers ask EPLB for a pass
+    assert [int((t.placement.tier == POOL).sum()) for t in env.tiers] == pinned
+    assert all(t.tier_pass_wanted for t in env.tiers)
+    p2l = model_state.physical_to_logical_map.clone()
+    _hot(model_state)
+    _cycle(state, model_state, state.step)
+    assert state.tier_passes == 1 and state.rearrangements == 1
+    assert all(int((t.placement.tier == POOL).sum()) == 1 for t in env.tiers)
+    assert not any(t.tier_pass_wanted for t in env.tiers)
+    assert torch.equal(model_state.physical_to_logical_map, p2l)
+    for t in env.tiers:
+        t.placement.check()
+    # the next full rearrangement keeps the bound
     _hot(model_state)
     _cycle(state, model_state, state.rearrange)
     assert all(int((t.placement.tier == POOL).sum()) == 1 for t in env.tiers)
     tstore.reset_sessions()
 
 
-def test_a_tier_seed_places_experts_and_tiers_when_eplb_has_no_loads(
+def test_tier_passes_every_n_steps_sort_the_tiers_within_their_budget(
     monkeypatch, tmp_path
 ):
-    """No state_path: the expert store's tier_seed (here a rankings file of
-    the 0.32 line: layer number -> experts hottest first) gives the loads the
-    restore fills the slots by: the hottest on the card, the next pinned, the
-    rest on the CPU; the temperature starts from them."""
+    """tier_interval 2, tier_max_moves 1, no full rearrangement: passes every
+    second step move one expert per layer each, from the window, until the
+    hot experts are off the CPU; no expert changes rank or slot."""
+    env, state, model_state = _build(
+        monkeypatch,
+        tmp_path,
+        eplb_extra={"tier_interval": 2, "tier_max_moves": 1, "step_interval": 10**6},
+    )
+    tiers = env.tiers[0]
+    p = tiers.placement
+    p2l = model_state.physical_to_logical_map.clone()
+    assert set(tiers.slot_logical[p.tier == HOST].tolist()) >= {6, 7}
+    for _ in range(40):
+        _hot(model_state)
+        _cycle(state, model_state, state.step)
+        if set(tiers.slot_logical[p.tier != HOST].tolist()) >= {6, 7}:
+            break
+    assert set(tiers.slot_logical[p.tier != HOST].tolist()) >= {6, 7}
+    assert state.tier_passes >= 2 and state.rearrangements == 0
+    assert all(m.get("units", 0) <= 1 for t in env.tiers for m in t.move_log)
+    assert torch.equal(model_state.physical_to_logical_map, p2l)
+    summary = tiers.scrub(p2l[0].numpy(), full=True)
+    assert summary["mismatches"] == 0 and summary["placement_equal"]
+    # the classes by the same window: logical 6 and 7 hot in layer 0
+    r = tiers.class_readout(1.5, 0.5, 1.1)
+    assert r["hot"] == 2 and r["warm_or_hot_on_cpu"] == 0
+    s = control.settings(state)
+    assert s["tier_interval"] == 2 and s["tier_max_moves"] == 1
+    assert control.check_settings(state, {"tier_warm": 3.0}) is not None
+    assert control.check_settings(state, {"tier_interval": -1}) is not None
+    control.apply_settings(state, {"tier_interval": 0})
+    passes = state.tier_passes
+    for _ in range(6):
+        _hot(model_state)
+        _cycle(state, model_state, state.step)
+    assert state.tier_passes == passes
+    tstore.reset_sessions()
+
+
+def test_a_seed_places_experts_and_tiers_when_eplb_has_no_loads(monkeypatch, tmp_path):
+    """No state_path: EPLB's seed_path (here a rankings file of the 0.32
+    line: layer number -> experts hottest first) gives the loads the restore
+    fills the slots by: the hottest on the card, the next pinned, the rest
+    on the CPU."""
     import json
 
     seed = tmp_path / "rankings.json"
     seed.write_text(json.dumps({"0": [7, 6, 5, 4, 3, 2, 1, 0], "1": [0, 1, 2, 3, 4]}))
-    env, state, model_state = _build(monkeypatch, tmp_path, tier_seed=str(seed))
+    env, state, model_state = _build(
+        monkeypatch, tmp_path, eplb_extra={"seed_path": str(seed)}
+    )
     assert state.has_tier_seed() and model_state.has_saved_load
     monkeypatch.setattr(eplb_state_mod, "all_reduce", lambda *a, **k: None)
     state.restore_saved_placement()
@@ -282,8 +336,7 @@ def test_a_tier_seed_places_experts_and_tiers_when_eplb_has_no_loads(
         p.check()
         assert set(tiers.slot_logical[p.tier == 0].tolist()) == card
         assert set(tiers.slot_logical[p.tier == POOL].tolist()) == pinned
-        hottest = int(np.argmax(tiers.temperature()))
-        assert p.tier[hottest] == 0
+        assert p.tier[int(np.argmax(tiers.temperature()))] == 0
         summary = tiers.scrub(None, full=True)
         assert summary["mismatches"] == 0 and summary["maps_equal"]
     tstore.reset_sessions()
@@ -292,42 +345,4 @@ def test_a_tier_seed_places_experts_and_tiers_when_eplb_has_no_loads(
 def test_without_a_seed_nothing_is_read(monkeypatch, tmp_path):
     env, state, model_state = _build(monkeypatch, tmp_path)
     assert not state.has_tier_seed() and not model_state.has_saved_load
-    tstore.reset_sessions()
-
-
-def test_the_working_set_moves_tiers_from_eplbs_steps_without_a_rearrangement(
-    monkeypatch, tmp_path
-):
-    """Paused EPLB (no rearrangement at all): the steps' between-steps point
-    reinjects the hot CPU slots to the card, beyond the moves per rank (2
-    here) over a few steps; EPLB's placement of experts is unchanged."""
-    import time
-
-    from vllm.model_executor.layers.fused_moe import xpu_working_set as wsm
-
-    wsm.reset_working_set()
-    env, state, model_state = _build(
-        monkeypatch, tmp_path, working_set=True, ws_halflife_steps=2.0,
-        ws_move_us=0.0, ws_batch=1, ws_units_per_step=4,
-    )  # fmt: skip
-    tiers = env.tiers[0]
-    p = tiers.placement
-    p2l = model_state.physical_to_logical_map.clone()
-    state.rearrangements_paused = True
-    host = np.flatnonzero(p.tier == HOST).tolist()
-    ids = torch.tensor([[host[0], host[1]], [host[2], host[0]]], dtype=torch.int32)
-    x = torch.zeros(2, HIDDEN, dtype=torch.bfloat16)
-    for _ in range(60):
-        tiers.cpu.compute(tiers, ids, torch.ones(2, 2), x, torch.empty_like(x))
-        state.step()
-        if all(p.tier[s] != HOST for s in host):
-            break
-        time.sleep(0.005)
-    assert all(p.tier[s] != HOST for s in host)
-    assert int((p.tier == 0).sum()) == tiers.num_fast
-    assert torch.equal(model_state.physical_to_logical_map, p2l)
-    assert tiers._ws.counters.committed >= 3  # one swap per batch here
-    summary = tiers.scrub(p2l[0].numpy(), full=True)
-    assert summary["mismatches"] == 0 and summary["placement_equal"]
-    wsm.reset_working_set()
     tstore.reset_sessions()

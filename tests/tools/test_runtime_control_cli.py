@@ -34,11 +34,25 @@ from tools.runtime_control import _op_and_args, _parser, _print_state
                 "6",
                 "--cache-gib",
                 "8",
-                "--promote-misses",
-                "4",
+                "--stage-min-calls",
+                "12",
             ],
             "cpu.set",
-            {"cpu_threads": 6, "host_cache_gib": 8.0, "host_promote_misses": 4},
+            {"cpu_threads": 6, "host_cache_gib": 8.0, "stage_min_calls": 12},
+        ),  # fmt: skip
+        (
+            [
+                "eplb",
+                "set",
+                "--tier-interval",
+                "64",
+                "--tier-max-moves",
+                "8",
+                "--tier-warm",
+                "0.4",
+            ],
+            "eplb.set",
+            {"tier_interval": 64, "tier_max_moves": 8, "tier_warm": 0.4},
         ),  # fmt: skip
         (["cpu", "stats"], "cpu.stats", {}),
         (

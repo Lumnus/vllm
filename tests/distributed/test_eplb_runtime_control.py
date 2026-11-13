@@ -304,6 +304,11 @@ def test_the_summary_reads_the_state(monkeypatch):
         "window_size": 4,
         "max_moves_per_rank": 8,
         "policy": "default",
+        # the tier pass's settings (off by default)
+        "tier_interval": 0,
+        "tier_max_moves": None,
+        "tier_hot": 1.5,
+        "tier_warm": 0.5,
     }
     assert out["rearrangements"] == 1
     assert out["in_flight"] is None
