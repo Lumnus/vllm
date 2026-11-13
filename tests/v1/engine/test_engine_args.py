@@ -286,6 +286,27 @@ def test_kv_cache_release_chunk_mib_from_cli():
         CacheConfig(kv_cache_release_chunk_mib=0)
 
 
+def test_kv_cache_grow_torch_floor_mib_from_cli():
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    assert EngineArgs.from_cli_args(args=args).kv_cache_grow_torch_floor_mib is None
+
+    args = parser.parse_args(["--kv-cache-grow-torch-floor-mib", "1024"])
+    engine_args = EngineArgs.from_cli_args(args=args)
+    assert engine_args.kv_cache_grow_torch_floor_mib == 1024
+
+    assert (
+        CacheConfig(kv_cache_grow_torch_floor_mib=0).kv_cache_grow_torch_floor_mib == 0
+    )
+    with pytest.raises(ValueError):
+        CacheConfig(kv_cache_grow_torch_floor_mib=-1)
+    # A runtime setting: no new compiled graph.
+    assert CacheConfig(kv_cache_grow_torch_floor_mib=1024).compile_factors() == (
+        CacheConfig().compile_factors()
+    )
+
+
 # Off CUDA and XPU the platform check trips first, before the behavior under test.
 requires_vmm_device = pytest.mark.skipif(
     not (torch.cuda.is_available() or torch.xpu.is_available()),

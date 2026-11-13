@@ -417,6 +417,15 @@ class CacheConfig:
     allocation per contiguous unmapped range. Requires the extensible KV
     cache."""
 
+    kv_cache_grow_torch_floor_mib: int | None = Field(default=None, ge=0)
+    """Memory, in MiB, that a grow of the extensible KV cache while serving
+    leaves torch's caching allocator able to reserve: under its cap (which a
+    grow lowers by what it commits) and in the device's free memory. A grow
+    goes only as far as keeps it, or not at all, whatever the memory
+    measurement allowed. If unspecified: the transient peak the startup
+    sizing kept free for torch, or the higher allocation serving has shown
+    since, whichever is larger."""
+
     kv_offloading_size: float | None = None
     """Size of the KV cache offloading buffer in GiB. When TP > 1, this is
     the total buffer size summed across all TP ranks. By default, this is set
@@ -471,6 +480,7 @@ class CacheConfig:
             "enable_extensible_kv_cache",
             "extensible_kv_cache_initial_blocks",
             "kv_cache_release_chunk_mib",
+            "kv_cache_grow_torch_floor_mib",
         }
 
         return get_compile_factors(self, ignored_factors)

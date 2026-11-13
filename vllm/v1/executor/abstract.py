@@ -189,6 +189,11 @@ class Executor(ABC):
         assert len(set(results)) == 1, f"Workers disagree on the size: {results}"
         return results[0]
 
+    def kv_cache_grow_reports(self) -> list[dict | None]:
+        """Every worker's numbers from the last grow's vote
+        (`GPUWorker.kv_cache_grow_report`); changes nothing."""
+        return self.collective_rpc("kv_cache_grow_report")
+
     def kv_cache_shrink_plan(self, num_blocks: int) -> list[dict]:
         """Every worker's answer to what a shrink to num_blocks would release
         (`GPUWorker.kv_cache_shrink_plan`); changes nothing."""

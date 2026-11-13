@@ -1335,9 +1335,15 @@ def test_serving_measurement_refuses_when_torch_has_nothing_to_give(grow_ranks):
     assert cache.num_committed_blocks == 8
 
 
-def test_grow_cap_follows_from_the_budget_and_stops_the_grow(grow_ranks, monkeypatch):
+@pytest.mark.parametrize("cache_comes_back", [True, False])
+def test_grow_cap_follows_from_the_budget_and_stops_the_grow(
+    grow_ranks, monkeypatch, cache_comes_back
+):
     """The cap after a grow is the budget less what the KV cache maps; a grow
-    that would put it below the allocation plus the reserve stops short."""
+    that would put it below the allocation plus the reserve stops short. It
+    also stops where the cap would fall below what torch keeps reserved:
+    torch's 12 MiB of unused cache must be given back for the cap to reach
+    the allocation (when it cannot be, the grow stops 4 blocks earlier)."""
     ranks = grow_ranks([40])
     cache = _sized_with_reserve(ranks, 0)
     total = 32 << 30
@@ -1347,6 +1353,13 @@ def test_grow_cap_follows_from_the_budget_and_stops_the_grow(grow_ranks, monkeyp
     monkeypatch.setattr(
         torch.xpu, "set_per_process_memory_fraction", lambda fraction, device=None: None
     )
+
+    def empty_cache() -> None:
+        if cache_comes_back:
+            ranks.free_memory[0] += ranks.torch_reserved - 500 * MIB
+            ranks.torch_reserved = 500 * MIB
+
+    monkeypatch.setattr(torch.accelerator, "empty_cache", empty_cache)
     # Torch holds 500 MiB; the budget leaves it room up to 20 blocks.
     cap = 500 * MIB + cache.physical_bytes_for(20) - cache.physical_bytes
     cache.set_torch_memory_limit(cap)
@@ -1355,9 +1368,137 @@ def test_grow_cap_follows_from_the_budget_and_stops_the_grow(grow_ranks, monkeyp
     budget = cache.torch_memory_budget
     assert budget == cap + cache.physical_bytes
 
-    assert ranks.grow(0, 40) == 20
-    assert cache.torch_memory_limit == budget - cache.physical_bytes
-    assert cache.torch_memory_limit == 500 * MIB
+    if cache_comes_back:
+        assert ranks.grow(0, 40) == 20
+        assert cache.torch_memory_limit == budget - cache.physical_bytes
+        assert cache.torch_memory_limit == 500 * MIB
+    else:
+        expected = cache.blocks_within(budget - 512 * MIB)
+        assert expected == 16
+        assert ranks.grow(0, 40) == expected
+        assert cache.torch_memory_limit == budget - cache.physical_bytes
+        assert cache.torch_memory_limit >= 512 * MIB
+
+
+def _measurement_says(monkeypatch, blocks: int) -> None:
+    """Replace the room measurement, as an experiment hook did on the card,
+    by one that reports `blocks` (the capacity: wrong)."""
+    monkeypatch.setattr(
+        extensible_kv_cache,
+        "_measure_kv_cache_serving",
+        lambda *args, **kwargs: blocks,
+    )
+
+
+def _capped(monkeypatch) -> None:
+    total = 32 << 30
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda device=None: (total, total)
+    )
+    monkeypatch.setattr(
+        torch.xpu, "set_per_process_memory_fraction", lambda fraction, device=None: None
+    )
+
+
+def test_a_grow_the_measurement_overstates_keeps_the_torch_floor_under_the_cap(
+    grow_ranks, monkeypatch
+):
+    """The card's case: the measurement said the whole reservation fits, the
+    grow committed it and lowered torch's cap by as much, and the next
+    ordinary allocation failed at the cap. The grow now stops where the cap
+    after it still leaves torch the floor (the startup transient here) above
+    what it has reserved."""
+    ranks = grow_ranks([10_000])  # the device itself has room for everything
+    cache = ranks.caches[0]
+    _capped(monkeypatch)
+    cache.reserved_headroom_bytes = 64 * MIB
+    ranks.torch_reserved = 520 * MIB
+    ranks.torch_stats = {
+        "allocated_bytes.all.current": 500 * MIB,
+        "allocated_bytes.all.peak": 500 * MIB,
+    }
+    # The cap leaves torch the floor above its reservation at 24 blocks.
+    cache.set_torch_memory_limit(
+        520 * MIB + 64 * MIB + cache.physical_bytes_for(24) - cache.physical_bytes
+    )
+    _measurement_says(monkeypatch, NUM_BLOCKS)
+
+    assert ranks.grow(0, NUM_BLOCKS) == 24
+
+    assert cache.num_committed_blocks == 24
+    assert cache.torch_memory_limit - 520 * MIB == 64 * MIB
+    report = cache.last_grow
+    assert report["measured_blocks"] == NUM_BLOCKS
+    assert report["floor_blocks"] == 24 and report["vote_blocks"] == 24
+    assert report["floor_bytes"] == 64 * MIB and report["floor_source"] == "transient"
+
+
+def test_a_grow_keeps_the_floor_in_the_device_free_memory(grow_ranks, monkeypatch):
+    """Without a cap, the device's free memory after the grow must still hold
+    the floor (here set: 32 MiB)."""
+    ranks = grow_ranks([20])
+    ranks.free_memory[0] += 32 * MIB
+    cache = ranks.caches[0]
+    ranks.runners[0].vllm_config.cache_config = SimpleNamespace(
+        kv_cache_grow_torch_floor_mib=32
+    )
+    _measurement_says(monkeypatch, NUM_BLOCKS)
+
+    assert ranks.grow(0, NUM_BLOCKS) == 20
+
+    free_after = extensible_kv_cache.current_platform.free_device_memory(
+        torch.device("xpu", 0)
+    )
+    assert free_after == 32 * MIB
+    assert cache.last_grow["floor_source"] == "setting"
+    assert cache.last_grow["free_after_bytes"] == free_after - (
+        cache.physical_bytes_for(NUM_BLOCKS) - cache.physical_bytes_for(20)
+    )
+
+
+def test_a_grow_the_floor_does_not_allow_changes_nothing(grow_ranks, monkeypatch):
+    ranks = grow_ranks([40, 40])
+    for runner in ranks.runners:
+        runner.vllm_config.cache_config = SimpleNamespace(
+            kv_cache_grow_torch_floor_mib=1 << 20
+        )
+    _measurement_says(monkeypatch, NUM_BLOCKS)
+    creates = ranks.fake_xpu.ops.calls.count("create")
+
+    assert ranks.grow_all(24) == [8, 8]
+
+    assert [c.num_committed_blocks for c in ranks.caches] == [8, 8]
+    assert ranks.fake_xpu.ops.calls.count("create") == creates
+    assert ranks.rebinds == []
+    assert [c.last_grow["floor_blocks"] for c in ranks.caches] == [8, 8]
+
+
+def test_one_rank_short_of_the_floor_holds_every_rank(grow_ranks, monkeypatch):
+    """The floor is part of each rank's vote, so the ranks agree on it."""
+    ranks = grow_ranks([10_000, 10_000])
+    ranks.free_memory[1] = (
+        ranks.caches[1].physical_bytes_for(16)
+        - ranks.caches[1].physical_bytes
+        + 8 * MIB
+    )
+    for runner in ranks.runners:
+        runner.vllm_config.cache_config = SimpleNamespace(
+            kv_cache_grow_torch_floor_mib=8
+        )
+    _measurement_says(monkeypatch, NUM_BLOCKS)
+
+    assert ranks.grow_all(40) == [16, 16]
+    assert [c.last_grow["floor_blocks"] for c in ranks.caches] == [NUM_BLOCKS, 16]
+
+
+def test_the_default_floor_is_the_startup_transient_or_the_serving_peak():
+    cache = SimpleNamespace(reserved_headroom_bytes=64 * MIB)
+    floor = extensible_kv_cache.grow_torch_floor_bytes
+    config = SimpleNamespace(cache_config=SimpleNamespace())
+    assert floor(cache, config, 500 * MIB, 500 * MIB) == (64 * MIB, "transient")
+    assert floor(cache, config, 500 * MIB, 600 * MIB) == (100 * MIB, "transient")
+    config.cache_config.kv_cache_grow_torch_floor_mib = 0
+    assert floor(cache, config, 500 * MIB, 600 * MIB) == (0, "setting")
 
 
 def test_sizing_baseline_records_what_torch_holds(fake_xpu, monkeypatch):

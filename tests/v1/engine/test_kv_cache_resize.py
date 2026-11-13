@@ -231,6 +231,71 @@ def test_resize_only_grows_the_scheduler_when_the_workers_did():
     assert scheduler.grown_to == [25]
 
 
+def _report(**overrides) -> dict[str, Any]:
+    report = {
+        "target_blocks": 64,
+        "committed_blocks": 10,
+        "capacity_blocks": 64,
+        "wanted_blocks": 64,
+        "measured_blocks": 64,
+        "floor_blocks": 64,
+        "vote_blocks": 64,
+        "floor_bytes": 1 << 30,
+        "floor_source": "transient",
+        "torch_allocated_bytes": 19 << 30,
+        "torch_reserved_bytes": 20 << 30,
+        "headroom_after_bytes": 0,
+        "cap_after_bytes": 20 << 30,
+        "free_after_bytes": 1 << 20,
+    }
+    report.update(overrides)
+    return report
+
+
+def test_a_grow_short_of_its_target_says_why():
+    executor = RecordingExecutor(resize_to=20)
+    executor.kv_cache_grow_reports = lambda: [  # type: ignore[attr-defined]
+        _report(),
+        _report(floor_blocks=20, vote_blocks=20),
+    ]
+    scheduler = FakeScheduler(executor, [])
+    core = _make_core(executor, scheduler)
+
+    record = EngineCore.resize_kv_cache(core, 64)
+    assert record["state"] == "finished" and record["num_blocks"] == 20
+    assert record["message"].startswith("Grew from 10 to 20 blocks of the 64 asked")
+    assert "rank 1" in record["message"]
+    assert "--kv-cache-grow-torch-floor-mib" in record["message"]
+
+    # Nothing more keeps the floor: unchanged, and said. (The real scheduler
+    # sets num_gpu_blocks when it grows; the fake does not.)
+    core.vllm_config.cache_config.num_gpu_blocks = 20
+    record = EngineCore.resize_kv_cache(core, 64)
+    assert record["state"] == "unchanged"
+    assert record["message"].startswith("Not grown from 20 blocks of the 64 asked")
+
+    # The measurement set the count.
+    executor.resize_to = 30
+    executor.kv_cache_grow_reports = lambda: [  # type: ignore[attr-defined]
+        _report(measured_blocks=30, wanted_blocks=30, floor_blocks=40, vote_blocks=30)
+    ]
+    record = EngineCore.resize_kv_cache(core, 64)
+    assert "memory measurement on rank 0 fits 30 blocks" in record["message"]
+
+    # A grow that reached its target says nothing.
+    executor.resize_to = 64
+    record = EngineCore.resize_kv_cache(core, 64)
+    assert record["num_blocks"] == 64 and record["message"] == ""
+
+
+def test_a_grow_short_of_its_target_without_reports_points_at_the_logs():
+    executor = RecordingExecutor(resize_to=12)
+    core = _make_core(executor, FakeScheduler(executor, []))
+    record = EngineCore.resize_kv_cache(core, 64)
+    assert record["num_blocks"] == 12
+    assert "KV cache grow floor" in record["message"]
+
+
 @pytest.mark.parametrize(
     ("change", "match"),
     [

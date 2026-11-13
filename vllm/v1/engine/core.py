@@ -96,6 +96,7 @@ from vllm.v1.engine.kv_cache_resize import (
     KVCacheMemoryHolder,
     KVCacheResize,
     KVCacheResizeState,
+    grow_message,
 )
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.tower_residency import TowerResidencyController
@@ -1030,6 +1031,12 @@ class EngineCore:
                 num_blocks,
                 f"{self.vllm_config.cache_config.kv_cache_size_tokens:,}",
             )
+        message = ""
+        if old_num_blocks < target_num_blocks and num_blocks < target_num_blocks:
+            message = self._kv_grow_message(
+                target_num_blocks, old_num_blocks, num_blocks
+            )
+            logger.warning("KV cache resize: %s", message)
         self._kv_resize = KVCacheResize(
             direction="grow",
             from_blocks=old_num_blocks,
@@ -1039,10 +1046,25 @@ class EngineCore:
                 if num_blocks > old_num_blocks
                 else KVCacheResizeState.UNCHANGED
             ),
+            message=message,
         )
         if num_blocks != old_num_blocks:
             self._publish_scheduler_stats()
         return self._kv_resize.record(num_blocks)
+
+    def _kv_grow_message(self, target: int, old: int, new: int) -> str:
+        """Why a grow stopped short of its target, from the workers' reports
+        of their vote; a generic line when they cannot be read."""
+        reports = None
+        get_reports = getattr(self.model_executor, "kv_cache_grow_reports", None)
+        if get_reports is not None:
+            try:
+                reports = get_reports()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "Could not read the workers' grow reports.", exc_info=True
+                )
+        return grow_message(target, old, new, reports)
 
     def _publish_scheduler_stats(self) -> None:
         """Send the scheduler's stats now, not with the next step's output:

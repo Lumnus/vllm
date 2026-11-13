@@ -78,6 +78,60 @@ class KVCacheResize:
         }
 
 
+def _gib(num_bytes: int | None) -> str:
+    return "none" if num_bytes is None else f"{num_bytes / 2**30:.2f} GiB"
+
+
+def grow_message(
+    target: int,
+    old: int,
+    new: int,
+    reports: list[dict[str, Any] | None] | None,
+) -> str:
+    """Why a grow toward target stopped at new blocks (from old), from the
+    workers' reports of their vote (`GPUWorker.kv_cache_grow_report`); empty
+    when it reached the target."""
+    if new >= target:
+        return ""
+    head = (
+        f"Not grown from {old} blocks"
+        if new <= old
+        else f"Grew from {old} to {new} blocks"
+    ) + f" of the {target} asked"
+    ranked = [(r, rep) for r, rep in enumerate(reports or []) if rep]
+    if not ranked:
+        return (
+            f"{head}; see the workers' 'KV cache grow floor' and 'KV cache resize "
+            "measurement' log lines."
+        )
+    rank, rep = min(ranked, key=lambda item: item[1]["vote_blocks"])
+    if rep["vote_blocks"] > new:
+        return (
+            f"{head}: every rank voted for at least {rep['vote_blocks']} blocks, "
+            "but memory could not be mapped on every rank (see the workers' "
+            "'Could not map memory' lines)."
+        )
+    if rep["floor_blocks"] < rep["wanted_blocks"]:
+        return (
+            f"{head}: rank {rank} keeps torch able to reserve "
+            f"{_gib(rep['floor_bytes'])} more ({rep['floor_source']}); at "
+            f"{rep['wanted_blocks']} blocks it would have "
+            f"{_gib(rep['headroom_after_bytes'])} (torch reserved "
+            f"{_gib(rep['torch_reserved_bytes'])}, allocated "
+            f"{_gib(rep['torch_allocated_bytes'])}; cap after the grow "
+            f"{_gib(rep['cap_after_bytes'])}, device free after "
+            f"{_gib(rep['free_after_bytes'])}), so at most "
+            f"{rep['floor_blocks']} blocks. --kv-cache-grow-torch-floor-mib sets "
+            "the floor."
+        )
+    if rep["measured_blocks"] < min(rep["target_blocks"], rep["capacity_blocks"]):
+        return (
+            f"{head}: the memory measurement on rank {rank} fits "
+            f"{rep['measured_blocks']} blocks."
+        )
+    return f"{head}: the reservation holds {rep['capacity_blocks']} blocks."
+
+
 class KVCacheMemoryHolder(Protocol):
     """Something in the engine that holds device memory the KV cache can
     make room for (expert rows, a vision tower). It is told when a shrink

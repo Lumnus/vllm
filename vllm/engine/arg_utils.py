@@ -626,6 +626,9 @@ class EngineArgs:
         CacheConfig.extensible_kv_cache_initial_blocks
     )
     kv_cache_release_chunk_mib: int | None = CacheConfig.kv_cache_release_chunk_mib
+    kv_cache_grow_torch_floor_mib: int | None = (
+        CacheConfig.kv_cache_grow_torch_floor_mib
+    )
     max_num_batched_tokens: int | None = None
     max_num_scheduled_tokens: int | None = None
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
@@ -1447,6 +1450,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--kv-cache-release-chunk-mib",
             **cache_kwargs["kv_cache_release_chunk_mib"],
+        )
+        cache_group.add_argument(
+            "--kv-cache-grow-torch-floor-mib",
+            **cache_kwargs["kv_cache_grow_torch_floor_mib"],
         )
         cache_group.add_argument("--kv-cache-dtype", **cache_kwargs["cache_dtype"])
         cache_group.add_argument(
@@ -2406,6 +2413,7 @@ class EngineArgs:
             enable_extensible_kv_cache=self.enable_extensible_kv_cache,  # type: ignore[arg-type]
             extensible_kv_cache_initial_blocks=self.extensible_kv_cache_initial_blocks,
             kv_cache_release_chunk_mib=self.kv_cache_release_chunk_mib,
+            kv_cache_grow_torch_floor_mib=self.kv_cache_grow_torch_floor_mib,
             cache_dtype=resolved_cache_dtype,  # type: ignore[arg-type]
             is_attention_free=model_config.is_attention_free,
             num_gpu_blocks_override=self.num_gpu_blocks_override,

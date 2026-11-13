@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from itertools import pairwise
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
 
@@ -144,6 +144,9 @@ class ExtensibleKVCache:
         # from and to and the torch cap before it. Left set by a failure, for
         # the next resize to finish.
         self.unfinished_grow: tuple[int, int, int | None] | None = None
+        # This rank's numbers from the last grow's vote (`grow_kv_cache`):
+        # what the measurement and the torch headroom floor allowed.
+        self.last_grow: dict[str, Any] | None = None
         # What torch reserved and had allocated when the cache was sized, for
         # measurements taken later while serving; None until then.
         self.torch_reserved_at_sizing: int | None = None
@@ -1117,6 +1120,122 @@ def _measure_kv_cache_serving(
     return fits
 
 
+class GrowFloor(NamedTuple):
+    """The torch headroom a grow leaves, checked apart from the room
+    measurement (`_measure_kv_cache_serving`), from torch's own numbers, the
+    budget the cap follows from and the device's free memory. Bytes."""
+
+    # The headroom torch must keep: what it can still reserve after the grow.
+    floor: int
+    # Where the floor comes from: "setting" or "transient".
+    source: str
+    allocated: int
+    reserved: int
+    # Torch's cap after a grow to `asked` blocks (None: no cap) and the
+    # device's free memory after it.
+    cap_after: int | None
+    free_after: int
+    asked: int
+    # The most blocks that keep the floor (the committed count if none more).
+    max_blocks: int
+
+    @property
+    def headroom_after(self) -> int:
+        """What torch could still reserve after a grow to `asked` blocks:
+        under its cap, and on the device (free memory and its own cache)."""
+        rooms = [self.free_after + max(self.reserved - self.allocated, 0)]
+        if self.cap_after is not None:
+            rooms.append(self.cap_after - self.reserved)
+        return min(rooms)
+
+
+def grow_torch_floor_bytes(
+    kv_cache: ExtensibleKVCache,
+    vllm_config: "VllmConfig",
+    allocated: int,
+    peak: int,
+) -> tuple[int, str]:
+    """The headroom a grow must leave torch: kv_cache_grow_torch_floor_mib
+    when set, else the transient the startup sizing kept free for torch
+    (the profiled activation peak, or warmup's transient if larger:
+    `reserved_headroom_bytes`) or the higher allocation serving has shown
+    since, whichever is larger."""
+    cache_config = getattr(vllm_config, "cache_config", None)
+    setting = getattr(cache_config, "kv_cache_grow_torch_floor_mib", None)
+    if setting is not None:
+        return int(setting) << 20, "setting"
+    return max(kv_cache.reserved_headroom_bytes, peak - allocated, 0), "transient"
+
+
+def grow_floor(
+    kv_cache: ExtensibleKVCache,
+    vllm_config: "VllmConfig",
+    device: torch.device,
+    num_blocks: int,
+) -> GrowFloor:
+    """How far a grow toward num_blocks may go and still leave torch the
+    floor of headroom (`grow_torch_floor_bytes`): after the grow, torch must
+    be able to reserve at least the floor more, both under its cap (which a
+    grow lowers by what it maps, see `refresh_torch_memory_limit`) and on
+    the device.
+
+    Under the cap, what torch has reserved counts as taken: an allocation
+    that needs a new segment fails at the cap however much of the reserved
+    memory is unused, and a reserved segment that holds one live block
+    cannot be given back. On the device, torch's unused cache counts as
+    room, as in the room measurement (`serving_kv_room`): it can serve torch
+    or be given back to the device. When the floor binds and torch holds
+    cached memory it does not use, the cache is given back first and the
+    numbers read again. Independent of the room measurement, so that a
+    measurement that is wrong cannot take the card to the last byte."""
+    allocated, peak, reserved = _torch_memory_now(device)
+    floor, source = grow_torch_floor_bytes(kv_cache, vllm_config, allocated, peak)
+    result = _grow_floor_at(kv_cache, num_blocks, floor, source, device)
+    if result.max_blocks < num_blocks and result.reserved > result.allocated:
+        torch.accelerator.empty_cache()
+        result = _grow_floor_at(kv_cache, num_blocks, floor, source, device)
+    return result
+
+
+def _grow_floor_at(
+    kv_cache: ExtensibleKVCache,
+    num_blocks: int,
+    floor: int,
+    source: str,
+    device: torch.device,
+) -> GrowFloor:
+    allocated, _, reserved = _torch_memory_now(device)
+    free_memory = current_platform.free_device_memory(device)
+    mapped = kv_cache.physical_bytes
+    external = sum(mapped_bytes() for mapped_bytes in kv_cache.external_mapped_bytes)
+    budget = kv_cache.torch_memory_budget
+
+    def mapped_after(n: int) -> int:
+        # What is mapped stays mapped (granules of a failed attempt included).
+        return max(kv_cache.physical_bytes_for(n), mapped)
+
+    # The largest mapped size that keeps the floor.
+    limits = [free_memory + max(reserved - allocated, 0) + mapped - floor]
+    if budget is not None:
+        limits.append(budget - external - reserved - floor)
+    max_mapped = min(limits)
+    max_blocks = kv_cache.num_committed_blocks
+    if max_mapped >= mapped:
+        max_blocks = max(kv_cache.blocks_within(max_mapped), max_blocks)
+    return GrowFloor(
+        floor=floor,
+        source=source,
+        allocated=allocated,
+        reserved=reserved,
+        cap_after=(
+            None if budget is None else budget - external - mapped_after(num_blocks)
+        ),
+        free_after=free_memory - (mapped_after(num_blocks) - mapped),
+        asked=num_blocks,
+        max_blocks=max_blocks,
+    )
+
+
 def _finish_grow(
     runner: "GPUModelRunner",
     start: int,
@@ -1223,6 +1342,7 @@ def grow_kv_cache(
         # A cap set without a budget holds for the size mapped now.
         kv_cache.anchor_torch_memory_budget()
     error: Exception | None = None
+    kv_cache.last_grow = None
     try:
         if kv_cache.unfinished_shrink is not None:
             raise RuntimeError(
@@ -1246,7 +1366,46 @@ def grow_kv_cache(
             requested_memory=requested_memory,
             target_num_blocks=min(target_num_blocks, kv_cache.capacity_blocks),
         )
-        vote = min(target_num_blocks, fits, kv_cache.capacity_blocks)
+        wanted = min(target_num_blocks, fits, kv_cache.capacity_blocks)
+        floor = grow_floor(kv_cache, vllm_config, runner.device, wanted)
+        vote = min(wanted, floor.max_blocks)
+        kv_cache.last_grow = {
+            "target_blocks": target_num_blocks,
+            "committed_blocks": kv_cache.num_committed_blocks,
+            "capacity_blocks": kv_cache.capacity_blocks,
+            "wanted_blocks": wanted,
+            "measured_blocks": fits,
+            "floor_blocks": floor.max_blocks,
+            "vote_blocks": vote,
+            "floor_bytes": floor.floor,
+            "floor_source": floor.source,
+            "torch_allocated_bytes": floor.allocated,
+            "torch_reserved_bytes": floor.reserved,
+            "headroom_after_bytes": floor.headroom_after,
+            "cap_after_bytes": floor.cap_after,
+            "free_after_bytes": floor.free_after,
+        }
+        log = logger.warning if vote < wanted else logger.info
+        log(
+            "KV cache grow floor: torch keeps at least %s GiB it can still "
+            "reserve (%s); allocated %s GiB, reserved %s GiB; a grow to %d "
+            "blocks would leave %s GiB (cap after: %s; device free after %s "
+            "GiB). %d blocks keep the floor; the measurement fits %d; voting "
+            "%d.",
+            format_gib(floor.floor),
+            "kv_cache_grow_torch_floor_mib"
+            if floor.source == "setting"
+            else "startup transient or serving peak",
+            format_gib(floor.allocated),
+            format_gib(floor.reserved),
+            wanted,
+            format_gib(floor.headroom_after),
+            "none" if floor.cap_after is None else f"{format_gib(floor.cap_after)} GiB",
+            format_gib(floor.free_after),
+            floor.max_blocks,
+            fits,
+            vote,
+        )
     except Exception as e:
         logger.exception(
             "This rank cannot take part in resizing the KV cache; no rank grows."

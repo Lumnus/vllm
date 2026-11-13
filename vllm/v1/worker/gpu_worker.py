@@ -1043,6 +1043,12 @@ class Worker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_blocks
         return num_blocks
 
+    def kv_cache_grow_report(self) -> dict | None:
+        """This rank's numbers from the last grow's vote: what the memory
+        measurement and the torch headroom floor allowed (None before any)."""
+        kv_cache = getattr(self.model_runner, "extensible_kv_cache", None)
+        return None if kv_cache is None else kv_cache.last_grow
+
     def kv_cache_shrink_plan(self, num_blocks: int) -> dict:
         """What shrinking the extensible KV cache to num_blocks would release
         on this rank; changes nothing."""
