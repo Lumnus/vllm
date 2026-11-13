@@ -8,6 +8,11 @@ is in which row is host state here, and two int32 maps on the device
 (``fast_map[g]``, ``slow_map[g]``: physical expert id -> row, -1 elsewhere) are
 what the kernels read. The maps are rewritten in place while serving.
 
+With a bound on the pinned rows (``num_pool_slots`` below the slots off the
+card) a third place exists: *host* slots have no row the kernels read. Both
+maps say -1 for them, and the layer computes them on the CPU from the expert
+store (its host cache in ordinary memory, the drive behind it).
+
 The weights of an expert never change, so a row is a lease on bytes that live
 elsewhere (the expert store): giving a row up is an unmap, never a write-back,
 and a row is refilled only from the store or from a pool row.
@@ -40,6 +45,7 @@ import numpy as np
 
 FAST = 0
 POOL = 1
+HOST = 2  # in no row the kernels read: computed on the CPU
 
 
 class RowsUnavailable(RuntimeError):
@@ -238,6 +244,41 @@ class RowAllocator:
 # --------------------------------------------------------------------------
 
 
+def choose_pool_set(
+    slot_load: np.ndarray,
+    candidates: np.ndarray,
+    is_pool: np.ndarray,
+    capacity: int,
+    hysteresis: float,
+) -> np.ndarray:
+    """The slots, among ``candidates`` (the slots off the card after a move),
+    that should hold pinned rows: at most ``capacity``, the hottest, keeping
+    the current pinned slots (``is_pool``) unless an outside slot carries more
+    than ``hysteresis`` times the load of one inside. Free capacity is filled
+    with the hottest outside candidates first."""
+    cand = np.asarray(candidates, dtype=bool)
+    load = np.asarray(slot_load, dtype=np.float64)
+    pool = np.asarray(is_pool, dtype=bool) & cand
+    outside = np.flatnonzero(cand & ~pool)
+    outside = outside[np.argsort(-load[outside], kind="stable")]
+    room = capacity - int(pool.sum())
+    if room < 0:  # more pinned slots than capacity: keep the hottest
+        inside = np.flatnonzero(pool)
+        inside = inside[np.argsort(-load[inside], kind="stable")]
+        pool[inside[capacity:]] = False
+        room = 0
+    take = outside[:room]
+    pool[take] = True
+    outside = outside[room:]
+    inside = np.flatnonzero(pool)
+    inside = inside[np.argsort(load[inside], kind="stable")]
+    for s, f in zip(outside, inside):
+        if load[s] <= hysteresis * max(load[f], 0.0):
+            break
+        pool[s], pool[f] = True, False
+    return pool
+
+
 def choose_fast_set(
     slot_load: np.ndarray,
     is_fast: np.ndarray,
@@ -294,6 +335,9 @@ class MovePlan:
     new_fast: np.ndarray  # bool per slot: fast after the move
     new_logical: np.ndarray  # logical expert per slot after the move
     reads: dict[int, int] = field(default_factory=dict)  # slot -> logical to read
+    # bool per slot: in a pinned row after the move (None: every slot that is
+    # not fast, the placement without host slots)
+    new_pool: np.ndarray | None = None
 
 
 @dataclass
@@ -316,8 +360,10 @@ class TierPlacement:
     row, the free pool rows, and the move planning over them.
 
     The initial placement is the one tiers have at load: slot ``s`` below
-    ``num_fast`` is fast row ``s``; the others are pool rows ``0..num_slow-1``;
-    the ``spare`` pool rows beyond are free.
+    ``num_fast`` is fast row ``s``; the next ``num_pool_slots`` (by default
+    every other slot) are pool rows ``0..num_pool_slots-1``; the slots after
+    them are host slots (no row); the ``spare`` (and ``extra_rows``) pool
+    rows beyond are free.
     """
 
     def __init__(
@@ -326,21 +372,31 @@ class TierPlacement:
         num_fast: int,
         spare: int,
         done: Callable[[Any], bool],
+        num_pool_slots: int | None = None,
+        extra_rows: int = 0,
     ):
         assert 0 < num_fast < num_slots
         self.num_slots = num_slots
         self.num_fast = num_fast
         self.num_slow = num_slots - num_fast
+        pinned = self.num_slow if num_pool_slots is None else num_pool_slots
+        assert 0 <= pinned <= self.num_slow
+        self.num_pinned = pinned  # slots in pinned rows when the tiers are full
+        self.num_host = self.num_slow - pinned
         self.spare = spare
-        self.num_pool_rows = self.num_slow + spare
+        # Rows beyond the spares, for host slots promoted between moves.
+        self.extra_rows = extra_rows
+        self.num_pool_rows = pinned + spare + extra_rows
         self.tier = np.empty(num_slots, dtype=np.int8)
         self.row = np.empty(num_slots, dtype=np.int32)
         self.tier[:num_fast] = FAST
         self.row[:num_fast] = np.arange(num_fast)
-        self.tier[num_fast:] = POOL
-        self.row[num_fast:] = np.arange(self.num_slow)
+        self.tier[num_fast : num_fast + pinned] = POOL
+        self.row[num_fast : num_fast + pinned] = np.arange(pinned)
+        self.tier[num_fast + pinned :] = HOST
+        self.row[num_fast + pinned :] = -1
         self.pool = RowAllocator(
-            self.num_pool_rows, range(self.num_slow, self.num_pool_rows), done
+            self.num_pool_rows, range(pinned, self.num_pool_rows), done
         )
         # Fast rows with no slot: none while the boundary stays where it was
         # at load, one per demoted slot when a slot is demoted alone.
@@ -365,9 +421,18 @@ class TierPlacement:
     def is_fast(self) -> np.ndarray:
         return self.tier == FAST
 
+    def is_pool(self) -> np.ndarray:
+        return self.tier == POOL
+
+    def is_host(self) -> np.ndarray:
+        return self.tier == HOST
+
     def check(self) -> None:
-        """Every slot is in exactly one row; no row serves two slots; the
-        free pool rows are the ones no slot uses."""
+        """Every slot is in exactly one tier, and in one row unless it is a
+        host slot; no row serves two slots; the free pool rows are the ones
+        no slot uses."""
+        assert np.isin(self.tier, (FAST, POOL, HOST)).all(), "slot in no tier"
+        assert (self.row[self.tier == HOST] == -1).all(), "host slot with a row"
         fast_rows = self.row[self.tier == FAST].tolist()
         pool_rows = self.row[self.tier == POOL].tolist()
         assert len(set(fast_rows)) == len(fast_rows), "fast row twice"
@@ -389,9 +454,19 @@ class TierPlacement:
         for s, g in enumerate(slot_global):
             if self.tier[s] == FAST:
                 fast_map[g] = self.row[s]
-            else:
+            elif self.tier[s] == POOL:
                 slow_map[g] = self.row[s]
+            # a host slot is in neither map: the CPU computes it
         return fast_map, slow_map
+
+    def promote_host(self, slot: int, row: int) -> None:
+        """Host slot ``slot`` now holds pinned row ``row`` (taken from the
+        free rows and filled by the caller; the caller writes the maps)."""
+        assert self.tier[slot] == HOST, f"slot {slot} is not a host slot"
+        assert row not in self.row[self.tier == POOL], f"row {row} is in use"
+        self.tier[slot] = POOL
+        self.row[slot] = row
+        self.check()
 
     # -- planning ---------------------------------------------------------
 
@@ -429,13 +504,64 @@ class TierPlacement:
             )
         else:
             new_fast = is_fast.copy()
-        return self.plan_from_set(old_logical, new_logical, new_fast)
+        if self.num_host == 0:
+            return self.plan_from_set(old_logical, new_logical, new_fast)
+        # Host slots: which off-card slots hold pinned rows is a choice of its
+        # own. Each slot entering a pinned or a fast row from the host is a
+        # read; when the choice reads more than the spare rows take, the
+        # pinned set stays, then the fast set too (a move of the experts
+        # alone always fits: EPLB bounds it by the spare rows).
+        attempts = [(new_fast, True)] if tier_moves else []
+        attempts += [(new_fast, False), (is_fast.copy(), False)]
+        plan = None
+        for fast, pool_moves in attempts:
+            pool = (
+                choose_pool_set(
+                    slot_load, ~fast, self.is_pool(), self.num_pinned, hysteresis
+                )
+                if pool_moves
+                else self._default_pool(fast)
+            )
+            plan = self.plan_from_set(
+                old_logical, new_logical, fast, pool, check_budget=False
+            )
+            if len(plan.reads) <= self.spare:
+                return plan
+        assert plan is not None
+        raise RowsUnavailable(
+            f"the move reads {len(plan.reads)} experts and the layer has "
+            f"{self.spare} spare rows"
+        )
+
+    def _default_pool(self, new_fast: np.ndarray) -> np.ndarray:
+        """The pinned set when only the fast set is chosen: the slots in
+        pinned rows that do not go fast stay; a slot leaving the fast tier
+        takes a pinned row while fewer than ``num_pinned`` are used, else it
+        goes to the host."""
+        new_fast = np.asarray(new_fast, dtype=bool)
+        pool = self.is_pool() & ~new_fast
+        room = self.num_pinned - int(pool.sum())
+        for s in np.flatnonzero(self.is_fast() & ~new_fast):
+            if room <= 0:
+                break
+            pool[s] = True
+            room -= 1
+        return pool
 
     def plan_from_set(
-        self, old_logical: np.ndarray, new_logical: np.ndarray, new_fast: np.ndarray
+        self,
+        old_logical: np.ndarray,
+        new_logical: np.ndarray,
+        new_fast: np.ndarray,
+        new_pool: np.ndarray | None = None,
+        *,
+        check_budget: bool = True,
     ) -> MovePlan:
-        """The move that puts the experts ``new_logical`` in the slots and
-        exactly the slots ``new_fast`` in fast rows."""
+        """The move that puts the experts ``new_logical`` in the slots,
+        exactly the slots ``new_fast`` in fast rows and, with host slots,
+        the slots ``new_pool`` in pinned rows (the rest on the host; by
+        default as :meth:`_default_pool` chooses). Without host slots every
+        slot that is not fast is in a pinned row."""
         old_logical = np.asarray(old_logical)
         new_logical = np.asarray(new_logical)
         new_fast = np.asarray(new_fast, dtype=bool)
@@ -444,14 +570,35 @@ class TierPlacement:
         changed = np.flatnonzero(changed_mask).tolist()
         demoted = np.flatnonzero(is_fast & ~new_fast & ~changed_mask).tolist()
         to_fast = np.flatnonzero(new_fast & (changed_mask | ~is_fast)).tolist()
-        reads = {s: int(new_logical[s]) for s in changed}
-        reads.update({s: int(old_logical[s]) for s in demoted})
-        if len(reads) > self.spare:
+        if self.num_host == 0:
+            pool = None
+            reads = {s: int(new_logical[s]) for s in changed}
+            reads.update({s: int(old_logical[s]) for s in demoted})
+        else:
+            pool = (
+                self._default_pool(new_fast)
+                if new_pool is None
+                else np.asarray(new_pool, dtype=bool) & ~new_fast
+            )
+            if int(pool.sum()) > self.num_pool_rows:
+                raise RowsUnavailable("more pinned slots than pool rows")
+            is_pool, is_host = self.is_pool(), self.is_host()
+            reads = {}
+            for s in range(self.num_slots):
+                lands = new_fast[s] or pool[s]
+                if changed_mask[s]:
+                    if lands:  # the new expert's bytes, into a row
+                        reads[s] = int(new_logical[s])
+                elif (pool[s] and not is_pool[s]) or (new_fast[s] and is_host[s]):
+                    reads[s] = int(old_logical[s])  # into a pinned row
+        if check_budget and len(reads) > self.spare:
             raise RowsUnavailable(
                 f"the move reads {len(reads)} experts and the layer has "
                 f"{self.spare} spare rows"
             )
-        return MovePlan(changed, demoted, to_fast, new_fast, new_logical.copy(), reads)
+        return MovePlan(
+            changed, demoted, to_fast, new_fast, new_logical.copy(), reads, pool
+        )
 
     def prepare(
         self,
@@ -515,13 +662,19 @@ class TierPlacement:
                     free_pool.append(int(self.row[s]))
                 if s in pool_dest:  # a changed slot's read row was only a source
                     free_pool.append(pool_dest[s])
-            else:
+            elif plan.new_pool is None or plan.new_pool[s]:
                 end_tier[s] = POOL
                 if s in pool_dest:
                     end_row[s] = pool_dest[s]
                     if was_pool:
                         free_pool.append(int(self.row[s]))
                 # unchanged pool slots keep their row
+                assert end_row[s] >= 0, f"slot {s} would be pinned with no row"
+            else:
+                end_tier[s] = HOST
+                end_row[s] = -1
+                if was_pool:
+                    free_pool.append(int(self.row[s]))
         return PreparedMove(
             plan, pool_dest, fast_dest, end_tier, end_row, free_pool, available
         )
@@ -560,7 +713,8 @@ class TierPlacement:
             and np.array_equal(move.end_tier, self.tier)
             and np.array_equal(move.end_row, self.row)
         ):
-            return  # nothing moves on this rank
+            return  # nothing moves on this rank (a host slot's new expert
+            # changes no row and no map)
         if move.fast_dest:
             drained = ops.record_compute()
             ops.side_wait(drained)
