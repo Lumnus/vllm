@@ -615,6 +615,7 @@ class EngineArgs:
     cpu_offload_per_expert: bool = UVAOffloadConfig.cpu_offload_per_expert
     cpu_offload_stage_min_tokens: int = UVAOffloadConfig.cpu_offload_stage_min_tokens
     cpu_offload_stage_prefetch: bool = UVAOffloadConfig.cpu_offload_stage_prefetch
+    cpu_offload_pinned_gb: float | None = UVAOffloadConfig.cpu_offload_pinned_gb
     offload_group_size: int = PrefetchOffloadConfig.offload_group_size
     offload_num_in_group: int = PrefetchOffloadConfig.offload_num_in_group
     offload_prefetch_step: int = PrefetchOffloadConfig.offload_prefetch_step
@@ -1542,6 +1543,9 @@ class EngineArgs:
         offload_group.add_argument(
             "--cpu-offload-stage-prefetch",
             **uva_kwargs["cpu_offload_stage_prefetch"],
+        )
+        offload_group.add_argument(
+            "--cpu-offload-pinned-gb", **uva_kwargs["cpu_offload_pinned_gb"]
         )
         offload_group.add_argument(
             "--offload-group-size",
@@ -2973,6 +2977,7 @@ class EngineArgs:
                 cpu_offload_per_expert=self.cpu_offload_per_expert,
                 cpu_offload_stage_min_tokens=self.cpu_offload_stage_min_tokens,
                 cpu_offload_stage_prefetch=self.cpu_offload_stage_prefetch,
+                cpu_offload_pinned_gb=self.cpu_offload_pinned_gb,
             ),
             prefetch=PrefetchOffloadConfig(
                 offload_group_size=self.offload_group_size,

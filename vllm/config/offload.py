@@ -54,6 +54,19 @@ class UVAOffloadConfig:
     single rank too. The budget goes to routed experts only:
     `cpu_offload_params` is ignored. Refused when UVA is disabled
     (`VLLM_WEIGHT_OFFLOADING_DISABLE_UVA`)."""
+    cpu_offload_pinned_gb: float | None = Field(default=None, gt=0)
+    """With `cpu_offload_per_expert` and an expert store
+    (`--expert-store-config`): GiB per rank of pinned host memory for expert
+    slots, at most `cpu_offload_gb`. The slots off the device that it pays for
+    hold pinned rows the kernels read through UVA; the others are in no
+    memory the device reads: their experts stay in the expert store (a cache
+    of `host_cache_gib` of ordinary memory in front of the drive) and are
+    computed on the CPU when a step routes to them, with the same arithmetic
+    as the device's, and added to the layer's output. The MoE layers then run
+    outside the captured CUDA/XPU graphs (the graphs are split at the MoE op;
+    full graphs are turned off). Per layer, the most-loaded experts of EPLB's
+    window take the device slots, the next ones the pinned rows. None (the
+    default): every slot off the device is pinned."""
     cpu_offload_stage_min_tokens: int = Field(default=0, ge=-1)
     """Steps with at least this many tokens copy each layer's offloaded
     fused-MoE expert weights into a device buffer before the expert kernel,
@@ -98,7 +111,19 @@ class UVAOffloadConfig:
             ignored_factors={
                 "cpu_offload_stage_min_tokens",
                 "cpu_offload_stage_prefetch",
+                # acts inside the opaque moe_forward op; the graph split it
+                # asks for is part of the compilation config's own factors
+                "cpu_offload_pinned_gb",
             },
+        )
+
+    def host_experts_on(self) -> bool:
+        """Whether some expert slots off the device are computed on the CPU
+        (the pinned budget is below the host budget)."""
+        return (
+            self.cpu_offload_per_expert
+            and self.cpu_offload_pinned_gb is not None
+            and self.cpu_offload_pinned_gb < self.cpu_offload_gb
         )
 
 

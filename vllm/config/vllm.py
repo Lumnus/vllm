@@ -1407,6 +1407,82 @@ class VllmConfig:
             warn_watermarking_override()
         return True
 
+    def _verify_cpu_experts(self) -> None:
+        """``--cpu-offload-pinned-gb`` computes experts on the CPU from the
+        expert store."""
+        uva = self.offload_config.uva
+        if uva.cpu_offload_pinned_gb is None:
+            return
+        if not uva.cpu_offload_per_expert:
+            raise ValueError(
+                "--cpu-offload-pinned-gb bounds the pinned expert slots of "
+                "--cpu-offload-per-expert: add it (with --cpu-offload-gb)"
+            )
+        store = self.expert_store_config
+        if uva.host_experts_on() and (store is None or not store.enabled):
+            raise ValueError(
+                "--cpu-offload-pinned-gb below --cpu-offload-gb computes the other "
+                "experts on the CPU from the expert store: add "
+                "--expert-store-config with dirs"
+            )
+        if not uva.host_experts_on():
+            logger.warning_once(
+                "--cpu-offload-pinned-gb %s is not below --cpu-offload-gb %s: "
+                "every expert slot off the device stays pinned, none is computed "
+                "on the CPU.",
+                uva.cpu_offload_pinned_gb,
+                uva.cpu_offload_gb,
+            )
+
+    def _split_graphs_for_cpu_experts(self) -> None:
+        """With experts computed on the CPU the MoE op waits for the host in
+        the middle of the layer, which a replayed graph cannot do. Decided
+        before capture: the piecewise graphs are split at the MoE ops (they
+        run eagerly between the captured pieces) and full graphs are off; a
+        configuration that cannot split falls back to no graphs."""
+        if not self.offload_config.uva.host_experts_on():
+            return
+        cc = self.compilation_config
+        if cc.cudagraph_mode == CUDAGraphMode.NONE:
+            return
+        moe_ops = ["vllm::moe_forward", "vllm::moe_forward_shared"]
+        if cc.use_breakable_cudagraph:
+            # Breakable graphs break at in-place ops only; the MoE ops return
+            # fresh tensors.
+            logger.warning(
+                "CPU experts (--cpu-offload-pinned-gb): breakable CUDA graphs "
+                "cannot leave the MoE op out of the capture; running without "
+                "CUDA graphs (cudagraph_mode NONE). Set "
+                "VLLM_USE_BREAKABLE_CUDAGRAPH=0 to keep piecewise graphs."
+            )
+            cc.cudagraph_mode = CUDAGraphMode.NONE
+            return
+        if cc.mode != CompilationMode.VLLM_COMPILE or not cc.splitting_ops:
+            logger.warning(
+                "CPU experts (--cpu-offload-pinned-gb): the model is not compiled "
+                "piecewise, so the MoE op cannot run between captured pieces; "
+                "running without CUDA graphs (cudagraph_mode NONE)."
+            )
+            cc.cudagraph_mode = CUDAGraphMode.NONE
+            return
+        for op in moe_ops:
+            if op not in cc.splitting_ops:
+                cc.splitting_ops.append(op)
+        before = cc.cudagraph_mode
+        if before.has_full_cudagraphs():
+            cc.cudagraph_mode = (
+                CUDAGraphMode.PIECEWISE
+                if before.has_piecewise_cudagraphs()
+                else CUDAGraphMode.NONE
+            )
+        logger.info(
+            "CPU experts (--cpu-offload-pinned-gb): the MoE ops run outside the "
+            "captured graphs (split at %s); cudagraph_mode %s -> %s.",
+            ", ".join(moe_ops),
+            before.name,
+            cc.cudagraph_mode.name,
+        )
+
     def _resolve_and_verify_engram_config(self) -> None:
         """Resolve defaults and validate n-gram embedding settings."""
         model_config = self.model_config
@@ -1496,6 +1572,7 @@ class VllmConfig:
             self.expert_store_config.verify_parallel_config(
                 self.parallel_config, self.offload_config
             )
+        self._verify_cpu_experts()
 
         self._check_supports_watermarking()
         # Models may have supplied their own DCP defaults above; anything still
@@ -2090,6 +2167,7 @@ class VllmConfig:
             all2all_backend=self.parallel_config.all2all_backend,
             data_parallel_size=effective_dp_size,
         )
+        self._split_graphs_for_cpu_experts()
 
         # final check of cudagraph mode after all possible updates
         if (
