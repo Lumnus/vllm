@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 
 import torch
 from compressed_tensors import CompressionFormat
@@ -24,6 +25,35 @@ logger = init_logger(__name__)
 
 
 class CompressedTensorsMoEMethod(FusedMoEMethodBase):
+    @staticmethod
+    def _xpu_w4a8_as_wna16(
+        weight_quant, input_quant, layer: torch.nn.Module, layer_name: str
+    ) -> FusedMoEMethodBase:
+        from vllm.config import get_current_vllm_config_or_none
+        from vllm.config.quantization import (
+            QuantSpec,
+            layer_target_spec_scope,
+            user_activation_override,
+        )
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kInt8DynamicTokenSym,
+        )
+
+        from .compressed_tensors_moe_wna16 import CompressedTensorsWNA16MoEMethod
+
+        _, user_set = user_activation_override("moe", get_current_vllm_config_or_none())
+        spec = None if user_set else QuantSpec(activation=kInt8DynamicTokenSym)
+        logger.info_once(
+            "compressed-tensors W4A8 experts (int4 weights, int8 per-token "
+            "activations declared by the checkpoint) on XPU: WNA16 weights with "
+            "%s activations.",
+            "the user's override of the" if user_set else "int8 per-token",
+        )
+        with layer_target_spec_scope(spec) if spec is not None else nullcontext():
+            return CompressedTensorsWNA16MoEMethod(
+                weight_quant, None, layer.moe_config, layer_name
+            )
+
     @staticmethod
     def get_moe_method(
         quant_config: "CompressedTensorsConfig",  # type: ignore # noqa E501
@@ -186,6 +216,21 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             logger.info_once("Using CompressedTensorsW4A8Fp8MoEMethod")
             return CompressedTensorsW4A8Fp8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
+            )
+        elif (
+            current_platform.is_xpu()
+            and quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant)
+            and input_quant.symmetric
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and format == CompressionFormat.pack_quantized.value
+        ):
+            # A pack-quantized int4 checkpoint that declares int8 per-token
+            # input activations (W4A8) runs on XPU as WNA16 weights with int8
+            # activations: the same XPU W4A8 experts that
+            # `quantization_config.moe.activation=int8_per_token` selects on a
+            # W4A16 checkpoint. A user activation override still wins.
+            return CompressedTensorsMoEMethod._xpu_w4a8_as_wna16(
+                weight_quant, input_quant, layer, layer_name
             )
         elif quant_config._is_dynamic_token_w4a8_int(weight_quant, input_quant):
             from .compressed_tensors_moe_w4a8_int8 import (
