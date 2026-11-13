@@ -144,3 +144,36 @@ def test_the_thinking_budget_default_is_read_per_request():
         model="m", messages=[{"role": "user", "content": "hi"}]
     )
     assert request.to_sampling_params(16, {}).thinking_token_budget is None
+
+
+def test_a_profiles_request_defaults_are_checked_and_applied_here():
+    app, client = _app()
+    bad = client.post(
+        "/runtime_control/profile.define",
+        json={"name": "p", "defaults": {"top_p": 0}},
+    )
+    assert bad.status_code == 400 and bad.json()["error"].startswith("defaults:")
+    assert app.state.engine_client.calls == []  # never reached the engine
+    app.state.engine_client.reply = {
+        "op": "profile.apply",
+        "applied": "applying",
+        "apply": {"status": "applying"},
+        "server_defaults": {"temperature": 0.3},
+    }
+    r = client.post("/runtime_control/profile.apply", json={"name": "p"})
+    assert r.status_code == 202
+    assert r.json()["defaults"] == {"temperature": [0.6, 0.3]}
+    assert "server_defaults" not in r.json()
+    assert app.state.openai_serving_chat.default_sampling_params["temperature"] == 0.3
+    app.state.engine_client.reply = {
+        "op": "profile.state",
+        "applied": "all",
+        "targets": {},
+        "server_defaults": {"temperature": 0.3},
+    }
+    state = client.post("/runtime_control/profile.state").json()
+    assert state["targets"]["defaults.temperature"] == {
+        "target": 0.3,
+        "actual": 0.3,
+        "match": True,
+    }

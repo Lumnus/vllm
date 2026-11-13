@@ -1,0 +1,8 @@
+{
+  "name": "long-sessions",
+  "description": "A few parallel long sessions (e.g. 4 x 30-40K tokens): a bounded KV cache, every other byte of accelerator memory for experts. Starting points, to be measured.",
+  "sched": {"max_num_active_seqs": 4},
+  "tower": {"policy": "host", "disk_idle_s": 1800},
+  "kv": {"tokens": 240000, "deadline_s": 120, "preempt": false},
+  "tiers": {"fast_slots": "max"}
+}

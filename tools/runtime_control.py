@@ -24,14 +24,16 @@ server has one, is read from `VLLM_API_KEY`.
     runtime_control.py tower set [--name T] [--promote-after N] [--promote-window S]
                                  [--demote-idle S] [--idle-location host|disk]
                                  [--host-floor-gib G] [--card-reserve-mib N]
+                                 [--policy dynamic|host|card] [--disk-idle S|none]
     runtime_control.py trace on [--path P] [--interval N] [--sample N]
     runtime_control.py trace off
     runtime_control.py trace set [--interval N] [--sample N] [--rotate-mb N] [--keep N]
     runtime_control.py ple set --stats-interval S
     runtime_control.py fault arm --stage load|plan|copy_rows [--rank R] [--count N]
     runtime_control.py fault clear [--stage S]
-    runtime_control.py governor state
-    runtime_control.py governor set [--mode off|dry_run|on] [--set NAME=VALUE ...]
+    runtime_control.py profile define FILE.json   (one profile, or {"profiles": [...]})
+    runtime_control.py profile list | state
+    runtime_control.py profile apply NAME [--wait]
     runtime_control.py spec set [--tokens N] [--on | --off] [--reset-stats]
     runtime_control.py sched set [--max-active-seqs N] [--max-scheduled-tokens N]
     runtime_control.py defaults state
@@ -166,6 +168,11 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
             _set(a, "idle_location", ns.idle_location)
             _set(a, "host_available_floor_gib", ns.host_floor_gib)
             _set(a, "card_reserve_mib", ns.card_reserve_mib)
+            _set(a, "policy", ns.policy)
+            if ns.disk_idle is not None:
+                a["disk_idle_s"] = (
+                    None if ns.disk_idle == "none" else float(ns.disk_idle)
+                )
         return f"tower.{verb}", a
     if group == "trace":
         if verb == "on":
@@ -191,15 +198,13 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
         else:
             _set(a, "stage", ns.stage)
         return f"fault.{verb}", a
-    if group == "governor":
-        if verb == "set":
-            _set(a, "mode", ns.mode)
-            for item in ns.set or []:
-                name, sep, text = item.partition("=")
-                if not sep or not name:
-                    raise SystemExit(f"--set wants NAME=VALUE, got {item!r}")
-                a[name] = _value(text)
-        return f"governor.{verb}", a
+    if group == "profile":
+        if verb == "apply":
+            a["name"] = ns.name
+        elif verb == "define":
+            with open(ns.file) as f:
+                a = json.load(f)
+        return f"profile.{verb}", a
     if group == "spec":
         _set(a, "num_speculative_tokens", ns.tokens)
         if ns.on:
@@ -228,15 +233,21 @@ def _print_state(state: dict) -> None:
         f"{kv.get('release_chunk_mib')} MiB, grow floor {kv.get('grow_floor_mib')} "
         f"MiB, resize {resize.get('state', '-')}"
     )
-    gov = state.get("governor") or {}
-    if gov.get("mode", "off") != "off":
-        inputs = gov.get("inputs", {})
+    demand = state.get("kv_demand") or {}
+    if demand:
+        rate = demand.get("prefix_cache_hit_rate")
         print(
-            f"governor: {gov['mode']}, level {gov.get('level')}; used "
-            f"{inputs.get('used', '-')} cached-free {inputs.get('cached_free', '-')}"
-            f" hit rate {inputs.get('hit_rate', '-')} waiting "
-            f"{inputs.get('waiting', '-')}; hot {inputs.get('hot', '-')} cool "
-            f"{inputs.get('cool', '-')}; moves {gov.get('counts')}"
+            f"KV demand: used {demand['used']}, cached-free "
+            f"{demand['cached_free_blocks']} blocks ({demand['cached_free']}), "
+            f"running {demand['running']} waiting {demand['waiting']}, "
+            f"preemptions {demand['preemptions']}, prefix hit rate "
+            f"{'-' if rate is None else rate}"
+        )
+    profile = state.get("profile") or {}
+    if profile:
+        print(
+            f"profile: active {profile.get('active')}, applying "
+            f"{profile.get('applying')}, defined {profile.get('defined')}"
         )
     spec = state.get("spec") or {}
     if spec.get("drafter"):
@@ -420,6 +431,8 @@ def _parser() -> argparse.ArgumentParser:
             tp.add_argument("--idle-location", choices=("host", "disk"))
             tp.add_argument("--host-floor-gib", type=float)
             tp.add_argument("--card-reserve-mib", type=int)
+            tp.add_argument("--policy", choices=("dynamic", "host", "card"))
+            tp.add_argument("--disk-idle", help="seconds, or 'none'")
 
     tr = groups.add_parser("trace").add_subparsers(dest="verb", required=True)
     on = tr.add_parser("on")
@@ -443,12 +456,14 @@ def _parser() -> argparse.ArgumentParser:
     fa_arm.add_argument("--count", type=int, default=1)
     fa.add_parser("clear").add_argument("--stage")
 
-    gv = groups.add_parser("governor").add_subparsers(dest="verb", required=True)
-    gv.add_parser("state")
-    gs = gv.add_parser("set")
-    gs.add_argument("--mode", choices=("off", "dry_run", "on"))
-    gs.add_argument(
-        "--set", action="append", metavar="NAME=VALUE", help="any setting, repeatable"
+    pf = groups.add_parser("profile").add_subparsers(dest="verb", required=True)
+    pf.add_parser("define").add_argument("file")
+    pf.add_parser("list")
+    pf.add_parser("state")
+    pa = pf.add_parser("apply")
+    pa.add_argument("name")
+    pa.add_argument(
+        "--wait", action="store_true", help="poll profile.state until it settles"
     )
 
     sp = groups.add_parser("spec").add_subparsers(dest="verb", required=True)
@@ -493,9 +508,38 @@ def main(argv: list[str] | None = None) -> int:
         _print_state(reply)
         return 0
     op, body = _op_and_args(ns)
+    if op == "profile.define" and isinstance(body.get("profiles"), list):
+        worst = 0
+        for profile in body["profiles"]:
+            status, reply = _request(
+                ns.url, "POST", "/runtime_control/profile.define", profile, ns.timeout
+            )
+            print(json.dumps(reply, indent=2))
+            worst = max(worst, 0 if status == 200 else 1)
+        return worst
     status, reply = _request(ns.url, "POST", f"/runtime_control/{op}", body, ns.timeout)
     print(json.dumps(reply, indent=2))
+    if op == "profile.apply" and status == 202 and getattr(ns, "wait", False):
+        return _wait_for_profile(ns)
     return 0 if status == 200 else 1
+
+
+def _wait_for_profile(ns: argparse.Namespace, poll_s: float = 2.0) -> int:
+    """Poll profile.state until the apply converges or stops."""
+    import time
+
+    deadline = time.monotonic() + ns.timeout
+    while time.monotonic() < deadline:
+        time.sleep(poll_s)
+        status, reply = _request(
+            ns.url, "POST", "/runtime_control/profile.state", {}, ns.timeout
+        )
+        apply = reply.get("apply") or {}
+        if status != 200 or apply.get("status") != "applying":
+            print(json.dumps(reply, indent=2))
+            return 0 if apply.get("status") == "converged" else 1
+    print("profile.state: still applying at the timeout")
+    return 1
 
 
 if __name__ == "__main__":

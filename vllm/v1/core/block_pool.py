@@ -1058,6 +1058,15 @@ class BlockPool:
         """
         return self.free_block_queue.num_free_blocks
 
+    def num_cached_free_blocks(self) -> int:
+        """Blocks with no owner that still hold a cached prefix (counted as
+        free by `get_usage`). Walks the block list: O(blocks)."""
+        return sum(
+            1
+            for block in self.blocks
+            if block.ref_cnt == 0 and block.block_hash is not None and not block.is_null
+        )
+
     def get_usage(self) -> float:
         """Get the KV cache usage.
 

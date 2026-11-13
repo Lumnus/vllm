@@ -340,7 +340,7 @@ class KVCacheManager:
         # Don't count a request that skipped the cache lookup.
         if not self.prefix_cache_lookup_enabled(request):
             return
-        # Since start, whatever the stats logging (read by the KV governor).
+        # Since start, whatever the stats logging (the runtime control readout).
         self.prefix_cache_queries_total += request.num_tokens
         self.prefix_cache_hits_total += num_hits
         if not self.log_stats:

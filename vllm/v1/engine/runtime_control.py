@@ -57,10 +57,12 @@ ENGINE_OPS = (
     "tower.promote",
     "tower.demote",
     "tower.set",
-    "governor.set",
-    "governor.state",
     "spec.set",
     "sched.set",
+    "profile.define",
+    "profile.list",
+    "profile.apply",
+    "profile.state",
 )
 # Answered by the API server process itself (request defaults it reads).
 SERVER_OPS = ("defaults.set", "defaults.state")
@@ -75,6 +77,10 @@ _TOWER_SETTINGS = {
     "host_available_floor_gib": float,
     "shrink_deadline_s": float,
 }
+# Placement settings of a dynamic tower that live on its controller (not in
+# its start options): the policy and the second idle timeout (to the drive).
+TOWER_POLICIES = ("dynamic", "host", "card")
+_TOWER_PLACEMENT = ("policy", "disk_idle_s")
 
 
 class ControlRefused(Exception):
@@ -182,14 +188,17 @@ class RuntimeControl:
             "operations": sorted(WORKER_OPS + ENGINE_OPS + SERVER_OPS),
             "kv": kv,
             "towers": self._towers_state(),
-            "governor": self._governor_state(),
             "ranks": ranks,
             "ranks_agree": _agreement(ranks),
         }
         scheduler = getattr(engine, "scheduler", None)
         if scheduler is not None:
+            out["kv_demand"] = kv_demand(engine)
             out["spec"] = self._spec_state(scheduler)
             out["sched"] = self._sched_state(scheduler)
+        profiles = getattr(engine, "_serving_profiles", None)
+        if profiles is not None:
+            out["profile"] = profiles.summary()
         return out
 
     def _towers_state(self) -> dict[str, Any]:
@@ -214,6 +223,7 @@ class RuntimeControl:
                 "idle_s": now - tower.last_use,
                 "hold_s": max(0.0, tower.hold_until - now),
                 "options": {k: getattr(tower.options, k) for k in _TOWER_SETTINGS},
+                **{k: getattr(tower, k, None) for k in _TOWER_PLACEMENT},
                 "stats": stats.get(name, {}),
             }
         return out
@@ -255,8 +265,8 @@ class RuntimeControl:
             return self._kv_fit()
         if op.startswith("tower."):
             return self._tower_op(op, args)
-        if op.startswith("governor."):
-            return self._governor_op(op, args)
+        if op.startswith("profile."):
+            return self._profile_op(op, args)
         if op == "spec.set":
             return self._spec_set(args)
         if op == "sched.set":
@@ -267,60 +277,19 @@ class RuntimeControl:
         )
 
     # ------------------------------------------------------------------
-    # The KV governor (vllm/v1/engine/kv_governor.py)
+    # Serving profiles (vllm/v1/engine/serving_profiles.py)
     # ------------------------------------------------------------------
 
-    def _governor_state(self) -> dict[str, Any]:
-        governor = getattr(self.engine, "_kv_governor", None)
-        if governor is None:
-            return {"mode": "off"}
-        return governor.state()
-
-    def _governor_op(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
-        from vllm.v1.engine.kv_governor import (
-            GovernorSettings,
-            KVGovernor,
-            check_settings,
-        )
+    def _profile_op(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        from vllm.v1.engine.serving_profiles import ServingProfiles
 
         engine = self.engine
-        if op == "governor.state":
-            if args:
-                raise ControlRefused("governor.state takes no arguments")
-            return {"op": op, "applied": "all", "governor": self._governor_state()}
-        if op != "governor.set":
-            raise ControlRefused(f"unknown operation {op!r}")
-        governor = getattr(engine, "_kv_governor", None)
-        current = governor.settings if governor is not None else GovernorSettings()
-        refusal = check_settings(current, args)
-        if refusal:
-            raise ControlRefused(refusal)
-        if args.get("mode", current.mode) != "off":
-            try:
-                engine._check_kv_cache_resizable()
-            except (ValueError, NotImplementedError, RuntimeError) as e:
-                raise RestartRequired(
-                    f"the governor moves memory between the KV cache and the "
-                    f"experts and towers, which needs a KV cache resizable "
-                    f"while serving: {e}"
-                ) from e
-            parallel = getattr(engine.vllm_config, "parallel_config", None)
-            if getattr(parallel, "data_parallel_size", 1) > 1:
-                raise RestartRequired(
-                    "the governor runs in the busy loop of a single engine core "
-                    "(no data parallelism)"
-                )
-        if governor is None:
-            # Made on first use: an engine that never turns it on never has one.
-            governor = KVGovernor(engine, GovernorSettings())
-            engine._kv_governor = governor
-        changes = governor.set(args)
-        return {
-            "op": op,
-            "applied": "all",
-            "changes": changes,
-            "governor": governor.state(),
-        }
+        profiles = getattr(engine, "_serving_profiles", None)
+        if profiles is None:
+            # Made on first use: an engine nobody gives a profile never has one.
+            profiles = ServingProfiles(engine)
+            engine._serving_profiles = profiles
+        return profiles.operation(op, args)
 
     # ------------------------------------------------------------------
     # The drafter (speculative decoding)
@@ -391,7 +360,9 @@ class RuntimeControl:
             ),
         }
 
-    def _spec_set(self, args: dict[str, Any]) -> dict[str, Any]:
+    def _spec_set(
+        self, args: dict[str, Any], check_only: bool = False
+    ) -> dict[str, Any]:
         from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
         scheduler = self.engine.scheduler
@@ -422,6 +393,8 @@ class RuntimeControl:
                 f"graphs were sized for at start; restart with "
                 f"--speculative-config num_speculative_tokens={k}"
             )
+        if check_only:
+            return {}
         old_cap = scheduler.spec_tokens_cap
         if enabled is False:
             cap: int | None = 0
@@ -475,7 +448,9 @@ class RuntimeControl:
             "chunked_prefill": bool(config.enable_chunked_prefill),
         }
 
-    def _sched_set(self, args: dict[str, Any]) -> dict[str, Any]:
+    def _sched_set(
+        self, args: dict[str, Any], check_only: bool = False
+    ) -> dict[str, Any]:
         scheduler = self.engine.scheduler
         config = scheduler.scheduler_config
         known = {"max_num_active_seqs", "max_num_scheduled_tokens"}
@@ -533,6 +508,8 @@ class RuntimeControl:
                     f"max_num_scheduled_tokens must stay >= max_model_len "
                     f"{scheduler.max_model_len}"
                 )
+        if check_only:
+            return {}
         changes: dict[str, list] = {}
         if seqs is not None and seqs != scheduler.max_num_active_reqs:
             changes["max_num_active_seqs"] = [scheduler.max_num_active_reqs, seqs]
@@ -607,6 +584,10 @@ class RuntimeControl:
                 raise ControlRefused(f"tower {tower.name} is on the accelerators")
             if tower._resize_active():
                 raise ControlRefused("a KV cache resize is in progress")
+            if getattr(tower, "policy", "dynamic") == "host":
+                raise ControlRefused(
+                    f"tower {tower.name} has policy host; set the policy instead"
+                )
             logger.info(
                 "Runtime control: tower %s: promotion asked (it is in %s).",
                 tower.name,
@@ -619,17 +600,54 @@ class RuntimeControl:
                     f"tower {tower.name} is in {tower.place.value}, not on the "
                     "accelerators"
                 )
+            if getattr(tower, "policy", "dynamic") == "card":
+                raise ControlRefused(
+                    f"tower {tower.name} has policy card; set the policy instead"
+                )
             logger.info("Runtime control: tower %s: demotion asked.", tower.name)
             tower._demote(now, now - tower.last_use)
         else:
             raise ControlRefused(f"unknown operation {op!r}")
         return {"op": op, "applied": "all", "tower": tower.record()}
 
-    def _tower_set(self, tower: Any, changes: dict[str, Any]) -> dict[str, Any]:
-        unknown = sorted(set(changes) - set(_TOWER_SETTINGS))
+    def _tower_check(self, args: dict[str, Any]) -> None:
+        """Raise ControlRefused if `tower.set args` would be refused; changes
+        nothing (a serving profile checks before it applies)."""
+        tower = self._tower(args)
+        changes = {k: v for k, v in args.items() if k != "name"}
+        old_options = tower.options
+        placement = {
+            k: getattr(tower, k) for k in _TOWER_PLACEMENT if hasattr(tower, k)
+        }
+        try:
+            self._tower_set(tower, changes, log=False)
+        finally:
+            tower.options = old_options
+            for k in _TOWER_PLACEMENT:
+                if k in placement:
+                    setattr(tower, k, placement[k])
+                elif hasattr(tower, k):
+                    delattr(tower, k)
+
+    def _tower_set(
+        self, tower: Any, changes: dict[str, Any], log: bool = True
+    ) -> dict[str, Any]:
+        known = sorted([*_TOWER_SETTINGS, *_TOWER_PLACEMENT])
+        unknown = sorted(set(changes) - set(known))
         if unknown:
+            raise ControlRefused(f"unknown tower settings {unknown}; known: {known}")
+        placement = {k: changes.pop(k) for k in _TOWER_PLACEMENT if k in changes}
+        policy = placement.get("policy", getattr(tower, "policy", "dynamic"))
+        if policy not in TOWER_POLICIES:
             raise ControlRefused(
-                f"unknown tower settings {unknown}; known: {sorted(_TOWER_SETTINGS)}"
+                f"policy must be one of {list(TOWER_POLICIES)}, got {policy!r}"
+            )
+        disk = placement.get("disk_idle_s", getattr(tower, "disk_idle_s", None))
+        if disk is not None and (
+            not isinstance(disk, int | float) or isinstance(disk, bool) or disk <= 0
+        ):
+            raise ControlRefused(
+                f"disk_idle_s must be null or a number > 0, got {disk!r}"
             )
         old = tower.options
         try:
@@ -643,7 +661,17 @@ class RuntimeControl:
             for k in _TOWER_SETTINGS
             if getattr(old, k) != getattr(new, k)
         }
-        for name, (before, after) in diff.items():
+        # The controller acts on a new policy at its next step (between two
+        # steps of the busy loop): "host" demotes, "card" promotes.
+        for name, value, default in (
+            ("policy", policy, "dynamic"),
+            ("disk_idle_s", disk, None),
+        ):
+            before = getattr(tower, name, default)
+            if before != value:
+                diff[name] = [before, value]
+                setattr(tower, name, value)
+        for name, (before, after) in diff.items() if log else ():
             logger.info(
                 "Runtime control: tower %s %s %s -> %s.",
                 tower.name,
@@ -766,6 +794,35 @@ def expert_tier_series(ranks: list[dict]) -> dict[str, dict[str, float]]:
                     series[f"slots_{tier}"] = now[tier]
         out[str(reply.get("rank", len(out)))] = {k: float(v) for k, v in series.items()}
     return out
+
+
+def kv_demand(engine: Any) -> dict[str, Any]:
+    """What the KV pool is asked for now, from the scheduler (no worker
+    call): the measurements an outside orchestrator chooses a serving profile
+    by. Live usage counts blocks held by requests; cached-but-free blocks
+    hold a reusable prefix and have no owner (the pool's usage counts them as
+    free); the prefix-cache hit rate and the preemptions are since start."""
+    scheduler = engine.scheduler
+    manager = scheduler.kv_cache_manager
+    pool = manager.block_pool
+    usable = max(1, pool.num_gpu_blocks - 1 - pool.num_fenced_blocks)
+    running, waiting = scheduler.get_request_counts()
+    waiting -= len(getattr(scheduler, "deferred_waiting", ()))
+    queries = int(getattr(manager, "prefix_cache_queries_total", 0))
+    hits = int(getattr(manager, "prefix_cache_hits_total", 0))
+    cached_free = pool.num_cached_free_blocks()
+    return {
+        "blocks": usable,
+        "used": round(float(manager.usage), 4),
+        "cached_free_blocks": cached_free,
+        "cached_free": round(cached_free / usable, 4),
+        "running": running,
+        "waiting": max(0, waiting),
+        "preemptions": int(getattr(scheduler, "num_preemptions_total", 0)),
+        "prefix_cache_queries": queries,
+        "prefix_cache_hits": hits,
+        "prefix_cache_hit_rate": round(hits / queries, 4) if queries else None,
+    }
 
 
 def _agreement(ranks: list[dict]) -> dict[str, bool]:

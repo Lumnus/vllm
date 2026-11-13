@@ -669,6 +669,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.gauge_kv_cache_fenced_blocks = create_metric_per_engine(
             gauge_kv_cache_fenced_blocks, per_engine_labelvalues
         )
+        gauge_kv_cache_cached_free_blocks = self._gauge_cls(
+            name="vllm:kv_cache_cached_free_blocks",
+            documentation=(
+                "KV cache blocks with no owner that still hold a cached prefix "
+                "(kv_cache_usage counts them as free)."
+            ),
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_kv_cache_cached_free_blocks = create_metric_per_engine(
+            gauge_kv_cache_cached_free_blocks, per_engine_labelvalues
+        )
 
         # Experts computed on the CPU (one series per rank), in the family
         # of the encoder towers' gauges below.
@@ -1237,6 +1249,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.gauge_kv_cache_fenced_blocks[engine_idx].set(
                 scheduler_stats.num_fenced_gpu_blocks
+            )
+            self.gauge_kv_cache_cached_free_blocks[engine_idx].set(
+                scheduler_stats.num_cached_free_gpu_blocks
             )
             for tower, values in scheduler_stats.encoder_tower_stats.items():
                 labels = [*self.per_engine_labelvalues[engine_idx], tower]

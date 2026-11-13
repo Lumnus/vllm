@@ -1,0 +1,14 @@
+{
+  "name": "agentic-coding",
+  "description": "Agentic coding: many requests with long, shared prefixes; the KV cache as large as the accelerators allow after the fast tier's floor. Starting points, to be measured.",
+  "sched": {"max_num_active_seqs": 16},
+  "tower": {
+    "policy": "dynamic",
+    "promote_after": 3,
+    "promote_window_s": 300,
+    "demote_idle_s": 600,
+    "disk_idle_s": 3600
+  },
+  "tiers": {"fast_slots": "min"},
+  "kv": {"fit": true}
+}

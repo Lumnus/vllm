@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The runtime control client: the governor, drafter, scheduler and request
-default commands."""
+"""The runtime control client: serving profiles, the tower's policy, the
+drafter, scheduler and request default commands."""
+
+import json
 
 import pytest
 
@@ -11,26 +13,19 @@ from tools.runtime_control import _op_and_args, _parser, _print_state
 @pytest.mark.parametrize(
     "argv, op, args",
     [
-        (["governor", "state"], "governor.state", {}),
-        (["governor", "set", "--mode", "dry_run"], "governor.set", {"mode": "dry_run"}),
+        (["profile", "list"], "profile.list", {}),
+        (["profile", "state"], "profile.state", {}),
         (
-            [
-                "governor",
-                "set",
-                "--set",
-                "usage_high=0.85",
-                "--set",
-                "fast_min_slots=null",
-                "--set",
-                "fast_tier_setting=fast_slots",
-            ],
-            "governor.set",
-            {
-                "usage_high": 0.85,
-                "fast_min_slots": None,
-                "fast_tier_setting": "fast_slots",
-            },
-        ),  # fmt: skip
+            ["profile", "apply", "long-sessions"],
+            "profile.apply",
+            {"name": "long-sessions"},
+        ),
+        (
+            ["tower", "set", "--policy", "host", "--disk-idle", "1800"],
+            "tower.set",
+            {"policy": "host", "disk_idle_s": 1800.0},
+        ),
+        (["tower", "set", "--disk-idle", "none"], "tower.set", {"disk_idle_s": None}),
         (["spec", "set", "--tokens", "2"], "spec.set", {"num_speculative_tokens": 2}),
         (["spec", "set", "--off"], "spec.set", {"enabled": False}),
         (
@@ -78,9 +73,11 @@ def test_commands_map_to_operations(argv, op, args):
     assert _op_and_args(_parser().parse_args(argv)) == (op, args)
 
 
-def test_a_bad_set_item_is_bad_usage():
-    with pytest.raises(SystemExit):
-        _op_and_args(_parser().parse_args(["governor", "set", "--set", "nope"]))
+def test_profile_define_reads_the_file(tmp_path):
+    path = tmp_path / "p.json"
+    path.write_text(json.dumps({"name": "p", "kv": {"fit": True}}))
+    op, args = _op_and_args(_parser().parse_args(["profile", "define", str(path)]))
+    assert op == "profile.define" and args == {"name": "p", "kv": {"fit": True}}
 
 
 def test_the_state_prints_the_new_parts(capsys):
@@ -88,12 +85,16 @@ def test_the_state_prints_the_new_parts(capsys):
         {
             "kv": {"num_blocks": 10, "resize": {"state": "idle"}},
             "towers": {},
-            "governor": {
-                "mode": "dry_run",
-                "level": "pressure",
-                "inputs": {"used": 0.93, "waiting": 3, "hot": 0.8, "cool": 0.0},
-                "counts": {"reclaims": 1},
+            "kv_demand": {
+                "used": 0.93,
+                "cached_free_blocks": 12,
+                "cached_free": 0.05,
+                "running": 4,
+                "waiting": 3,
+                "preemptions": 2,
+                "prefix_cache_hit_rate": 0.4,
             },
+            "profile": {"active": "long-sessions", "applying": None, "defined": ["a"]},
             "spec": {
                 "drafter": True,
                 "method": "dflash",
@@ -112,6 +113,7 @@ def test_the_state_prints_the_new_parts(capsys):
         }
     )
     out = capsys.readouterr().out
-    assert "governor: dry_run, level pressure" in out
+    assert "KV demand: used 0.93, cached-free 12 blocks" in out
+    assert "profile: active long-sessions" in out
     assert "drafter dflash: 8 of 15 tokens" in out and "acceptance 0.410" in out
     assert "active seqs 4 of 16" in out

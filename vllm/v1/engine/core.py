@@ -98,8 +98,8 @@ from vllm.v1.engine.kv_cache_resize import (
     KVCacheResizeState,
     grow_message,
 )
-from vllm.v1.engine.kv_governor import KVGovernor
 from vllm.v1.engine.runtime_control import ExpertTierStatsPoller, RuntimeControl
+from vllm.v1.engine.serving_profiles import ServingProfiles
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.tower_residency import TowerResidencyController
 from vllm.v1.engine.utils import (
@@ -226,9 +226,9 @@ class EngineCore:
         # The CPU expert tier's counters for the metrics (experts computed on
         # the CPU, --cpu-offload-pinned-gb, with stats on); None otherwise.
         self._expert_tier_stats = ExpertTierStatsPoller.maybe_create(self)
-        # Lends accelerator memory to experts and towers while KV demand is
-        # low (VLLM_KV_GOVERNOR, or governor.set); None while off.
-        self._kv_governor = KVGovernor.maybe_create(self)
+        # Serving profiles an outside orchestrator applies (profile.*), with a
+        # boot profile from VLLM_SERVING_PROFILES; None until one is given.
+        self._serving_profiles = ServingProfiles.maybe_create(self)
 
         kv_connector = self.scheduler.get_kv_connector()
         self._set_kv_connector_handshake_metadata()
@@ -976,7 +976,7 @@ class EngineCore:
     _kv_memory_holders: tuple[KVCacheMemoryHolder, ...] = ()
     _tower_residency: TowerResidencyController | None = None
     _expert_tier_stats: ExpertTierStatsPoller | None = None
-    _kv_governor: KVGovernor | None = None
+    _serving_profiles: ServingProfiles | None = None
     # Seconds between attempts to finish a release a worker failed.
     KV_RESIZE_RETRY_INTERVAL_S = 1.0
     # A shrink's default deadline for the drain, in seconds.
@@ -2243,9 +2243,9 @@ class EngineCoreProc(EngineCore):
             # And the CPU expert tier's counters, every few seconds.
             if self._expert_tier_stats is not None:
                 self._poll_expert_tier_stats()
-            # And the KV governor, when it is on.
-            if self._kv_governor is not None:
-                self._advance_kv_governor()
+            # And a serving profile being applied (one step at a time).
+            if self._serving_profiles is not None:
+                self._advance_serving_profile()
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # Publish request counts before and after GPU step to ensure freshness.
@@ -2289,16 +2289,16 @@ class EngineCoreProc(EngineCore):
             self._fail_kv_resize_executor()
             raise
 
-    def _advance_kv_governor(self) -> None:
-        assert self._kv_governor is not None
+    def _advance_serving_profile(self) -> None:
+        assert self._serving_profiles is not None
         try:
-            self._kv_governor.advance()
+            self._serving_profiles.advance()
         except TimeoutError:
             # A worker that did not answer may answer into the next call.
             self._fail_kv_resize_executor()
             raise
         except Exception:
-            logger.exception("KV governor: a step failed; serving goes on.")
+            logger.exception("Serving profile: a step failed; serving goes on.")
 
     def _fail_kv_resize_executor(self) -> None:
         # The workers may still answer, and their replies would be read as
@@ -2332,9 +2332,9 @@ class EngineCoreProc(EngineCore):
                 if block and self._tower_residency is not None
                 else None
             )
-            # And for the KV governor's next sample (an idle pool is low demand).
-            if block and self._kv_governor is not None:
-                wake = self._kv_governor.seconds_to_next_event()
+            # And for the next step of a serving profile being applied.
+            if block and self._serving_profiles is not None:
+                wake = self._serving_profiles.seconds_to_next_event()
                 if wake is not None:
                     timeout = wake if timeout is None else min(timeout, wake)
             try:

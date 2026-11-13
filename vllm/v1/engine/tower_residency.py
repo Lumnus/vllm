@@ -121,6 +121,16 @@ class TowerResidency:
         self._last_poll = 0.0
         # A KV cache size to grow back to once no resize is in the way.
         self._grow_to: int | None = None
+        # The placement policy, set while serving (tower.set, a serving
+        # profile): "dynamic" moves by requests and idle time as above;
+        # "host" keeps it off the accelerators (demoted at once if there);
+        # "card" brings it there and keeps it. Its only source of accelerator
+        # memory is the KV cache (request_kv_cache_release), never the experts.
+        self.policy = "dynamic"
+        # Seconds idle in host memory after which the host copy is released
+        # too (the drive tier: the next request reloads it). None: the start
+        # option `idle_location` decides, as before.
+        self.disk_idle_s: float | None = None
 
         if options.idle_location == "disk":
             delegate.host_tower(name).release(wait=False)
@@ -139,13 +149,19 @@ class TowerResidency:
     def seconds_to_next_event(self, now: float) -> float | None:
         if self.phase != TowerPhase.STEADY or self._grow_to is not None:
             return self.POLL_INTERVAL_S
-        deadlines: list[float] = []
-        if self.place == TowerPlace.CARD or (
-            self.place == TowerPlace.HOST and self.options.idle_location == "disk"
+        if (self.policy == "host" and self.place == TowerPlace.CARD) or (
+            self.policy == "card" and self.place != TowerPlace.CARD
         ):
+            return self.POLL_INTERVAL_S
+        deadlines: list[float] = []
+        if self.place == TowerPlace.CARD and self.policy == "dynamic":
             deadlines.append(self.last_use + self.options.demote_idle_s)
+        disk_after = self._disk_after()
+        if self.place == TowerPlace.HOST and disk_after is not None:
+            deadlines.append(self.last_use + disk_after)
         if (
-            self.place != TowerPlace.CARD
+            self.policy == "dynamic"
+            and self.place != TowerPlace.CARD
             and len(self.arrivals) >= self.options.promote_after
         ):
             # Held off after a failure, or waiting for another resize.
@@ -187,25 +203,40 @@ class TowerResidency:
             self.arrivals.popleft()
 
         idle = now - self.last_use
+        disk_after = self._disk_after()
         if self.place in (TowerPlace.HOST, TowerPlace.DISK):
-            if (
-                len(self.arrivals) >= self.options.promote_after
-                and now >= self.hold_until
-                and not self._resize_active()
-            ):
+            earned = (
+                self.policy == "card"
+                or self.policy == "dynamic"
+                and len(self.arrivals) >= self.options.promote_after
+            )
+            if earned and now >= self.hold_until and not self._resize_active():
                 self._start_promotion(
                     now,
-                    f"{len(self.arrivals)} requests for its modalities in "
+                    "policy card"
+                    if self.policy == "card"
+                    else f"{len(self.arrivals)} requests for its modalities in "
                     f"{window:.0f} s",
                 )
             elif (
                 self.place == TowerPlace.HOST
-                and self.options.idle_location == "disk"
-                and idle >= self.options.demote_idle_s
+                and disk_after is not None
+                and idle >= disk_after
             ):
                 self._host_to_disk(now, idle)
-        elif self.place == TowerPlace.CARD and idle >= self.options.demote_idle_s:
-            self._demote(now, idle)
+        elif self.place == TowerPlace.CARD:
+            if self.policy == "host":
+                self._demote(now, idle, "policy host")
+            elif self.policy == "dynamic" and idle >= self.options.demote_idle_s:
+                self._demote(now, idle)
+
+    def _disk_after(self) -> float | None:
+        """Idle seconds in host memory before the host copy is released."""
+        if self.disk_idle_s is not None:
+            return self.disk_idle_s
+        if self.options.idle_location == "disk":
+            return self.options.demote_idle_s
+        return None
 
     def _start_promotion(self, now: float, reason: str) -> None:
         self._from = self.place
@@ -349,7 +380,7 @@ class TowerResidency:
             return 0
         return max((int(r["bytes"]) for r in results), default=0)
 
-    def _demote(self, now: float, idle: float) -> None:
+    def _demote(self, now: float, idle: float, reason: str | None = None) -> None:
         start = self._clock()
         blocks = self._num_blocks()
         # New items go to the host copy from the next scheduling pass; the
@@ -358,7 +389,7 @@ class TowerResidency:
         self._delegate.set_tower_on_card(self.name, False)
         nbytes = self._release_everywhere()
         host = self._delegate.host_tower(self.name)
-        if self.options.idle_location == "disk":
+        if self.options.idle_location == "disk" and self.disk_idle_s is None:
             host.release(wait=False)
             target = TowerPlace.DISK
         else:
@@ -379,7 +410,7 @@ class TowerResidency:
             "each accelerator, freed",
             blocks,
             self._num_blocks(),
-            f"no request for its modalities in {idle:.0f} s",
+            reason or f"no request for its modalities in {idle:.0f} s",
         )
         self._publish()
 

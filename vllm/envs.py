@@ -346,7 +346,7 @@ if TYPE_CHECKING:
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
     VLLM_XPU_MOE_COMBINE: Literal["split", "rank", "exact"] = "split"
     VLLM_XPU_MOE_PLACEMENT_TRACE: str = ""
-    VLLM_KV_GOVERNOR: str = ""
+    VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
     VLLM_NIC_SELECTION_VARS: str = ""
@@ -2384,11 +2384,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_MOE_COMBINE": env_with_choices(
         "VLLM_XPU_MOE_COMBINE", "split", ["split", "rank", "exact"]
     ),
-    # The KV governor (vllm/v1/engine/kv_governor.py) from the start: "" or
-    # "off" (default: none), "dry_run" (logs what it would move), "on", or a
-    # JSON object of its settings ("mode" defaults to "dry_run"). The runtime
-    # control surface turns it on, off and retunes it in a running engine.
-    "VLLM_KV_GOVERNOR": lambda: os.getenv("VLLM_KV_GOVERNOR", ""),
+    # Serving profiles at start (vllm/v1/engine/serving_profiles.py): a JSON
+    # file {"profiles": [...], "boot": "<name>"}; the boot profile is applied
+    # in the first steps. Empty (default): none until profile.define.
+    "VLLM_SERVING_PROFILES": lambda: os.getenv("VLLM_SERVING_PROFILES", ""),
     # Debug: path prefix of a trace of where each routed expert of every token
     # was computed (expert-parallel rank, device or host tier, row), written
     # per rank to <prefix>.rank<R>.jsonl while the file <prefix>.on exists.
@@ -2612,8 +2611,8 @@ def compile_factors() -> dict[str, object]:
         # as an opaque op.
         "VLLM_XPU_MOE_COMBINE",
         "VLLM_XPU_MOE_PLACEMENT_TRACE",
-        # Engine-core policy between steps; no compiled code reads it.
-        "VLLM_KV_GOVERNOR",
+        # Runtime settings applied between steps; no compiled code reads it.
+        "VLLM_SERVING_PROFILES",
     }
 
     from vllm.config.utils import normalize_value

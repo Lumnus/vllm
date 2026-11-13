@@ -84,13 +84,59 @@ async def runtime_control(op: str, raw_request: Request):
     logger.info("Runtime control: %s %s", op, args)
     if op.startswith("defaults."):
         return _server_defaults(op, args, raw_request)
+    if op == "profile.define" and isinstance(args.get("defaults"), dict):
+        # The request defaults of a profile are this process's; check them
+        # now so that applying the profile cannot fail on them later.
+        from vllm.entrypoints.serve.dev.control import server_defaults
+
+        try:
+            server_defaults.check(raw_request.app.state, args["defaults"])
+        except server_defaults.DefaultsRefused as e:
+            content: dict = {"error": f"defaults: {e}"}
+            if e.restart_required:
+                content["restart_required"] = True
+            return JSONResponse(content=content, status_code=400)
     try:
         reply = await engine_client(raw_request).runtime_control(op, args)
     except Exception as e:  # noqa: BLE001 - the engine core reports a refusal so
         logger.warning("Runtime control: %s refused: %s", op, e)
         return JSONResponse(content=_refusal(str(e)), status_code=400)
-    status = 200 if reply.get("applied") == "all" else 409
+    if op in ("profile.apply", "profile.state"):
+        _profile_defaults(op, reply, raw_request)
+    status = {"all": 200, "applying": 202}.get(reply.get("applied"), 409)
     return JSONResponse(content=reply, status_code=status)
+
+
+def _profile_defaults(op: str, reply: dict, raw_request: Request) -> None:
+    """A profile's request defaults are applied here, in the process that
+    reads them, once the engine has accepted the profile (they hold no
+    accelerator memory, so they need not wait for its memory steps); the
+    state adds their target against their value now."""
+    from vllm.entrypoints.serve.dev.control import server_defaults
+
+    wanted = reply.pop("server_defaults", None)
+    if not wanted:
+        return
+    app_state = raw_request.app.state
+    if op == "profile.apply" and reply.get("applied") in ("all", "applying"):
+        try:
+            reply["defaults"] = server_defaults.apply(app_state, wanted)["changes"]
+        except server_defaults.DefaultsRefused as e:
+            reply["defaults_error"] = str(e)
+            reply["applied"] = "partial"
+    now = server_defaults.state(app_state)
+    targets = reply.setdefault("targets", {}) if op == "profile.state" else {}
+    for key, value in wanted.items():
+        actual = (
+            now.get(server_defaults.CJK_KEY)
+            if key == server_defaults.CJK_KEY
+            else now["defaults"].get(key)
+        )
+        targets[f"defaults.{key}"] = {
+            "target": value,
+            "actual": actual,
+            "match": value == actual,
+        }
 
 
 # A refusal whose reason a restart (with other flags) removes starts with it.

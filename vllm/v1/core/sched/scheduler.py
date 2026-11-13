@@ -3493,6 +3493,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_usage=self.kv_cache_manager.usage,
             num_gpu_blocks=self.kv_cache_manager.block_pool.num_gpu_blocks,
             num_fenced_gpu_blocks=self.kv_cache_manager.block_pool.num_fenced_blocks,
+            num_cached_free_gpu_blocks=self._cached_free_blocks(),
             encoder_tower_stats=self._encoder_tower_stats(),
             expert_tier_stats=self.expert_tier_stats or {},
             prefix_cache_stats=prefix_cache_stats,
@@ -3528,6 +3529,16 @@ class Scheduler(SchedulerInterface):
             num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens
         )
         return spec_decoding_stats
+
+    def _cached_free_blocks(self) -> int:
+        """`BlockPool.num_cached_free_blocks`, walked at most once a second
+        (the stats are made every step)."""
+        now = time.monotonic()
+        last = getattr(self, "_cached_free_sample", None)
+        if last is None or now - last[0] >= 1.0:
+            last = (now, self.kv_cache_manager.block_pool.num_cached_free_blocks())
+            self._cached_free_sample = last
+        return last[1]
 
     @property
     def num_spec_tokens_now(self) -> int:
