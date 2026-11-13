@@ -1075,6 +1075,17 @@ class Worker(WorkerBase):
         self.cache_config.num_gpu_blocks = num_blocks
         return released
 
+    def runtime_control(
+        self, phase: str, op: str = "", args: dict | None = None
+    ) -> dict:
+        """The runtime control surface's worker side: the state of this
+        rank's dynamic subsystems, or check/apply/restore an operation
+        (`vllm/v1/worker/runtime_control.py`). Never raises for an
+        operation that fails: the reply says so."""
+        from vllm.v1.worker.runtime_control import handle
+
+        return handle(self, phase, op, args)
+
     # The accelerator copies of encoder towers with residency "dynamic"
     # (vllm/multimodal/card_tower.py); the engine core calls these in order.
     def _card_tower(self, name: str):

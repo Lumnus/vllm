@@ -1227,6 +1227,14 @@ class AsyncLLM(EngineClient):
     async def get_kv_cache_resize_state(self) -> dict[str, Any]:
         return await self.engine_core.get_kv_cache_resize_state_async()
 
+    async def runtime_control(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
+        return await self.engine_core.call_utility_async("runtime_control", op, args)
+
+    async def get_runtime_control_state(
+        self, only: list[str] | None = None
+    ) -> dict[str, Any]:
+        return await self.engine_core.call_utility_async("runtime_control_state", only)
+
     async def sleep(
         self, level: int = 1, mode: PauseMode = "abort", reset_connector: bool = True
     ) -> None:

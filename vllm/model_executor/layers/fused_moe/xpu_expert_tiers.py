@@ -21,6 +21,7 @@ to the order of that sum.
 """
 
 import time
+import weakref
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -198,6 +199,20 @@ class _PinnedArena:
 
 
 _ARENA = _PinnedArena()
+
+# The layers' tiers in this process once wired to their kernels, for the
+# runtime control surface's readout (`live_tiers`).
+_LIVE_TIERS: "weakref.WeakSet[ExpertTiers]" = weakref.WeakSet()
+
+
+def live_tiers() -> list["ExpertTiers"]:
+    """The tiered expert layers of this process, in layer name order."""
+    return sorted(_LIVE_TIERS, key=lambda t: t.layer_name)
+
+
+def pinned_arena_gib() -> float:
+    """Pinned host memory the tiers' arena holds in this process."""
+    return _ARENA.gib
 
 
 def _repack_int4_pinned(
@@ -455,6 +470,7 @@ class ExpertTiers:
                 self.num_pool_rows, self.slot_bytes(), self.num_slow
             )
         experts.tiers = self
+        _LIVE_TIERS.add(self)
 
     def _check_views_alias(self) -> None:
         """With a store, host threads write the pool rows into the pinned

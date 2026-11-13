@@ -1999,6 +1999,38 @@ class ExpertStore:
             state = self._keys.get((int(key[0]), int(key[1])))
             return state is not None and state.state == "ready"
 
+    @property
+    def check_every(self) -> int:
+        """Reads per unit check (0: unit checks off)."""
+        checker = self._integrity
+        return 0 if checker is None else checker.every
+
+    def can_check_units(self) -> bool:
+        """The store has per-unit digests, so unit checks can be turned on."""
+        return self._integrity is not None or bool(
+            self._checksum_source is not None and self._checksum_source[1]
+        )
+
+    def set_check_every(self, every: int, threads: int = 2) -> None:
+        """Change how often units are checked against their digests while
+        the store serves (0 turns the checks off). Reads in flight finish
+        under the setting they started with: each takes the checker once."""
+        if every < 0:
+            raise ValueError("check_every must be >= 0")
+        if every == 0:
+            self._integrity = None
+            return
+        checker = self._integrity
+        if checker is not None:
+            checker.every = every
+            return
+        if self._checksum_source is None or not self._checksum_source[1]:
+            raise StoreMismatchError("this store has no per-unit checksums")
+        directory, info = self._checksum_source
+        self._integrity = _make_checker(
+            directory, {"unit_checksums": info}, every, threads
+        )
+
     def stats(self) -> dict[str, Any]:
         """Counters since open (a snapshot)."""
         with self._lock:
