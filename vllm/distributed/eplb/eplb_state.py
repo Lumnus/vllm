@@ -32,6 +32,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
 from torch.distributed import ProcessGroup, all_reduce
 
@@ -292,6 +293,30 @@ class EplbModelState:
     map_change_hook: Callable[["EplbModelState"], None] | None = None
     """Called before a placement is committed to this model (the expert load
     trace maps the counts so far with the placement still in force)."""
+    move_cost: dict[str, float] = field(default_factory=dict)
+    """Where the async rearrangement in flight spends its time on this rank,
+    by phase (`MOVE_COST_FIELDS`), written by the async worker and the
+    serving thread; one `[debug eplb] move` line at its end, then cleared."""
+
+
+MOVE_COST_FIELDS = (
+    "plan_ms",
+    "flag_ms",
+    "prepare_ms",
+    "device_wait_ms",
+    "ready_checks",
+    "ready_wait_ms",
+    "commit_ms",
+    "commit_steps",
+    "steps",
+    "step_ms",
+    "units",
+    "bytes",
+    "card_bytes",
+    "changed",
+    "verify_ms",
+)
+"""The per-move phase counters; see `EplbState._emit_move_cost`."""
 
 
 class EplbState:
@@ -331,7 +356,22 @@ class EplbState:
         """
         Interval for expert rearrangement steps.
         This is a constant and is taken from the config.
+        0: no periodic rearrangement (`EPLBConfig.step_interval`).
         """
+        self.rearrange_requested: bool = False
+        """A rearrangement asked for (runtime control) starts at the next
+        step whatever the interval; set on every rank between the same two
+        steps."""
+        self.low_imbalance_skips: int = 0
+        """Periodic rearrangements not started because the window's imbalance
+        was below `EPLBConfig.min_imbalance`."""
+        self.last_imbalance: float | None = None
+        """Busiest rank's load over the mean rank load at the last periodic
+        rearrangement's test (`min_imbalance`), or None."""
+        self._last_step_time: float | None = None
+        self._step_ms_idle: float | None = None
+        """Moving mean of the serving step period outside rearrangements, for
+        the `[debug eplb] move` line."""
         self.should_record_tensor: torch.Tensor | None = None
         """
         Shared scalar bool tensor for all layers.  Every
@@ -606,7 +646,9 @@ class EplbState:
         policy_type = eplb_config.policy
         self.policy = EPLB_POLICIES[policy_type]
         if issubclass(self.policy, IncrementalEplbPolicy):
-            self.policy = self.policy.configured(eplb_config.max_moves_per_rank)
+            self.policy = self.policy.configured(
+                eplb_config.max_moves_per_rank, eplb_config.move_min_gain
+            )
         logger.debug("Selected EPLB policy: %s", policy_type)
 
         # num_ubatches is 0 when DBO is disabled.
@@ -1119,6 +1161,7 @@ class EplbState:
         # rearrangement step and perform rearrangement to ensure all ranks are
         # performing collective communication.
         self.expert_rearrangement_step += 1
+        self._time_step()
 
         # Models whose pending layer was committed (or given up) at this step:
         # the same on every rank, since every rank takes the same branch.
@@ -1131,9 +1174,14 @@ class EplbState:
                 self._consume_async_result(eplb_model_state, ep_group.rank())
                 if pending is not None and eplb_model_state.pending_result is None:
                     settled.add(id(eplb_model_state))
+                    if not eplb_model_state.rebalanced:
+                        self._after_async_cycle(eplb_model_state, ep_group.rank())
         self._step_residency_masks(settled)
 
-        if self.expert_rearrangement_step >= self.expert_rearrangement_step_interval:
+        interval = self.expert_rearrangement_step_interval
+        if self.rearrange_requested or (
+            interval > 0 and self.expert_rearrangement_step >= interval
+        ):
             if self.is_async and any(
                 eplb_model_state.rebalanced
                 for eplb_model_state in self.model_states.values()
@@ -1144,17 +1192,133 @@ class EplbState:
                 self._update_layer_should_record(log_stats=log_stats)
                 return
             self.expert_rearrangement_step = 0
+            requested, self.rearrange_requested = self.rearrange_requested, False
             if self.rearrangements_paused:
                 self.paused_intervals += 1
             else:
                 use_saved = self.next_uses_saved_load
                 self.next_uses_saved_load = False
                 self.window_fill = 0
-                self.rearrange(use_last_expert_load=use_saved)
+                self.rearrange(
+                    use_last_expert_load=use_saved,
+                    periodic=not requested and not use_saved,
+                )
         elif self._tier_pass_due():
             self.rearrange(tier_only=True)
 
         self._update_layer_should_record(log_stats=log_stats)
+
+    def _time_step(self) -> None:
+        """The serving step's period (time between two EPLB steps on this
+        thread), into the move in flight or the moving mean outside moves."""
+        now = time.perf_counter()
+        last, self._last_step_time = self._last_step_time, now
+        if last is None:
+            return
+        period = (now - last) * 1e3
+        moving = [ms for ms in self.model_states.values() if ms.rebalanced]
+        for ms in moving:
+            cost = ms.move_cost
+            cost["steps"] = cost.get("steps", 0.0) + 1
+            cost["step_ms"] = cost.get("step_ms", 0.0) + period
+        if not moving:
+            idle = self._step_ms_idle
+            self._step_ms_idle = period if idle is None else 0.9 * idle + 0.1 * period
+
+    def _after_async_cycle(self, model_state: EplbModelState, ep_rank: int) -> None:
+        """An async rearrangement or tier pass of `model_state` ended at this
+        step (last layer committed, or abandoned): the same step on every
+        rank."""
+        stats = model_state.eplb_stats
+        full = stats is not None and not stats.tier_only
+        if full and self.parallel_config.eplb_config.interval_from_end:
+            self.expert_rearrangement_step = 0
+        if runtime_debug.on("eplb"):
+            self._emit_move_cost(model_state, ep_rank, full)
+        model_state.move_cost = {}
+
+    def _emit_move_cost(
+        self, model_state: EplbModelState, ep_rank: int, full: bool
+    ) -> None:
+        """One `[debug eplb] move` line per rank: where the cycle's time went.
+        Worker: plan, the per-layer flag exchange, prepare (tier plan and store
+        reads, or the transfer), and its waits on the device for the serving
+        thread's commits (the last layer's wait may land after this line).
+        Serving thread: the ready checks it ran at every step of the cycle
+        (a host barrier between the ranks), the commits, the step period
+        inside the cycle against outside."""
+        c = model_state.move_cost
+        steps = int(c.get("steps", 0))
+        seconds = (
+            time.perf_counter() - model_state.rearrangement_started
+            if model_state.rearrangement_started
+            else 0.0
+        )
+        idle = self._step_ms_idle
+        runtime_debug.emit(
+            "eplb",
+            logger,
+            "move (%s, EP rank %d): %s in %.2f s over %d steps; step period "
+            "%.1f ms inside, %s outside. Worker: plan %.0f ms, flag exchange "
+            "%.0f ms, prepare %.0f ms (%d units read, %.1f MiB), device wait "
+            "%.0f ms (mode %s). Serving thread: %d ready checks %.1f ms, commit "
+            "%.1f ms at %d steps. %d experts changed, %.1f MiB copied to card "
+            "rows; verify %.0f ms.",
+            model_state.model_name,
+            ep_rank,
+            "rearrangement" if full else "tier pass",
+            seconds,
+            steps,
+            c.get("step_ms", 0.0) / max(steps, 1),
+            "n/a" if idle is None else f"{idle:.1f} ms",
+            c.get("plan_ms", 0.0),
+            c.get("flag_ms", 0.0),
+            c.get("prepare_ms", 0.0),
+            int(c.get("units", 0)),
+            c.get("bytes", 0.0) / 2**20,
+            c.get("device_wait_ms", 0.0),
+            self.parallel_config.eplb_config.worker_gpu_wait,
+            int(c.get("ready_checks", 0)),
+            c.get("ready_wait_ms", 0.0),
+            c.get("commit_ms", 0.0),
+            int(c.get("commit_steps", 0)),
+            int(c.get("changed", 0)),
+            c.get("card_bytes", 0.0) / 2**20,
+            c.get("verify_ms", 0.0),
+        )
+
+    def _window_imbalance(
+        self, global_expert_load_windows: list[torch.Tensor]
+    ) -> float:
+        """The busiest EP rank's load over the mean rank load, by the current
+        placement, from the all-reduced logical windows (the largest over the
+        models). Identical on every rank: its inputs are."""
+        num_ranks = get_ep_group().device_group.size()
+        worst = 1.0
+        with gpu_sync_allowed():
+            for model_state, window in zip(
+                self.model_states.values(), global_expert_load_windows
+            ):
+                load = window.float().cpu().numpy()
+                phys2log = model_state.physical_to_logical_map.cpu().numpy()
+                layers, num_physical = phys2log.shape
+                if num_physical % num_ranks:
+                    continue
+                per_rank = np.zeros(num_ranks, dtype=np.float64)
+                rank_of = np.repeat(np.arange(num_ranks), num_physical // num_ranks)
+                for layer in range(layers):
+                    slots = phys2log[layer]
+                    held = slots >= 0
+                    count = np.bincount(slots[held], minlength=load.shape[1])
+                    share = np.zeros(num_physical, dtype=np.float64)
+                    share[held] = load[layer][slots[held]] / np.maximum(
+                        count[slots[held]], 1
+                    )
+                    per_rank += np.bincount(rank_of, weights=share, minlength=num_ranks)
+                mean = float(per_rank.mean())
+                if mean > 0:
+                    worst = max(worst, float(per_rank.max()) / mean)
+        return worst
 
     def _tier_pass_due(self) -> bool:
         """Whether this step starts a tier pass: every `tier_interval` steps
@@ -1424,6 +1588,7 @@ class EplbState:
         use_last_expert_load: bool = False,
         blocking: bool = False,
         tier_only: bool = False,
+        periodic: bool = False,
     ) -> torch.Tensor | None:
         """Rearrange the experts according to the current load.
 
@@ -1438,6 +1603,9 @@ class EplbState:
             tier_only: A tier pass (`EPLBConfig.tier_interval`): no expert
                 changes rank; the layers that place their own experts cut
                 their tiers from the window. Async, those models only.
+            periodic: Started by the interval (not asked for): it is skipped
+                when the window's imbalance is below
+                `EPLBConfig.min_imbalance`.
 
         """
         ep_group = get_ep_group().device_group
@@ -1505,6 +1673,23 @@ class EplbState:
             and not tier_only
         ):
             self._save_expert_load(global_expert_load_windows)
+        min_imbalance = self.parallel_config.eplb_config.min_imbalance
+        if periodic and min_imbalance > 0 and not (tier_only or is_profile):
+            imbalance = self._window_imbalance(global_expert_load_windows)
+            self.last_imbalance = imbalance
+            if imbalance < 1.0 + min_imbalance:
+                self.low_imbalance_skips += 1
+                if is_main_rank and runtime_debug.on("eplb"):
+                    runtime_debug.emit(
+                        "eplb",
+                        logger,
+                        "no rearrangement: busiest rank %.4f x the mean rank "
+                        "load, below 1 + min_imbalance %g (%d skipped so far)",
+                        imbalance,
+                        min_imbalance,
+                        self.low_imbalance_skips,
+                    )
+                return None
 
         # TODO(bowen): Treat differently for prefill and decode nodes
         eplb_model_state = next(iter(self.model_states.values()))
@@ -1655,6 +1840,7 @@ class EplbState:
                     num_gpus=num_gpus,
                     tier_only=tier_only,
                 )
+                eplb_model_state.move_cost = {}
                 eplb_model_state.rebalanced = True
                 eplb_model_state.rearrangement_started = started
         # Signal async thread to start transferring layers
@@ -1971,7 +2157,16 @@ class EplbState:
         step."""
         # rebalanced must remain consistent amongst all ranks otherwise the
         # all_reduce in _all_ranks_result_ready will hang
-        if not (model_state.rebalanced and self._all_ranks_result_ready(model_state)):
+        if not model_state.rebalanced:
+            return
+        started = time.perf_counter()
+        ready = self._all_ranks_result_ready(model_state)
+        cost = model_state.move_cost
+        cost["ready_checks"] = cost.get("ready_checks", 0.0) + 1
+        cost["ready_wait_ms"] = (
+            cost.get("ready_wait_ms", 0.0) + (time.perf_counter() - started) * 1e3
+        )
+        if not ready:
             return
         if model_state.abandon_votes:
             _abandon_layer(model_state=model_state, ep_rank=ep_rank)
@@ -2510,6 +2705,8 @@ def _move_to_workspace(
 ) -> None:
     result = model_state.pending_result
     assert result is not None
+    cost = model_state.move_cost
+    commit_started = time.perf_counter()
     if result.prepared is not None:
         # The layer places its own experts: its prepared rows and tier maps
         # switch in this window, next to EPLB's maps below.
@@ -2520,6 +2717,10 @@ def _move_to_workspace(
         mover.commit(result.prepared)
         stats = model_state.rearrangement_stats
         for key, value in mover.prepared_stats(result.prepared).items():
+            if key in ("units", "bytes", "card_bytes", "changed"):
+                cost[key] = cost.get(key, 0.0) + value
+            if key in ("card_bytes", "changed"):
+                continue  # the move line's; not the INFO line's
             stats[key] = stats.get(key, 0.0) + value
         stats["commit_ms"] = (
             stats.get("commit_ms", 0.0) + (time.perf_counter() - started) * 1e3
@@ -2539,6 +2740,10 @@ def _move_to_workspace(
         new_physical_to_logical_map=result.new_physical_to_logical_map,
         layer=result.layer_idx,
     )
+    cost["commit_ms"] = (
+        cost.get("commit_ms", 0.0) + (time.perf_counter() - commit_started) * 1e3
+    )
+    cost["commit_steps"] = cost.get("commit_steps", 0.0) + 1
 
     if result.layer_idx == model_state.model.num_moe_layers - 1:
         model_state.rebalanced = False
@@ -2563,7 +2768,9 @@ def _move_to_workspace(
         if model_state.movers is not None and model_state.movers[0] is not None:
             every = model_state.movers[0].scrub_every
             if every and model_state.completed_rearrangements % every == 0:
+                started = time.perf_counter()
                 _scrub_movers(model_state, ep_rank, full=False, when="rearrangement")
+                cost["verify_ms"] = (time.perf_counter() - started) * 1e3
 
     # Reset pending_result before unblocking the async worker
     model_state.pending_result = None

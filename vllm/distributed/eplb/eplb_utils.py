@@ -64,6 +64,19 @@ class CpuGpuEvent:
             # not leave the event armed for the next iteration.
             self._recorded.clear()
 
+    def wait_host(self) -> None:
+        """Block until record() was called (the serving thread enqueued what
+        the event marks); nothing is waited for on the device."""
+        self._recorded.wait()
+
+    def query(self) -> bool:
+        """After wait_host(): whether the device has run what the event marks."""
+        return bool(self._event.query())
+
+    def clear(self) -> None:
+        """Re-arm after a wait_host() that is not followed by wait()."""
+        self._recorded.clear()
+
     def record(self, stream: torch.Stream | None = None):
         """Unblocks the waiting thread after calling event.record().
 

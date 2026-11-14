@@ -111,7 +111,7 @@ def test_an_async_rearrangement_in_flight_refuses_policy_changes(monkeypatch):
 @pytest.mark.parametrize(
     "changes, refusal",
     [
-        ({"step_interval": 0}, "positive integer"),
+        ({"step_interval": -1}, "integer >= 0"),
         ({"window_size": -1}, "positive integer"),
         ({"max_moves_per_rank": True}, "positive integer"),
         ({"policy": "magic"}, "unknown policy"),
@@ -309,6 +309,11 @@ def test_the_summary_reads_the_state(monkeypatch):
         "tier_max_moves": None,
         "tier_hot": 1.5,
         "tier_warm": 0.5,
+        # what a periodic move must be worth, and how the worker waits
+        "min_imbalance": 0.0,
+        "move_min_gain": None,
+        "interval_from_end": False,
+        "worker_gpu_wait": "block",
     }
     assert out["rearrangements"] == 1
     assert out["in_flight"] is None

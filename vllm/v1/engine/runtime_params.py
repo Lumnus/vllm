@@ -436,12 +436,65 @@ def _register_builtin() -> None:
         Param(
             "eplb.step_interval",
             "int",
-            "Steps between rearrangements.",
+            "Steps between periodic rearrangements (0 = none: EPLB observes; "
+            "eplb.rearrange still moves).",
             "eplb.set",
             unit="steps",
-            min=1,
+            min=0,
+            default=0,
             start="--eplb-config step_interval",
             read=_rank0("eplb", "settings", "step_interval"),
+        )
+    )
+    P(
+        Param(
+            "eplb.min_imbalance",
+            "float",
+            "A periodic rearrangement starts only when the busiest rank carries "
+            "at least 1 + this times the mean rank load of the window (0 = always).",
+            "eplb.set",
+            min=0,
+            default=0.0,
+            start="--eplb-config min_imbalance",
+            read=_rank0("eplb", "settings", "min_imbalance"),
+        )
+    )
+    P(
+        Param(
+            "eplb.move_min_gain",
+            "float",
+            "Incremental policy: the least a swap must lower the busiest rank's "
+            "load, as a fraction of the mean rank load (null = 0.001).",
+            "eplb.set",
+            min=0,
+            nullable=True,
+            start="--eplb-config move_min_gain",
+            read=_rank0("eplb", "settings", "move_min_gain"),
+        )
+    )
+    P(
+        Param(
+            "eplb.interval_from_end",
+            "bool",
+            "Count step_interval from the end of the previous rearrangement.",
+            "eplb.set",
+            default=False,
+            start="--eplb-config interval_from_end",
+            read=_rank0("eplb", "settings", "interval_from_end"),
+        )
+    )
+    P(
+        Param(
+            "eplb.worker_gpu_wait",
+            "enum",
+            "How the async worker waits for each layer's commit: block (a device "
+            "synchronize), poll (event queries), skip (store-backed layers: host "
+            "only).",
+            "eplb.set",
+            choices=["block", "poll", "skip"],
+            default="block",
+            start="--eplb-config worker_gpu_wait",
+            read=_rank0("eplb", "settings", "worker_gpu_wait"),
         )
     )
     P(

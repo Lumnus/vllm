@@ -20,6 +20,14 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_POLL_S = 0.0005
+"""Sleep between two queries of a commit's event (`worker_gpu_wait` poll)."""
+
+
+def _add_ms(cost: dict[str, float], key: str, started: float) -> None:
+    """Add the milliseconds since `started` to `cost[key]` (move counters)."""
+    cost[key] = cost.get(key, 0.0) + (time.perf_counter() - started) * 1e3
+
 
 def start_async_worker(
     state: "EplbState",
@@ -137,6 +145,8 @@ def _transfer_cycle(
         new_physical_to_logical_map = run_rebalance_experts(
             model_state, state, physical_to_logical_map_cpu, stream
         )
+        cost = model_state.move_cost
+        cost["plan_ms"] = (time.perf_counter() - t_start) * 1e3
 
         migration_batches_by_layer = None
         if state.parallel_config.eplb_config.migration_batching_enabled:
@@ -165,7 +175,9 @@ def _transfer_cycle(
                 dtype=torch.int32,
                 device="cpu",
             )
+            started = time.perf_counter()
             torch.distributed.all_reduce(flag, group=eplb_cpu_group)
+            _add_ms(cost, "flag_ms", started)
             if int(flag.item()) != eplb_cpu_group.size():
                 logger.warning(
                     "async worker (rank=%d): layer %d coordinated stop "
@@ -222,7 +234,9 @@ def _transfer_cycle(
                     layer_idx,
                     (time.perf_counter() - started) * 1e3,
                 )
+                _add_ms(cost, "prepare_ms", started)
             else:
+                started = time.perf_counter()
                 transfer_metadata = transfer_layer(
                     old_layer_indices=physical_to_logical_map_cpu[layer_idx],
                     new_layer_indices=new_physical_to_logical_map[layer_idx],
@@ -244,10 +258,22 @@ def _transfer_cycle(
                         else None
                     ),
                 )
+                _add_ms(cost, "prepare_ms", started)
+
+            # How this layer waits for its commit (EPLBConfig.worker_gpu_wait):
+            # a layer that fills its slots from the expert store queued nothing
+            # on this stream and reads its next rows into pool rows released by
+            # their own events, so it may skip the device waits.
+            wait_mode = state.parallel_config.eplb_config.worker_gpu_wait
+            if mover is None and wait_mode == "skip":
+                wait_mode = "block"
 
             # Wait until all writes to expert_buffer have finished before making the
             # AsyncEplbLayerResult visible to the main thread.
-            stream.synchronize()
+            if mover is None or wait_mode == "block":
+                started = time.perf_counter()
+                stream.synchronize()
+                _add_ms(cost, "device_wait_ms", started)
 
             # This event guarantees that expert_buffer will not be overwritten by
             # subsequent iterations of this loop until the main thread has consumed
@@ -274,10 +300,23 @@ def _transfer_cycle(
             # Block this thread until the main thread and main stream
             # finish copying model_state.expert_buffer into
             # model_state.model.expert_weights[layer_idx]
-            consumed_event.wait(stream=stream)
-            # Host-issued writes into expert_buffer (e.g. NIXL RDMA reads) are not
-            # stream-ordered, so wait until move_from_buffer has run on the GPU.
-            stream.synchronize()
+            consumed_event.wait_host()
+            started = time.perf_counter()
+            if wait_mode == "block":
+                consumed_event.wait(stream=stream)
+                # Host-issued writes into expert_buffer (e.g. NIXL RDMA reads)
+                # are not stream-ordered, so wait until move_from_buffer has
+                # run on the GPU.
+                stream.synchronize()
+            elif wait_mode == "poll":
+                # The same wait without a blocking call into the device
+                # runtime while the serving thread submits.
+                while not consumed_event.query():
+                    time.sleep(_POLL_S)
+                consumed_event.clear()
+            else:  # skip: the commit was enqueued; nothing here reads it
+                consumed_event.clear()
+            _add_ms(cost, "device_wait_ms", started)
             assert model_state.pending_result is None
             # Woken by an FT reset's record, not a normal consume.
             if state.ft_reset_epoch != reset_epoch:

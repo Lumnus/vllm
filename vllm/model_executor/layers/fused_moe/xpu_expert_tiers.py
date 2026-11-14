@@ -1824,6 +1824,8 @@ class ExpertTiers:
         move.stats = {
             "units": float(len(plan.reads)),
             "bytes": float(len(plan.reads) * self.slot_bytes()),
+            "card_bytes": float(len(plan.to_fast) * self.slot_bytes()),
+            "changed": float(len(plan.changed)),
             "prepare_ms": (time.perf_counter() - t0) * 1e3,
         }
         return move
@@ -1969,7 +1971,7 @@ class ExpertTiers:
     def prepared_stats(prepared: "PreparedMove") -> dict[str, float]:
         return {
             k: prepared.stats[k]
-            for k in ("units", "bytes", "prepare_ms")
+            for k in ("units", "bytes", "card_bytes", "changed", "prepare_ms")
             if k in prepared.stats
         }
 

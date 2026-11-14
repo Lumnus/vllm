@@ -39,6 +39,7 @@ DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
 EPLBPolicyOption = Literal["default", "incremental"]
 EPLBResidencyMaskOption = Literal["off", "nonresident", "coldest"]
+EPLBWorkerGpuWait = Literal["block", "poll", "skip"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 EPLBCommunicatorBackend = Literal[
     "torch_nccl", "torch_gloo", "torch_xccl", "nixl", "pynccl", "symm_mem"
@@ -69,13 +70,53 @@ class EPLBConfig:
 
     window_size: int = Field(default=1000, gt=0)
     """Window size for expert load recording."""
-    step_interval: int = Field(default=3000, gt=0)
+    step_interval: int = Field(default=0, ge=0)
     """
     Interval for rearranging experts in expert parallelism.
 
     Note that if this is greater than the EPLB window size, only the metrics
     of the last `lb_window_size` steps will be used for rearranging experts.
+
+    0 (default): no periodic full rearrangement. EPLB observes (the load
+    window records every step), tier passes run if `tier_interval` asks for
+    them, and a rearrangement happens when asked for (the runtime-control
+    verb `eplb.rearrange`, a state file at start). A positive value turns
+    periodic rearrangements on; both can be changed while serving
+    (`eplb.set`).
     """
+
+    min_imbalance: float = Field(default=0.0, ge=0.0)
+    """A periodic full rearrangement starts only when the busiest EP rank
+    carries at least `1 + min_imbalance` times the mean rank load of the
+    window (summed over the MoE layers, by the current placement); below it
+    the interval passes without a move (counted in the EPLB state). The test
+    runs on the all-reduced window, so every rank takes the same decision.
+    0 (default): every interval rearranges. A rearrangement asked for by the
+    runtime-control verb is not held back. Changeable while serving."""
+
+    move_min_gain: float | None = Field(default=None, ge=0.0)
+    """With `policy="incremental"`: the smallest reduction of the busiest
+    rank's load, as a fraction of the mean rank load, that one swap must
+    bring to be made. None (default): the policy's own 0.001. A larger value
+    leaves near-balanced layers as they are, so a rearrangement moves only
+    what pays. Changeable while serving."""
+
+    interval_from_end: bool = False
+    """Count `step_interval` from the end of the previous rearrangement (its
+    last layer's commit) instead of from its start, so that a rearrangement
+    lasting longer than the interval is not followed by the next at once.
+    Changeable while serving."""
+
+    worker_gpu_wait: EPLBWorkerGpuWait = "block"
+    """How the async worker waits, after each layer, for the serving thread's
+    commit of that layer: "block" (default) waits on the device for the
+    commit to have run (a host synchronize per layer, through most of every
+    step of a move); "poll" waits for the same thing by querying the event
+    with short sleeps (no blocking call into the device runtime); "skip", for
+    layers that fill their slots from the expert store, waits for the commit
+    on the host only (their next layer's reads use pool rows released by
+    their own events, so nothing waits on the device). Layers that move
+    weights between ranks always block. Changeable while serving."""
 
     num_redundant_experts: int = Field(default=None, ge=0)  # type: ignore[assignment]
     """Number of redundant experts to use for expert parallelism.
@@ -279,6 +320,10 @@ class EPLBConfig:
                 "trace_rotate_mb",
                 "trace_keep",
                 "max_moves_per_rank",
+                "min_imbalance",
+                "move_min_gain",
+                "interval_from_end",
+                "worker_gpu_wait",
                 "tier_hysteresis",
                 "tier_interval",
                 "tier_max_moves",

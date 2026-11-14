@@ -13,6 +13,9 @@ server has one, is read from `VLLM_API_KEY`.
                                 [--max-moves N] [--policy default|incremental]
                                 [--tier-interval N] [--tier-max-moves N]
                                 [--tier-hot X] [--tier-warm X]
+                                [--min-imbalance X] [--move-min-gain X|none]
+                                [--interval-from-end on|off]
+                                [--worker-gpu-wait block|poll|skip]
     runtime_control.py eplb save [--path P] [--source last|window]
     runtime_control.py eplb load [--path P]
     runtime_control.py store scrub [--moved-only]
@@ -138,6 +141,14 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
             _set(a, "tier_max_moves", ns.tier_max_moves)
             _set(a, "tier_hot", ns.tier_hot)
             _set(a, "tier_warm", ns.tier_warm)
+            _set(a, "min_imbalance", ns.min_imbalance)
+            if ns.move_min_gain is not None:
+                a["move_min_gain"] = (
+                    None if ns.move_min_gain == "none" else float(ns.move_min_gain)
+                )
+            if ns.interval_from_end is not None:
+                a["interval_from_end"] = ns.interval_from_end == "on"
+            _set(a, "worker_gpu_wait", ns.worker_gpu_wait)
         elif verb == "save":
             _set(a, "path", ns.path)
             a["source"] = ns.source
@@ -465,6 +476,12 @@ def _parser() -> argparse.ArgumentParser:
     es.add_argument("--tier-max-moves", type=int, help="reads per layer per pass")
     es.add_argument("--tier-hot", type=float)
     es.add_argument("--tier-warm", type=float)
+    es.add_argument(
+        "--min-imbalance", type=float, help="skip periodic moves below 1+x imbalance"
+    )
+    es.add_argument("--move-min-gain", help="least gain per swap, or 'none'")
+    es.add_argument("--interval-from-end", choices=("on", "off"))
+    es.add_argument("--worker-gpu-wait", choices=("block", "poll", "skip"))
     sv = e.add_parser("save")
     sv.add_argument("--path")
     sv.add_argument("--source", choices=("last", "window"), default="last")

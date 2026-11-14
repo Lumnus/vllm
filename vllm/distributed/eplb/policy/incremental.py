@@ -36,11 +36,15 @@ class IncrementalEplbPolicy(AbstractEplbPolicy):
     as a fraction of the mean rank load."""
 
     @classmethod
-    def configured(cls, max_moves_per_rank: int) -> type["IncrementalEplbPolicy"]:
-        """This policy with its move bound set."""
-        return type(
-            cls.__name__, (cls,), {"max_moves_per_rank": int(max_moves_per_rank)}
-        )
+    def configured(
+        cls, max_moves_per_rank: int, min_gain: float | None = None
+    ) -> type["IncrementalEplbPolicy"]:
+        """This policy with its move bound (and, when given, its smallest
+        gain per swap) set."""
+        attrs: dict[str, float | int] = {"max_moves_per_rank": int(max_moves_per_rank)}
+        if min_gain is not None:
+            attrs["min_gain"] = float(min_gain)
+        return type(cls.__name__, (cls,), attrs)
 
     @classmethod
     def rebalance_experts(
