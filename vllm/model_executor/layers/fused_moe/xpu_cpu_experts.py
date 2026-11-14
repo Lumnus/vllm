@@ -60,7 +60,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
@@ -903,6 +903,9 @@ class CpuExpertStats:
     stage_copy_ms: float = 0.0
     stage_by_cost: int = 0
     stage_declined: int = 0
+    # of the layer calls that staged, those whose experts went to the
+    # device staging rows by DMA (stage_device_rows)
+    stage_device: int = 0
 
 
 class StageCost:
@@ -1395,9 +1398,16 @@ class CpuExpertRuntime:
         phys = ids.reshape(-1)[selection.pair]
         uniq, counts = np.unique(phys, return_counts=True)
         rows = None
+        on_device = 0
         if by_cost:
             rows = tiers.stage_rows(device)
-            heavy, plan = self._staged_by_cost(uniq, counts, rows.num_rows)
+            on_device = self._device_rows(rows)
+            heavy, plan = self._staged_by_cost(
+                uniq,
+                counts,
+                on_device or rows.num_rows,
+                dma_batch=rows.DMA_BATCH if on_device else 0,
+            )
             rule = f"by the cost model ({plan})"
         else:
             heavy = uniq[counts >= threshold]
@@ -1408,9 +1418,11 @@ class CpuExpertRuntime:
             return None
         if rows is None:
             rows = tiers.stage_rows(device)
-        if not by_cost and heavy.size > rows.num_rows:  # the busiest ones
+            on_device = self._device_rows(rows)
+        limit = on_device or rows.num_rows
+        if not by_cost and heavy.size > limit:  # the busiest ones
             by_calls = counts[counts >= threshold]
-            heavy = heavy[np.argsort(-by_calls, kind="stable")[: rows.num_rows]]
+            heavy = heavy[np.argsort(-by_calls, kind="stable")[:limit]]
         assert tiers.slot_logical is not None and tiers.store_binding is not None
         layer = tiers.store_binding.store_layer
         heavy_keys = [
@@ -1419,7 +1431,14 @@ class CpuExpertRuntime:
         cache_rows = self.cache.acquire(heavy_keys)
         copied = time.perf_counter()
         try:
-            self._copy_to_stage(cache_rows, rows)
+            if on_device:
+                # each batch of rows crosses to the card while the host
+                # copies the next one into the pinned rows
+                rows.begin_dma()
+                self._copy_to_stage(cache_rows, rows, rows.to_device)
+                rows.end_dma()
+            else:
+                self._copy_to_stage(cache_rows, rows)
         finally:
             self.cache.release(cache_rows)
         copy_s = time.perf_counter() - copied
@@ -1435,14 +1454,19 @@ class CpuExpertRuntime:
         st.per_tier["staged"] += staged_calls
         st.stage_ms += (time.perf_counter() - start) * 1e3
         st.stage_copy_ms += copy_s * 1e3
+        # with device rows the host's copy time includes enqueueing the DMAs
+        # (asynchronous from pinned rows): still the host's time per unit
         self.cost.copied(int(heavy.size), copy_s * 1e6)
+        if on_device:
+            st.stage_device += 1
+        where = "device rows" if on_device else "pinned rows, read by UVA"
         if by_cost:
             st.stage_by_cost += 1
             logger.info_once(
                 "CPU experts: a layer call of %d tokens (stage_min_tokens %d) "
                 "staged CPU-tier experts to the card by the cost model "
                 "(%s: %d of %d experts, %d calls; the CPU computes the other %d; "
-                "copies %.2f ms on %d threads).",
+                "copies %.2f ms on %d threads; the card reads them from %s).",
                 n,
                 min_tokens,
                 tiers.layer_name,
@@ -1452,6 +1476,7 @@ class CpuExpertRuntime:
                 n_calls - staged_calls,
                 copy_s * 1e3,
                 self._copy_threads(),
+                where,
             )
         else:
             logger.info_once(
@@ -1469,7 +1494,7 @@ class CpuExpertRuntime:
                 "cpu",
                 logger,
                 "%s: %d tokens, staged %d of %d CPU-tier experts %s, %d of %d "
-                "calls; copies %.2f ms",
+                "calls; copies %.2f ms; %s",
                 tiers.layer_name,
                 n,
                 heavy.size,
@@ -1478,17 +1503,42 @@ class CpuExpertRuntime:
                 staged_calls,
                 n_calls,
                 copy_s * 1e3,
+                where,
             )
+        if on_device:
+            logger.info_once(
+                "CPU experts: staged experts go to the card's device staging "
+                "rows by DMA (%s: %d experts; stage_device_rows %d).",
+                tiers.layer_name,
+                heavy.size,
+                on_device,
+            )
+            return tiers.stage_device_impl(rows)
         return tiers.stage_impl(rows)
+
+    def _device_rows(self, rows: Any) -> int:
+        """Device staging rows in use: ``stage_device_rows`` up to those
+        reserved at load (0: the card reads the pinned rows by UVA)."""
+        return min(
+            int(getattr(self.config, "stage_device_rows", 0)),
+            int(getattr(rows, "device_rows", 0)),
+        )
 
     def _copy_threads(self) -> int:
         return max(1, int(getattr(self.config, "stage_copy_threads", 1)))
 
-    def _copy_to_stage(self, cache_rows: Sequence[int], rows: Any) -> None:
+    def _copy_to_stage(
+        self,
+        cache_rows: Sequence[int],
+        rows: Any,
+        done: Callable[[int, int], None] | None = None,
+    ) -> None:
         """The units in host cache rows ``cache_rows`` into staging rows
         ``0..len-1``, tensor by tensor, split over ``stage_copy_threads``
         threads (each a contiguous range of the rows; torch's copies leave
-        the GIL, so the threads copy at once)."""
+        the GIL, so the threads copy at once). With ``done``: in batches of
+        ``rows.DMA_BATCH`` rows, ``done(lo, hi)`` after each (the device
+        rows' DMA of the batch, which crosses while the next is copied)."""
         L = self.layout
         n = len(cache_rows)
         index = torch.tensor(list(cache_rows), dtype=torch.int64)
@@ -1499,16 +1549,27 @@ class CpuExpertRuntime:
                 src = self.cache.slab[:, offset : offset + L.nbytes[name]]
                 torch.index_select(src, 0, idx, out=rows.rows_u8(name)[lo:hi])
 
-        threads = min(self._copy_threads(), n)
-        if threads <= 1:
-            part(0, n)
+        if done is None:
+            self._copy_range(part, 0, n)
             return
-        bounds = np.linspace(0, n, threads + 1).astype(int)
+        batch = max(1, int(rows.DMA_BATCH))
+        for lo in range(0, n, batch):
+            hi = min(n, lo + batch)
+            self._copy_range(part, lo, hi)
+            done(lo, hi)
+
+    def _copy_range(self, part: Callable[[int, int], None], lo: int, hi: int) -> None:
+        """``part`` over rows ``lo..hi-1``, split over the copy threads."""
+        threads = min(self._copy_threads(), hi - lo)
+        if threads <= 1:
+            part(lo, hi)
+            return
+        bounds = np.linspace(lo, hi, threads + 1).astype(int)
         pool = self._copy_pool(threads)
         futures = [
-            pool.submit(part, int(lo), int(hi))
-            for lo, hi in zip(bounds[:-1], bounds[1:])
-            if hi > lo
+            pool.submit(part, int(a), int(b))
+            for a, b in zip(bounds[:-1], bounds[1:])
+            if b > a
         ]
         for f in futures:
             f.result()
@@ -1525,7 +1586,11 @@ class CpuExpertRuntime:
         return pool
 
     def _staged_by_cost(
-        self, experts: np.ndarray, calls: np.ndarray, num_rows: int
+        self,
+        experts: np.ndarray,
+        calls: np.ndarray,
+        num_rows: int,
+        dma_batch: int = 0,
     ) -> tuple[np.ndarray, str]:
         """Which of a layer call's CPU-tier ``experts`` (with their ``calls``)
         go to the card through the staging rows: the busiest ``k`` for the
@@ -1541,7 +1606,21 @@ class CpuExpertRuntime:
         ``stage_card_us``). S overlaps the card's own experts of the layer
         and G the CPU's work, which is why the two are not simply added; S is
         charged in full (the card's own time is not seen from the host), so
-        the rule errs towards the CPU."""
+        the rule errs towards the CPU.
+
+        With device staging rows (``dma_batch`` > 0, the rows per DMA batch)
+        the card does not read host memory: each batch of rows crosses by DMA
+        (D = ``stage_dma_us`` per unit) while the host copies the next batch,
+        so the staged experts are on the card when the last DMA ends,
+
+            R(k) = max over batches j of S(through j) + D(from j on),
+
+        which, linear in j for the full batches, is the largest of j = 1, the
+        last full batch and the last batch. The card's call over device rows
+        costs what its resident experts do (not charged, like the card's own
+        experts). The layer's host-side
+        time is then max(S(k) + C(k), R(k)): the CPU starts on the rest once
+        the host's copies are done, the card once the last DMA is."""
         order = np.argsort(-calls, kind="stable")
         cpu_us = self.cost.cpu_us(calls[order])  # per expert, busiest first
         total = float(cpu_us.sum())
@@ -1549,8 +1628,24 @@ class CpuExpertRuntime:
         k = np.arange(limit + 1)
         left = total - np.concatenate(([0.0], np.cumsum(cpu_us[:limit])))
         copy_us = self.cost.copy_us(self.layout.row_bytes, self._copy_threads())
-        card_us = float(getattr(self.config, "stage_card_us", 100.0))
-        objective = k * copy_us + np.maximum(k * card_us, left)
+        if dma_batch > 0:
+            dma_us = float(getattr(self.config, "stage_dma_us", 140.0))
+            batch = int(dma_batch)
+            batches = -(-k // batch)  # B, 0 at k = 0
+            last = k - np.maximum(batches - 1, 0) * batch  # the last batch's rows
+            first = np.minimum(k, batch) * copy_us + k * dma_us
+            final = k * copy_us + last * dma_us
+            # the last full batch (j = B - 1), where there are two or more
+            before = np.where(
+                batches >= 2,
+                (batches - 1) * batch * copy_us + (batch + last) * dma_us,
+                0.0,
+            )
+            ready = np.maximum(np.maximum(first, final), before)
+            objective = np.maximum(k * copy_us + left, ready)
+        else:
+            card_us = float(getattr(self.config, "stage_card_us", 100.0))
+            objective = k * copy_us + np.maximum(k * card_us, left)
         best = int(np.argmin(objective))  # the first minimum: fewest staged
         plan = (
             f"{best} staged: host {objective[best] / 1e3:.2f} ms against "
@@ -1964,6 +2059,7 @@ class CpuExpertRuntime:
             "stage_copy_ms": st.stage_copy_ms,
             "stage_by_cost": st.stage_by_cost,
             "stage_declined": st.stage_declined,
+            "stage_device": st.stage_device,
         }
 
     def log_stats(self) -> None:
