@@ -248,6 +248,24 @@ def test_refusals(monkeypatch, tmp_path, op):
     tstore.reset_sessions()
 
 
+@pytest.mark.parametrize("level", [3, 4, 5, 6, 7])
+def test_auto_takes_a_wider_instruction_set(monkeypatch, tmp_path, op, level):
+    """Kernels with AVX-VNNI / AVX-512 / AMX codes report a level above 2:
+    the tier starts with it and checks it against the scalar code."""
+    if op and cx._op_isa(0) < level:
+        pytest.skip("the loaded op's host lacks the level")
+    if not op:
+        monkeypatch.setattr(cx, "_op_isa", lambda want: level)
+    env = _host_env(monkeypatch, tmp_path, cpu_isa="auto")
+    assert env.tiers[0].cpu.isa == level
+    tstore.reset_sessions()
+
+
+def test_every_level_has_a_setting_and_a_name():
+    assert sorted(cx._ISA.values()) == list(range(9))
+    assert sorted(cx._ISA_NAME) == list(range(1, 9))
+
+
 def test_auto_refuses_a_host_without_avx2(monkeypatch, tmp_path, op):
     run(monkeypatch, tmp_path, store=True)
     monkeypatch.setattr(cx, "_op_isa", lambda want: 1)

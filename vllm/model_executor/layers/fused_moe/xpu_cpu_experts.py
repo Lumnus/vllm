@@ -83,8 +83,33 @@ logger = init_logger(__name__)
 
 # The tensors of an expert unit, in the order the op's offsets name them.
 UNIT_TENSORS = ("w13", "w2", "w13_scales", "w2_scales")
-_ISA = {"auto": 0, "scalar": 1, "avx2": 2}
-_ISA_NAME = {1: "scalar", 2: "AVX2+FMA"}
+# The kernels' dispatch levels (int4_moe_cpu_isa): auto picks the widest of
+# 1..7 the host has; every level but 8 computes the scalar code's result bit
+# for bit; 8 adds the card-class AMX-BF16 prefill (not bit-identical, asked
+# for explicitly). Kernels before the levels know 0..2 only.
+_ISA = {
+    "auto": 0,
+    "scalar": 1,
+    "avx2": 2,
+    "avx-vnni": 3,
+    "avx512": 4,
+    "avx512-vnni": 5,
+    "avx512-bf16": 6,
+    "amx": 7,
+    "amx-card-class": 8,
+}
+_ISA_NAME = {
+    1: "scalar",
+    2: "AVX2+FMA",
+    3: "AVX2+FMA+AVX-VNNI",
+    4: "AVX-512",
+    5: "AVX-512+VNNI",
+    6: "AVX-512+VNNI+BF16",
+    7: "AMX+AVX-512",
+    8: "AMX+AVX-512, card-class AMX-BF16 prefill",
+}
+# the level whose prefill is not the scalar code's result bit for bit
+_ISA_CARD_CLASS = 8
 PAGE = 4096
 # Up to this many calls in a layer call, its experts are listed with a dict
 # (cheaper than numpy's sort at decode sizes); above, with np.unique.
@@ -1014,7 +1039,7 @@ class CpuExpertRuntime:
         self.threads = int(config.cpu_threads)
         want = _ISA[config.cpu_isa]
         self.isa = _op_isa(want)
-        if self.isa != 2 and config.cpu_isa == "auto":
+        if self.isa < 2 and config.cpu_isa == "auto":
             raise CpuExpertError(
                 "this host has no AVX2 with FMA: the CPU expert tier would run "
                 "its scalar code, hundreds of times slower. Set "
@@ -1222,10 +1247,12 @@ class CpuExpertRuntime:
             )
             grouped_steps = bf16_steps(grouped, grouped_want)
             steps = max(steps, grouped_steps)
-        if self.isa == 2:
+        if 2 <= self.isa != _ISA_CARD_CLASS:
             # The vector code must take the scalar code's steps in its order
             # (the build keeps fp contraction and reassociation off): the two
-            # agree bit for bit, or the build is not the one tested.
+            # agree bit for bit, or the build is not the one tested. (Level 8
+            # differs from the scalar code at prefill on purpose; its check
+            # is the one against the card's arithmetic below.)
             scalar = torch.empty_like(x)
             isa, self.isa = self.isa, 1
             try:
@@ -1241,10 +1268,10 @@ class CpuExpertRuntime:
                 self.isa = isa
             if not torch.equal(scalar.view(torch.int16), out.view(torch.int16)):
                 raise CpuExpertError(
-                    "the CPU expert kernel's AVX2 code and its scalar code "
-                    "disagree: the kernels were built with floating-point "
-                    "contraction or reassociation on; refusing to compute "
-                    "experts with it"
+                    f"the CPU expert kernel's {_ISA_NAME[self.isa]} code and "
+                    "its scalar code disagree: the kernels were built with "
+                    "floating-point contraction or reassociation on; refusing "
+                    "to compute experts with it"
                 )
         if not steps <= 1.0:
             raise CpuExpertError(
@@ -1271,7 +1298,9 @@ class CpuExpertRuntime:
             differ,
             out.numel(),
             steps,
-            "; AVX2 and scalar code bit-identical" if self.isa == 2 else "",
+            f"; {_ISA_NAME[self.isa]} and scalar code bit-identical"
+            if 2 <= self.isa != _ISA_CARD_CLASS
+            else "",
             "; the card's W4A8 GEMM for every call"
             if self.w4a8
             else "; the card's grouped GEMM and GEMV, chosen per layer call"
