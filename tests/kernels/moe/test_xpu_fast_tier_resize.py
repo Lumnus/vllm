@@ -527,22 +527,38 @@ def test_the_rows_go_into_the_range_before_the_weights_load(
     _assert_serves_the_store(env, tiers)
 
 
-def test_a_move_the_device_does_not_pay_back_is_named(monkeypatch, caplog_vllm):
-    """Free memory after the moves worse than rows and granules alone by
-    more than 0.3 GiB: a WARNING with torch's numbers."""
+def _moves_line(monkeypatch, caplog, torch_now, free_delta):
+    """The moves' line and its WARNING for one layer, with torch's
+    allocated/reserved at the line and the move's own free-memory change."""
     g = 1 << 30
+    caplog.clear()
+    ft.reset_adoption_summary()
     old = ft.OldStorages([torch.zeros(1024, dtype=torch.uint8)])  # freed now
-    free = iter([10 * g - 4 * g])
-    monkeypatch.setattr(ft, "_free_or_none", lambda device: next(free))
-    monkeypatch.setattr(ft, "_torch_or_none", lambda device: (7 * g, 11 * g))
+    monkeypatch.setattr(ft, "_free_or_none", lambda device: 10 * g + free_delta)
+    monkeypatch.setattr(ft, "_torch_or_none", lambda device: torch_now)
     ft.finish_move("l0", old, 0, torch.device("cpu"), 10 * g, 1)
-    assert ft.adoption_summary()["free_delta"] == -4 * g
-    warned = [
-        r.getMessage()
-        for r in caplog_vllm.records
-        if "torch keeps it cached" in r.getMessage()
-    ]
-    assert warned and "reserved 11.00 GiB" in warned[0]
+    msgs = [r.getMessage() for r in caplog.records]
+    line = [m for m in msgs if "moved into their reserved ranges" in m]
+    warned = [m for m in msgs if "will be smaller" in m]
+    return line, warned
+
+
+def test_the_moves_line_reads_what_the_kv_sizing_will_pay(monkeypatch, caplog_vllm):
+    """The line reports torch's cache that stays reserved after the moves and
+    a cache release (what the KV sizing pays for), and warns only when that
+    is large; a move's own free-memory change (at construction, reused by
+    the rest of the load) raises no alarm."""
+    g = 1 << 30
+    # the card boot of construction moves: the moves' own deltas short by
+    # 3.4 GiB, torch holding 0.29 GiB at the line: no WARNING
+    line, warned = _moves_line(
+        monkeypatch, caplog_vllm, (int(6.19 * g), int(6.48 * g)), -int(3.43 * g)
+    )
+    assert line and "keeps 0.29 GiB cached" in line[0] and not warned
+    # the card boot of the move after loading: torch holds 4.1 GiB
+    line, warned = _moves_line(monkeypatch, caplog_vllm, (7 * g, int(11.1 * g)), 0)
+    assert warned and "keeps 4.10 GiB cached" in warned[0]
+    assert "reserved 11.10 GiB" in warned[0]
 
 
 def test_a_capacity_range_maps_only_the_rows_in_use(fake_xpu):  # noqa: F811

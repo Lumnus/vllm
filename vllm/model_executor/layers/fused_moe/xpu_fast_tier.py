@@ -534,9 +534,10 @@ def _holders(data_ptr: int) -> str:
 _MOVES: dict[str, dict[str, Any]] = {}
 _LEDGER: dict[str, Any] = {"holders": None, "logged_at": None}
 
-# Free memory worse than rows and granules alone by more than this: the
-# freed storage did not go back to the device (torch keeps it cached).
-STRANDED_WARN_BYTES = int(0.3 * 2**30)
+# Torch's cache it cannot give back after the moves, above which the line
+# warns: a load leaves some (about 0.3 GiB per rank on QFN two-card boots
+# with or without the card tier); a stranded card tier is several GiB.
+STRANDED_WARN_BYTES = int(0.5 * 2**30)
 
 
 def _free_or_none(device: torch.device) -> int | None:
@@ -655,34 +656,41 @@ def _log_moves(device: torch.device) -> None:
     _LEDGER["logged_at"] = key
     s = adoption_summary()
     gib = 2**30
-    alone = s["old"] - s["mapped"]
+    # What the KV cache's sizing will pay for: torch's cache that stays
+    # reserved after it gives back all it can (segments that still hold a
+    # live block). Read here, at weight processing, after the last move and
+    # a cache release, and not summed from the moves: a move at construction
+    # frees blocks that later allocations of the load reuse, so its own
+    # change of free memory says nothing about what the sizing will read.
+    give_back_torch_cache()
+    numbers = _torch_or_none(device)
+    held = None if numbers is None else max(numbers[1] - numbers[0], 0)
     logger.info(
         "Expert tiers: the card rows of %d layers moved into their reserved "
         "ranges (%s): %.2f GiB mapped, %.2f GiB of storage given up (%.2f GiB "
         "of it held by other tensors, %.2f GiB of that released in place); "
-        "device free memory %s over the moves (rows and granules alone: "
-        "%+.2f GiB).",
+        "torch now keeps %s cached that it cannot give back (allocated %s, "
+        "reserved %s).",
         s["layers"],
         ", ".join(sorted(s["when"])),
         s["mapped"] / gib,
         s["old"] / gib,
         s["stale"] / gib,
         s["released"] / gib,
-        "unknown" if s["free_delta"] is None else f"{s['free_delta'] / gib:+.2f} GiB",
-        alone / gib,
+        "?" if held is None else f"{held / gib:.2f} GiB",
+        "?" if numbers is None else f"{numbers[0] / gib:.2f} GiB",
+        "?" if numbers is None else f"{numbers[1] / gib:.2f} GiB",
     )
-    if s["free_delta"] is not None and s["free_delta"] < alone - STRANDED_WARN_BYTES:
-        numbers = _torch_or_none(device)
+    if held is not None and held > STRANDED_WARN_BYTES:
         logger.warning(
-            "Expert tiers: the device got back %.2f GiB less than the card "
-            "rows' storage that the moves gave up (%.2f GiB): torch keeps it "
-            "cached (allocated %s GiB, reserved %s GiB), in segments it cannot "
-            "return while other tensors live in them, and the KV cache, sized "
-            "from free device memory, pays for it.",
-            (alone - s["free_delta"]) / gib,
-            s["old"] / gib,
-            "?" if numbers is None else f"{numbers[0] / gib:.2f}",
-            "?" if numbers is None else f"{numbers[1] / gib:.2f}",
+            "Expert tiers: torch keeps %.2f GiB cached after the card rows "
+            "moved and its cache was given back (allocated %.2f GiB, reserved "
+            "%.2f GiB): free blocks in segments that still hold live tensors. "
+            "The KV cache, sized from free device memory, will be smaller by "
+            "about that much.",
+            held / gib,
+            numbers[0] / gib,  # type: ignore[index]
+            numbers[1] / gib,  # type: ignore[index]
         )
 
 
