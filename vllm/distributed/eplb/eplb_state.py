@@ -465,6 +465,17 @@ class EplbState:
         layer whose tier capacity changed)."""
         self.tier_step: int = 0
         """Steps since the last tier pass."""
+        self.steps_total: int = 0
+        """EPLB steps since start (the tier passes' read ledger counts its
+        window in them; `EPLBConfig.tier_window_moves`)."""
+        self.tier_pass_skips: int = 0
+        """Tier passes not started because their cut would move fewer than
+        `EPLBConfig.tier_min_changes` slots."""
+        self.last_tier_changes: int | None = None
+        """The slots the last tier pass test counted (all layers and ranks)."""
+        self.tier_window_limited: int = 0
+        """Layers of tier passes whose read budget the window's cap
+        (`EPLBConfig.tier_window_moves`) lowered."""
         self.last_rearrange_seconds: float | None = None
         """Wall time of the last synchronous rearrangement on this rank."""
         if self.device.type in ("cuda", "xpu"):
@@ -1161,6 +1172,7 @@ class EplbState:
         # rearrangement step and perform rearrangement to ensure all ranks are
         # performing collective communication.
         self.expert_rearrangement_step += 1
+        self.steps_total += 1
         self._time_step()
 
         # Models whose pending layer was committed (or given up) at this step:
@@ -1231,8 +1243,13 @@ class EplbState:
         rank."""
         stats = model_state.eplb_stats
         full = stats is not None and not stats.tier_only
-        if full and self.parallel_config.eplb_config.interval_from_end:
-            self.expert_rearrangement_step = 0
+        if self.parallel_config.eplb_config.interval_from_end:
+            if full:
+                self.expert_rearrangement_step = 0
+            elif stats is not None:
+                # a tier pass: the next one `tier_interval` steps from here,
+                # so passes longer than the interval do not chain
+                self.tier_step = 0
         if runtime_debug.on("eplb"):
             self._emit_move_cost(model_state, ep_rank, full)
         model_state.move_cost = {}
@@ -1350,6 +1367,69 @@ class EplbState:
         if due:
             self.tier_step = 0
         return due
+
+    def _tier_pass_too_small(
+        self, global_expert_load_windows: list[torch.Tensor]
+    ) -> bool:
+        """`EPLBConfig.tier_min_changes`: whether this tier pass would move
+        fewer slots than that, summed over the layers (each rank its own
+        slots, by the all-reduced window) and over the EP ranks; then it is
+        skipped on every rank (the sum is all-reduced, so every rank takes
+        the same branch). A pass a capacity change asked for always runs."""
+        config = self.parallel_config.eplb_config
+        least = int(config.tier_min_changes)
+        if least <= 0:
+            return False
+        wanted = any(
+            getattr(m, "tier_pass_wanted", False)
+            for s in self.model_states.values()
+            if s.movers is not None
+            for m in s.movers
+            if m is not None
+        )
+        changes = 0
+        if not wanted:
+            with gpu_sync_allowed():
+                for model_state, window in zip(
+                    self.model_states.values(), global_expert_load_windows
+                ):
+                    if model_state.movers is None:
+                        continue
+                    load = window.float().cpu().numpy()
+                    phys2log = model_state.physical_to_logical_map.cpu().numpy()
+                    for layer, mover in enumerate(model_state.movers):
+                        count = getattr(mover, "tier_changes_wanted", None)
+                        if count is None:
+                            continue
+                        changes += int(
+                            count(
+                                phys2log[layer],
+                                load[layer],
+                                config.tier_hysteresis,
+                                config.tier_min_gain,
+                                config.tier_max_moves,
+                            )
+                        )
+        flags = torch.tensor([changes, int(wanted)], dtype=torch.int32, device="cpu")
+        ep_group = get_ep_group()
+        if ep_group.device_group.size() > 1:
+            ep_group.cpu_all_reduce_(flags)
+        total, wanted_any = (int(v) for v in flags.tolist())
+        self.last_tier_changes = None if wanted_any else total
+        if wanted_any or total >= least:
+            return False
+        self.tier_pass_skips += 1
+        if ep_group.device_group.rank() == 0 and runtime_debug.on("eplb"):
+            runtime_debug.emit(
+                "eplb",
+                logger,
+                "no tier pass: its cut would move %d slots over the layers and "
+                "ranks, below tier_min_changes %d (%d skipped so far)",
+                total,
+                least,
+                self.tier_pass_skips,
+            )
+        return True
 
     def _add_residency_mask(self, model_state: EplbModelState) -> None:
         """Create the model's residency mask and hand each MoE layer's router
@@ -1664,6 +1744,8 @@ class EplbState:
         global_expert_load_windows = self._allreduce_prepared(
             global_expert_load_windows, reduce_input
         )
+        if tier_only and self._tier_pass_too_small(global_expert_load_windows):
+            return None
         if (
             self.parallel_config.eplb_config.state_path is not None
             and is_main_rank

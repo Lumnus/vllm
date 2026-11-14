@@ -17,6 +17,8 @@ guards only `/v1`, `/v2`, `/inference` and `/cohere`).
 A refused operation answers 400 with `{"error": ...}`; nothing was changed.
 An operation that some rank could not apply answers 409 with the per-rank
 replies and whether the others were undone (`applied`: `partial` or `none`).
+An operation that runs on between steps answers 202 (`applied`: `applying`,
+or `waiting` for a `tiers.set` held while EPLB moves experts).
 """
 
 import hashlib
@@ -126,7 +128,9 @@ async def runtime_control(op: str, raw_request: Request):
         return JSONResponse(content=_refusal(str(e)), status_code=400)
     if op in ("profile.apply", "profile.state"):
         _profile_defaults(op, reply, raw_request)
-    status = {"all": 200, "applying": 202}.get(reply.get("applied"), 409)
+    status = {"all": 200, "applying": 202, "waiting": 202}.get(
+        reply.get("applied"), 409
+    )
     return JSONResponse(content=reply, status_code=status)
 
 

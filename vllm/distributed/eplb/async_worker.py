@@ -4,6 +4,7 @@
 
 import threading
 import time
+from collections import deque
 from typing import TYPE_CHECKING
 
 import torch
@@ -209,8 +210,16 @@ def _transfer_cycle(
                         new_physical_to_logical_map[layer_idx].numpy(),
                         model_state.plan_load[layer_idx].float().numpy(),
                         config.tier_hysteresis,
-                        **({"read_budget": config.tier_max_moves} if tier_only else {}),
+                        **(
+                            _tier_pass_args(state, model_state, layer_idx)
+                            if tier_only
+                            else {}
+                        ),
                     )
+                    if tier_only and config.tier_window_moves is not None:
+                        _tier_reads(model_state, layer_idx).append(
+                            (state.steps_total, int(prepared.stats.get("units", 0)))
+                        )
                 except Exception:
                     # A rearrangement is optional work: a read that failed or
                     # did not return must not take serving down. Nothing was
@@ -313,6 +322,42 @@ def _transfer_cycle(
                 time.perf_counter() - t_start,
             )
             _log_tier_classes(state, model_state)
+
+
+def _tier_reads(model_state: "EplbModelState", layer_idx: int) -> deque:
+    """The tier passes' reads of one layer on this rank: (EPLB step, units),
+    oldest first (`EPLBConfig.tier_window_moves`)."""
+    ledger = getattr(model_state, "tier_reads", None)
+    if ledger is None:
+        ledger = model_state.tier_reads = {}
+    return ledger.setdefault(layer_idx, deque())
+
+
+def _tier_pass_args(
+    state: "EplbState", model_state: "EplbModelState", layer_idx: int
+) -> dict:
+    """A tier pass's arguments to a layer's mover: the read budget
+    (`tier_max_moves`, less what the passes read in this layer over the last
+    `window_size` steps when `tier_window_moves` caps it) and the gain test
+    (`tier_min_gain`). Unset: the budget alone, as before."""
+    config = state.parallel_config.eplb_config
+    budget = config.tier_max_moves
+    cap = config.tier_window_moves
+    if cap is not None:
+        reads = _tier_reads(model_state, layer_idx)
+        since = state.steps_total - state.expert_load_window_size
+        while reads and reads[0][0] <= since:
+            reads.popleft()
+        used = sum(n for _, n in reads)
+        left = max(0, cap - used)
+        if budget is None or left < budget:
+            if used:
+                state.tier_window_limited += 1
+            budget = left
+    args: dict = {"read_budget": budget}
+    if config.tier_min_gain:
+        args["min_gain"] = config.tier_min_gain
+    return args
 
 
 def _log_tier_classes(state: "EplbState", model_state: "EplbModelState") -> None:

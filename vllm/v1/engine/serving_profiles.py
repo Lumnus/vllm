@@ -55,6 +55,16 @@ _KV_KEYS = ("tokens", "blocks", "fit", "deadline_s", "preempt")
 _TIERS_KEYS = ("fast_rows", "host_tier_bound")
 _RESIZE_ACTIVE = ("draining", "releasing", "unfinished")
 _FAST_ACTIVE = ("waiting", "draining", "committing")
+
+
+def _eplb_busy(refusal: str) -> bool:
+    """A refusal that is EPLB moving experts: a step waits for it (the fast
+    tier's rule, vllm/v1/engine/fast_tier.py)."""
+    from vllm.v1.engine.fast_tier import FastTierController
+
+    return any(b in refusal for b in FastTierController._EPLB_BUSY)
+
+
 # How long a step may wait for the engine to settle (a tower move).
 TOWER_WAIT_S = 300.0
 
@@ -477,17 +487,21 @@ class ServingProfiles:
         engine = self.engine
         refusals: list[str] = []
 
-        def worker(op: str, args: dict[str, Any]) -> None:
+        def worker(op: str, args: dict[str, Any], waits: bool = False) -> None:
             for reply in control._rpc("check", op, args):
-                if reply.get("refusal"):
-                    refusals.append(f"{op}: rank {reply['rank']}: {reply['refusal']}")
+                refusal = reply.get("refusal")
+                if refusal and not (waits and _eplb_busy(refusal)):
+                    refusals.append(f"{op}: rank {reply['rank']}: {refusal}")
 
         for section, op in (("cpu", "cpu.set"), ("eplb", "eplb.set")):
             if profile.get(section):
                 worker(op, profile[section])
         tiers = profile.get("tiers") or {}
         if "host_tier_bound" in tiers:
-            worker("tiers.set", {"host_tier_bound": tiers["host_tier_bound"]})
+            # an EPLB move in flight is waited for by the step, not refused
+            worker(
+                "tiers.set", {"host_tier_bound": tiers["host_tier_bound"]}, waits=True
+            )
         if "fast_rows" in tiers:
             view, why = self.fast_tier.read()
             if view is None:
@@ -582,13 +596,7 @@ class ServingProfiles:
                 steps.append(op_step(op, op, profile[section]))
         tiers = profile.get("tiers") or {}
         if "host_tier_bound" in tiers:
-            steps.append(
-                op_step(
-                    "tiers.set host_tier_bound",
-                    "tiers.set",
-                    {"host_tier_bound": tiers["host_tier_bound"]},
-                )
-            )
+            steps.append(self._bound_step(tiers["host_tier_bound"]))
         tower = dict(profile.get("tower") or {})
         card_policy = tower.get("policy") == "card"
         if tower:
@@ -619,6 +627,41 @@ class ServingProfiles:
             steps.append(op_step("tower.set policy card", "tower.set", args))
             steps.append(self._tower_wait("tower on the accelerators", tower, True))
         return steps
+
+    def _bound_step(self, bound: Any) -> _Step:
+        """``tiers.set host_tier_bound``: applied at once, or held by the
+        engine while EPLB moves experts (``applied: waiting``); then the step
+        waits like the card tier's, reading the held record."""
+        control = self.control
+        step = _Step("tiers.set host_tier_bound", lambda: None)
+
+        def run() -> str | None:
+            from vllm.v1.engine.runtime_control import ControlRefused
+
+            reply = control.apply("tiers.set", {"host_tier_bound": bound})
+            step.detail = reply.get("changes") or reply.get("applied")
+            if reply.get("applied") == "waiting":
+                return "wait"
+            if reply.get("applied") not in (None, "all"):
+                raise ControlRefused(reply.get("error") or str(reply.get("applied")))
+            return None
+
+        def done() -> str | None:
+            controller = getattr(self.engine, "_fast_tier", None)
+            held = None if controller is None else controller.tier_set
+            if held is None:
+                return None
+            state = held.state.value
+            if state in _FAST_ACTIVE:
+                return "wait"
+            if state == "failed":
+                return held.message or "failed"
+            step.detail = "applied after waiting for EPLB"
+            return None
+
+        step.run = run
+        step.done = done
+        return step
 
     def _fast_step(self, value: Any, shrink: bool) -> _Step:
         step = _Step(f"fast tier {'down' if shrink else 'up'}", lambda: None)

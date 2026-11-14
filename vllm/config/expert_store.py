@@ -154,6 +154,24 @@ class ExpertStoreConfig:
     """Staging rows (pinned, shared by the layers of a rank); 0: as many as
     a layer has CPU slots."""
 
+    stage_min_tokens: int = Field(default=0, ge=0)
+    """With ``--cpu-offload-pinned-gb``: a layer call of at least this many
+    tokens chooses the CPU-tier experts it stages by a cost model instead of
+    ``stage_min_calls``: the busiest ones, as many as make the layer's
+    host-side time (copies into the staging rows, then the CPU's experts
+    while the card reads the staged ones) smallest, with the CPU's cost per
+    expert and per call fitted to its own measured calls. 0 (default): off.
+    Runtime setting (``cpu.set stage_min_tokens``)."""
+
+    stage_copy_threads: int = Field(default=1, ge=1, le=256)
+    """Threads that copy units from the host cache into the staging rows
+    (1, the default: one, on the forward's thread). Runtime setting."""
+
+    stage_card_us: float = Field(default=100.0, gt=0)
+    """The card's time per staged expert the staging cost model assumes
+    (µs; about what reading one unit through UVA costs a card beside its
+    resident experts). Runtime setting."""
+
     fast_rows_max: int = Field(default=0, ge=0)
     """0 (default): the card tier of each layer is fixed at load, as many rows
     as ``--cpu-offload-gb`` leaves on the card. N: the card tier can grow and
@@ -295,6 +313,9 @@ class ExpertStoreConfig:
                 # staging adds a call outside the captured graphs
                 "stage_min_calls",
                 "stage_rows",
+                "stage_min_tokens",
+                "stage_copy_threads",
+                "stage_card_us",
                 # the card tier's run-time settings (fast_rows_max is added
                 # by compile_factors when set)
                 "fast_rows_max",

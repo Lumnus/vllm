@@ -269,6 +269,8 @@ def _cpu_state() -> dict[str, Any] | None:
         },
         "counters": rt.snapshot(),
         "max_experts_per_layer_call": rt.stats.max_experts,
+        # what the staging rule weighs (stage_min_tokens)
+        "stage_cost": rt.cost.readout(),
     }
 
 
@@ -644,14 +646,13 @@ def _apply_scrub(worker: Any, args: dict) -> tuple[dict, dict, Any]:
 def _check_tiers_set(worker: Any, args: dict) -> str | None:
     if not _tiers():
         return "no expert layer keeps its slots in tiers (--cpu-offload-per-expert)"
+    from vllm.distributed.eplb.runtime_control import in_flight
+
     eplb = _eplb(worker)
-    if eplb is not None and any(
-        ms.rebalanced for ms in getattr(eplb, "model_states", {}).values()
-    ):
-        return (
-            "an EPLB rearrangement is in flight (its layers are being prepared "
-            "and committed one by one); ask after it completes"
-        )
+    why = None if eplb is None else in_flight(eplb)
+    if why is not None:
+        # the engine core waits for it (vllm/v1/engine/fast_tier.py)
+        return f"{why}; ask after it completes"
     for name, value in args.items():
         setting = _TIER_SETTINGS.get(name)
         if setting is None:
@@ -693,6 +694,12 @@ _CPU_SETTINGS: dict[str, tuple[type, float]] = {
     "cpu_threads": (int, 1),
     "host_cache_gib": (float, 0.0),
     "stage_min_calls": (int, 0),
+    # prefill staging by the cost model: the fewest tokens of a layer call
+    # that stages by it (0 = off), the threads copying units into the
+    # staging rows, the card's time per staged expert the model assumes
+    "stage_min_tokens": (int, 0),
+    "stage_copy_threads": (int, 1),
+    "stage_card_us": (float, 0.0),
 }
 _NO_CPU_TIER = (
     "no experts are computed on the CPU in this engine (--cpu-offload-pinned-gb)"
@@ -755,7 +762,7 @@ def _set_cpu(rt: Any, values: dict[str, Any]) -> None:
         elif name == "cpu_threads":
             rt.set_threads(int(value))
         else:
-            setattr(rt.config, name, int(value))
+            setattr(rt.config, name, _CPU_SETTINGS[name][0](value))
 
 
 def _apply_cpu_set(worker: Any, args: dict) -> tuple[dict, dict, Any]:

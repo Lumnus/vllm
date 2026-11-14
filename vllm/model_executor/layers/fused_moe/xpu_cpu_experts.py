@@ -692,6 +692,86 @@ class CpuExpertStats:
     stage_layers: int = 0
     stage_experts: int = 0
     stage_ms: float = 0.0
+    # of which copying units into the rows; layer calls that staged by the
+    # cost model (stage_min_tokens), and that it left on the CPU
+    stage_copy_ms: float = 0.0
+    stage_by_cost: int = 0
+    stage_declined: int = 0
+
+
+class StageCost:
+    """What the staging rule weighs, from this tier's own measurements.
+
+    CPU: one layer call's compute time ``y`` (µs) against its distinct
+    experts ``E`` and calls ``N``, ``y = a * E + b * N``, a ridge fit (decayed
+    sums, so it follows a change of threads or of the kernel) pulled towards
+    the prior ``A0_US``, ``B0_US`` (an AVX2 host at 8 threads: about 100 µs
+    per expert at one token, 34 µs per expert-token beyond) while the
+    data cannot separate the two (every call one token per expert, as in
+    decode). Copy: the measured µs per unit copied into the staging rows,
+    a moving mean; before the first copy, the unit's bytes at 8 GB/s per
+    copy thread up to 32 GB/s."""
+
+    A0_US = 100.0
+    B0_US = 34.0
+    DECAY = 0.99
+    PRIOR = 4.0  # weight of the prior, in layer calls of 10 experts
+
+    def __init__(self) -> None:
+        self.reset()
+        self._copy_us: float | None = None
+
+    def reset(self) -> None:
+        # decayed sums of E*E, E*N, N*N, E*y, N*y
+        self._s = [0.0] * 5
+        self.samples = 0
+
+    def observe(self, experts: int, calls: int, us: float) -> None:
+        e, n, d = float(experts), float(calls), self.DECAY
+        s = self._s
+        s[0] = d * s[0] + e * e
+        s[1] = d * s[1] + e * n
+        s[2] = d * s[2] + n * n
+        s[3] = d * s[3] + e * us
+        s[4] = d * s[4] + n * us
+        self.samples += 1
+
+    def coeffs(self) -> tuple[float, float]:
+        """(a, b) in µs: per expert and per call."""
+        lam = self.PRIOR * 100.0  # (10 experts)^2 per prior call
+        s = self._s
+        xx = np.array([[s[0] + lam, s[1]], [s[1], s[2] + lam]])
+        xy = np.array([s[3] + lam * self.A0_US, s[4] + lam * self.B0_US])
+        a, b = np.linalg.solve(xx, xy)
+        return max(float(a), 0.0), max(float(b), 0.0)
+
+    def cpu_us(self, calls: np.ndarray) -> np.ndarray:
+        a, b = self.coeffs()
+        return a + b * np.asarray(calls, dtype=np.float64)
+
+    def copied(self, units: int, us: float) -> None:
+        if units <= 0:
+            return
+        per = us / units
+        self._copy_us = (
+            per if self._copy_us is None else 0.8 * self._copy_us + 0.2 * per
+        )
+
+    def copy_us(self, unit_bytes: int, threads: int) -> float:
+        if self._copy_us is not None:
+            return self._copy_us
+        return unit_bytes / (min(8.0 * max(threads, 1), 32.0) * 1e3)
+
+    def readout(self) -> dict[str, float]:
+        a, b = self.coeffs()
+        return {
+            "cpu_us_per_expert": round(a, 1),
+            "cpu_us_per_call": round(b, 2),
+            "cpu_fit_samples": self.samples,
+            "copy_us_per_unit": None
+            if self._copy_us is None
+            else round(self._copy_us, 1),
+        }
 
 
 class CpuExpertRuntime:
@@ -730,6 +810,8 @@ class CpuExpertRuntime:
         # The arith of the layer call being computed (card_arith); 0 when the
         # op has no such argument (it computes the GEMV's arithmetic).
         self.arith = 0
+        # the staging rule's measurements (stage_min_tokens)
+        self.cost = StageCost()
         self._buffers: _Buffers | None = None
         self._last_stats = time.monotonic()
         self._first_logged = False
@@ -752,10 +834,13 @@ class CpuExpertRuntime:
         pool per thread count; pinned, at most one per core of the set)."""
         if threads < 1:
             raise ValueError("cpu_threads must be at least 1")
+        old = self.threads
         self.config.cpu_threads = int(threads)
         self.threads = int(threads)
         if self.cores:
             self._configure_threads()
+        if self.threads != old:
+            self.cost.reset()  # the fit was of the old thread count
 
     def _configure_threads(self) -> None:
         """Pin the op's workers (``VLLM_CPU_EXPERTS_CORES``) and set their
@@ -1004,32 +1089,49 @@ class CpuExpertRuntime:
         return b.out[:n].to(device, non_blocking=True)
 
     def stage(self, pending: Pending, device: torch.device) -> Any:
-        """Prefill staging (``stage_min_calls``): wait for the routing, and
-        copy the CPU-tier experts this layer call routes at least that many
-        tokens to into the staging rows (most calls first, as far as the rows
-        go), with their map. Returns the layer's kernel call over the rows for
-        the caller to run on the card, or None (nothing staged); the CPU then
-        computes only the rest (:meth:`finish`)."""
+        """Prefill staging: wait for the routing, and copy CPU-tier experts
+        this layer call routes to into the staging rows, with their map.
+        Returns the layer's kernel call over the rows for the caller to run on
+        the card, or None (nothing staged); the CPU then computes only the
+        rest (:meth:`finish`).
+
+        Which experts: in a layer call of at least ``stage_min_tokens`` tokens
+        (> 0), the set the cost model gives (:meth:`_staged_by_cost`);
+        otherwise, with ``stage_min_calls`` > 0, the experts routed at least
+        that many tokens (most calls first, as far as the rows go). Both 0:
+        nothing, without waiting."""
         threshold = int(self.config.stage_min_calls)
-        if threshold <= 0:
-            return None
+        min_tokens = int(getattr(self.config, "stage_min_tokens", 0))
         n, b = pending.num_tokens, pending.buffers
+        by_cost = 0 < min_tokens <= n
+        if threshold <= 0 and not by_cost:
+            return None
         self._wait(pending)
         tiers = pending.tiers
         ids = b.ids[:n].numpy()
         selection = tiers._host_selection(ids)
         pending.selection = selection
         keys, tok, k, _ = selection
-        if not keys or len(keys) < threshold:
+        if not keys or (not by_cost and len(keys) < threshold):
             return None
         start = time.perf_counter()
         phys = ids[tok, k]
         uniq, counts = np.unique(phys, return_counts=True)
-        heavy = uniq[counts >= threshold]
+        rows = None
+        if by_cost:
+            rows = tiers.stage_rows(device)
+            heavy, plan = self._staged_by_cost(uniq, counts, rows.num_rows)
+            rule = f"by the cost model ({plan})"
+        else:
+            heavy = uniq[counts >= threshold]
+            rule = f"with at least {threshold} calls each"
         if heavy.size == 0:
+            if by_cost:
+                self.stats.stage_declined += 1
             return None
-        rows = tiers.stage_rows(device)
-        if heavy.size > rows.num_rows:  # the busiest ones
+        if rows is None:
+            rows = tiers.stage_rows(device)
+        if not by_cost and heavy.size > rows.num_rows:  # the busiest ones
             by_calls = counts[counts >= threshold]
             heavy = heavy[np.argsort(-by_calls, kind="stable")[: rows.num_rows]]
         assert tiers.slot_logical is not None and tiers.store_binding is not None
@@ -1038,13 +1140,12 @@ class CpuExpertRuntime:
             (layer, int(tiers.slot_logical[tiers._slot_of_global[p]])) for p in heavy
         ]
         cache_rows = self.cache.acquire(heavy_keys)
+        copied = time.perf_counter()
         try:
-            for i, row in enumerate(cache_rows):
-                src = self.cache.dests(row)
-                for name in UNIT_TENSORS:
-                    rows.rows_u8(name)[i].copy_(src[name])
+            self._copy_to_stage(cache_rows, rows)
         finally:
             self.cache.release(cache_rows)
+        copy_s = time.perf_counter() - copied
         rows.map_host.fill_(-1)
         rows.map_host[torch.from_numpy(heavy.astype(np.int64))] = torch.arange(
             heavy.size, dtype=torch.int32
@@ -1057,17 +1158,129 @@ class CpuExpertRuntime:
         st.stage_experts += int(heavy.size)
         st.per_tier["staged"] += staged_calls
         st.stage_ms += (time.perf_counter() - start) * 1e3
-        logger.info_once(
-            "CPU experts: a large step's CPU-tier experts were staged to the card "
-            "(%s: %d experts with at least %d calls each, %d calls; the CPU "
-            "computes the other %d).",
-            tiers.layer_name,
-            heavy.size,
-            threshold,
-            staged_calls,
-            len(keys) - staged_calls,
-        )
+        st.stage_copy_ms += copy_s * 1e3
+        self.cost.copied(int(heavy.size), copy_s * 1e6)
+        if by_cost:
+            st.stage_by_cost += 1
+            logger.info_once(
+                "CPU experts: a layer call of %d tokens (stage_min_tokens %d) "
+                "staged CPU-tier experts to the card by the cost model "
+                "(%s: %d of %d experts, %d calls; the CPU computes the other %d; "
+                "copies %.2f ms on %d threads).",
+                n,
+                min_tokens,
+                tiers.layer_name,
+                heavy.size,
+                uniq.size,
+                staged_calls,
+                len(keys) - staged_calls,
+                copy_s * 1e3,
+                self._copy_threads(),
+            )
+        else:
+            logger.info_once(
+                "CPU experts: a large step's CPU-tier experts were staged to the "
+                "card (%s: %d experts with at least %d calls each, %d calls; the "
+                "CPU computes the other %d).",
+                tiers.layer_name,
+                heavy.size,
+                threshold,
+                staged_calls,
+                len(keys) - staged_calls,
+            )
+        if runtime_debug.on("cpu"):
+            runtime_debug.emit(
+                "cpu",
+                logger,
+                "%s: %d tokens, staged %d of %d CPU-tier experts %s, %d of %d "
+                "calls; copies %.2f ms",
+                tiers.layer_name,
+                n,
+                heavy.size,
+                uniq.size,
+                rule,
+                staged_calls,
+                len(keys),
+                copy_s * 1e3,
+            )
         return tiers.stage_impl(rows)
+
+    def _copy_threads(self) -> int:
+        return max(1, int(getattr(self.config, "stage_copy_threads", 1)))
+
+    def _copy_to_stage(self, cache_rows: Sequence[int], rows: Any) -> None:
+        """The units in host cache rows ``cache_rows`` into staging rows
+        ``0..len-1``, tensor by tensor, split over ``stage_copy_threads``
+        threads (each a contiguous range of the rows; torch's copies leave
+        the GIL, so the threads copy at once)."""
+        L = self.layout
+        n = len(cache_rows)
+        index = torch.tensor(list(cache_rows), dtype=torch.int64)
+
+        def part(lo: int, hi: int) -> None:
+            idx = index[lo:hi]
+            for name, offset in zip(UNIT_TENSORS, L.offsets):
+                src = self.cache.slab[:, offset : offset + L.nbytes[name]]
+                torch.index_select(src, 0, idx, out=rows.rows_u8(name)[lo:hi])
+
+        threads = min(self._copy_threads(), n)
+        if threads <= 1:
+            part(0, n)
+            return
+        bounds = np.linspace(0, n, threads + 1).astype(int)
+        pool = self._copy_pool(threads)
+        futures = [
+            pool.submit(part, int(lo), int(hi))
+            for lo, hi in zip(bounds[:-1], bounds[1:])
+            if hi > lo
+        ]
+        for f in futures:
+            f.result()
+
+    def _copy_pool(self, threads: int) -> Any:
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = getattr(self, "_stage_pool", None)
+        if pool is None or pool._max_workers != threads:
+            if pool is not None:
+                pool.shutdown(wait=True)
+            pool = ThreadPoolExecutor(threads, thread_name_prefix="cpu-stage")
+            self._stage_pool = pool
+        return pool
+
+    def _staged_by_cost(
+        self, experts: np.ndarray, calls: np.ndarray, num_rows: int
+    ) -> tuple[np.ndarray, str]:
+        """Which of a layer call's CPU-tier ``experts`` (with their ``calls``)
+        go to the card through the staging rows: the busiest ``k`` for the
+        ``k`` that minimises the layer's host-side time
+
+            S(k) + max(G(k), C(k))
+
+        where the host first copies the k units into the rows (S, measured
+        per expert, the copies spread over ``stage_copy_threads``), then
+        computes the rest on the CPU (C = sum of a + b * calls over the
+        experts left, a and b fitted to this tier's own measured calls) while
+        the card reads the k from the rows through UVA (G = k *
+        ``stage_card_us``). S overlaps the card's own experts of the layer
+        and G the CPU's work, which is why the two are not simply added; S is
+        charged in full (the card's own time is not seen from the host), so
+        the rule errs towards the CPU."""
+        order = np.argsort(-calls, kind="stable")
+        cpu_us = self.cost.cpu_us(calls[order])  # per expert, busiest first
+        total = float(cpu_us.sum())
+        limit = min(int(num_rows), len(order))
+        k = np.arange(limit + 1)
+        left = total - np.concatenate(([0.0], np.cumsum(cpu_us[:limit])))
+        copy_us = self.cost.copy_us(self.layout.row_bytes, self._copy_threads())
+        card_us = float(getattr(self.config, "stage_card_us", 100.0))
+        objective = k * copy_us + np.maximum(k * card_us, left)
+        best = int(np.argmin(objective))  # the first minimum: fewest staged
+        plan = (
+            f"{best} staged: host {objective[best] / 1e3:.2f} ms against "
+            f"{total / 1e3:.2f} ms all on the CPU"
+        )
+        return experts[order[:best]], plan
 
     def finish_pairs(self, pending: Pending, device: torch.device) -> HostPairs | None:
         """:meth:`finish` for a sum that takes each pair's own row (the
@@ -1220,6 +1433,8 @@ class CpuExpertRuntime:
         st.max_experts = max(st.max_experts, distinct)
         st.read_ms += (read_done - waited) * 1e3
         st.compute_ms += (done - read_done) * 1e3
+        if getattr(self.config, "stage_min_tokens", 0) > 0:  # the staging fit
+            self.cost.observe(distinct, len(keys), (done - read_done) * 1e6)
         if not self._first_logged:
             self._first_logged = True
             logger.info(
@@ -1284,6 +1499,9 @@ class CpuExpertRuntime:
             "stage_layers": st.stage_layers,
             "stage_experts": st.stage_experts,
             "stage_ms": st.stage_ms,
+            "stage_copy_ms": st.stage_copy_ms,
+            "stage_by_cost": st.stage_by_cost,
+            "stage_declined": st.stage_declined,
         }
 
     def log_stats(self) -> None:

@@ -401,7 +401,14 @@ def test_the_bound_over_the_control_surface(monkeypatch, tmp_path, op):
     assert all(t.placement.num_pinned == 2 for t in env.tiers)
     # refused while EPLB rearranges
     worker.model_runner.eplb_state = SimpleNamespace(
-        model_states={"m": SimpleNamespace(rebalanced=True)}
+        model_states={
+            "m": SimpleNamespace(
+                rebalanced=True,
+                model_name="m",
+                pending_result=None,
+                model=SimpleNamespace(num_moe_layers=1),
+            )
+        }
     )
     refusal = wrc.handle(worker, "check", "tiers.set", {"host_tier_bound": 1})
     assert "in flight" in refusal["refusal"]

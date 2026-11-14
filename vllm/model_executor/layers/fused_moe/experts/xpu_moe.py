@@ -966,7 +966,8 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             sources = [c.source() for c in captured]
             if pending is not None:
                 assert cpu is not None
-                # Prefill staging (stage_min_calls) as in the per-tier sum:
+                # Prefill staging (stage_min_tokens / stage_min_calls) as in
+                # the per-tier sum:
                 # the staged experts' pairs come from the card's call over
                 # the staging rows, the CPU computes the others.
                 stage = getattr(cpu, "stage", None)
@@ -1010,8 +1011,8 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         output.add_(slow_out)
         if pending is not None:
             assert cpu is not None
-            # Prefill staging (stage_min_calls): the CPU-tier experts this call
-            # routes many tokens to go to the card through staging rows; the
+            # Prefill staging (stage_min_tokens / stage_min_calls): CPU-tier
+            # experts of this call go to the card through staging rows; the
             # CPU computes the rest meanwhile.
             stage = getattr(cpu, "stage", None)
             staged = None if stage is None else stage(pending, output.device)
