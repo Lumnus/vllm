@@ -420,16 +420,47 @@ class OldStorages:
         from torch.multiprocessing.reductions import StorageWeakRef
 
         self.refs = []
+        # storages that are the tensor's own (not a part of a larger buffer)
+        self.own: set[int] = set()
         for t in tensors:
             storage = t.untyped_storage()
             self.refs.append(
                 (StorageWeakRef(storage), int(storage.nbytes()), storage.data_ptr())
             )
+            if t.storage_offset() == 0 and storage.nbytes() == (
+                t.numel() * t.element_size()
+            ):
+                self.own.add(storage.data_ptr())
             del storage
         self.bytes = sum(n for _, n, _ in self.refs)
 
     def alive(self) -> list[tuple[Any, int, int]]:
         return [r for r in self.refs if not r[0].expired()]
+
+
+def _storages_in_use() -> set[int]:
+    """Storages the kernels or a layer still read: those of the tiers whose
+    rows have not moved yet (their impls' tensors and their layers'
+    parameters). An old storage among them is shared, never released."""
+    from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
+        _TIER_FIELDS,
+        live_tiers,
+    )
+
+    ptrs: set[int] = set()
+    for t in live_tiers():
+        if getattr(t, "fast_rows", None) is not None:
+            continue
+        tensors: list[Any] = []
+        if t._impls is not None:
+            tensors += [getattr(t._impls[0], f) for f, _ in _TIER_FIELDS]
+        layer = None if t._layer_ref is None else t._layer_ref()
+        if layer is not None:
+            tensors += list(layer.parameters(recurse=False))
+        for x in tensors:
+            if isinstance(x, torch.Tensor):
+                ptrs.add(x.untyped_storage().data_ptr())
+    return ptrs
 
 
 def _holders(data_ptr: int) -> str:
@@ -508,7 +539,12 @@ def finish_move(
     if alive:
         if _ADOPTED["holders"] is None:
             _ADOPTED["holders"] = _holders(alive[0][2])
-        for ref, n, _ in alive:
+        in_use = _storages_in_use()
+        for ref, n, ptr in alive:
+            if ptr not in old.own or ptr in in_use:
+                # part of a larger buffer, or read by a layer that has not
+                # moved yet: reported, not released
+                continue
             storage = torch.UntypedStorage._new_with_weak_ptr(ref.cdata)
             if storage is None:
                 continue

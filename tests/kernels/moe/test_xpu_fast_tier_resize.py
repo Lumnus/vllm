@@ -491,6 +491,36 @@ def test_an_old_storage_another_tensor_holds_is_released_in_place(
         _assert_serves_the_store(env, tiers)
 
 
+def test_an_old_storage_in_a_larger_buffer_is_reported_not_released(
+    monkeypatch,
+    tmp_path,
+    fake_xpu,  # noqa: F811
+):
+    """Rows whose storage is a part of a larger buffer (shared with something
+    else) are never released in place: reported only."""
+    held = []
+    adopt = xt.ExpertTiers._adopt_fast_rows
+
+    def in_a_larger_buffer_then_adopt(self, fast):
+        w2 = fast.w2
+        n = w2.numel() * w2.element_size()
+        big = torch.zeros(2 * n, dtype=torch.uint8)
+        big[:n].copy_(w2.data.reshape(-1).view(torch.uint8))
+        w2.data = big[:n].view(w2.dtype).view(w2.shape)
+        held.append(big)
+        return adopt(self, fast)
+
+    monkeypatch.setattr(
+        xt.ExpertTiers, "_adopt_fast_rows", in_a_larger_buffer_then_adopt
+    )
+    env = _env(monkeypatch, tmp_path)
+    summary = ft.adoption_summary()
+    assert summary["stale"] == sum(b.numel() for b in held) and summary["released"] == 0
+    assert all(b.untyped_storage().nbytes() == b.numel() for b in held)
+    for tiers in env.tiers:
+        _assert_serves_the_store(env, tiers)
+
+
 def test_a_grow_maps_only_bytes_that_are_there():
     """The ranks' memory check of a grow (before anything is mapped)."""
     g = 1 << 30
