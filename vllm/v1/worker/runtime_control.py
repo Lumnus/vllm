@@ -372,6 +372,27 @@ def _ple_state(worker: Any) -> list[dict[str, Any]]:
                 hit_rate=(stats.hits / lookups) if lookups else None,
                 seconds=time.monotonic() - stats.started,
             )
+        if hasattr(table, "page_cache"):
+            entry.update(
+                page_cache=table.page_cache,
+                warm_s=table.warm_s,
+                row_state_path=table.row_state_path,
+                preloaded_rows=table.preloaded_rows,
+                preload_s=table.preload_s,
+            )
+        saver = getattr(table, "saver", None)
+        if saver is not None:
+            entry.update(
+                state_interval_s=saver.interval_s,
+                state_saves=saver.saves,
+                state_errors=saver.errors,
+                state_last_rows=saver.last_rows,
+                state_last_age_s=(
+                    None
+                    if saver.last_saved is None
+                    else time.monotonic() - saver.last_saved
+                ),
+            )
         out.append(entry)
     return out
 
@@ -958,15 +979,37 @@ def _restore_trace_set(worker: Any, before: dict) -> None:
 # ---- PLE row cache
 
 
+_PLE_SETTINGS = ("stats_interval_s", "state_interval_s", "save_state")
+
+
+def _ple_savers(worker: Any) -> list[Any]:
+    savers = (getattr(t, "saver", None) for _, t in _row_tables(worker))
+    return [s for s in savers if s is not None]
+
+
 def _check_ple_set(worker: Any, args: dict) -> str | None:
     if not any(_row_stats(t) is not None for _, t in _row_tables(worker)):
         return "no PLE row table on disk in this model"
-    unknown = sorted(set(args) - {"stats_interval_s"})
+    unknown = sorted(set(args) - set(_PLE_SETTINGS))
     if unknown:
-        return f"unknown PLE settings {unknown}; known: ['stats_interval_s']"
-    value = args.get("stats_interval_s")
-    if not isinstance(value, int | float) or isinstance(value, bool) or value < 0:
-        return f"stats_interval_s must be a number >= 0, got {value!r}"
+        return f"unknown PLE settings {unknown}; known: {list(_PLE_SETTINGS)}"
+    if not args:
+        return f"nothing to set; known: {list(_PLE_SETTINGS)}"
+    for key in ("stats_interval_s", "state_interval_s"):
+        if key not in args:
+            continue
+        value = args[key]
+        if not isinstance(value, int | float) or isinstance(value, bool) or value < 0:
+            return f"{key} must be a number >= 0, got {value!r}"
+    if "save_state" in args and not isinstance(args["save_state"], bool):
+        return f"save_state must be true or false, got {args['save_state']!r}"
+    if ("state_interval_s" in args or args.get("save_state")) and not _ple_savers(
+        worker
+    ):
+        return (
+            "no PLE row state file in this engine: start with --engram-config "
+            "disk_row_state_path"
+        )
     return None
 
 
@@ -981,15 +1024,36 @@ def _set_ple_interval(worker: Any, interval_s: float) -> None:
 
 def _apply_ple_set(worker: Any, args: dict) -> tuple[dict, dict, Any]:
     tables = [t for _, t in _row_tables(worker) if _row_stats(t) is not None]
-    old = _row_stats(tables[0]).interval_s
-    new = float(args["stats_interval_s"])
-    _set_ple_interval(worker, new)
-    changes = {"stats_interval_s": [old, new]} if old != new else {}
-    return changes, {"ple": _ple_state(worker)}, old
+    savers = _ple_savers(worker)
+    old = {
+        "stats_interval_s": _row_stats(tables[0]).interval_s,
+        "state_interval_s": savers[0].interval_s if savers else None,
+    }
+    changes: dict[str, list] = {}
+    if "stats_interval_s" in args:
+        new = float(args["stats_interval_s"])
+        _set_ple_interval(worker, new)
+        if new != old["stats_interval_s"]:
+            changes["stats_interval_s"] = [old["stats_interval_s"], new]
+    if "state_interval_s" in args:
+        new = float(args["state_interval_s"])
+        for saver in savers:
+            saver.set_interval(new)
+        if new != old["state_interval_s"]:
+            changes["state_interval_s"] = [old["state_interval_s"], new]
+    result: dict[str, Any] = {}
+    if args.get("save_state"):
+        result["save_started"] = [saver.save() for saver in savers]
+        result["row_state_files"] = [saver.path for saver in savers]
+    result["ple"] = _ple_state(worker)
+    return changes, result, old
 
 
-def _restore_ple_set(worker: Any, old: float) -> None:
-    _set_ple_interval(worker, old)
+def _restore_ple_set(worker: Any, old: dict) -> None:
+    _set_ple_interval(worker, old["stats_interval_s"])
+    if old["state_interval_s"] is not None:
+        for saver in _ple_savers(worker):
+            saver.set_interval(old["state_interval_s"])
 
 
 # ---- fault injection (development mode only)

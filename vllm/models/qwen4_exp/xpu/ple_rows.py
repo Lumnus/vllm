@@ -5,8 +5,10 @@
 Every row of the n-gram table has one owner among the TP ranks. A rank holds its
 rows either in pinned slabs (``PinnedRowSlabs``) or behind a bounded row cache
 over the table's files (``RowCache``, ``RowReader``, ``RowServer``,
-``RowLookahead``). This module only needs numpy and numba, so it says nothing
-about devices; ``ple_table.py`` connects it to the model.
+``RowLookahead``). A row cache can start warm: from a file of the rows it held
+in an earlier run (``load_row_state``, ``RowStateSaver``), and with the rank's
+rows in the page cache (``scan_rows``). This module only needs numpy and numba,
+so it says nothing about devices; ``ple_table.py`` connects it to the model.
 """
 
 from __future__ import annotations
@@ -14,10 +16,12 @@ from __future__ import annotations
 import ctypes
 import json
 import logging
+import math
 import mmap
 import os
 import threading
 import time
+import zlib
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from functools import cache
@@ -412,6 +416,10 @@ class RowReader:
         for index, extent in enumerate(extents):
             if extent.path not in self._fds:
                 fd, self.direct = _open_for_reads(extent.path, self.direct)
+                if not direct:
+                    # Rows are read one page at a time and in no order: through
+                    # the page cache, read-around would only fetch other rows.
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
                 self._fds[extent.path] = fd
             fd = self._fds[extent.path]
             self._extent_fds[index] = fd
@@ -634,6 +642,317 @@ class RowCache:
         if speculative:
             self.epoch[slots] = _EPOCH_FREE
             self.ref[slots] = 0
+
+    def preload(
+        self,
+        local_rows: np.ndarray,
+        referenced: np.ndarray,
+        fill: Callable[[np.ndarray], None],
+    ) -> None:
+        """Fill an unused cache with ``local_rows`` before the first step.
+
+        ``fill(out)`` writes the rows' bytes into ``out`` ([n, row_bytes], in the
+        order of ``local_rows``). Every preloaded row stays evictable, as a row no
+        step has asked for yet; ``referenced`` rows keep their reference bit, so
+        CLOCK passes them once before it evicts them. The free slots after them
+        are used first.
+        """
+        local_rows = np.asarray(local_rows, dtype=np.int64).reshape(-1)
+        count = int(local_rows.shape[0])
+        if self.step != 0 or self.hand != 0 or (self.slot2row >= 0).any():
+            raise RuntimeError("PLE row cache: preload needs an unused cache")
+        if count > self.capacity:
+            raise ValueError(
+                f"PLE row cache: {count} rows to preload, capacity {self.capacity}"
+            )
+        if count == 0:
+            return
+        fill(self.slab[:count])
+        self.slot2row[:count] = local_rows
+        self.row2slot[local_rows] = np.arange(count, dtype=np.int32)
+        self.ref[:count] = np.asarray(referenced, dtype=bool)
+        self.hand = count % self.capacity
+
+    def hot_rows(self) -> np.ndarray:
+        """The cached local rows, most recently used first.
+
+        Reads the maps without a lock, so it may run beside a step: a row that
+        moves meanwhile can be missing or listed once out of order, and the list
+        stays a list of distinct rows of this cache's range.
+        """
+        rows = self.slot2row.copy()
+        epoch = self.epoch.copy()
+        ref = self.ref.copy()
+        held = rows >= 0
+        rows, epoch, ref = rows[held], epoch[held], ref[held]
+        # Last key first: newest epoch, then a set reference bit.
+        order = np.lexsort((-ref.astype(np.int64), -epoch))
+        rows = rows[order]
+        _, first = np.unique(rows, return_index=True)
+        return rows[np.sort(first)]
+
+
+# --------------------------------------------------------------------------
+# Warm start
+# --------------------------------------------------------------------------
+
+ROW_STATE_FORMAT = "vllm-xpu-ple-row-state/1"
+_ROW_STATE_MAGIC = b"PLEROWS1"
+
+
+def row_state_file(path: str, rank: int, world: int) -> str:
+    """The file of one TP rank under a row state path."""
+    return f"{path}.tp{rank}of{world}"
+
+
+def row_state_meta(
+    extents: Sequence[RowExtent], row_bytes: int, start: int, end: int
+) -> dict:
+    """What a saved row list must match to be used: the table's files and the
+    rank's rows."""
+
+    def size(path: str) -> int:
+        try:
+            return os.stat(path).st_size
+        except OSError:
+            return -1
+
+    return {
+        "format": ROW_STATE_FORMAT,
+        "start": int(start),
+        "end": int(end),
+        "row_bytes": int(row_bytes),
+        "extents": [
+            [e.path, int(e.offset), int(e.num_rows), size(e.path)] for e in extents
+        ],
+    }
+
+
+def save_row_state(path: str, local_rows: np.ndarray, meta: dict) -> None:
+    """Write ``local_rows`` (int32, most recently used first) with ``meta``.
+
+    The file is written beside its final name and renamed into place, so a
+    reader sees the old list or the new one, never a part.
+    """
+    rows = np.ascontiguousarray(local_rows, dtype="<i4")
+    # Buffers, not bytes copies: zlib and the file write let go of the GIL.
+    body = memoryview(rows).cast("B")
+    header = json.dumps(
+        dict(meta, rows=int(rows.shape[0]), crc32=zlib.crc32(body))
+    ).encode()
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    partial = f"{path}.part{os.getpid()}"
+    try:
+        with open(partial, "wb") as handle:
+            handle.write(_ROW_STATE_MAGIC)
+            handle.write(len(header).to_bytes(8, "little"))
+            handle.write(header)
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(partial, path)
+    finally:
+        if os.path.exists(partial):
+            os.unlink(partial)
+
+
+def load_row_state(path: str, meta: dict) -> np.ndarray | None:
+    """The local rows a row state file lists, most recently used first.
+
+    A missing file gives None quietly (the first run writes it). A file that is
+    unreadable, damaged, or saved for another table, row range or row size gives
+    None with one warning: the cache then starts empty, as without the file.
+    """
+    if not os.path.exists(path):
+        logger.info("PLE row state %s does not exist yet; the cache starts empty", path)
+        return None
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+        if data[:8] != _ROW_STATE_MAGIC:
+            raise ValueError("not a PLE row state file")
+        length = int.from_bytes(data[8:16], "little")
+        header = json.loads(data[16 : 16 + length])
+        body = data[16 + length :]
+        if len(body) % 4 or len(body) // 4 != header.get("rows"):
+            raise ValueError(
+                f"{len(body)} B of rows, the header says {header.get('rows')}"
+            )
+        if zlib.crc32(body) != header.get("crc32"):
+            raise ValueError("the rows do not match their checksum")
+        differ = [key for key, value in meta.items() if header.get(key) != value]
+        if differ:
+            logger.warning(
+                "PLE row state %s was saved for another table or rank (%s differ); "
+                "the cache starts empty",
+                path,
+                ", ".join(differ),
+            )
+            return None
+        rows = np.frombuffer(body, dtype="<i4").astype(np.int64)
+        if rows.size and (rows.min() < 0 or rows.max() >= meta["end"] - meta["start"]):
+            raise ValueError("rows outside the rank's range")
+        if np.unique(rows).shape[0] != rows.shape[0]:
+            raise ValueError("a row is listed twice")
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        logger.warning(
+            "PLE row state %s is not usable (%s); the cache starts empty", path, exc
+        )
+        return None
+    return rows
+
+
+def scan_rows(
+    extents: Sequence[RowExtent],
+    row_bytes: int,
+    start: int,
+    end: int,
+    *,
+    pick: np.ndarray | None = None,
+    out: np.ndarray | None = None,
+    direct: bool = True,
+    threads: int = 4,
+    chunk_bytes: int = 64 << 20,
+) -> bool:
+    """Read table rows [start, end) in order, in large sequential chunks.
+
+    With ``pick`` (sorted, distinct global rows inside the range) only the
+    chunks that hold a picked row are read, and the picked rows land in ``out``
+    in their order. Without it every chunk is read: through the page cache
+    (``direct=False``) that leaves the range in host memory the kernel may
+    reclaim. Returns whether O_DIRECT was used.
+    """
+    if pick is not None:
+        pick = np.asarray(pick, dtype=np.int64)
+        if out is None or out.shape[0] != pick.shape[0]:
+            raise ValueError("scan_rows: out must have one row per picked row")
+        if pick.size and (pick[0] < start or pick[-1] >= end):
+            raise ValueError("scan_rows: picked rows outside the range")
+    first_rows = np.cumsum([0] + [e.num_rows for e in extents], dtype=np.int64)
+    if end > int(first_rows[-1]):
+        raise ValueError(
+            f"PLE table holds {int(first_rows[-1])} rows, scan needs {end}"
+        )
+    chunk_rows = max(1, int(chunk_bytes) // row_bytes)
+    buffer = np.empty((min(chunk_rows, max(end - start, 1)), row_bytes), np.uint8)
+    piece = max(PAGE, int(chunk_bytes) // max(int(threads), 1))
+    used_direct = True
+    for lo in range(int(start), int(end), chunk_rows):
+        hi = min(int(end), lo + chunk_rows)
+        if pick is not None:
+            a, b = np.searchsorted(pick, [lo, hi])
+            if a == b:
+                continue
+        part = buffer[: hi - lo]
+        for extent, first in zip(extents, first_rows.tolist()):
+            ext_lo = max(lo, first)
+            ext_hi = min(hi, first + extent.num_rows)
+            if ext_lo >= ext_hi:
+                continue
+            used_direct &= read_file_range(
+                extent.path,
+                extent.offset + (ext_lo - first) * row_bytes,
+                part[ext_lo - lo : ext_hi - lo],
+                direct=direct,
+                threads=threads,
+                chunk_bytes=piece,
+            )
+        if pick is not None:
+            assert out is not None
+            out[a:b] = part[pick[a:b] - lo]
+    return used_direct
+
+
+def mem_available_bytes() -> int | None:
+    """MemAvailable of the host, or None where /proc/meminfo has none."""
+    try:
+        with open("/proc/meminfo") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    return None
+
+
+class RowStateSaver:
+    """Writes a rank's hot rows to its row state file, off the step thread.
+
+    The step thread calls ``maybe_save`` once per step; when the interval has
+    passed it starts one writer thread, which lists the cache's rows (most
+    recently used first, ``RowCache.hot_rows``) and replaces the file. One write
+    runs at a time. ``close`` waits for it and writes once more.
+    """
+
+    def __init__(
+        self, cache: RowCache, path: str, meta: dict, interval_s: float, rank: int
+    ) -> None:
+        self.cache = cache
+        self.path = path
+        self.meta = meta
+        self.rank = rank
+        self.saves = 0
+        self.errors = 0
+        self.last_rows = 0
+        self.last_saved: float | None = None
+        self.last_error: str | None = None
+        self._thread: threading.Thread | None = None
+        self._closed = False
+        self.set_interval(interval_s)
+
+    def set_interval(self, interval_s: float) -> None:
+        self.interval_s = float(interval_s)
+        self._next = (
+            time.monotonic() + self.interval_s if self.interval_s > 0 else math.inf
+        )
+
+    def maybe_save(self) -> None:
+        now = time.monotonic()
+        if now < self._next:
+            return
+        self._next = now + self.interval_s
+        self.save()
+
+    def save(self) -> bool:
+        """Start a write in the background; False when one is still running."""
+        if self._closed or (self._thread is not None and self._thread.is_alive()):
+            return False
+        self._thread = threading.Thread(
+            target=self._write, name="ple-row-state", daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._thread is not None:
+            self._thread.join()
+        self._write()
+
+    def _write(self) -> None:
+        started = time.perf_counter()
+        try:
+            rows = self.cache.hot_rows()
+            save_row_state(self.path, rows, self.meta)
+        except Exception as exc:  # a lost save only costs a cold start
+            self.errors += 1
+            self.last_error = str(exc)
+            logger.warning("PLE row state not written to %s: %s", self.path, exc)
+            return
+        self.saves += 1
+        self.last_rows = int(rows.shape[0])
+        self.last_saved = time.monotonic()
+        logger.info(
+            "PLE row cache rank %d: %d rows written to %s in %.1f s",
+            self.rank,
+            self.last_rows,
+            self.path,
+            time.perf_counter() - started,
+        )
 
 
 # --------------------------------------------------------------------------

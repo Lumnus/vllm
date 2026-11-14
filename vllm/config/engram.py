@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Literal, Self
 
 from pydantic import model_validator
 
@@ -64,6 +64,30 @@ class EngramConfig:
     disk_stats_interval_s: float = 0.0
     """XPU: seconds between disk_offload row cache log lines per rank; 0 for none."""
 
+    disk_row_state_path: str | None = None
+    """XPU: a file of the rows the disk_offload row cache holds, kept across
+    restarts so the cache starts warm. At boot each TP rank preloads the rows its
+    file lists (``<path>.tp<rank>of<world>``), most recently used first, up to
+    the cache's capacity; while serving it writes the rows its cache holds every
+    disk_row_state_interval_s seconds, off the step thread, and once more at
+    shutdown. A missing file means an empty cache (the run writes it); a damaged
+    file, or one saved for another table, rank range or row size, is ignored
+    with one warning. Unset: no file is read or written."""
+
+    disk_row_state_interval_s: float = 600.0
+    """XPU: seconds between writes of the disk_row_state_path file while serving;
+    0 writes it only at shutdown. Live through the runtime control's ple.set."""
+
+    disk_page_cache: Literal["off", "on", "warm"] = "off"
+    """XPU: how disk_offload reads rows. "off": direct reads that bypass the page
+    cache. "on": reads through the page cache, so the rows read stay in host
+    memory the kernel can reclaim, and a later miss on them costs a memory copy
+    instead of a drive read. "warm": as "on", and each TP rank reads its share of
+    the table once at boot, in order, so every row is in the page cache from the
+    first step (about the table's size in page cache, which stays reclaimable and
+    counts as available memory; skipped with a warning when the host has less
+    than twice the rank's share available)."""
+
     embedding_across_dp: bool = False
     """Shard embeddings across TP and all DP ranks when enabled.
     Otherwise, each DP rank has a separate TP-sharded embedding replica."""
@@ -112,6 +136,14 @@ class EngramConfig:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
         if self.int8_table_path and not (self.cpu_offload or self.disk_offload):
             raise ValueError("int8_table_path requires cpu_offload or disk_offload")
+        if not self.disk_offload and (
+            self.disk_row_state_path or self.disk_page_cache != "off"
+        ):
+            raise ValueError(
+                "disk_row_state_path and disk_page_cache require disk_offload"
+            )
+        if self.disk_row_state_interval_s < 0:
+            raise ValueError("disk_row_state_interval_s must be >= 0")
         if self.use_thp and (not self.cpu_offload or self.dp_shared_memory):
             raise ValueError(
                 "use_thp requires cpu_offload=True and dp_shared_memory=False"
@@ -156,6 +188,9 @@ class EngramConfig:
                 "disk_read_threads",
                 "disk_lookahead",
                 "disk_stats_interval_s",
+                "disk_row_state_path",
+                "disk_row_state_interval_s",
+                "disk_page_cache",
             )
             if getattr(self, name) != getattr(defaults, name)
         ]
@@ -226,5 +261,14 @@ class EngramConfig:
     def compile_factors(self) -> CompileFactors:
         """Hash settings that affect embedding execution and graph structure."""
         # The store only matters at startup; a per-launch path must not
-        # invalidate the compile cache.
-        return get_compile_factors(self, {"peer_group_store"})
+        # invalidate the compile cache. How the disk rows reach the host
+        # (warm start, page cache) changes no graph either.
+        return get_compile_factors(
+            self,
+            {
+                "peer_group_store",
+                "disk_row_state_path",
+                "disk_row_state_interval_s",
+                "disk_page_cache",
+            },
+        )

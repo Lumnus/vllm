@@ -11,11 +11,14 @@ over TP, byte for byte, and decodes it.
 ``PinnedRowTable`` (``cpu_offload``) keeps the rows in pinned slabs, and a device
 kernel inside the forward gathers them through UVA, so a step does no host work.
 ``DiskRowTable`` (``disk_offload``) keeps them in the files, behind a pinned row
-cache filled before the forward with direct reads.
+cache filled before the forward with direct reads. Its cache can start warm, from
+the rows an earlier run saved (``disk_row_state_path``), and its reads can go
+through the page cache, warmed with the rank's rows at boot (``disk_page_cache``).
 """
 
 from __future__ import annotations
 
+import time
 import weakref
 from collections.abc import Sequence
 from typing import Any
@@ -33,16 +36,23 @@ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 from .ple_int8 import decode_rows
 from .ple_rows import (
     MAX_SLABS,
+    PAGE,
     PinnedRowSlabs,
     RowCache,
     RowExtent,
     RowLookahead,
     RowReader,
     RowServer,
+    RowStateSaver,
     RowStats,
     current_chunk_keys,
+    load_row_state,
+    mem_available_bytes,
     owned_heads,
     plan_next_chunks,
+    row_state_file,
+    row_state_meta,
+    scan_rows,
 )
 
 logger = init_logger(__name__)
@@ -326,7 +336,10 @@ class DiskRowTable(_RowTable):
         self._stage_np.fill(0)
         self._dirty = 0
         threads = engram_config.disk_read_threads
-        reader = RowReader(extents, row_bytes, threads=threads)
+        self.page_cache = engram_config.disk_page_cache
+        direct = self.page_cache == "off"
+        reader = RowReader(extents, row_bytes, threads=threads, direct=direct)
+        cache = RowCache(self.end - self.start, self._slab_np)
         self._server = RowServer(
             start=self.start,
             end=self.end,
@@ -335,24 +348,31 @@ class DiskRowTable(_RowTable):
             offsets=offsets,
             eos_token_id=eos_token_id,
             heads_per_ngram=heads_per_ngram,
-            cache=RowCache(self.end - self.start, self._slab_np),
+            cache=cache,
             reader=reader,
             stats=RowStats(self.rank, engram_config.disk_stats_interval_s),
         )
         self._context_len = ple_constants["multipliers"].shape[0] - 1
         self._eos = eos_token_id
+        self.preloaded_rows = 0
+        self.preload_s = 0.0
+        self.warm_s: float | None = None
+        self.row_state_path: str | None = None
+        self._saver: RowStateSaver | None = None
+        self._warm_start(engram_config, extents, row_bytes, reader)
         self._lookahead: RowLookahead | None = None
         if engram_config.disk_lookahead:
             self._lookahead = RowLookahead(
                 self._server,
-                RowReader(extents, row_bytes, threads=threads),
+                RowReader(extents, row_bytes, threads=threads, direct=direct),
                 max_rows=max_tokens * max(1, self.own_heads.shape[0]),
             )
         # The readers hold file descriptors and a thread pool, and the lookahead
         # a thread. Release them when the table is collected (the runner drops
-        # the model at shutdown) or at exit, unless close() ran first.
+        # the model at shutdown) or at exit, unless close() ran first; the row
+        # state is written once more then.
         self._finalizer = weakref.finalize(
-            self, _close_disk_table, reader, self._lookahead
+            self, _close_disk_table, reader, self._lookahead, self._saver
         )
         logger.info(
             "XPU PLE rows on disk (rank %d): %s rows [%d, %d), %d B/row, %s, "
@@ -368,6 +388,134 @@ class DiskRowTable(_RowTable):
             threads,
             "on" if self._lookahead is not None else "off",
         )
+
+    def _warm_start(
+        self,
+        engram_config: Any,
+        extents: Sequence[RowExtent],
+        row_bytes: int,
+        reader: RowReader,
+    ) -> None:
+        """Warm the page cache and preload the saved rows, as configured.
+
+        With ``disk_page_cache="warm"`` the rank's rows are read once, in order,
+        through the page cache (skipped with a warning when the host has less
+        than twice their size available); the saved rows are picked out of the
+        same pass. Without it the saved rows are read in one ordered pass when
+        they cover a quarter of the rank's pages or more, else row by row.
+        """
+        cache = self._server.cache
+        state_path = engram_config.disk_row_state_path
+        rows: np.ndarray | None = None
+        if state_path:
+            self.row_state_path = row_state_file(
+                state_path, self.rank, self.group.world_size
+            )
+            meta = row_state_meta(extents, row_bytes, self.start, self.end)
+            rows = load_row_state(self.row_state_path, meta)
+            self._saver = RowStateSaver(
+                cache,
+                self.row_state_path,
+                meta,
+                engram_config.disk_row_state_interval_s,
+                self.rank,
+            )
+        range_bytes = (self.end - self.start) * row_bytes
+        warm = self.page_cache == "warm"
+        if warm:
+            available = mem_available_bytes()
+            if available is not None and available < 2 * range_bytes:
+                logger.warning(
+                    "XPU PLE page cache warm skipped (rank %d): %.1f GiB available, "
+                    "the rank's rows are %.1f GiB; rows are read through the page "
+                    "cache as they are asked for",
+                    self.rank,
+                    available / 2**30,
+                    range_bytes / 2**30,
+                )
+                warm = False
+        if warm and cache.capacity >= self.end - self.start:
+            # The cache holds the rank's whole share: every row goes in, so no
+            # step ever reads (the preload of the 0.32 line, cache sized to the
+            # table). The saved list adds nothing then.
+            local = np.arange(self.end - self.start, dtype=np.int64)
+            referenced = np.ones(local.shape[0], dtype=bool)
+        elif rows is not None:
+            keep = rows[: cache.capacity]
+            order = np.argsort(keep, kind="stable")
+            local = keep[order]
+            # The most recently used half keeps a reference bit.
+            referenced = order < (keep.shape[0] + 1) // 2
+        else:
+            local = np.zeros(0, dtype=np.int64)
+            referenced = np.zeros(0, dtype=bool)
+        started = time.perf_counter()
+        if warm:
+
+            def fill(out: np.ndarray) -> None:
+                scan_rows(
+                    extents,
+                    row_bytes,
+                    self.start,
+                    self.end,
+                    pick=local + self.start,
+                    out=out,
+                    direct=False,
+                )
+
+            if local.shape[0]:
+                cache.preload(local, referenced, fill)
+            else:
+                fill(np.empty((0, row_bytes), np.uint8))
+            self.warm_s = time.perf_counter() - started
+            logger.info(
+                "XPU PLE page cache warm (rank %d): rows [%d, %d), %.2f GiB read "
+                "in %.1f s (%.2f GB/s)",
+                self.rank,
+                self.start,
+                self.end,
+                range_bytes / 2**30,
+                self.warm_s,
+                range_bytes / max(self.warm_s, 1e-9) / 1e9,
+            )
+        elif local.shape[0]:
+            if local.shape[0] * PAGE * 4 >= range_bytes:
+
+                def fill(out: np.ndarray) -> None:
+                    scan_rows(
+                        extents,
+                        row_bytes,
+                        self.start,
+                        self.end,
+                        pick=local + self.start,
+                        out=out,
+                        direct=reader.direct,
+                    )
+
+            else:
+
+                def fill(out: np.ndarray) -> None:
+                    reader.read_rows(local + self.start, out=out)
+
+            cache.preload(local, referenced, fill)
+        if local.shape[0]:
+            self.preloaded_rows = int(local.shape[0])
+            self.preload_s = time.perf_counter() - started
+            logger.info(
+                "XPU PLE row cache (rank %d): %d rows preloaded from %s in %.1f s "
+                "(%.1f %% of the cache)",
+                self.rank,
+                self.preloaded_rows,
+                self.row_state_path
+                if self.preloaded_rows < self.end - self.start
+                else "the table (the rank's whole share)",
+                self.preload_s,
+                100.0 * self.preloaded_rows / cache.capacity,
+            )
+
+    @property
+    def saver(self) -> RowStateSaver | None:
+        return self._saver
 
     def close(self) -> None:
         """Stop the lookahead thread and close the readers. Idempotent."""
@@ -401,6 +549,8 @@ class DiskRowTable(_RowTable):
         if num_padded:
             self.packed[:num_padded].copy_(self._stage[:num_padded], non_blocking=True)
         self._submit_lookahead(input_batch, req_states)
+        if self._saver is not None:
+            self._saver.maybe_save()
 
     def lookup(self, num_tokens: int, dtype: torch.dtype) -> torch.Tensor:
         return self._reduce_and_decode(self.packed[:num_tokens], dtype)
@@ -455,11 +605,17 @@ class DiskRowTable(_RowTable):
         )
 
 
-def _close_disk_table(reader: RowReader, lookahead: RowLookahead | None) -> None:
+def _close_disk_table(
+    reader: RowReader,
+    lookahead: RowLookahead | None,
+    saver: RowStateSaver | None = None,
+) -> None:
     # Holds no reference to the table, so the table can be collected.
     if lookahead is not None:
         lookahead.close()
     reader.close()
+    if saver is not None:
+        saver.close()
 
 
 def build_row_table(

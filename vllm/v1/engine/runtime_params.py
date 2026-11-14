@@ -151,6 +151,19 @@ def _attr(*path: str) -> Callable[[Any, dict], Any]:
     return read
 
 
+def _ple(key: str) -> Callable[[Any, dict], Any]:
+    """A key of rank 0's first PLE row table on disk."""
+
+    def read(engine: Any, state: dict) -> Any:
+        ranks = state.get("ranks") or [{}]
+        for table in ranks[0].get("ple") or []:
+            if table.get("on_disk"):
+                return table.get(key)
+        return None
+
+    return read
+
+
 def _tower(key: str) -> Callable[[Any, dict], Any]:
     def read(engine: Any, state: dict) -> Any:
         towers = state.get("towers") or {}
@@ -911,7 +924,16 @@ def _register_builtin() -> None:
             read=_rank0("trace", "keep"),
         )
     )
-    V(Verb("ple.set", "PLE row cache stats.", kind="set"))
+    V(
+        Verb(
+            "ple.set",
+            "PLE row cache stats and its saved hot rows.",
+            args={
+                "save_state": "bool, write the row state file now (in the background)",
+            },
+            kind="set",
+        )
+    )
     P(
         Param(
             "ple.stats_interval_s",
@@ -921,6 +943,7 @@ def _register_builtin() -> None:
             unit="s",
             min=0,
             start="--engram-config disk_stats_interval_s",
+            read=_ple("stats_interval_s"),
         )
     )
     P(
@@ -931,6 +954,40 @@ def _register_builtin() -> None:
             unit="GiB",
             restart_reason="the row cache is " + _LOAD,
             start="--engram-config disk_row_cache_gib",
+        )
+    )
+    P(
+        Param(
+            "ple.state_interval_s",
+            "float",
+            "Seconds between writes of the PLE row state file (0 = only at shutdown).",
+            "ple.set",
+            unit="s",
+            min=0,
+            start="--engram-config disk_row_state_interval_s",
+            read=_ple("state_interval_s"),
+        )
+    )
+    P(
+        Param(
+            "ple.row_state_path",
+            "str",
+            "File of the PLE row cache's hot rows, preloaded at boot and written while serving.",
+            nullable=True,
+            restart_reason="the cache is preloaded from it at load",
+            start="--engram-config disk_row_state_path",
+            read=_ple("row_state_path"),
+        )
+    )
+    P(
+        Param(
+            "ple.page_cache",
+            "enum",
+            "How PLE rows are read: off (direct), on (page cache), warm (page cache, filled at boot).",
+            choices=["off", "on", "warm"],
+            restart_reason="the readers are opened at load",
+            start="--engram-config disk_page_cache",
+            read=_ple("page_cache"),
         )
     )
     V(

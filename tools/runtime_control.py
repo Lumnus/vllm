@@ -34,7 +34,7 @@ server has one, is read from `VLLM_API_KEY`.
     runtime_control.py trace on [--path P] [--interval N] [--sample N]
     runtime_control.py trace off
     runtime_control.py trace set [--interval N] [--sample N] [--rotate-mb N] [--keep N]
-    runtime_control.py ple set --stats-interval S
+    runtime_control.py ple set [--stats-interval S] [--state-interval S] [--save-state]
     runtime_control.py fault arm --stage load|plan|copy_rows [--rank R] [--count N]
     runtime_control.py fault clear [--stage S]
     runtime_control.py profile define FILE.json   (one profile, or {"profiles": [...]})
@@ -220,7 +220,10 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
             _set(a, "keep", ns.keep)
         return "trace.set", a
     if group == "ple":
-        a["stats_interval_s"] = ns.stats_interval
+        _set(a, "stats_interval_s", ns.stats_interval)
+        _set(a, "state_interval_s", ns.state_interval)
+        if ns.save_state:
+            a["save_state"] = True
         return "ple.set", a
     if group == "fault":
         if verb == "arm":
@@ -444,6 +447,17 @@ def _print_state(state: dict) -> None:
                     f"{table['steps']} steps, misses {table['misses']}, stats "
                     f"every {table['stats_interval_s']} s"
                 )
+                if (
+                    table.get("row_state_path")
+                    or table.get("page_cache", "off") != "off"
+                ):
+                    print(
+                        f"{head} PLE {table['module']}: page cache "
+                        f"{table.get('page_cache')}, {table.get('preloaded_rows', 0)} "
+                        f"rows preloaded from {table.get('row_state_path')}, "
+                        f"{table.get('state_saves', 0)} saves (last "
+                        f"{table.get('state_last_rows', 0)} rows)"
+                    )
         faults = rank.get("faults") or {}
         if faults.get("armed"):
             print(f"{head} faults armed: {faults['armed']}")
@@ -552,7 +566,10 @@ def _parser() -> argparse.ArgumentParser:
     ts.add_argument("--keep", type=int)
 
     pl = groups.add_parser("ple").add_subparsers(dest="verb", required=True)
-    pl.add_parser("set").add_argument("--stats-interval", type=float, required=True)
+    pl_set = pl.add_parser("set")
+    pl_set.add_argument("--stats-interval", type=float)
+    pl_set.add_argument("--state-interval", type=float)
+    pl_set.add_argument("--save-state", action="store_true")
 
     fa = groups.add_parser("fault").add_subparsers(dest="verb", required=True)
     fa_arm = fa.add_parser("arm")

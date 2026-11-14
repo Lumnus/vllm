@@ -191,6 +191,68 @@ def test_ple_stats_interval_changes_and_reads(monkeypatch):
     assert not table._server.stats.enabled
 
 
+class _Saver:
+    def __init__(self) -> None:
+        self.interval_s = 600.0
+        self.saves = self.errors = self.last_rows = 0
+        self.last_saved = None
+        self.path = "/state/ple.rows.tp0of1"
+        self.started = 0
+
+    def set_interval(self, s: float) -> None:
+        self.interval_s = s
+
+    def save(self) -> bool:
+        self.started += 1
+        return True
+
+
+def _ple_table(saver=None) -> SimpleNamespace:
+    return SimpleNamespace(
+        _server=SimpleNamespace(stats=_Stats()),
+        saver=saver,
+        page_cache="warm",
+        warm_s=12.5,
+        row_state_path=None if saver is None else saver.path,
+        preloaded_rows=0 if saver is None else 1234,
+        preload_s=0.0 if saver is None else 3.0,
+    )
+
+
+def test_ple_row_state_interval_and_save_are_live():
+    worker = _worker()
+    saver = _Saver()
+    worker.__dict__["_runtime_control_row_tables"] = [("model.ple", _ple_table(saver))]
+    reply = wrc.handle(
+        worker, "apply", "ple.set", {"state_interval_s": 60, "save_state": True}
+    )
+    assert reply["ok"], reply
+    assert reply["changes"] == {"state_interval_s": [600.0, 60.0]}
+    assert saver.interval_s == 60.0 and saver.started == 1
+    assert reply["result"]["row_state_files"] == [saver.path]
+    state = wrc.handle(worker, "state", args={"only": ["ple"]})["ple"][0]
+    assert state["page_cache"] == "warm" and state["preloaded_rows"] == 1234
+    assert state["state_interval_s"] == 60.0 and state["state_last_age_s"] is None
+    wrc.handle(worker, "restore", "ple.set")
+    assert saver.interval_s == 600.0
+
+
+def test_ple_row_state_verbs_need_a_state_file():
+    worker = _worker()
+    worker.__dict__["_runtime_control_row_tables"] = [("model.ple", _ple_table())]
+    for args in (
+        {"state_interval_s": 60},
+        {"save_state": True},
+        {},
+        {"state_interval_s": -1},
+        {"save_state": 1},
+        {"warm": True},
+    ):
+        reply = wrc.handle(worker, "apply", "ple.set", args)
+        assert not reply["ok"], args
+    assert wrc.handle(worker, "apply", "ple.set", {"stats_interval_s": 5})["ok"]
+
+
 class _Session:
     def __init__(self) -> None:
         self.config = SimpleNamespace(
