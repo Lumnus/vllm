@@ -222,7 +222,11 @@ class RuntimeControl:
         rows = fast[0]["rows"] if resizable else None
         controller = getattr(self.engine, "_fast_tier", None)
         resize = None if controller is None else controller.resize
+        held = None if controller is None else controller.tier_set
         return {
+            # the last tiers.set that went through the controller (waiting,
+            # finished or failed)
+            "tier_set": None if held is None else held.record(),
             "resizable": resizable,
             "rows": rows,
             "ranks_agree": resizable and all(f["rows"] == rows for f in fast),
@@ -279,6 +283,9 @@ class RuntimeControl:
                 if "grow_floor_mib" in args:
                     cache_config.kv_cache_grow_torch_floor_mib = args["grow_floor_mib"]
             return reply
+        if op == "tiers.set":
+            # waits for an EPLB move in flight (vllm/v1/engine/fast_tier.py)
+            return self._fast_tier().set_tiers(args)
         if op in WORKER_OPS:
             return self._worker_op(op, args)
         if op == "tiers.fast":

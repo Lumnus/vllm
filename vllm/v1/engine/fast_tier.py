@@ -101,9 +101,42 @@ class FastTierResize:
         return out
 
 
+@dataclass
+class TierSetWait:
+    """A ``tiers.set`` (the pinned bound) that EPLB's move in flight held
+    back: the busy loop asks the ranks again between steps until it applies
+    or its deadline passes. The deadline counts the engine's busy time
+    (gaps between two asks count at most a second each), since EPLB moves
+    on only with steps."""
+
+    args: dict[str, Any]
+    state: FastTierState
+    deadline_s: float = 60.0
+    message: str = ""
+    started: float = field(default_factory=time.monotonic)
+    ended: float | None = None
+    waited_s: float = 0.0
+    last_ask: float | None = None
+    asks: int = 0
+
+    def record(self) -> dict[str, Any]:
+        end = self.ended if self.ended is not None else time.monotonic()
+        return {
+            "state": self.state.value,
+            "args": dict(self.args),
+            "seconds": round(end - self.started, 3),
+            "waited_s": round(self.waited_s, 3),
+            "asks": self.asks,
+            "deadline_s": self.deadline_s,
+            "message": self.message,
+        }
+
+
 class FastTierController:
     """Held by the runtime control surface (made on first use); the busy
-    loop advances it (``EngineCore._fast_tier``)."""
+    loop advances it (``EngineCore._fast_tier``). It also holds a
+    ``tiers.set`` that waits for EPLB (:meth:`set_tiers`), through the same
+    wait rule as a resize."""
 
     DEFAULT_DEADLINE_S = 60.0
 
@@ -111,6 +144,105 @@ class FastTierController:
         self.engine = engine
         self.control = control
         self.resize: FastTierResize | None = None
+        self.tier_set: TierSetWait | None = None
+
+    # -- tiers.set (the pinned bound) while EPLB moves ----------------------
+
+    def set_tiers(self, args: dict[str, Any]) -> dict[str, Any]:
+        """``tiers.set``: applied at once when the ranks take it; when they
+        refuse because an EPLB rearrangement or tier pass is in flight, held
+        (answer ``applied: waiting``) and asked again between steps until it
+        applies or ``deadline_s`` (default 60) of waiting passes. Any other
+        refusal is the answer, nothing changed."""
+        from vllm.v1.engine.runtime_control import ControlRefused
+
+        held = self.tier_set
+        if held is not None and held.state.active:
+            raise ControlRefused(
+                f"a tiers.set {held.args} is waiting for EPLB "
+                f"({held.waited_s:.1f} of {held.deadline_s:g} s); one at a time"
+            )
+        args = dict(args)
+        deadline = args.pop("deadline_s", self.DEFAULT_DEADLINE_S)
+        if not isinstance(deadline, int | float) or isinstance(deadline, bool):
+            raise ControlRefused(f"deadline_s is a number; got {deadline!r}")
+        wait = TierSetWait(args, FastTierState.WAITING, float(deadline))
+        reply = self._tiers_set_op(wait)
+        if reply["applied"] == "all":
+            wait.state = FastTierState.FINISHED
+            wait.ended = time.monotonic()
+            self.tier_set = wait
+            return {**reply, "tiers_set": wait.record()}
+        error = str(reply.get("error") or "not applied on every rank")
+        if reply.get("refused") and self._eplb_busy(error):
+            self.tier_set = wait
+            wait.last_ask = time.monotonic()
+            wait.message = f"waiting for EPLB: {error}"
+            logger.info(
+                "Tiers: tiers.set %s waits for EPLB (%s); at most %.0f s.",
+                args,
+                error,
+                wait.deadline_s,
+            )
+            return {
+                "op": "tiers.set",
+                "applied": "waiting",
+                "tiers_set": wait.record(),
+            }
+        if reply.get("refused"):
+            raise ControlRefused(error)
+        return reply
+
+    def _tiers_set_op(self, wait: TierSetWait) -> dict[str, Any]:
+        from vllm.v1.engine.runtime_control import ControlRefused
+
+        wait.asks += 1
+        try:
+            return self.control._worker_op("tiers.set", dict(wait.args))
+        except ControlRefused as e:
+            return {"op": "tiers.set", "applied": "none", "error": str(e),
+                    "refused": True, "ranks": []}  # fmt: skip
+
+    def _advance_tier_set(self) -> None:
+        wait = self.tier_set
+        if wait is None or wait.state != FastTierState.WAITING:
+            return
+        now = time.monotonic()
+        last = wait.last_ask if wait.last_ask is not None else now
+        wait.waited_s += max(0.0, min(now - last, 1.0))
+        wait.last_ask = now
+        try:
+            reply = self._tiers_set_op(wait)
+        except TimeoutError:
+            raise  # the engine core fails the executor, as for a resize
+        except Exception as e:  # noqa: BLE001 - ends this change, not the engine
+            reply = {"applied": "none", "error": f"{type(e).__name__}: {e}"}
+        if reply["applied"] == "all":
+            wait.state = FastTierState.FINISHED
+            wait.ended = time.monotonic()
+            wait.message = ""
+            logger.info(
+                "Tiers: tiers.set %s applied after waiting %.1f s for EPLB (%d asks).",
+                wait.args,
+                wait.ended - wait.started,
+                wait.asks,
+            )
+            return
+        error = str(reply.get("error") or "not applied on every rank")
+        if reply.get("refused") and self._eplb_busy(error):
+            if wait.deadline_s <= 0 or wait.waited_s <= wait.deadline_s:
+                wait.message = f"waiting for EPLB: {error}"
+                return
+            error = f"EPLB still moving experts after {wait.waited_s:.0f} s: {error}"
+        wait.state = FastTierState.FAILED
+        wait.ended = time.monotonic()
+        wait.message = error
+        logger.warning(
+            "Tiers: tiers.set %s not applied after %.1f s: %s.",
+            wait.args,
+            wait.ended - wait.started,
+            error,
+        )
 
     # -- readout ----------------------------------------------------------
 
@@ -300,9 +432,11 @@ class FastTierController:
         )
 
     def advance(self) -> None:
-        """Between two steps (busy loop): start the KV shrink of a grow that
-        waited for EPLB, commit a grow whose KV shrink has released, or close
-        one whose shrink ended otherwise."""
+        """Between two steps (busy loop): apply a ``tiers.set`` that waited
+        for EPLB, start the KV shrink of a grow that waited for EPLB, commit
+        a grow whose KV shrink has released, or close one whose shrink ended
+        otherwise."""
+        self._advance_tier_set()
         resize = self.resize
         if resize is None or not resize.state.active:
             return

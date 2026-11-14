@@ -1815,14 +1815,17 @@ class ExpertTiers:
         *,
         timeout: float = 5.0,
         read_budget: int | None = None,
+        min_gain: float | None = None,
     ) -> "PreparedMove":
         """Plan the move to the experts ``new_logical`` (per local slot) with
         the tier choice for ``slot_load`` (the load of the expert each slot
         will hold), and read what it needs into free pool rows (from the CPU
         tier's host cache where it holds the expert, else the store), at most
-        ``read_budget`` experts (default: the spare rows). Runs on any thread;
-        touches no device state. Commit the result with :meth:`commit_move`
-        between two steps, on the thread that enqueues the forward."""
+        ``read_budget`` experts (default: the spare rows), each tier swap
+        passing the gain test ``min_gain`` (EPLB's tier pass). Runs on any
+        thread; touches no device state. Commit the result with
+        :meth:`commit_move` between two steps, on the thread that enqueues
+        the forward."""
         _, placement, _ = self._require_store()
         assert self.slot_logical is not None
         t0 = time.perf_counter()
@@ -1832,6 +1835,7 @@ class ExpertTiers:
             slot_load,
             hysteresis,
             read_budget=read_budget,
+            **({"min_gain": min_gain} if min_gain else {}),
         )
         move = placement.prepare(plan, self._fill_rows_cached, timeout=timeout)
         self._prepared_load = np.asarray(slot_load, dtype=np.float64).copy()
@@ -1935,12 +1939,14 @@ class ExpertTiers:
         logical_load: np.ndarray,
         hysteresis: float,
         read_budget: int | None = None,
+        min_gain: float | None = None,
     ) -> "PreparedMove":
         """EPLB's mover: the move from ``old_phys2log`` to ``new_phys2log``
         with the tiers cut from ``logical_load`` (its window). With the two
         maps equal it is a tier pass: no expert of the rank changes, the
         slots move between the card, the pinned rows and the CPU, at most
-        ``read_budget`` experts read."""
+        ``read_budget`` experts read, each swap passing the gain test
+        ``min_gain`` (``EPLBConfig.tier_min_gain``)."""
         old_logical, _ = self._local_view(old_phys2log, logical_load)
         new_logical, slot_load = self._local_view(new_phys2log, logical_load)
         assert self.slot_logical is not None
@@ -1958,11 +1964,33 @@ class ExpertTiers:
             self._prepared_mean = float(load.mean()) if load.size else None
             try:
                 return self.prepare_move(
-                    new_logical, slot_load, hysteresis, read_budget=read_budget
+                    new_logical,
+                    slot_load,
+                    hysteresis,
+                    read_budget=read_budget,
+                    min_gain=min_gain,
                 )
             except BaseException:
                 self._eplb_pending = False
                 raise
+
+    def tier_changes_wanted(
+        self,
+        phys2log: np.ndarray,
+        logical_load: np.ndarray,
+        hysteresis: float,
+        min_gain: float | None,
+        budget: int | None,
+    ) -> int:
+        """About how many of this rank's slots a tier pass would move now,
+        by the window ``logical_load`` (``TierPlacement.tier_changes_wanted``);
+        0 for a layer without the store's placement."""
+        if self.placement is None or self.store_binding is None:
+            return 0
+        _, slot_load = self._local_view(phys2log, logical_load)
+        return self.placement.tier_changes_wanted(
+            slot_load, hysteresis, min_gain, budget
+        )
 
     def commit(self, prepared: "PreparedMove") -> None:
         try:

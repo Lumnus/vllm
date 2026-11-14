@@ -563,6 +563,41 @@ def _register_builtin() -> None:
     )
     P(
         Param(
+            "eplb.tier_min_gain",
+            "float",
+            "A tier swap only when the call cost it saves over the window repays its move this many times (null = hysteresis alone).",
+            "eplb.set",
+            min=0,
+            nullable=True,
+            start="--eplb-config tier_min_gain",
+            read=_rank0("eplb", "settings", "tier_min_gain"),
+        )
+    )
+    P(
+        Param(
+            "eplb.tier_min_changes",
+            "int",
+            "A tier pass only when its cut moves at least this many slots over the layers and ranks (0 = every interval).",
+            "eplb.set",
+            min=0,
+            start="--eplb-config tier_min_changes",
+            read=_rank0("eplb", "settings", "tier_min_changes"),
+        )
+    )
+    P(
+        Param(
+            "eplb.tier_window_moves",
+            "int",
+            "Experts the tier passes may read per layer and rank over the last window_size steps (null = no cap).",
+            "eplb.set",
+            min=1,
+            nullable=True,
+            start="--eplb-config tier_window_moves",
+            read=_rank0("eplb", "settings", "tier_window_moves"),
+        )
+    )
+    P(
+        Param(
             "eplb.tier_hot",
             "float",
             "Temperature (load over the mean expert's) from which an expert counts as hot.",
@@ -603,7 +638,18 @@ def _register_builtin() -> None:
         )
     )
     # -- tiers, store, CPU tier
-    V(Verb("tiers.set", "Expert tier settings a tier component registers.", kind="set"))
+    V(
+        Verb(
+            "tiers.set",
+            "Expert tier settings a tier component registers; while EPLB moves "
+            "experts the change waits for it (answer `waiting`).",
+            args={
+                "deadline_s": "float, how long the change may wait for EPLB "
+                "(default 60)",
+            },
+            kind="set",
+        )
+    )
     P(
         Param(
             "tiers.host_tier_bound",
@@ -651,6 +697,41 @@ def _register_builtin() -> None:
             min=0,
             start="--expert-store-config stage_min_calls",
             read=_rank0("cpu", "settings", "stage_min_calls"),
+        )
+    )
+    P(
+        Param(
+            "cpu.stage_min_tokens",
+            "int",
+            "Prefill staging by cost: a layer call of at least this many tokens stages the CPU-tier experts that make its host-side time smallest (0 = off).",
+            "cpu.set",
+            min=0,
+            start="--expert-store-config stage_min_tokens",
+            read=_rank0("cpu", "settings", "stage_min_tokens"),
+        )
+    )
+    P(
+        Param(
+            "cpu.stage_copy_threads",
+            "int",
+            "Threads copying units from the host cache into the staging rows.",
+            "cpu.set",
+            min=1,
+            max=256,
+            start="--expert-store-config stage_copy_threads",
+            read=_rank0("cpu", "settings", "stage_copy_threads"),
+        )
+    )
+    P(
+        Param(
+            "cpu.stage_card_us",
+            "float",
+            "The card's time per staged expert the staging cost model assumes.",
+            "cpu.set",
+            unit="us",
+            min=0,
+            start="--expert-store-config stage_card_us",
+            read=_rank0("cpu", "settings", "stage_card_us"),
         )
     )
     P(
