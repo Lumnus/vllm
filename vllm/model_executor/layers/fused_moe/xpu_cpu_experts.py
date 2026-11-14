@@ -53,6 +53,7 @@ card) moves a value across a rounding boundary. The W4A8 card path runs no
 output hook, so its layers keep the per-tier sums (``finish``).
 """
 
+import contextlib
 import functools
 import mmap
 import os
@@ -169,6 +170,196 @@ def _op_configure(cores: list[int], spin_us: int) -> bool:
 # "numpy": with numpy always. Both give the same lists.
 _SELECT_ENV = "VLLM_CPU_EXPERTS_SELECT"
 _NO_MAP = torch.empty(0, dtype=torch.int32)
+
+
+# Where a layer call's CPU part runs (environment, read when the tier
+# starts): VLLM_CPU_EXPERTS_ASYNC unset or "0": on the thread that runs the
+# model, which waits for the routing, computes and then enqueues the rest
+# (finish_pairs); "spin": on a host thread of its own (_AsyncHost), while the
+# model's thread goes on enqueuing; the card waits for the result rows with
+# a kernel that reads a pinned host word (xpu_host_wait). Only for the sums
+# that take each pair's row (VLLM_XPU_MOE_COMBINE unset with this tier, rank,
+# exact), layer calls of at most VLLM_CPU_EXPERTS_ASYNC_MAX_TOKENS tokens and
+# no prefill staging; every other layer call runs as with it unset. The CPU
+# computes the same rows from the same inputs either way.
+_ASYNC_ENV = "VLLM_CPU_EXPERTS_ASYNC"
+_ASYNC_TOKENS_ENV = "VLLM_CPU_EXPERTS_ASYNC_MAX_TOKENS"
+_ASYNC_SPINS_ENV = "VLLM_CPU_EXPERTS_ASYNC_SPINS"
+_ASYNC_DEFAULT_TOKENS = 32
+# Reads of the host word before the card gives up (each a read over PCIe,
+# about 1 us: about a second; below the driver's hang check).
+_ASYNC_DEFAULT_SPINS = 1_000_000
+# How long the model's thread waits for the host thread to finish what was
+# posted before it fails the step (it waits between steps and before a
+# layer call that runs on the model's thread).
+_ASYNC_DRAIN_S = 60.0
+
+
+def _async_settings() -> tuple[int, int] | None:
+    """(max tokens, max spins) with VLLM_CPU_EXPERTS_ASYNC=spin, else None."""
+    mode = os.environ.get(_ASYNC_ENV, "").strip().lower()
+    if mode in ("", "0", "off"):
+        return None
+    if mode != "spin":
+        raise CpuExpertError(f"{_ASYNC_ENV} is 'spin' or unset, not {mode!r}")
+    tokens = int(os.environ.get(_ASYNC_TOKENS_ENV, "") or _ASYNC_DEFAULT_TOKENS)
+    spins = int(os.environ.get(_ASYNC_SPINS_ENV, "") or _ASYNC_DEFAULT_SPINS)
+    if tokens < 1 or spins < 1:
+        raise CpuExpertError(f"{_ASYNC_TOKENS_ENV} and {_ASYNC_SPINS_ENV} are >= 1")
+    return tokens, spins
+
+
+class _AsyncHost:
+    """A layer call's CPU part on a host thread of its own
+    (VLLM_CPU_EXPERTS_ASYNC=spin).
+
+    The model's thread posts the layer call (its inputs are on their way to
+    pinned buffers, :meth:`CpuExpertRuntime.post`), hands it here with a
+    sequence number, enqueues the card's wait for that number and the copies
+    of the result rows and the pair map, and goes on with the step: it no
+    longer waits for the routing, so the device queue does not drain at every
+    MoE layer. This thread waits for the routing, lists the calls, computes
+    them into the pinned rows, writes the map, and then the number into the
+    ``done`` word; the card's wait ends and its copies read the rows.
+
+    One set of pinned buffers is enough: the next layer call's inputs reach
+    them by a copy the card runs after this call's wait ended (stream order),
+    so after this thread finished with them, and its results are written
+    after those inputs arrived, so after this call's rows were copied out.
+
+    A failure (an expert the store cannot give) writes the number into the
+    ``failed`` word, so the card stops waiting, and fails the step on the
+    model's thread: at the next layer call's post, or when the model's thread
+    drains this thread between steps (:meth:`drain`, from the model runner's
+    step hook). A card that stopped waiting (timed out) is failed the same
+    way."""
+
+    def __init__(self, runtime: "CpuExpertRuntime", max_tokens: int, spins: int):
+        from vllm.model_executor.layers.fused_moe import xpu_host_wait
+
+        self.runtime = runtime
+        self.max_tokens = max_tokens
+        self.spins = spins
+        self._wait_mod = xpu_host_wait
+        self.atomic = xpu_host_wait.read_mode() == "atomic"
+        self.flag = xpu_host_wait.flag_words()
+        self.words = self.flag.numpy()
+        self._views: dict[str, torch.Tensor] = {}
+        self.seq = 0
+        self.posted = 0  # layer calls handed here
+        self._jobs: list[tuple[Pending, int] | None] = []
+        self._cond = threading.Condition()
+        self._open = 0  # handed here and not finished
+        self.error: BaseException | None = None
+        self.core = runtime.cores[0] if runtime.cores else None
+        self._thread = threading.Thread(
+            target=self._loop, name="cpu-experts-host", daemon=True
+        )
+        self._thread.start()
+
+    def view(self, device: torch.device) -> torch.Tensor:
+        key = str(device)
+        v = self._views.get(key)
+        if v is None:
+            v = self._views[key] = self._wait_mod.device_view(self.flag, device)
+        return v
+
+    def check(self) -> None:
+        """Fail the step if this thread failed a layer call or the card
+        stopped waiting for one."""
+        if self.error is not None:
+            raise CpuExpertError(
+                "CPU experts: a layer call computed on the host thread failed "
+                f"({self.error}); the step's output is not valid"
+            ) from self.error
+        stuck = int(self.words[self._wait_mod.TIMED_OUT])
+        if stuck:
+            raise CpuExpertError(
+                f"CPU experts: the card stopped waiting for layer call {stuck} "
+                f"after {self.spins} reads of the host word (the host thread "
+                "did not finish it in time); the step's output is not valid"
+            )
+
+    def drain(self, timeout_s: float = _ASYNC_DRAIN_S) -> None:
+        """Wait until every layer call handed here is finished, then
+        :meth:`check`."""
+        with self._cond:
+            ok = self._cond.wait_for(lambda: self._open == 0, timeout_s)
+        if not ok:
+            raise CpuExpertError(
+                f"CPU experts: the host thread did not finish {self._open} "
+                f"layer calls in {timeout_s:.0f} s"
+            )
+        self.check()
+
+    def submit(self, pending: "Pending", device: torch.device) -> "HostPairs":
+        """Hand the layer call to this thread and enqueue the card's side:
+        the wait for it, then the copies of the result rows (every pair's row
+        slot: how many the CPU computes is not known yet) and the map."""
+        self.check()
+        n, b = pending.num_tokens, pending.buffers
+        topk = b.ids.shape[1]
+        self.runtime._pair_buffers(b, n * topk)
+        assert b.pair_rows is not None and b.row_map is not None
+        self.seq = self.seq % 0x7FFFFFFF + 1
+        seq = self.seq
+        if pending.times is not None:
+            pending.times["handed"] = time.perf_counter()
+        with self._cond:
+            self._jobs.append((pending, seq))
+            self._open += 1
+            self.posted += 1
+            self._cond.notify()
+        self._wait_mod.wait_host_flag(
+            self.flag, self.view(device), seq, self.spins, atomic=self.atomic
+        )
+        return HostPairs(
+            b.pair_rows[: n * topk].to(device, non_blocking=True),
+            b.row_map[:n].to(device, non_blocking=True),
+        )
+
+    def stop(self) -> None:
+        with self._cond:
+            self._jobs.append(None)
+            self._cond.notify()
+
+    def _loop(self) -> None:
+        if self.core is not None and hasattr(os, "sched_setaffinity"):
+            # cores[0] of the op's set is meant for the op's caller
+            with contextlib.suppress(OSError):
+                os.sched_setaffinity(0, {self.core})
+        while True:
+            with self._cond:
+                self._cond.wait_for(lambda: bool(self._jobs))
+                job = self._jobs.pop(0)
+            if job is None:
+                return
+            pending, seq = job
+            word = self._wait_mod.DONE
+            try:
+                if self.error is None:
+                    pair = self.runtime._pairs_into_buffers(pending, fill_map=True)
+                    if pending.times is not None:
+                        self.runtime._emit_host_thread(pending, pair)
+                else:
+                    word = self._wait_mod.FAILED
+            except BaseException as e:  # noqa: BLE001 - failed on the model's thread
+                self.error = e
+                word = self._wait_mod.FAILED
+            finally:
+                self.words[word] = seq
+                with self._cond:
+                    self._open -= 1
+                    self._cond.notify_all()
+
+
+def drain_async() -> None:
+    """Between steps (the model runner's step hook): wait for the host thread
+    of VLLM_CPU_EXPERTS_ASYNC to finish what the step handed it, and fail the
+    step if a layer call failed. Nothing without that thread."""
+    rt = _RUNTIME
+    if rt is not None and rt._async is not None:
+        rt._async.drain()
 
 
 def _select_op() -> Any:
@@ -890,6 +1081,13 @@ class Pending:
     # staged to the card, which the CPU leaves out.
     selection: Any = None
     staged: np.ndarray | None = None
+    # The host timeline of this layer call (debug part "cpustep"): host
+    # times (perf_counter) by point, whether the card had reached the
+    # routing when the host waited for it, and an event after the card's
+    # own experts of the layer.
+    times: dict[str, float] | None = None
+    card_ahead: bool | None = None
+    card_event: Any = None
 
 
 @dataclass
@@ -1009,6 +1207,10 @@ class CpuExpertRuntime:
     """The CPU tier of one process: the host cache, the host op, the
     pinned staging buffers and the counters."""
 
+    # VLLM_CPU_EXPERTS_ASYNC's host thread (set in __init__; None also for a
+    # runtime made without it, as tests' stand-ins are)
+    _async: "_AsyncHost | None" = None
+
     def __init__(
         self,
         config: "ExpertStoreConfig",
@@ -1064,7 +1266,31 @@ class CpuExpertRuntime:
         self._x_row = not self.w4a8 and op_takes_arith() and op_takes_x_row()
         self._last_stats = time.monotonic()
         self._first_logged = False
+        # the end of the last layer call's host part (debug part "cpustep")
+        self._last_exit: float | None = None
+        # (routing arrived, units present, op done) of the last call with CPU
+        # calls (perf_counter)
+        self._last_call: tuple[float, float, float] | None = None
         self._self_check()
+        # VLLM_CPU_EXPERTS_ASYNC: the CPU part on a host thread of its own
+        self._async: _AsyncHost | None = None
+        settings = _async_settings()
+        if settings is not None:
+            self._async = _AsyncHost(self, *settings)
+            logger.info(
+                "CPU experts: a layer call's CPU part runs on a host thread of "
+                "its own%s while the model's thread enqueues on; the card waits "
+                "for the result rows by reading a host word (%s reads, at most "
+                "%d; %s=spin, layer calls of at most %d tokens without prefill "
+                "staging; the others as without it).",
+                ""
+                if self._async.core is None
+                else f" (pinned to core {self._async.core})",
+                "acquire" if self._async.atomic else "volatile",
+                self._async.spins,
+                _ASYNC_ENV,
+                self._async.max_tokens,
+            )
         logger.info(
             "CPU experts: %s kernel (%s), %d threads, host cache of %d experts "
             "(%.2f GiB of ordinary memory, %d B per expert); experts not in it "
@@ -1084,6 +1310,7 @@ class CpuExpertRuntime:
         pool per thread count; pinned, at most one per core of the set)."""
         if threads < 1:
             raise ValueError("cpu_threads must be at least 1")
+        self.drain()
         old = self.threads
         self.config.cpu_threads = int(threads)
         self.threads = int(threads)
@@ -1127,6 +1354,7 @@ class CpuExpertRuntime:
     def resize_cache(self, gib: float) -> None:
         """The host cache to ``gib`` (rows of whole experts), between two
         steps: the most recently used experts stay as far as they fit."""
+        self.drain()
         rows = self.cache.rows_for_gib(gib)
         old = self.cache.num_rows
         self.cache.resize(rows)
@@ -1358,6 +1586,11 @@ class CpuExpertRuntime:
                 "graphs (the config splits the graphs at the MoE op when this "
                 "is on, and a capture path that ignores that cannot run it)"
             )
+        if self._async is not None:
+            self._async.check()
+        times = None
+        if runtime_debug.on("cpustep"):
+            times = {"post": time.perf_counter()}
         tokens, topk = topk_ids.shape
         b = self._buffers_for(tokens, topk, hidden_states.shape[1])
         b.ids[:tokens].copy_(topk_ids, non_blocking=True)
@@ -1373,12 +1606,123 @@ class CpuExpertRuntime:
             if not self.w4a8 and op_takes_arith() and self.config.cpu_arith == "card"
             else 0
         )
-        return Pending(tiers, tokens, event, b, arith=arith, weights=weights)
+        pending = Pending(tiers, tokens, event, b, arith=arith, weights=weights)
+        if times is not None:
+            times["posted"] = time.perf_counter()
+            pending.times = times
+        return pending
+
+    # -- where the CPU part runs (VLLM_CPU_EXPERTS_ASYNC) ----------------------
+
+    def takes_async(self, pending: Pending) -> bool:
+        """Whether this layer call's CPU part runs on the host thread
+        (:meth:`finish_pairs_async`): VLLM_CPU_EXPERTS_ASYNC=spin, at most its
+        token bound, and no prefill staging for it (staging lists the calls
+        on the model's thread)."""
+        a = self._async
+        if a is None or pending.num_tokens > a.max_tokens:
+            return False
+        if int(self.config.stage_min_calls) > 0:
+            return False
+        min_tokens = int(getattr(self.config, "stage_min_tokens", 0))
+        return not 0 < min_tokens <= pending.num_tokens
+
+    def finish_pairs_async(self, pending: Pending, device: torch.device) -> HostPairs:
+        """:meth:`finish_pairs` without waiting: the host thread computes the
+        rows; the card waits for them (stream order) before its copies of the
+        rows and the map. Every pair's row slot is copied (the map says which
+        hold a CPU result: -1 where none, the whole map when the CPU computes
+        nothing), so the per-pair sum reads what it reads on the model's
+        thread."""
+        assert self._async is not None
+        host = self._async.submit(pending, device)
+        if pending.times is not None:
+            pending.times["enqueued"] = time.perf_counter()
+            self._emit_step(pending)
+        return host
+
+    def drain(self) -> None:
+        """Wait until the host thread finished every layer call handed to it
+        (nothing without it); raises if one failed."""
+        if self._async is not None:
+            self._async.drain()
+
+    def card_enqueued(self, pending: Pending, device: torch.device) -> None:
+        """The card's own experts of the layer are enqueued (debug part
+        "cpustep": the time, and an event after them on ``device``)."""
+        if pending.times is None:
+            return
+        pending.times["card"] = time.perf_counter()
+        if device.type != "cpu":
+            mod = torch.get_device_module(device)
+            ev = mod.Event()
+            ev.record(mod.current_stream())
+            pending.card_event = ev
+
+    def _emit_step(self, pending: Pending) -> None:
+        """One "cpustep" line: where the host's time of this layer call went
+        (ms), and what the card was doing at the two points the host can
+        see without waiting."""
+        t = pending.times
+        assert t is not None
+        last = self._last_exit
+        end = t.get("end", t.get("enqueued", t["posted"]))
+        self._last_exit = end
+
+        def span(a: str, b: str) -> float:
+            return (t[b] - t[a]) * 1e3 if a in t and b in t else float("nan")
+
+        runtime_debug.emit(
+            "cpustep",
+            logger,
+            "%s: %d tokens, %s; host ms: since the last layer call's host part "
+            "%.3f, post %.3f, card's experts enqueued %.3f, %s; card at the "
+            "routing when the host waited: %s; card's experts done when the "
+            "CPU's were: %s",
+            pending.tiers.layer_name,
+            pending.num_tokens,
+            "handed to the host thread"
+            if "enqueued" in t
+            else f"{t.get('calls', 0)} CPU calls",
+            float("nan") if last is None else (t["post"] - last) * 1e3,
+            span("post", "posted"),
+            span("posted", "card"),
+            f"handing over and the card's wait {span('card', 'enqueued'):.3f}"
+            if "enqueued" in t
+            else (
+                f"wait {span('wait', 'waited'):.3f}, list+cache "
+                f"{span('waited', 'listed'):.3f}, op {span('listed', 'computed'):.3f}, "
+                f"results {span('computed', 'end'):.3f}"
+            ),
+            "n/a" if pending.card_ahead is None else pending.card_ahead,
+            "n/a" if "card_done" not in t else bool(t["card_done"]),
+        )
+
+    def _emit_host_thread(self, pending: Pending, pair: np.ndarray | None) -> None:
+        """The host thread's "cpustep" line of a layer call it computed."""
+        t = pending.times
+        assert t is not None
+        runtime_debug.emit(
+            "cpustep",
+            logger,
+            "%s: host thread: %d CPU calls; ms: from handed to the routing's "
+            "arrival %.3f, list+cache %.3f, op %.3f; card at the routing when "
+            "the host thread began: %s; card's experts done when the CPU's "
+            "were: %s",
+            pending.tiers.layer_name,
+            0 if pair is None else len(pair),
+            (t["waited"] - t.get("handed", t["wait"])) * 1e3,
+            (t["listed"] - t["waited"]) * 1e3,
+            (t["computed"] - t["listed"]) * 1e3,
+            "n/a" if pending.card_ahead is None else pending.card_ahead,
+            "n/a" if "card_done" not in t else bool(t["card_done"]),
+        )
 
     def finish(self, pending: Pending, device: torch.device) -> torch.Tensor | None:
         """Wait for the routing only, compute the layer's host calls and
         return their summed contribution on the device (None: no host call).
         Raises :class:`CpuExpertError` when an expert cannot be served."""
+        self.drain()
         n, b = pending.num_tokens, pending.buffers
         if not pending.weights:
             raise CpuExpertError(
@@ -1593,11 +1937,42 @@ class CpuExpertRuntime:
         output row per (token, top-k) pair the CPU computes, with its map;
         pairs of experts :meth:`stage` sent to the card are left out. None:
         no host call."""
+        self.drain()
         n, b = pending.num_tokens, pending.buffers
-        self._wait(pending)
-        self.arith = pending.arith
         topk = b.ids.shape[1]
         self._pair_buffers(b, n * topk)
+        assert b.pair_rows is not None and b.row_map is not None
+        pair = self._pairs_into_buffers(pending)
+        if pair is None:
+            out = None
+        else:
+            out = HostPairs(
+                b.pair_rows[: len(pair)].to(device, non_blocking=True),
+                b.row_map[:n].to(device, non_blocking=True),
+            )
+        if pending.times is not None:
+            pending.times["end"] = time.perf_counter()
+            pending.times["calls"] = 0 if pair is None else len(pair)
+            self._emit_step(pending)
+        return out
+
+    def _pairs_into_buffers(
+        self, pending: Pending, fill_map: bool = False
+    ) -> np.ndarray | None:
+        """Wait for the layer call's routing, compute its CPU calls into the
+        pinned pair rows (call ``i`` in row ``i``) and write the pair map
+        (``fill_map``: also when there is no call: all -1). Returns the flat
+        pair index of each call, or None (no call). On the model's thread
+        (:meth:`finish_pairs`) or the host thread (VLLM_CPU_EXPERTS_ASYNC)."""
+        n, b = pending.num_tokens, pending.buffers
+        t = pending.times
+        if t is not None:
+            t["wait"] = time.perf_counter()
+            event_query = getattr(pending.event, "query", None)
+            if event_query is not None:
+                pending.card_ahead = bool(event_query())
+        self._wait(pending)
+        self.arith = pending.arith
         assert b.pair_rows is not None and b.row_map is not None
         # The map goes to the reused pinned buffer: written after this layer's
         # routing arrived, so after the previous layer's copy of it left.
@@ -1607,16 +1982,28 @@ class CpuExpertRuntime:
             pending.staged, pending.selection, row_map,
             None if b.x_i16 is None else b.x_i16[:n],
         )  # fmt: skip
+        if t is not None:
+            t["waited"], t["listed"], t["computed"] = self._call_times(t)
+            if pending.card_event is not None:
+                t["card_done"] = float(pending.card_event.query())
         if pair is None:
+            if fill_map:
+                row_map.numpy().fill(-1)
             return None
         if not mapped:
             flat = row_map.numpy().reshape(-1)
             flat.fill(-1)
             flat[pair] = self._iota(len(pair)).numpy()
-        return HostPairs(
-            b.pair_rows[: len(pair)].to(device, non_blocking=True),
-            row_map.to(device, non_blocking=True),
-        )
+        return pair
+
+    def _call_times(self, t: dict[str, float]) -> tuple[float, float, float]:
+        """(routing arrived, units present, op done) of the last layer call
+        (perf_counter; the wait's end when the call had no CPU calls)."""
+        last = self._last_call
+        now = time.perf_counter()
+        if last is None or last[0] < t["wait"]:
+            return now, now, now
+        return last
 
     def _pair_buffers(self, b: _Buffers, pairs: int) -> None:
         """The per-pair host buffers of ``b`` for at least ``pairs`` pairs
@@ -1915,6 +2302,7 @@ class CpuExpertRuntime:
         finally:
             self.cache.release(cache_rows)
         done = time.perf_counter()
+        self._last_call = (waited, read_done, done)
         st.layers += 1
         st.calls += calls
         if calls > st.max_calls:
@@ -2092,6 +2480,8 @@ def reset_runtime() -> None:
     staging rows that belong to it."""
     global _RUNTIME
     with _RUNTIME_LOCK:
+        if _RUNTIME is not None and _RUNTIME._async is not None:
+            _RUNTIME._async.stop()
         _RUNTIME = None
     from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
         reset_stage_rows,
