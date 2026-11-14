@@ -271,6 +271,8 @@ def _cpu_state() -> dict[str, Any] | None:
         "max_experts_per_layer_call": rt.stats.max_experts,
         # what the staging rule weighs (stage_min_tokens)
         "stage_cost": rt.cost.readout(),
+        # device staging rows reserved at load (stage_device_rows)
+        "stage_device_rows_reserved": _device_rows(),
     }
 
 
@@ -721,6 +723,10 @@ _CPU_SETTINGS: dict[str, tuple[type, float]] = {
     "stage_min_tokens": (int, 0),
     "stage_copy_threads": (int, 1),
     "stage_card_us": (float, 0.0),
+    # device staging rows in use (up to those reserved at load; 0 = the card
+    # reads the pinned rows by UVA) and the DMA time per unit the rule assumes
+    "stage_device_rows": (int, 0),
+    "stage_dma_us": (float, 0.0),
 }
 _NO_CPU_TIER = (
     "no experts are computed on the CPU in this engine (--cpu-offload-pinned-gb)"
@@ -738,6 +744,14 @@ _CPU_FIXED = {
     "stage_rows": "the staging rows are pinned memory allocated at first use",
     "read_timeout_s": "an expert store setting; not part of the CPU tier",
 }
+
+
+def _device_rows() -> int:
+    """Device staging rows reserved at load in this process (0: none)."""
+    from vllm.model_executor.layers.fused_moe import xpu_expert_tiers as xt
+
+    rows = xt._STAGE_ROWS
+    return 0 if rows is None else int(rows.device_rows)
 
 
 def _check_cpu_set(worker: Any, args: dict) -> str | None:
@@ -758,9 +772,18 @@ def _check_cpu_set(worker: Any, args: dict) -> str | None:
             return f"{name} must be a number > {low:g}, got {value!r}"
         if name == "cpu_threads" and value > 1024:
             return "cpu_threads must be at most 1024"
+        if name == "stage_device_rows" and value > (reserved := _device_rows()):
+            return (
+                f"stage_device_rows {value}: {reserved} device staging rows were "
+                "reserved at load (--expert-store-config stage_device_rows); more "
+                "needs a restart, since the KV cache gave that memory at load"
+            )
     if "host_cache_gib" in args:
         rows = rt.cache.rows_for_gib(float(args["host_cache_gib"]))
         need = max(1, rt.stats.max_experts)
+        # between two steps the last direct DMA into the device staging rows
+        # has completed: its host cache rows need not stay held
+        rt.settle_dma()
         if rows < need:
             return (
                 f"host_cache_gib {args['host_cache_gib']} holds {rows} experts; "

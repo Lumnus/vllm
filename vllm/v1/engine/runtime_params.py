@@ -749,6 +749,33 @@ def _register_builtin() -> None:
     )
     P(
         Param(
+            "cpu.stage_device_rows",
+            "int",
+            "Device staging rows in use: the card reads staged CPU-tier experts "
+            "from device memory filled by DMA; 0 = it reads the pinned rows "
+            "through UVA. At most the rows reserved at load "
+            "(--expert-store-config stage_device_rows); more needs a restart.",
+            "cpu.set",
+            min=0,
+            start="--expert-store-config stage_device_rows",
+            read=_rank0("cpu", "settings", "stage_device_rows"),
+        )
+    )
+    P(
+        Param(
+            "cpu.stage_dma_us",
+            "float",
+            "The time of one unit's host-to-card copy the staging cost model "
+            "assumes with device staging rows.",
+            "cpu.set",
+            unit="us",
+            min=0,
+            start="--expert-store-config stage_dma_us",
+            read=_rank0("cpu", "settings", "stage_dma_us"),
+        )
+    )
+    P(
+        Param(
             "cpu.stage_rows",
             "int",
             "Staging rows (0 = a layer's CPU slots).",

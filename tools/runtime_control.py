@@ -26,7 +26,8 @@ server has one, is read from `VLLM_API_KEY`.
                                  (waits for an EPLB move in flight: 202 waiting)
     runtime_control.py cpu set [--threads N] [--cache-gib G] [--stage-min-calls N]
                                [--stage-min-tokens N] [--stage-copy-threads N]
-                               [--stage-card-us X]
+                               [--stage-card-us X] [--stage-device-rows N]
+                               [--stage-dma-us X]
     runtime_control.py tiers fast --rows N | --delta N [--deadline S] [--preempt]
                                   [--no-kv]
     runtime_control.py kv resize N [--deadline S] [--preempt]
@@ -195,6 +196,8 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
             _set(a, "stage_min_tokens", ns.stage_min_tokens)
             _set(a, "stage_copy_threads", ns.stage_copy_threads)
             _set(a, "stage_card_us", ns.stage_card_us)
+            _set(a, "stage_device_rows", ns.stage_device_rows)
+            _set(a, "stage_dma_us", ns.stage_dma_us)
         return f"cpu.{verb}", a
     if group == "kv":
         if verb == "resize":
@@ -561,6 +564,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     cs.add_argument("--stage-copy-threads", type=int)
     cs.add_argument("--stage-card-us", type=float)
+    cs.add_argument(
+        "--stage-device-rows",
+        type=int,
+        help="device staging rows in use (0: the card reads pinned rows by UVA)",
+    )
+    cs.add_argument("--stage-dma-us", type=float)
     cp.add_parser("stats")
 
     kv = groups.add_parser("kv").add_subparsers(dest="verb", required=True)
