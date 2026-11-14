@@ -67,6 +67,35 @@ logger = init_logger(__name__)
 # The weight group the kernels' W4A8 grouped GEMM takes (moe_w4a8.GROUP).
 W4A8_GROUP = 128
 
+# Routed ids read as unsigned for the one-pass range check of host_selection.
+_UNSIGNED = {
+    np.dtype(np.int32): np.dtype(np.uint32),
+    np.dtype(np.int64): np.dtype(np.uint64),
+}
+
+
+@dataclass
+class HostSelection:
+    """The calls of a layer call that this rank computes on the CPU, as
+    arrays: ``pair`` the flat (token * top_k + k) index of each call, in
+    token order and top-k order inside a token; ``logical`` its logical
+    expert; ``layer`` the store layer (store keys are ``(layer, logical)``);
+    ``counts`` the rank's routed calls per tier. Arrays listed by the
+    runtime's select op are views of its kept buffers, valid until its next
+    listing."""
+
+    pair: np.ndarray
+    logical: np.ndarray
+    layer: int
+    counts: dict[str, int]
+    # the distinct logical experts in order of first use, when the lister
+    # had them at hand (the select op); None: derived from ``logical``
+    distinct: list[int] | None = None
+
+    def keys(self) -> list[tuple[int, int]]:
+        return [(self.layer, int(e)) for e in self.logical]
+
+
 # Decoder layers only: other MoE layers (e.g. MTP) keep their experts in VRAM, so
 # the budget below is exact.
 _LAYER_RE = re.compile(r"(?:^|\.)(?:model|language_model)\.layers\.(\d+)\.")
@@ -974,38 +1003,61 @@ class ExpertTiers:
         """As :meth:`host_calls`, for a sum that takes each (token, top-k)
         pair's own row (VLLM_XPU_MOE_COMBINE rank/exact): the store keys and
         the flat pair index ``token * top_k + k`` of every call."""
-        keys, tok, k, counts = self._host_selection(ids)
-        pair = tok.astype(np.int64) * ids.shape[1] + k
-        return keys, pair, counts
+        sel = self.host_selection(ids)
+        return sel.keys(), sel.pair, sel.counts
 
     def _host_selection(
         self, ids: np.ndarray
     ) -> tuple[list[tuple[int, int]], np.ndarray, np.ndarray, dict[str, int]]:
+        sel = self.host_selection(ids)
+        tok, k = np.divmod(sel.pair, ids.shape[1])
+        return sel.keys(), tok, k, sel.counts
+
+    def host_selection(self, ids: np.ndarray) -> "HostSelection":
+        """The calls of a step's routing ``ids`` [T, K] (physical ids) that
+        this rank computes on the CPU, as arrays (no per-call Python): the
+        flat pair index ``token * K + k`` of each, in token order and top-k
+        order inside a token, its logical expert, the store layer, and the
+        rank's routed calls per tier. Raises when a routed id is outside the
+        physical ids: nothing the kernels would skip silently passes here."""
         from vllm.model_executor.layers.fused_moe.xpu_cpu_experts import (
             CpuExpertError,
         )
         from vllm.model_executor.offloader.expert_tier_map import FAST, HOST, POOL
 
-        if ids.size and (int(ids.min()) < 0 or int(ids.max()) >= self.num_global):
+        flat = ids.reshape(-1)
+        # One pass checks the range: a negative id read as unsigned is above
+        # every table index, so the gather raises for both ends.
+        unsigned = _UNSIGNED.get(flat.dtype)
+        try:
+            if unsigned is None:
+                if flat.size and int(flat.min()) < 0:
+                    raise IndexError
+                tier = self._tier_of_global[flat]
+            else:
+                tier = self._tier_of_global[flat.view(unsigned)]
+        except IndexError:
             raise CpuExpertError(
                 f"{self.layer_name}: a routed expert id is outside the "
                 f"{self.num_global} physical experts (min {int(ids.min())}, max "
                 f"{int(ids.max())})"
-            )
-        tier = self._tier_of_global[ids]
+            ) from None
+        # tier values -1 (another rank's), FAST, POOL, HOST -> bins 0..3
+        bins = np.bincount(tier.view(np.uint8) + np.uint8(1), minlength=4)
         counts = {
-            "card": int((tier == FAST).sum()),
-            "pinned": int((tier == POOL).sum()),
-            "cpu": int((tier == HOST).sum()),
+            "card": int(bins[FAST + 1]),
+            "pinned": int(bins[POOL + 1]),
+            "cpu": int(bins[HOST + 1]),
         }
-        tok, k = np.nonzero(tier == HOST)
-        if tok.size == 0:
-            return [], tok, k, counts
-        assert self.slot_logical is not None and self.store_binding is not None
-        slots = self._slot_of_global[ids[tok, k]]
-        layer = self.store_binding.store_layer
-        keys = [(layer, int(e)) for e in self.slot_logical[slots]]
-        return keys, tok, k, counts
+        pair = np.flatnonzero(tier == HOST)
+        binding = self.store_binding
+        layer = 0 if binding is None else binding.store_layer
+        if pair.size == 0:
+            logical = pair
+        else:
+            assert self.slot_logical is not None and binding is not None
+            logical = np.asarray(self.slot_logical)[self._slot_of_global[flat[pair]]]
+        return HostSelection(pair, logical.astype(np.int64, copy=False), layer, counts)
 
     # -- prefill staging of CPU-tier experts (stage_min_calls) ----------------
 
