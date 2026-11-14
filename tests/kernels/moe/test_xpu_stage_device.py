@@ -403,8 +403,8 @@ def test_on_a_card_the_outputs_equal_the_uva_calls():
     host = {
         "w13": torch.randint(0, 256, (rows, 2 * inter, hidden // 2), generator=g),
         "w2": torch.randint(0, 256, (rows, hidden, inter // 2), generator=g),
-        "w13_scales": torch.rand(rows, hidden // group, 2 * inter, generator=g),
-        "w2_scales": torch.rand(rows, inter // group, hidden, generator=g),
+        "w13_scales": torch.rand(rows, 2 * inter, hidden // group, generator=g),
+        "w2_scales": torch.rand(rows, hidden, inter // group, generator=g),
     }
     host = {
         k: (v.to(torch.uint8) if "scales" not in k else (v * 0.02).bfloat16())
