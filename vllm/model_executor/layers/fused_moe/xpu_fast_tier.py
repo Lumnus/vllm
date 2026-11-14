@@ -225,8 +225,74 @@ def _free_device_bytes(device: torch.device) -> int:
     return free + reclaimable
 
 
-def check(rows: Any) -> str | None:
-    """Why this rank cannot move its card tier to ``rows`` now, or None."""
+def device_memory(device: torch.device) -> tuple[int, int, int, int]:
+    """Free device memory, and torch's allocated, peak allocated (since the
+    KV cache's sizing) and reserved bytes on ``device``."""
+    from vllm.platforms import current_platform
+
+    stats = torch.accelerator.memory_stats(device)
+    return (
+        int(current_platform.free_device_memory(device)),
+        int(stats.get("allocated_bytes.all.current", 0)),
+        int(stats.get("allocated_bytes.all.peak", 0)),
+        int(torch.accelerator.memory_reserved(device)),
+    )
+
+
+def grow_refusal(
+    need: int,
+    credit: int,
+    *,
+    free: int,
+    reclaimable: int,
+    floor: int,
+    cap_room: int | None,
+) -> str | None:
+    """Why ``need`` more bytes of card rows may not be mapped now, or None.
+
+    The rows are mapped from free device memory only: torch's unused cache
+    is not room for them (a cached segment that holds one live block cannot
+    be given back). ``credit`` is what the KV cache released for this resize
+    within the same operation: those bytes were the KV cache's and go to
+    the rows, torch's share stays as it was. Bytes beyond the credit must
+    leave torch the floor the KV cache's grow leaves it
+    (``grow_torch_floor_bytes``), on the device (free memory plus its unused
+    cache) and under its cap (``cap_room``: the budget less the KV cache,
+    the other holders, torch's reservation and the floor; None without a
+    cap)."""
+    if need <= 0:
+        return None
+    gib = 2**30
+    if need > free:
+        return (
+            f"the device has {free / gib:.2f} GiB free and the rows need "
+            f"{need / gib:.2f} GiB: the KV cache must give them back first"
+        )
+    beyond = max(need - credit, 0)
+    if beyond <= 0:
+        return None
+    room = free + reclaimable - floor
+    if beyond > room:
+        return (
+            f"{beyond / gib:.2f} GiB more card rows would leave torch less than "
+            f"its floor of {floor / gib:.2f} GiB (the KV cache grow floor; "
+            f"{max(room, 0) / gib:.2f} GiB above it): the KV cache must give "
+            "them back first"
+        )
+    if cap_room is not None and beyond > cap_room:
+        return (
+            f"{beyond / gib:.2f} GiB more card rows would put torch's cap below "
+            f"what it holds and its floor of {floor / gib:.2f} GiB "
+            f"({max(cap_room, 0) / gib:.2f} GiB to spare): the KV cache must "
+            "give them back first"
+        )
+    return None
+
+
+def check(rows: Any, memory: bool = True) -> str | None:
+    """Why this rank cannot move its card tier to ``rows`` now, or None.
+    ``memory`` false leaves the device memory out (asked before the KV cache
+    gives it)."""
     tiers = resizable_tiers()
     if not tiers:
         return (
@@ -249,7 +315,7 @@ def check(rows: Any) -> str | None:
     if pending:
         return f"an EPLB move is prepared on {pending[0]}; ask after it commits"
     now = rows_now()
-    if now is not None and rows > now:
+    if memory and now is not None and rows > now:
         need = bytes_to(rows)
         device = tiers[0].fast_rows.buffer.device
         have = _free_device_bytes(device)
@@ -336,6 +402,220 @@ def apply(rows: int) -> dict[str, Any]:
         "seconds": seconds,
         **{k: int(v) for k, v in totals.items()},
     }
+
+
+# --------------------------------------------------------------------------
+# The move into the reserved range at load: what it gave back
+# --------------------------------------------------------------------------
+
+
+class OldStorages:
+    """The storages a layer's card rows leave when they move into the
+    reserved range (weak references: holding them would keep them alive).
+    After the move each must be gone; one still alive is held by a tensor
+    somewhere else, which would keep its device memory for good and leave
+    the KV cache smaller by it at sizing."""
+
+    def __init__(self, tensors: Sequence[torch.Tensor]) -> None:
+        from torch.multiprocessing.reductions import StorageWeakRef
+
+        self.refs = []
+        # storages that are the tensor's own (not a part of a larger buffer)
+        self.own: set[int] = set()
+        for t in tensors:
+            storage = t.untyped_storage()
+            self.refs.append(
+                (StorageWeakRef(storage), int(storage.nbytes()), storage.data_ptr())
+            )
+            if t.storage_offset() == 0 and storage.nbytes() == (
+                t.numel() * t.element_size()
+            ):
+                self.own.add(storage.data_ptr())
+            del storage
+        self.bytes = sum(n for _, n, _ in self.refs)
+
+    def alive(self) -> list[tuple[Any, int, int]]:
+        return [r for r in self.refs if not r[0].expired()]
+
+
+def _storages_in_use() -> set[int]:
+    """Storages the kernels or a layer still read: those of the tiers whose
+    rows have not moved yet (their impls' tensors and their layers'
+    parameters). An old storage among them is shared, never released."""
+    from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
+        _TIER_FIELDS,
+        live_tiers,
+    )
+
+    ptrs: set[int] = set()
+    for t in live_tiers():
+        if getattr(t, "fast_rows", None) is not None:
+            continue
+        tensors: list[Any] = []
+        if t._impls is not None:
+            tensors += [getattr(t._impls[0], f) for f, _ in _TIER_FIELDS]
+        layer = None if t._layer_ref is None else t._layer_ref()
+        if layer is not None:
+            tensors += list(layer.parameters(recurse=False))
+        for x in tensors:
+            if isinstance(x, torch.Tensor):
+                ptrs.add(x.untyped_storage().data_ptr())
+    return ptrs
+
+
+def _holders(data_ptr: int) -> str:
+    """Tensors on the storage at ``data_ptr`` and what refers to them (a
+    garbage collector walk: once per process, only when a storage survived)."""
+    import gc
+
+    found = []
+    for obj in gc.get_objects():
+        try:
+            # type(), not isinstance: some objects compute __class__
+            if not issubclass(type(obj), torch.Tensor):
+                continue
+            if obj.untyped_storage().data_ptr() != data_ptr:
+                continue
+        except Exception:  # noqa: BLE001 - any object the walk meets
+            continue
+        owners = sorted(
+            {
+                type(r).__name__
+                for r in gc.get_referrers(obj)
+                if not isinstance(r, list) or len(r) < 1000
+            }
+        )
+        found.append(f"{type(obj).__name__}{tuple(obj.shape)} <- {', '.join(owners)}")
+        if len(found) >= 3:
+            break
+    return "; ".join(found) or "no tensor found (the storage itself is held)"
+
+
+_ADOPTED: dict[str, Any] = {
+    "layers": 0,
+    "mapped": 0,
+    "old": 0,
+    "stale": 0,
+    "released": 0,
+    "free_delta": 0,
+    "free_known": True,
+    "logged": False,
+    "holders": None,
+}
+
+
+def _free_or_none(device: torch.device) -> int | None:
+    try:
+        from vllm.platforms import current_platform
+
+        return int(current_platform.free_device_memory(device))
+    except Exception:  # noqa: BLE001 - no device to read (tests)
+        return None
+
+
+def free_before_move(device: torch.device) -> int | None:
+    """Free device memory before one layer's move (see `finish_move`)."""
+    return _free_or_none(device)
+
+
+def finish_move(
+    layer_name: str,
+    old: OldStorages,
+    mapped: int,
+    device: torch.device,
+    free_before: int | None,
+    expected_layers: int,
+) -> None:
+    """After a layer's rows moved into its range: give back on the spot any
+    old storage another tensor still holds (its bytes cannot be reached by
+    the kernels any more, and keeping them would take them from the KV
+    cache), then count the move. Once every layer has moved, one line says
+    what the moves did to the device: mapped bytes against the storage
+    given up and the change of free memory, so a boot shows at once whether
+    the card tier costs more than its rows."""
+    alive = old.alive()
+    stale = sum(n for _, n, _ in alive)
+    released = 0
+    if alive:
+        if _ADOPTED["holders"] is None:
+            _ADOPTED["holders"] = _holders(alive[0][2])
+        in_use = _storages_in_use()
+        for ref, n, ptr in alive:
+            if ptr not in old.own or ptr in in_use:
+                # part of a larger buffer, or read by a layer that has not
+                # moved yet: reported, not released
+                continue
+            storage = torch.UntypedStorage._new_with_weak_ptr(ref.cdata)
+            if storage is None:
+                continue
+            try:
+                storage.resize_(0)
+                released += n
+            except Exception:  # noqa: BLE001 - reported below
+                logger.warning(
+                    "%s: an old storage of the card rows (%d bytes) is still "
+                    "held and cannot be released in place.",
+                    layer_name,
+                    n,
+                    exc_info=True,
+                )
+            del storage
+        if torch.accelerator.is_available():
+            torch.accelerator.empty_cache()
+    free_after = _free_or_none(device)
+    a = _ADOPTED
+    a["layers"] += 1
+    a["mapped"] += mapped
+    a["old"] += old.bytes
+    a["stale"] += stale
+    a["released"] += released
+    if free_before is None or free_after is None:
+        a["free_known"] = False
+    else:
+        a["free_delta"] += free_after - free_before
+    if alive:
+        logger.warning_once(
+            "Expert tiers: after the card rows moved into their reserved range, "
+            "another tensor still held their old storage (%s); released in "
+            "place on every layer where it happens. A reader of that tensor "
+            "would read nothing now: it was not the card tier the kernels read.",
+            a["holders"],
+        )
+    if a["layers"] >= expected_layers and not a["logged"]:
+        a["logged"] = True
+        gib = 2**30
+        logger.info(
+            "Expert tiers: the card rows of %d layers moved into their reserved "
+            "ranges: %.2f GiB mapped, %.2f GiB of storage given up (%.2f GiB of "
+            "it held by other tensors, %.2f GiB of that released in place); "
+            "device free memory %s over the moves (rows and granules alone: "
+            "%+.2f GiB).",
+            a["layers"],
+            a["mapped"] / gib,
+            a["old"] / gib,
+            a["stale"] / gib,
+            a["released"] / gib,
+            f"{a['free_delta'] / gib:+.2f} GiB" if a["free_known"] else "unknown",
+            (a["old"] - a["mapped"]) / gib,
+        )
+
+
+def adoption_summary() -> dict[str, Any]:
+    return dict(_ADOPTED)
+
+
+def reset_adoption_summary() -> None:
+    _ADOPTED.update(
+        layers=0,
+        mapped=0,
+        old=0,
+        stale=0,
+        released=0,
+        free_delta=0,
+        free_known=True,
+        logged=False,
+        holders=None,
+    )
 
 
 # --------------------------------------------------------------------------

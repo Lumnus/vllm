@@ -1305,8 +1305,17 @@ def grow_kv_cache(
     init_free_memory: int,
     requested_memory: int,
     reduce_min: Callable[[int], int],
+    restore: bool = False,
 ) -> int:
     """Commit more of an extensible KV cache's reservation while serving.
+
+    restore: target_num_blocks is the size the cache had before an operation
+    that took memory from it and gave none of it away (a card tier resize
+    that failed after its KV shrink). The vote is then the target: the
+    measurement and the torch floor are logged but do not cut it (they were
+    met at that size a moment ago and nothing else took the bytes), and the
+    mapping itself still decides: a rank that cannot map leaves all ranks
+    where they are.
 
     Every rank takes part: each measures what its memory fits now
     (`_measure_kv_cache_serving`), and the ranks agree, through reduce_min
@@ -1375,6 +1384,17 @@ def grow_kv_cache(
         wanted = min(target_num_blocks, fits, kv_cache.capacity_blocks)
         floor = grow_floor(kv_cache, vllm_config, runner.device, wanted)
         vote = min(wanted, floor.max_blocks)
+        if restore:
+            restored = min(target_num_blocks, kv_cache.capacity_blocks)
+            if restored > vote:
+                logger.info(
+                    "KV cache: back to %d blocks, its size before an operation "
+                    "that took the memory and did not use it (the measurement "
+                    "and the floor below would give %d).",
+                    restored,
+                    vote,
+                )
+            vote = wanted = max(vote, restored)
         kv_cache.last_grow = {
             "target_blocks": target_num_blocks,
             "committed_blocks": kv_cache.num_committed_blocks,

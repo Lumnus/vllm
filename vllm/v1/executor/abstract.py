@@ -173,9 +173,11 @@ class Executor(ABC):
         """Commit the final size of an extensible KV cache on the workers."""
         self.collective_rpc("extend_kv_cache", args=(num_blocks,))
 
-    def resize_kv_cache(self, target_num_blocks: int) -> int:
+    def resize_kv_cache(self, target_num_blocks: int, restore: bool = False) -> int:
         """Grow the extensible KV cache on the workers toward the target; the
-        block count they now all hold."""
+        block count they now all hold. restore: back to a size the cache had
+        before an operation that took memory from it and did not use it
+        (`EngineCore.resize_kv_cache`)."""
         # The workers agree among themselves inside the call; bound the wait
         # as for a model step, so that workers stuck there surface as a
         # timeout instead of an engine that stops answering.
@@ -183,7 +185,7 @@ class Executor(ABC):
 
         results: list[int] = self.collective_rpc(
             "resize_kv_cache",
-            args=(target_num_blocks,),
+            args=(target_num_blocks, True) if restore else (target_num_blocks,),
             timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
         )
         assert len(set(results)) == 1, f"Workers disagree on the size: {results}"

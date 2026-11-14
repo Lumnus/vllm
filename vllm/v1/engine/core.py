@@ -99,7 +99,11 @@ from vllm.v1.engine.kv_cache_resize import (
     KVCacheResizeState,
     grow_message,
 )
-from vllm.v1.engine.runtime_control import ExpertTierStatsPoller, RuntimeControl
+from vllm.v1.engine.runtime_control import (
+    ControlRefused,
+    ExpertTierStatsPoller,
+    RuntimeControl,
+)
 from vllm.v1.engine.serving_profiles import ServingProfiles
 from vllm.v1.engine.tensor_ipc import TensorIpcReceiver
 from vllm.v1.engine.tower_residency import TowerResidencyController
@@ -991,9 +995,15 @@ class EngineCore:
         target_num_blocks: int,
         deadline_s: float | None = None,
         preempt: bool = False,
+        restore: bool = False,
     ) -> dict[str, Any]:
         """Resize the KV cache toward target_num_blocks while serving; returns
         the resize's record (`KVCacheResize.record`).
+
+        restore (a grow only): the target is the size the cache had before an
+        operation that took memory from it and gave none of it to anyone (a
+        card tier resize that failed after the KV shrink); the workers map
+        it back when the device has the bytes, without the measured vote.
 
         A larger target grows the cache within the call: the workers commit
         what their memory fits, up to the target, and the record is FINISHED
@@ -1049,7 +1059,11 @@ class EngineCore:
             )
         num_blocks = old_num_blocks
         if target_num_blocks > old_num_blocks:
-            num_blocks = self.model_executor.resize_kv_cache(target_num_blocks)
+            num_blocks = (
+                self.model_executor.resize_kv_cache(target_num_blocks, restore=True)
+                if restore
+                else self.model_executor.resize_kv_cache(target_num_blocks)
+            )
         if num_blocks > old_num_blocks:
             self.scheduler.grow_kv_cache(num_blocks)
             logger.info(
@@ -2309,9 +2323,12 @@ class EngineCoreProc(EngineCore):
         target_num_blocks: int,
         deadline_s: float | None = None,
         preempt: bool = False,
+        restore: bool = False,
     ) -> dict[str, Any]:
         try:
-            return super().resize_kv_cache(target_num_blocks, deadline_s, preempt)
+            return super().resize_kv_cache(
+                target_num_blocks, deadline_s, preempt, restore=restore
+            )
         except TimeoutError:
             self._fail_kv_resize_executor()
             raise
@@ -2603,6 +2620,10 @@ class EngineCoreProc(EngineCore):
                 result.add_done_callback(callback)
                 return
             output.result = UtilityResult(result)
+        except ControlRefused as e:
+            # A refusal is an answer (nothing changed), not an engine fault.
+            logger.info("%s refused: %s", name, e)
+            output.failure_message = f"Call to {name} method failed: {str(e)}"
         except Exception as e:
             logger.exception("Invocation of %s method failed", name)
             output.failure_message = f"Call to {name} method failed: {str(e)}"

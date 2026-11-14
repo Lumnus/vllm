@@ -37,6 +37,8 @@ logger = init_logger(__name__)
 
 class FastTierState(StrEnum):
     IDLE = "idle"
+    # a grow that waits for EPLB before it takes KV memory
+    WAITING = "waiting"
     DRAINING = "draining"
     COMMITTING = "committing"
     FINISHED = "finished"
@@ -45,7 +47,11 @@ class FastTierState(StrEnum):
 
     @property
     def active(self) -> bool:
-        return self in (FastTierState.DRAINING, FastTierState.COMMITTING)
+        return self in (
+            FastTierState.WAITING,
+            FastTierState.DRAINING,
+            FastTierState.COMMITTING,
+        )
 
 
 @dataclass
@@ -69,6 +75,10 @@ class FastTierResize:
     deadline_s: float = 60.0
     # when the commit first found EPLB moving experts (None: it did not)
     eplb_wait_since: float | None = None
+    # a grow's KV shrink may preempt at its deadline
+    preempt: bool = False
+    # the ranks refused at their check (nothing was changed on any rank)
+    refused: bool = False
 
     def record(self, rows_now: int | None) -> dict[str, Any]:
         end = self.ended if self.ended is not None else time.monotonic()
@@ -220,40 +230,107 @@ class FastTierController:
             kv_blocks_before=blocks,
             from_kv=from_kv,
             deadline_s=deadline,
+            preempt=preempt,
         )
+        # Ask the ranks before the KV cache gives anything: a rearrangement
+        # of EPLB in flight is waited for (then the KV shrink starts), any
+        # other refusal is the answer and nothing changes.
+        why = self._precheck(target)
+        if why is not None and not self._eplb_busy(why):
+            raise ControlRefused(why)
+        if why is not None:
+            self.resize = resize
+            resize.state = FastTierState.WAITING
+            self._waits_for_eplb(resize, {"error": why})
+            return self._reply()
         if from_kv and need > 0:
-            try:
-                kv = self.engine.request_kv_cache_release(
-                    need, urgent=preempt, deadline_s=deadline
-                )
-            except (ValueError, RuntimeError, NotImplementedError) as e:
-                raise ControlRefused(
-                    f"the KV cache cannot give back {need:,} bytes per rank for "
-                    f"{target - rows_now} more card rows per layer: {e}"
-                ) from e
-            resize.kv = kv
-            resize.kv_resize = self.engine._kv_resize
-            resize.state = FastTierState.DRAINING
-            logger.info(
-                "Fast tier: card rows per layer %d -> %d asked; the KV cache gives "
-                "back %.2f GiB per rank first (shrink %d -> %d blocks, %s).",
-                rows_now,
-                target,
-                need / 2**30,
-                blocks,
-                kv.get("to_blocks", kv.get("num_blocks", -1)),
-                kv.get("state"),
-            )
+            self._release(resize)
         self.resize = resize
         self.advance()
+        if (
+            resize.state == FastTierState.FAILED
+            and resize.refused
+            and resize.kv is None
+        ):
+            # refused by the ranks with nothing taken from the KV cache
+            raise ControlRefused(resize.message)
         return self._reply()
 
+    def _precheck(self, rows: int) -> str | None:
+        """Why the ranks would refuse ``rows`` now, memory aside (EPLB, the
+        range, a prepared move), or None."""
+        checks = self.control._rpc(
+            "check", "tiers.fast", {"rows": rows, "precheck": True}
+        )
+        refusals = [c for c in checks if c.get("refusal")]
+        if not refusals:
+            return None
+        return "; ".join(f"rank {c['rank']}: {c['refusal']}" for c in refusals)
+
+    def _eplb_busy(self, why: str) -> bool:
+        return any(b in why for b in self._EPLB_BUSY)
+
+    def _release(self, resize: FastTierResize) -> None:
+        """A grow's KV shrink of the bytes the rows map; raises
+        ControlRefused when the KV cache cannot give them."""
+        from vllm.v1.engine.runtime_control import ControlRefused
+
+        need = resize.bytes_per_rank
+        try:
+            kv = self.engine.request_kv_cache_release(
+                need, urgent=resize.preempt, deadline_s=resize.deadline_s
+            )
+        except (ValueError, RuntimeError, NotImplementedError) as e:
+            raise ControlRefused(
+                f"the KV cache cannot give back {need:,} bytes per rank for "
+                f"{resize.to_rows - resize.from_rows} more card rows per layer: {e}"
+            ) from e
+        resize.kv = kv
+        resize.kv_resize = self.engine._kv_resize
+        resize.state = FastTierState.DRAINING
+        logger.info(
+            "Fast tier: card rows per layer %d -> %d asked; the KV cache gives "
+            "back %.2f GiB per rank first (shrink %d -> %d blocks, %s).",
+            resize.from_rows,
+            resize.to_rows,
+            need / 2**30,
+            resize.kv_blocks_before,
+            kv.get("to_blocks", kv.get("num_blocks", -1)),
+            kv.get("state"),
+        )
+
     def advance(self) -> None:
-        """Between two steps (busy loop): commit a grow whose KV shrink has
-        released, or close one whose shrink ended otherwise."""
+        """Between two steps (busy loop): start the KV shrink of a grow that
+        waited for EPLB, commit a grow whose KV shrink has released, or close
+        one whose shrink ended otherwise."""
         resize = self.resize
         if resize is None or not resize.state.active:
             return
+        if resize.state == FastTierState.WAITING:
+            from vllm.v1.engine.runtime_control import ControlRefused
+
+            why = self._precheck(resize.to_rows)
+            if why is not None:
+                if self._eplb_busy(why) and self._waits_for_eplb(
+                    resize, {"error": why}
+                ):
+                    return
+                self._fail(resize, why)
+                return
+            resize.message = ""
+            if resize.from_kv and resize.bytes_per_rank > 0:
+                # the KV cache's size when it starts giving (a grow of the KV
+                # cache may have run while this waited)
+                resize.kv_blocks_before = (
+                    self.engine.vllm_config.cache_config.num_gpu_blocks
+                )
+                try:
+                    self._release(resize)
+                except ControlRefused as e:
+                    self._fail(resize, str(e))
+                    return
+            else:
+                resize.state = FastTierState.COMMITTING
         if resize.state == FastTierState.DRAINING:
             from vllm.v1.engine.kv_cache_resize import KVCacheResizeState
 
@@ -306,8 +383,24 @@ class FastTierController:
         resize.message = f"waiting for EPLB: {error}"
         return True
 
+    def _op(self, args: dict[str, Any]) -> dict[str, Any]:
+        """The worker op; a refusal at the ranks' check (nothing changed on
+        any rank) as a reply, so that the caller can wait for EPLB or fail
+        the resize with it."""
+        from vllm.v1.engine.runtime_control import ControlRefused
+
+        try:
+            return self.control._worker_op("tiers.fast", args)
+        except ControlRefused as e:
+            return {"op": "tiers.fast", "applied": "none", "error": str(e),
+                    "refused": True, "ranks": []}  # fmt: skip
+
     def _commit(self, resize: FastTierResize) -> None:
-        reply = self.control._worker_op("tiers.fast", {"rows": resize.to_rows})
+        args: dict[str, Any] = {"rows": resize.to_rows}
+        if resize.from_kv and resize.kv is not None and resize.bytes_per_rank > 0:
+            # the KV cache released these bytes for the rows, in this resize
+            args["kv_released"] = resize.bytes_per_rank
+        reply = self._op(args)
         if reply["applied"] != "all" and self._waits_for_eplb(resize, reply):
             return
         if reply["applied"] == "all":
@@ -317,24 +410,28 @@ class FastTierController:
             resize.kv_blocks_after = blocks
             logger.info(
                 "Fast tier: card rows per layer %d -> %d in %.2f s on %d ranks; "
-                "%.2f GiB per rank taken from the KV cache (KV cache %d -> %d "
-                "blocks).",
+                "%.2f GiB per rank %s (KV cache %d -> %d blocks).",
                 resize.from_rows,
                 resize.to_rows,
                 resize.ended - resize.started,
                 len(reply["ranks"]),
                 resize.bytes_per_rank / 2**30,
+                "taken from the KV cache"
+                if resize.from_kv and resize.kv is not None
+                else "mapped from free device memory",
                 resize.kv_blocks_before,
                 blocks,
             )
             self.engine._publish_scheduler_stats()
             return
+        resize.refused = bool(reply.get("refused"))
         resize.rolled_back = reply.get("rolled_back", reply["applied"] == "none")
         self._fail(resize, reply.get("error") or "not applied on every rank")
 
     def _fail(self, resize: FastTierResize, why: str) -> None:
         """The rows stay where they were; the KV cache gets back what it
-        gave (a grow to its size before, if it shrank)."""
+        gave: its size before, restored as it was (the bytes it released
+        were never mapped by the rows), not a new measured grow."""
         resize.state = FastTierState.FAILED
         resize.message = why
         resize.ended = time.monotonic()
@@ -342,8 +439,14 @@ class FastTierController:
         blocks = cache_config.num_gpu_blocks
         if resize.from_kv and blocks < resize.kv_blocks_before:
             try:
-                kv = self.engine.resize_kv_cache(resize.kv_blocks_before)
+                kv = self.engine.resize_kv_cache(resize.kv_blocks_before, restore=True)
                 resize.kv = kv
+                if cache_config.num_gpu_blocks < resize.kv_blocks_before:
+                    resize.message += (
+                        f"; the KV cache came back to {cache_config.num_gpu_blocks}"
+                        f" of {resize.kv_blocks_before} blocks"
+                        + (f" ({kv.get('message')})" if kv.get("message") else "")
+                    )
             except Exception as e:  # noqa: BLE001 - reported in the record
                 resize.message += f"; growing the KV cache back failed: {e}"
         resize.kv_blocks_after = cache_config.num_gpu_blocks
@@ -382,16 +485,21 @@ class FastTierController:
         )
         self.resize = resize
         self._shrink_commit(resize)
+        if resize.state == FastTierState.FAILED and resize.refused:
+            from vllm.v1.engine.runtime_control import ControlRefused
+
+            raise ControlRefused(resize.message)
         return self._reply()
 
     def _shrink_commit(self, resize: FastTierResize) -> None:
         rows_now, target = resize.from_rows, resize.to_rows
         blocks = resize.kv_blocks_before
         from_kv = resize.from_kv
-        reply = self.control._worker_op("tiers.fast", {"rows": target})
+        reply = self._op({"rows": target})
         if reply["applied"] != "all" and self._waits_for_eplb(resize, reply):
             return
         if reply["applied"] != "all":
+            resize.refused = bool(reply.get("refused"))
             resize.rolled_back = reply.get("rolled_back", reply["applied"] == "none")
             resize.state = FastTierState.FAILED
             resize.message = reply.get("error") or "not applied on every rank"
