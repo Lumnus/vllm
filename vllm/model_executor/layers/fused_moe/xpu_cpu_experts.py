@@ -34,6 +34,7 @@ own large-batch kernel does from its decode kernel.
 """
 
 import mmap
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -68,20 +69,132 @@ class CpuExpertError(RuntimeError):
     """The CPU tier cannot serve an expert it was routed: the step fails."""
 
 
+# The op's library namespaces, in the order they are looked up: the XPU
+# kernels' extension carries it today; a host-only build of the same source
+# (no device code, loadable beside any accelerator's build) would register
+# it under the second name.
+_OP_NAMESPACES = ("_xpu_C", "_cpu_moe_C")
+
+
+def _ops() -> Any:
+    for name in _OP_NAMESPACES:
+        try:
+            ns = getattr(torch.ops, name)
+            if hasattr(ns, "int4_moe_cpu"):
+                return ns
+        except (AttributeError, RuntimeError):
+            continue
+    return None
+
+
 def host_op_available() -> bool:
-    try:
-        return hasattr(torch.ops._xpu_C, "int4_moe_cpu")
-    except (AttributeError, RuntimeError):
-        return False
+    return _ops() is not None
 
 
 def _op_isa(want: int) -> int:
     """What the host op resolves ``want`` (0 auto, 1 scalar, 2 AVX2) to."""
-    return int(torch.ops._xpu_C.int4_moe_cpu_isa(want))
+    return int(_ops().int4_moe_cpu_isa(want))
 
 
 def _op_run(*args: Any) -> None:
-    torch.ops._xpu_C.int4_moe_cpu(*args)
+    _ops().int4_moe_cpu(*args)
+
+
+def _op_configure(cores: list[int], spin_us: int) -> bool:
+    """Pin the op's pool workers to ``cores`` and set their spin time; False
+    when the loaded op is older than this setting."""
+    ns = _ops()
+    if ns is None or not hasattr(ns, "int4_moe_cpu_configure"):
+        return False
+    ns.int4_moe_cpu_configure(cores, spin_us)
+    return True
+
+
+# Where the op's threads run (environment, read once per process):
+#   VLLM_CPU_EXPERTS_CORES  unset or "": not pinned (the threads go where the
+#       kernel puts them). "auto": the physical cores of the process's CPU
+#       mask (one hardware thread each), split in order into as many equal
+#       parts as there are ranks on the host; this rank takes the first
+#       cpu_threads cores of its part (on EPYC the order is CCX after CCX, so
+#       the parts are whole CCXs when the counts allow). A list such as
+#       "0-11;12-23" gives each local rank its own set (rank r takes the r-th,
+#       one set for all ranks when only one is given).
+#   VLLM_CPU_EXPERTS_SPIN_US  how long a worker spins after a phase before
+#       it sleeps (unset: the op's default, 100). Spinning through the gap
+#       between two MoE layers (a few ms) saves the wake-ups of every layer
+#       call; worth it on cores given to the op alone.
+_CORES_ENV = "VLLM_CPU_EXPERTS_CORES"
+_SPIN_ENV = "VLLM_CPU_EXPERTS_SPIN_US"
+
+
+def _parse_cpu_list(text: str) -> list[int]:
+    cores: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            cores.extend(range(int(lo), int(hi) + 1))
+        else:
+            cores.append(int(part))
+    return cores
+
+
+def _physical_cores(allowed: set[int]) -> list[int]:
+    """One hardware thread per physical core of ``allowed``, in order."""
+    seen: set[str] = set()
+    out = []
+    for cpu in sorted(allowed):
+        path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        try:
+            with open(path) as f:
+                key = f.read().strip()
+        except OSError:
+            key = str(cpu)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cpu)
+    return out
+
+
+def cpu_cores_for_rank(
+    setting: str, local_rank: int, local_ranks: int, threads: int
+) -> list[int]:
+    """The cores this rank's op threads take (empty: not pinned)."""
+    setting = setting.strip()
+    if not setting:
+        return []
+    if setting == "auto":
+        cores = _physical_cores(set(os.sched_getaffinity(0)))
+        per = len(cores) // max(1, local_ranks)
+        if per < 1:
+            raise CpuExpertError(
+                f"{_CORES_ENV}=auto: {len(cores)} physical cores for "
+                f"{local_ranks} ranks"
+            )
+        part = cores[local_rank * per : (local_rank + 1) * per]
+        return part[:threads]
+    sets = [s for s in setting.split(";") if s.strip()]
+    if len(sets) > 1 and local_rank >= len(sets):
+        raise CpuExpertError(
+            f"{_CORES_ENV} names {len(sets)} core sets and this is local rank "
+            f"{local_rank}"
+        )
+    return _parse_cpu_list(sets[local_rank] if len(sets) > 1 else sets[0])
+
+
+def _local_rank() -> tuple[int, int]:
+    """(local rank, ranks on this host); (0, 1) outside a distributed run.
+    The host's rank count is the world group's size (one host)."""
+    try:
+        from vllm.distributed.parallel_state import get_world_group
+
+        world = get_world_group()
+        return int(world.local_rank), int(world.world_size)
+    except (AssertionError, AttributeError, ImportError, RuntimeError):
+        return 0, 1
 
 
 # --------------------------------------------------------------------------
@@ -538,6 +651,8 @@ class CpuExpertRuntime:
                 "its scalar code, hundreds of times slower. Set "
                 "--expert-store-config cpu_isa to 'scalar' to accept that"
             )
+        self.cores: list[int] = []
+        self._configure_threads()
         rows = max(1, int(config.host_cache_gib * 2**30) // layout.row_bytes)
         self.cache = HostExpertCache(store, layout, rows, config.read_timeout_s)
         self.stats = CpuExpertStats()
@@ -560,11 +675,45 @@ class CpuExpertRuntime:
 
     def set_threads(self, threads: int) -> None:
         """Threads of the host op from the next call on (the op keeps one
-        pool per thread count)."""
+        pool per thread count; pinned, at most one per core of the set)."""
         if threads < 1:
             raise ValueError("cpu_threads must be at least 1")
-        self.threads = int(threads)
         self.config.cpu_threads = int(threads)
+        self.threads = int(threads)
+        if self.cores:
+            self._configure_threads()
+
+    def _configure_threads(self) -> None:
+        """Pin the op's workers (``VLLM_CPU_EXPERTS_CORES``) and set their
+        spin time (``VLLM_CPU_EXPERTS_SPIN_US``); neither set: as the op
+        does by itself."""
+        setting = os.environ.get(_CORES_ENV, "")
+        spin_text = os.environ.get(_SPIN_ENV, "").strip()
+        if not setting.strip() and not spin_text:
+            return
+        spin = int(spin_text) if spin_text else -1
+        rank, ranks = _local_rank()
+        want = int(self.config.cpu_threads)
+        cores = cpu_cores_for_rank(setting, rank, ranks, want)
+        if cores and want > len(cores):
+            want = len(cores)  # one thread per core
+        if not _op_configure(cores, spin):
+            raise CpuExpertError(
+                f"{_CORES_ENV} / {_SPIN_ENV} need the host op's "
+                "int4_moe_cpu_configure, which the installed kernels do not "
+                "have: install kernels built with it, or unset them"
+            )
+        self.cores = cores
+        self.threads = want
+        logger.info_once(
+            "CPU experts: local rank %d of %d, %d op threads%s, workers spin "
+            "%s after a phase.",
+            rank,
+            ranks,
+            want,
+            f" pinned to cores {cores}" if cores else " (not pinned)",
+            f"{spin} us" if spin >= 0 else "the op's default",
+        )
 
     def resize_cache(self, gib: float) -> None:
         """The host cache to ``gib`` (rows of whole experts), between two
