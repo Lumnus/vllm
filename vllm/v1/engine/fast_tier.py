@@ -79,6 +79,8 @@ class FastTierResize:
     preempt: bool = False
     # the ranks refused at their check (nothing was changed on any rank)
     refused: bool = False
+    # torch's room on each rank after the operation (the rows' readout)
+    torch_after: list[Any] | None = None
 
     def record(self, rows_now: int | None) -> dict[str, Any]:
         end = self.ended if self.ended is not None else time.monotonic()
@@ -98,6 +100,8 @@ class FastTierResize:
         }
         if self.rolled_back is not None:
             out["rolled_back"] = self.rolled_back
+        if self.torch_after is not None:
+            out["torch_after"] = self.torch_after
         return out
 
 
@@ -422,6 +426,7 @@ class FastTierController:
                 resize.kv_blocks_before,
                 blocks,
             )
+            self._note_torch_room(resize)
             self.engine._publish_scheduler_stats()
             return
         resize.refused = bool(reply.get("refused"))
@@ -462,6 +467,7 @@ class FastTierController:
             resize.kv_blocks_before,
             resize.kv_blocks_after,
         )
+        self._note_torch_room(resize)
         self.engine._publish_scheduler_stats()
 
     # -- shrink -----------------------------------------------------------
@@ -545,7 +551,28 @@ class FastTierController:
             blocks,
             resize.kv_blocks_after,
         )
+        self._note_torch_room(resize)
         self.engine._publish_scheduler_stats()
+
+    def _note_torch_room(self, resize: FastTierResize) -> None:
+        """Each rank's torch room after the operation into the record, and
+        one line with the least of them: what the next peak has."""
+        try:
+            ranks = self._ranks()
+        except Exception:  # noqa: BLE001 - the record goes without it
+            return
+        rooms = [((r.get("tiers") or {}).get("fast") or {}).get("torch") for r in ranks]
+        resize.torch_after = rooms
+        known = [t for t in rooms if t]
+        dev = [t["device_room"] for t in known if t.get("device_room") is not None]
+        cap = [t["cap_room"] for t in known if t.get("cap_room") is not None]
+        if dev or cap:
+            logger.info(
+                "Fast tier: torch's room after the resize (least rank): %s on "
+                "the device, %s under its cap.",
+                f"{min(dev) / 2**30:.2f} GiB" if dev else "?",
+                f"{min(cap) / 2**30:.2f} GiB" if cap else "no cap",
+            )
 
 
 def register_runtime_params(register_verb, register_param, Verb, Param) -> None:

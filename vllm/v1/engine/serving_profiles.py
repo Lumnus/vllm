@@ -135,6 +135,11 @@ class SurfaceFastTierPort:
         state = (reply.get("fast") or {}).get("state")
         return "wait" if state in _FAST_ACTIVE else None
 
+    def torch_after(self) -> list[Any] | None:
+        """Torch's room on each rank after the last resize (its record)."""
+        record = (self._fast() or {}).get("record") or {}
+        return record.get("torch_after")
+
     def settled(self) -> str | None:
         record = (self._fast() or {}).get("record") or {}
         state = record.get("state")
@@ -637,7 +642,16 @@ class ServingProfiles:
             return None
 
         step.run = run
-        step.done = lambda: self.fast_tier.settled()
+
+        def done() -> str | None:
+            outcome = self.fast_tier.settled()
+            room = getattr(self.fast_tier, "torch_after", None)
+            if outcome is None and callable(room):
+                # torch's room per rank after the resize, in the step's report
+                step.detail = {"rows": step.detail, "torch_after": room()}
+            return outcome
+
+        step.done = done
         return step
 
     def _kv_step(self, kv: dict[str, Any], shrink: bool) -> _Step:

@@ -743,27 +743,74 @@ def test_a_kv_fit_after_a_grow_leaves_the_card_rows_their_memory(monkeypatch):
     assert fit().max_blocks * blk - kv.physical_bytes == g + g // 2
 
 
-def test_a_kv_restore_maps_back_what_a_failed_resize_took(grow_ranks):  # noqa: F811
-    """After a card tier grow fails past its KV shrink, the KV cache goes back
-    to its size before as it was, not to what a new measurement allows."""
+def test_a_kv_restore_passes_the_measurement_not_the_floor(grow_ranks):  # noqa: F811
+    """A restore (a resize's KV memory given back) goes past what the
+    request's measurement allows, up to the device and torch floor, never
+    past them."""
     from vllm.v1.worker import extensible_kv_cache as ekv
 
     ranks = grow_ranks([40])
+    cache = ranks.caches[0]
+    # the request's budget fits 30 blocks; the device fits 40
+    short = cache.physical_bytes_for(40) - cache.physical_bytes_for(30)
 
     def grow(target, restore):
         return ekv.grow_kv_cache(
             ranks.runners[0],
             target,
             init_free_memory=1024 << 20,
-            requested_memory=1024 << 20,
+            requested_memory=(1024 << 20) - short,
             reduce_min=lambda v: v,
             restore=restore,
         )
 
-    assert grow(30, True) == 30  # below what fits: as an ordinary grow
-    assert grow(60, False) == 40  # the measurement binds an ordinary grow
-    assert grow(60, True) == 60  # a restore is the size before
-    assert ranks.caches[0].last_grow["vote_blocks"] == 60
+    assert grow(20, True) == 20  # below what fits: as an ordinary grow
+    assert grow(60, False) == 30  # the measurement binds an ordinary grow
+    assert grow(60, True) == 40  # a restore goes to the floor, not past it
+    assert cache.last_grow["vote_blocks"] == 40
+
+
+def test_a_grow_shrink_cycle_leaves_torch_its_floor(grow_ranks, monkeypatch):  # noqa: F811
+    """The card's cycle (16:26Z): KV at its boot size, +8 rows take 251
+    blocks, −8 give them back while serving has left torch more reserved
+    than at boot. The KV cache must not go back past the torch floor: after
+    the return, torch's cap still covers its reservation plus the serving
+    peak's headroom (else the next 2K x 4 step runs the card out)."""
+    from vllm.v1.worker import extensible_kv_cache as ekv
+
+    # the card's numbers in blocks of 3.37 MiB, scaled by 1/100: after +8 the
+    # KV cache holds 20 (2,010), the restore asks for 23 (2,260); torch
+    # allocated 22 (7.27 GiB), reserved 24 (7.77), keep 3 (1.13); the floor
+    # allows 21 (2,113), the measurement 23 (2,259)
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda device=None: (32 << 30, 32 << 30)
+    )
+    monkeypatch.setattr(
+        torch.xpu, "set_per_process_memory_fraction", lambda fraction, device=None: None
+    )
+    ranks = grow_ranks([60], committed=20)
+    cache = ranks.caches[0]
+    assert cache.physical_bytes_for(23) > cache.physical_bytes_for(21)
+    blk = 8 << 20  # torch's numbers in units of 8 MiB
+    allocated, keep, reserved = 22 * blk, 3 * blk, 24 * blk
+    ranks.torch_stats = {
+        "allocated_bytes.all.current": allocated,
+        "allocated_bytes.all.peak": allocated + 3 * blk,
+    }
+    ranks.torch_reserved = reserved
+    cache.reserved_headroom_bytes = keep
+    cache.torch_memory_budget = cache.physical_bytes_for(21) + reserved + keep
+    n = ekv.grow_kv_cache(
+        ranks.runners[0],
+        23,
+        init_free_memory=1024 << 20,
+        requested_memory=1024 << 20,
+        reduce_min=lambda v: v,
+        restore=True,
+    )
+    assert 20 < n < 23  # fewer blocks, the floor kept (295a2cdff6 gave 23)
+    cap_after = cache.torch_memory_budget - cache.physical_bytes
+    assert cap_after - reserved >= keep  # the next peak has its headroom
 
 
 # -- the pinned rows follow the bound (pinned_release) ---------------------------
