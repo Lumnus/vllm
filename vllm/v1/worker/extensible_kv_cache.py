@@ -1385,12 +1385,26 @@ def grow_kv_cache(
         floor = grow_floor(kv_cache, vllm_config, runner.device, wanted)
         vote = min(wanted, floor.max_blocks)
         if restore:
-            restored = min(target_num_blocks, kv_cache.capacity_blocks)
-            if restored > vote:
+            # Back toward the size before, past the measurement but never
+            # past the floor: torch must keep its headroom whatever the KV
+            # cache gave, or the next peak runs the card out of memory.
+            asked = min(target_num_blocks, kv_cache.capacity_blocks)
+            restored = min(asked, max(floor.max_blocks, kv_cache.num_committed_blocks))
+            if restored < asked:
+                logger.warning(
+                    "KV cache: back to %d of the %d blocks an operation took "
+                    "and did not use: torch keeps its floor of %s GiB (the "
+                    "rest stays free for it; kv.fit takes it when torch "
+                    "needs less).",
+                    restored,
+                    asked,
+                    format_gib(floor.floor),
+                )
+            elif restored > vote:
                 logger.info(
                     "KV cache: back to %d blocks, its size before an operation "
                     "that took the memory and did not use it (the measurement "
-                    "and the floor below would give %d).",
+                    "would give %d; the torch floor allows it).",
                     restored,
                     vote,
                 )

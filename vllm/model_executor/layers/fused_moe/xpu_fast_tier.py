@@ -251,16 +251,36 @@ def _free_device_bytes(device: torch.device) -> int:
     return free + reclaimable
 
 
-def _torch_readout(device: torch.device) -> dict[str, int] | None:
+def torch_room(
+    allocated: int, reserved: int, free: int | None, cap: int | None
+) -> dict[str, int | None]:
+    """Torch's room for its next allocations: on the device (free memory
+    plus its own unused cache) and under its cap (the cap less what it has
+    reserved: a new segment past it fails however much cache is unused)."""
+    return {
+        "allocated": allocated,
+        "reserved": reserved,
+        "device_room": None if free is None else free + max(reserved - allocated, 0),
+        "cap": cap,
+        "cap_room": None if cap is None else cap - reserved,
+    }
+
+
+# The KV cache the card tier registered with (its torch cap), for the readout.
+_KV_CACHE: list[Any] = []
+
+
+def _torch_readout(device: torch.device) -> dict[str, Any] | None:
     try:
         stats = torch.accelerator.memory_stats(device)
-        return {
-            "allocated": int(stats.get("allocated_bytes.all.current", 0)),
-            "reserved": int(torch.accelerator.memory_reserved(device)),
-            "alloc_retries": int(stats.get("num_alloc_retries", 0)),
-        }
+        allocated = int(stats.get("allocated_bytes.all.current", 0))
+        reserved = int(torch.accelerator.memory_reserved(device))
     except Exception:  # noqa: BLE001 - no device to read (tests)
         return None
+    cap = getattr(_KV_CACHE[0], "torch_memory_limit", None) if _KV_CACHE else None
+    out = torch_room(allocated, reserved, _free_or_none(device), cap)
+    out["alloc_retries"] = int(stats.get("num_alloc_retries", 0))
+    return out
 
 
 def device_memory(device: torch.device) -> tuple[int, int, int, int]:
@@ -744,3 +764,4 @@ def register_with_kv_cache(kv_cache: Any) -> None:
     baseline = mapped_bytes()
     kv_cache.external_mapped_bytes.append(lambda: mapped_bytes() - baseline)
     kv_cache._fast_tier_registered = True
+    _KV_CACHE[:] = [kv_cache]

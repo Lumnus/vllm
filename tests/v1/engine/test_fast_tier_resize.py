@@ -34,6 +34,7 @@ class Ranks:
             "rows": self.rows[rank],
             "min": self.lo,
             "max": self.hi,
+            "torch": getattr(self, "torch", None),
             "bytes_to": {
                 str(t): max(t - self.rows[rank], 0) * self.per_row for t in targets
             },
@@ -454,3 +455,19 @@ def test_a_refusal_is_logged_in_one_line(caplog_vllm):
     caplog.clear()
     call(RuntimeError("boom"))
     assert any(r.levelno == logging.ERROR and r.exc_info for r in caplog.records)
+
+
+def test_the_reply_carries_torch_room_after_the_resize(setup):
+    """A caller (a profile, an operator) sees each rank's torch room after
+    the operation in the resize's record."""
+    from vllm.model_executor.layers.fused_moe.xpu_fast_tier import torch_room
+
+    engine, ranks, ctl = setup
+    g = GIB
+    ranks.torch = torch_room(7 * g, 8 * g, 1 * g, 9 * g)
+    reply = ctl.start({"rows": 4})
+    after = reply["fast"]["torch_after"]
+    assert len(after) == 2 and after[0]["device_room"] == 2 * g
+    assert after[0]["cap_room"] == g
+    # without the KV cache's cap: no cap room
+    assert torch_room(1, 2, None, None)["cap_room"] is None
