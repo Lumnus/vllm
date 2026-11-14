@@ -384,8 +384,15 @@ def test_a_wait_past_the_deadline_restores_the_kv_cache_as_it_was(setup, monkeyp
     ranks.refusal = EPLB_BUSY
     engine.drain()
     ctl.advance()
-    clock["t"] += 31
+    # an idle gap counts one second at most: the wait goes on
+    clock["t"] += 600
     ctl.advance()
+    assert ctl.resize.state == FastTierState.COMMITTING
+    assert ctl.resize.waited_s == 1.0
+    # busy time past the deadline
+    for _ in range(30):
+        clock["t"] += 1.0
+        ctl.advance()
     record = ctl.resize.record(8)
     assert record["state"] == "failed" and "in flight" in record["message"]
     # the KV cache back to its size before, as a restore (no measured vote)

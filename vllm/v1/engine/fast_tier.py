@@ -73,8 +73,11 @@ class FastTierResize:
     kv_resize: Any = None
     # how long a commit waits for EPLB's rearrangement or tier pass in flight
     deadline_s: float = 60.0
-    # when the commit first found EPLB moving experts (None: it did not)
+    # when the commit first found EPLB moving experts (None: it did not),
+    # the busy time waited since, and the last ask (FastTierController._eplb_wait)
     eplb_wait_since: float | None = None
+    waited_s: float = 0.0
+    last_ask: float | None = None
     # a grow's KV shrink may preempt at its deadline
     preempt: bool = False
     # the ranks refused at their check (nothing was changed on any rank)
@@ -109,9 +112,8 @@ class FastTierResize:
 class TierSetWait:
     """A ``tiers.set`` (the pinned bound) that EPLB's move in flight held
     back: the busy loop asks the ranks again between steps until it applies
-    or its deadline passes. The deadline counts the engine's busy time
-    (gaps between two asks count at most a second each), since EPLB moves
-    on only with steps."""
+    or its deadline passes, by the same wait as a card tier resize
+    (:meth:`FastTierController._eplb_wait`)."""
 
     args: dict[str, Any]
     state: FastTierState
@@ -119,6 +121,7 @@ class TierSetWait:
     message: str = ""
     started: float = field(default_factory=time.monotonic)
     ended: float | None = None
+    eplb_wait_since: float | None = None
     waited_s: float = 0.0
     last_ask: float | None = None
     asks: int = 0
@@ -178,16 +181,10 @@ class FastTierController:
             self.tier_set = wait
             return {**reply, "tiers_set": wait.record()}
         error = str(reply.get("error") or "not applied on every rank")
-        if reply.get("refused") and self._eplb_busy(error):
+        if reply.get("refused") and self._eplb_wait(
+            wait, error, f"Tiers: tiers.set {args}"
+        ):
             self.tier_set = wait
-            wait.last_ask = time.monotonic()
-            wait.message = f"waiting for EPLB: {error}"
-            logger.info(
-                "Tiers: tiers.set %s waits for EPLB (%s); at most %.0f s.",
-                args,
-                error,
-                wait.deadline_s,
-            )
             return {
                 "op": "tiers.set",
                 "applied": "waiting",
@@ -211,10 +208,6 @@ class FastTierController:
         wait = self.tier_set
         if wait is None or wait.state != FastTierState.WAITING:
             return
-        now = time.monotonic()
-        last = wait.last_ask if wait.last_ask is not None else now
-        wait.waited_s += max(0.0, min(now - last, 1.0))
-        wait.last_ask = now
         try:
             reply = self._tiers_set_op(wait)
         except TimeoutError:
@@ -234,8 +227,7 @@ class FastTierController:
             return
         error = str(reply.get("error") or "not applied on every rank")
         if reply.get("refused") and self._eplb_busy(error):
-            if wait.deadline_s <= 0 or wait.waited_s <= wait.deadline_s:
-                wait.message = f"waiting for EPLB: {error}"
+            if self._eplb_wait(wait, error, f"Tiers: tiers.set {wait.args}"):
                 return
             error = f"EPLB still moving experts after {wait.waited_s:.0f} s: {error}"
         wait.state = FastTierState.FAILED
@@ -500,25 +492,44 @@ class FastTierController:
         """Whether a refused commit is EPLB moving experts on some rank and
         the resize still has time to wait for it (then it stays committing
         and the busy loop asks again between the next steps)."""
-        error = str(reply.get("error") or "")
-        if reply.get("rolled_back") is False or not any(
-            b in error for b in self._EPLB_BUSY
-        ):
+        if reply.get("rolled_back") is False:
+            return False
+        return self._eplb_wait(
+            resize,
+            str(reply.get("error") or ""),
+            f"Fast tier: card rows per layer {resize.from_rows} -> {resize.to_rows}",
+        )
+
+    # The most one gap between two asks adds to a wait's time (busy loop).
+    EPLB_GAP_S = 1.0
+
+    def _eplb_wait(
+        self, waiter: FastTierResize | TierSetWait, error: str, what: str
+    ) -> bool:
+        """The one wait for EPLB of everything this controller holds back
+        (a card tier resize, a ``tiers.set``): whether the ranks' refusal
+        ``error`` is EPLB moving experts (``_EPLB_BUSY``: the text of
+        ``in_flight()`` or of a prepared move) and ``waiter`` may still wait.
+        Its deadline counts the engine's busy time: a gap between two asks
+        adds at most ``EPLB_GAP_S``, since EPLB moves on only with steps. One
+        INFO line when the wait starts."""
+        if not self._eplb_busy(error):
             return False
         now = time.monotonic()
-        if resize.eplb_wait_since is None:
-            resize.eplb_wait_since = now
+        if waiter.eplb_wait_since is None:
+            waiter.eplb_wait_since = now
             logger.info(
-                "Fast tier: card rows per layer %d -> %d waits for EPLB (%s); "
-                "at most %.0f s.",
-                resize.from_rows,
-                resize.to_rows,
+                "%s waits for EPLB (%s); at most %.0f s.",
+                what,
                 error,
-                resize.deadline_s,
+                waiter.deadline_s,
             )
-        if resize.deadline_s > 0 and now - resize.eplb_wait_since > resize.deadline_s:
+        elif waiter.last_ask is not None:
+            waiter.waited_s += max(0.0, min(now - waiter.last_ask, self.EPLB_GAP_S))
+        waiter.last_ask = now
+        if waiter.deadline_s > 0 and waiter.waited_s > waiter.deadline_s:
             return False
-        resize.message = f"waiting for EPLB: {error}"
+        waiter.message = f"waiting for EPLB: {error}"
         return True
 
     def _op(self, args: dict[str, Any]) -> dict[str, Any]:
