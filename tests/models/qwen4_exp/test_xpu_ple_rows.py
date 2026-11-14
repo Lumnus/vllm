@@ -14,7 +14,7 @@ import torch
 from safetensors.torch import save_file
 
 from vllm.models.qwen4_exp.nvidia.ngram_embedding import Qwen4ExpNGramEmbedding
-from vllm.models.qwen4_exp.xpu import ple_int8
+from vllm.models.qwen4_exp.xpu import ple_int8, ple_rows
 from vllm.models.qwen4_exp.xpu.ple_rows import (
     PAGE,
     PinnedRowSlabs,
@@ -23,14 +23,20 @@ from vllm.models.qwen4_exp.xpu.ple_rows import (
     RowLookahead,
     RowReader,
     RowServer,
+    RowStateSaver,
     RowStats,
     current_chunk_keys,
     host_ngram_ids,
+    load_row_state,
     merge_extents,
     owned_heads,
     plan_next_chunks,
     plan_slabs,
     read_file_range,
+    row_state_file,
+    row_state_meta,
+    save_row_state,
+    scan_rows,
 )
 
 ROW_BYTES = 164
@@ -498,3 +504,296 @@ def test_table_with_another_format_is_refused(tmp_path):
     save_file({"table": torch.zeros(2, 2, dtype=torch.uint8)}, path, {"format": "x"})
     with pytest.raises(ValueError, match="expected 'ple-int8-rowscale/v1'"):
         ple_int8.read_table_header(str(path))
+
+
+# --------------------------------------------------------------------------
+# Warm start: the saved hot rows and the page cache
+# --------------------------------------------------------------------------
+
+
+def _meta(table_file, start=500, end=1500) -> dict:
+    path, offset, rows = table_file
+    return row_state_meta([RowExtent(str(path), offset, rows)], ROW_BYTES, start, end)
+
+
+def test_row_state_round_trips_in_order(table_file, tmp_path, caplog):
+    meta = _meta(table_file)
+    rows = np.array([7, 999, 0, 42, 500], dtype=np.int64)
+    path = str(tmp_path / "state" / "ple.rows.tp0of2")
+    save_row_state(path, rows, meta)
+    assert not [p for p in os.listdir(tmp_path / "state") if ".part" in p]
+    with caplog.at_level(logging.WARNING):
+        assert load_row_state(path, meta).tolist() == rows.tolist()
+    assert not caplog.records
+    assert row_state_file("/s/ple.rows", 1, 2) == "/s/ple.rows.tp1of2"
+
+
+def test_a_missing_row_state_is_quiet(table_file, tmp_path, caplog):
+    with caplog.at_level(logging.WARNING):
+        assert load_row_state(str(tmp_path / "none"), _meta(table_file)) is None
+    assert not caplog.records
+
+
+def _damage(path: Path, how: str) -> None:
+    data = bytearray(path.read_bytes())
+    if how == "magic":
+        data[0:8] = b"NOTROWS!"
+    elif how == "truncated":
+        data = data[:-3]
+    elif how == "flipped":
+        data[-1] ^= 0xFF
+    elif how == "header":
+        data[16:20] = b"\xff\xfe\xfd\xfc"
+    path.write_bytes(bytes(data))
+
+
+@pytest.mark.parametrize("how", ["magic", "truncated", "flipped", "header"])
+def test_a_damaged_row_state_is_ignored_with_one_warning(
+    table_file, tmp_path, caplog, how
+):
+    meta = _meta(table_file)
+    path = tmp_path / "rows"
+    save_row_state(str(path), np.arange(10), meta)
+    _damage(path, how)
+    with caplog.at_level(logging.WARNING):
+        assert load_row_state(str(path), meta) is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "not usable" in warnings[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"start": 0},
+        {"end": 1400},
+        {"row_bytes": 320},
+        {"extents": [["/elsewhere/table", 512, 2000, 328512]]},
+    ],
+)
+def test_a_row_state_of_another_table_or_rank_is_ignored_with_one_warning(
+    table_file, tmp_path, caplog, change
+):
+    meta = _meta(table_file)
+    path = str(tmp_path / "rows")
+    save_row_state(path, np.arange(10), meta)
+    with caplog.at_level(logging.WARNING):
+        assert load_row_state(path, dict(meta, **change)) is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "another table or rank" in warnings[0].getMessage()
+
+
+def test_a_row_state_with_rows_out_of_range_or_twice_is_ignored(
+    table_file, tmp_path, caplog
+):
+    meta = _meta(table_file)
+    path = str(tmp_path / "rows")
+    for rows in ([1, 2, 1000], [3, 4, 3]):  # the range holds 1,000 rows
+        save_row_state(path, np.array(rows), meta)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            assert load_row_state(path, meta) is None
+        assert len(caplog.records) == 1
+
+
+def test_preload_fills_exactly_the_named_rows(table_file):
+    path, offset, rows = table_file
+    reader = RowReader([RowExtent(str(path), offset, rows)], ROW_BYTES, threads=2)
+    try:
+        cache = _cache(1000, 16)
+        local = np.array([3, 8, 400, 999])
+        referenced = np.array([True, False, True, False])
+        cache.preload(
+            local, referenced, lambda out: reader.read_rows(local + 500, out=out)
+        )
+        held = np.nonzero(cache.row2slot >= 0)[0]
+        assert held.tolist() == local.tolist()
+        assert np.array_equal(
+            cache.slab[cache.row2slot[local]], _row_bytes(local + 500)
+        )
+        assert cache.ref[:4].tolist() == [1, 0, 1, 0]
+        assert (cache.slot2row[4:] == -1).all()
+        with pytest.raises(RuntimeError, match="unused cache"):
+            cache.preload(local, referenced, lambda out: None)
+    finally:
+        reader.close()
+
+
+def test_preloaded_rows_never_block_a_step():
+    """A cache preloaded to the brim still serves a full step: preloaded rows are
+    evictable until a step asks for them."""
+    cache = _cache(100, 6)
+    local = np.arange(6)
+    cache.preload(local, np.ones(6, dtype=bool), lambda out: out.fill(1))
+    cache.begin_step()
+    hits = cache.lookup(np.array([0, 1]))
+    assert (hits >= 0).all()
+    new = np.array([50, 51, 52, 53])
+    cache.install(new, _row_bytes(new))
+    # The two rows the step asked for stay; four untouched ones gave way.
+    assert (cache.row2slot[[0, 1]] >= 0).all()
+    assert (cache.row2slot[new] >= 0).all()
+    assert (cache.row2slot[2:6] == -1).all()
+
+
+def test_hot_rows_are_most_recently_used_first():
+    cache = _cache(100, 8)
+    cache.begin_step()
+    cache.install(np.array([10, 11]), _row_bytes(np.array([10, 11])))
+    cache.begin_step()
+    cache.install(np.array([20]), _row_bytes(np.array([20])))
+    cache.install(
+        np.array([30]), _row_bytes(np.array([30])), speculative=True
+    )  # never asked for
+    cache.begin_step()
+    cache.lookup(np.array([11]))
+    assert cache.hot_rows().tolist() == [11, 20, 10, 30]
+
+
+def test_scan_reads_only_chunks_with_picked_rows(table_file, monkeypatch):
+    path, offset, rows = table_file
+    extents = [
+        RowExtent(str(path), offset, 700),
+        RowExtent(str(path), offset + 700 * ROW_BYTES, rows - 700),
+    ]
+    reads: list[int] = []
+    real = ple_rows.read_file_range
+
+    def counted(path, start, out, **kwargs):
+        reads.append(out.shape[0])
+        return real(path, start, out, **kwargs)
+
+    monkeypatch.setattr(ple_rows, "read_file_range", counted)
+    pick = np.array([500, 501, 699, 700, 1499])
+    out = np.empty((pick.shape[0], ROW_BYTES), np.uint8)
+    chunk = 100 * ROW_BYTES  # 100 rows
+    scan_rows(
+        extents,
+        ROW_BYTES,
+        500,
+        1500,
+        pick=pick,
+        out=out,
+        direct=False,
+        chunk_bytes=chunk,
+    )
+    assert np.array_equal(out, _row_bytes(pick))
+    # Chunks [500, 600), [600, 700), [700, 800), [1400, 1500) of 10.
+    assert sum(reads) == 400
+    reads.clear()
+    scan_rows(extents, ROW_BYTES, 500, 1500, direct=False, chunk_bytes=chunk)
+    assert sum(reads) == 1000  # a warm reads every row of the range
+
+
+def test_page_cache_reader_reads_the_same_bytes(table_file):
+    path, offset, rows = table_file
+    extents = [RowExtent(str(path), offset, rows)]
+    direct = RowReader(extents, ROW_BYTES, threads=2)
+    cached = RowReader(extents, ROW_BYTES, threads=2, direct=False)
+    try:
+        assert not cached.direct
+        picked = np.array([0, 24, 25, 1999, 1000])
+        assert np.array_equal(direct.read_rows(picked), cached.read_rows(picked))
+    finally:
+        direct.close()
+        cached.close()
+
+
+def test_the_saver_writes_on_its_interval_and_at_close(table_file, tmp_path):
+    meta = _meta(table_file)
+    cache = _cache(1000, 8)
+    cache.begin_step()
+    cache.install(np.array([5, 6]), _row_bytes(np.array([5, 6])))
+    path = str(tmp_path / "rows")
+    saver = RowStateSaver(cache, path, meta, interval_s=3600.0, rank=0)
+    saver.maybe_save()
+    assert saver._thread is None  # not yet due
+    saver.set_interval(1e-9)
+    saver.maybe_save()
+    assert saver._thread is not None
+    saver._thread.join()
+    assert saver.saves == 1 and sorted(load_row_state(path, meta).tolist()) == [5, 6]
+    saver.set_interval(0.0)  # only at close from now on
+    cache.begin_step()
+    cache.install(np.array([7]), _row_bytes(np.array([7])))
+    saver.maybe_save()
+    assert saver.saves == 1
+    saver.close()
+    assert saver.saves == 2 and load_row_state(path, meta).tolist()[0] == 7
+    assert not saver.save()  # closed
+
+
+def test_a_failed_save_is_counted_and_logged(table_file, tmp_path, caplog):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    saver = RowStateSaver(
+        _cache(1000, 4), str(blocker / "rows"), _meta(table_file), 0.0, rank=0
+    )
+    with caplog.at_level(logging.WARNING):
+        saver.close()
+    assert saver.errors == 1 and saver.saves == 0
+    assert "not written" in caplog.text
+
+
+def _decode(server: RowServer, tokens: list[int], drafts: int = 3) -> int:
+    """Serve a decode sequence step by step: each step verifies one token and
+    ``drafts`` draft tokens after it; returns the rows read from the file."""
+    reads = 0
+    for step in range(2, len(tokens) - drafts):
+        window = np.array(tokens[step : step + 1 + drafts], dtype=np.int64)
+        context = np.array([tokens[step - 2 : step]], dtype=np.int64)
+        own = server.hash_own(window, np.array([0, window.shape[0]]), context)
+        reads_before = server.reader.reads_total
+        server.resolve(own)
+        reads += server.reader.reads_total - reads_before
+    return reads
+
+
+@pytest.fixture
+def counted_reader(monkeypatch):
+    real = RowReader.read_rows
+
+    def read_rows(self, rows, out=None, latencies=None):
+        self.reads_total = getattr(self, "reads_total", 0) + np.asarray(rows).size
+        return real(self, rows, out=out, latencies=latencies)
+
+    monkeypatch.setattr(RowReader, "read_rows", read_rows)
+    monkeypatch.setattr(RowReader, "reads_total", 0, raising=False)
+
+
+def test_a_warm_start_covers_a_repeated_decode_and_reads_only_new_rows(
+    table_file, tmp_path, counted_reader
+):
+    path, offset, rows = table_file
+    meta = row_state_meta([RowExtent(str(path), offset, rows)], ROW_BYTES, 0, 2000)
+    generator = np.random.default_rng(7)
+    text = generator.integers(1, 200, 120).tolist()
+    # A first run, cold: every distinct n-gram is read once.
+    cold = _server(path, offset, capacity=4096)
+    cold_reads = _decode(cold, text)
+    assert cold_reads > 0
+    state = str(tmp_path / "rows")
+    RowStateSaver(cold.cache, state, meta, 0.0, rank=0).close()
+    cold.reader.close()
+    # The next boot preloads what the first run held: the same text reads nothing.
+    warm = _server(path, offset, capacity=4096)
+    saved = load_row_state(state, meta)
+    assert saved is not None
+    local = np.sort(saved)
+    warm.cache.preload(
+        local,
+        np.ones(local.shape[0], dtype=bool),
+        lambda out: warm.reader.read_rows(local, out=out),
+    )
+    warm.reader.reads_total = 0
+    assert _decode(warm, text) == 0
+    # New text reads its new n-grams only, each once.
+    changed = text[:60] + generator.integers(200, 400, 60).tolist()
+    new_rows = set()
+    for step in range(2, len(changed) - 3):
+        window = np.array(changed[step : step + 4], dtype=np.int64)
+        context = np.array([changed[step - 2 : step]], dtype=np.int64)
+        own = warm.hash_own(window, np.array([0, 4]), context).reshape(-1).tolist()
+        new_rows.update(r for r in own if warm.cache.row2slot[r] < 0)
+    assert new_rows
+    assert _decode(warm, changed) == len(new_rows)
+    warm.reader.close()

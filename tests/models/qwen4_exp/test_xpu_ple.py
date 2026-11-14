@@ -432,6 +432,140 @@ def test_disk_table_closes_when_collected(monkeypatch, tmp_path) -> None:
     assert not thread.is_alive()
 
 
+WARM_STARTS = [
+    pytest.param({"disk_page_cache": "on"}, id="page-cache"),
+    pytest.param({"disk_page_cache": "warm"}, id="page-cache-warm"),
+    pytest.param({"disk_row_state_path": "STATE"}, id="row-state"),
+    pytest.param(
+        {"disk_row_state_path": "STATE", "disk_page_cache": "warm"},
+        id="row-state-and-warm",
+    ),
+]
+
+
+def _with_state(fields: dict, tmp_path: Path) -> dict:
+    fields = dict(fields)
+    if fields.get("disk_row_state_path") == "STATE":
+        fields["disk_row_state_path"] = str(tmp_path / "state" / "ple.rows")
+    return fields
+
+
+@pytest.mark.parametrize("checkpoint", FORMATS, indirect=True)
+@pytest.mark.parametrize("fields", WARM_STARTS)
+def test_warm_start_stages_the_same_bytes(
+    monkeypatch, checkpoint, tmp_path, fields
+) -> None:
+    folder, fmt = checkpoint
+    fields = _with_state(fields, tmp_path)
+    packed = []
+    for boot, extra in enumerate([{}, fields, fields]):
+        ple = _make_ple(
+            monkeypatch, _engram(fmt, folder, disk_offload=True, **extra), fmt
+        )
+        _load(ple, folder)
+        table = cast(DiskRowTable, ple.row_table)
+        for _ in range(2):
+            _stage(ple)
+            rows = ple.lookup(ROW_IDS.shape[0], torch.bfloat16)
+            torch.testing.assert_close(rows, _expected_rows(fmt), rtol=0, atol=0)
+            packed.append(table.packed.clone())
+        if boot == 2 and "disk_row_state_path" in fields:
+            # The second boot with the file preloaded every row the first held.
+            assert table.preloaded_rows == np.unique(ROW_IDS.numpy()).shape[0]
+        table.close()
+    for other in packed[1:]:
+        assert torch.equal(other, packed[0])
+
+
+def test_row_state_is_written_at_close_and_preloaded_at_boot(
+    monkeypatch, tmp_path
+) -> None:
+    folder = _save_checkpoint(tmp_path / "ckpt", torch.bfloat16)
+    state = tmp_path / "state" / "ple.rows"
+    config = _engram("bf16", folder, disk_offload=True, disk_row_state_path=str(state))
+    ple = _make_ple(monkeypatch, config, "bf16")
+    _load(ple, folder)
+    table = cast(DiskRowTable, ple.row_table)
+    assert table.preloaded_rows == 0 and table.row_state_path == f"{state}.tp0of1"
+    _stage(ple)
+    table.close()
+    saver = table.saver
+    assert saver is not None and saver.saves == 1
+    assert saver.last_rows == np.unique(ROW_IDS.numpy()).shape[0]
+    # Next boot: the rows come from the file; a step reads nothing.
+    ple = _make_ple(monkeypatch, config, "bf16")
+    _load(ple, folder)
+    table = cast(DiskRowTable, ple.row_table)
+    assert table.preloaded_rows == saver.last_rows
+    monkeypatch.setattr(table._server.reader, "read_rows", None)
+    _stage(ple)
+    rows = ple.lookup(ROW_IDS.shape[0], torch.bfloat16)
+    torch.testing.assert_close(rows, _expected_rows("bf16"), rtol=0, atol=0)
+    table.close()
+
+
+def test_page_cache_modes_choose_the_readers(monkeypatch, tmp_path) -> None:
+    folder = _save_checkpoint(tmp_path / "ckpt", torch.bfloat16)
+    for mode, direct in (("off", True), ("on", False), ("warm", False)):
+        config = _engram("bf16", folder, disk_offload=True, disk_page_cache=mode)
+        ple = _make_ple(monkeypatch, config, "bf16")
+        _load(ple, folder)
+        table = cast(DiskRowTable, ple.row_table)
+        assert table.page_cache == mode
+        assert table._lookahead is not None
+        # tmp may refuse O_DIRECT; a page cache mode never asks for it.
+        if not direct:
+            assert not table._server.reader.direct
+            assert not table._lookahead.reader.direct
+        assert (table.warm_s is not None) == (mode == "warm")
+        table.close()
+
+
+def test_page_cache_warm_is_skipped_on_a_full_host(
+    monkeypatch, tmp_path, caplog
+) -> None:
+    folder = _save_checkpoint(tmp_path / "ckpt", torch.bfloat16)
+    monkeypatch.setattr(ple_table, "mem_available_bytes", lambda: 1)
+    config = _engram("bf16", folder, disk_offload=True, disk_page_cache="warm")
+    ple = _make_ple(monkeypatch, config, "bf16")
+    with caplog.at_level("WARNING"):
+        _load(ple, folder)
+    table = cast(DiskRowTable, ple.row_table)
+    assert table.warm_s is None and "warm skipped" in caplog.text
+    table.close()
+
+
+def test_warm_start_settings_need_disk_offload_on_xpu(monkeypatch) -> None:
+    with pytest.raises(ValueError, match="require disk_offload"):
+        EngramConfig(disk_row_state_path="/s")
+    with pytest.raises(ValueError, match="require disk_offload"):
+        EngramConfig(disk_page_cache="warm")
+    with pytest.raises(ValueError, match="disk_row_state_interval_s"):
+        EngramConfig(disk_offload=True, disk_row_state_interval_s=-1)
+    monkeypatch.setattr(current_platform, "is_xpu", lambda: False)
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    for fields in (
+        {"disk_row_state_path": "/s"},
+        {"disk_page_cache": "on"},
+        {"disk_row_state_interval_s": 60.0},
+    ):
+        with pytest.raises(ValueError, match="on XPU"):
+            EngramConfig(disk_offload=True, **fields).verify_model_config(
+                _qwen4_exp_model()
+            )
+
+
+def test_warm_start_settings_leave_the_compile_hash_alone() -> None:
+    base = EngramConfig(disk_offload=True).compile_factors()
+    warm = EngramConfig(
+        disk_offload=True,
+        disk_row_state_path="/s",
+        disk_row_state_interval_s=5.0,
+        disk_page_cache="warm",
+    ).compile_factors()
+    assert warm == base
+
+
 def test_pinned_table_needs_uva(monkeypatch, tmp_path) -> None:
     folder = _save_checkpoint(tmp_path / "ckpt", torch.bfloat16)
     ple = _make_ple(monkeypatch, _engram("bf16", folder, cpu_offload=True), "bf16")

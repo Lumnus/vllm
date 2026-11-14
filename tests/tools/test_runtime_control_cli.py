@@ -95,6 +95,11 @@ from tools.runtime_control import _op_and_args, _parser, _print_state
             {"stats_interval_s": 60.0},
         ),
         (
+            ["ple", "set", "--state-interval", "300", "--save-state"],
+            "ple.set",
+            {"state_interval_s": 300.0, "save_state": True},
+        ),
+        (
             ["fault", "arm", "--stage", "load", "--rank", "1"],
             "fault.arm",
             {"stage": "load", "count": 1, "rank": 1},
