@@ -111,10 +111,24 @@ class ExpertStoreConfig:
     """With ``--cpu-offload-pinned-gb``: host threads per rank that compute
     the experts on the CPU."""
 
-    cpu_isa: Literal["auto", "avx2", "scalar"] = "auto"
-    """The CPU experts' code: ``auto`` takes AVX2 with FMA and refuses to
-    start without it; ``avx2`` the same; ``scalar`` the portable code (the
-    same results, hundreds of times slower; for tests)."""
+    cpu_isa: Literal[
+        "auto",
+        "avx2",
+        "avx-vnni",
+        "avx512",
+        "avx512-vnni",
+        "avx512-bf16",
+        "amx",
+        "amx-card-class",
+        "scalar",
+    ] = "auto"
+    """The CPU experts' code: ``auto`` takes the widest the host has (AVX2
+    with FMA, AVX-VNNI, AVX-512, AVX-512 VNNI or BF16, AMX) and refuses to
+    start without AVX2 and FMA; a named one is that code or a refusal when
+    the host lacks it. All give the scalar code's results bit for bit except
+    ``amx-card-class`` (AMX-BF16 for prefill calls in the grouped GEMM's
+    arithmetic class, never automatic); ``scalar`` is the portable code
+    (hundreds of times slower; for tests)."""
 
     cpu_arith: Literal["card", "gemv"] = "card"
     """The arithmetic of the CPU experts' dot products: ``card`` (default)

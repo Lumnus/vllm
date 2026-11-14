@@ -117,7 +117,7 @@ class Cpu:
         self.cpu_set = cpu_set
         self.posted = 0
 
-    def post(self, tiers, h, ids, w):
+    def post(self, tiers, h, ids, w, weights=True):
         self.posted += 1
         return (ids, w)
 

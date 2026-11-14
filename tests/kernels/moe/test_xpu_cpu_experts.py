@@ -248,6 +248,24 @@ def test_refusals(monkeypatch, tmp_path, op):
     tstore.reset_sessions()
 
 
+@pytest.mark.parametrize("level", [3, 4, 5, 6, 7])
+def test_auto_takes_a_wider_instruction_set(monkeypatch, tmp_path, op, level):
+    """Kernels with AVX-VNNI / AVX-512 / AMX codes report a level above 2:
+    the tier starts with it and checks it against the scalar code."""
+    if op and cx._op_isa(0) < level:
+        pytest.skip("the loaded op's host lacks the level")
+    if not op:
+        monkeypatch.setattr(cx, "_op_isa", lambda want: level)
+    env = _host_env(monkeypatch, tmp_path, cpu_isa="auto")
+    assert env.tiers[0].cpu.isa == level
+    tstore.reset_sessions()
+
+
+def test_every_level_has_a_setting_and_a_name():
+    assert sorted(cx._ISA.values()) == list(range(9))
+    assert sorted(cx._ISA_NAME) == list(range(1, 9))
+
+
 def test_auto_refuses_a_host_without_avx2(monkeypatch, tmp_path, op):
     run(monkeypatch, tmp_path, store=True)
     monkeypatch.setattr(cx, "_op_isa", lambda want: 1)
@@ -378,6 +396,79 @@ def test_the_graphs_are_split_at_the_moe_ops():
     assert c.compilation_config.cudagraph_mode == CUDAGraphMode.NONE
 
 
+def _resolve_graphs(monkeypatch, pinned, env, by_default=True):
+    """The two config steps in their real order: breakable graphs decided,
+    then the piecewise split for the CPU experts."""
+    from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
+    from vllm.config.offload import OffloadConfig, UVAOffloadConfig
+
+    if env is None:
+        monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", env)
+    uva = UVAOffloadConfig(
+        cpu_offload_gb=8, cpu_offload_per_expert=True, cpu_offload_pinned_gb=pinned
+    )
+    cc = SimpleNamespace(
+        cudagraph_mode=CUDAGraphMode.FULL_AND_PIECEWISE,
+        use_breakable_cudagraph=None,
+        mode=CompilationMode.VLLM_COMPILE,
+        splitting_ops=["a::attn"],
+    )
+    c = SimpleNamespace(
+        offload_config=OffloadConfig(uva=uva),
+        compilation_config=cc,
+        _uses_breakable_cudagraph_by_default=lambda: by_default,
+        _uses_breakable_cudagraph_for_batch_invariance=lambda: False,
+    )
+    VllmConfig._maybe_enable_breakable_cudagraph(c)
+    VllmConfig._split_graphs_for_cpu_experts(c)
+    return cc
+
+
+def test_the_cpu_tier_keeps_piecewise_graphs_when_breakable_is_unset(
+    monkeypatch, caplog
+):
+    from vllm.config import CompilationMode, CUDAGraphMode
+
+    # the CPU tier on, the variable unset: not auto-enabled, split at the MoE ops
+    cc = _resolve_graphs(monkeypatch, 2, None)
+    assert cc.use_breakable_cudagraph is False
+    assert cc.mode == CompilationMode.VLLM_COMPILE
+    assert cc.cudagraph_mode == CUDAGraphMode.PIECEWISE
+    assert "vllm::moe_forward" in cc.splitting_ops
+    assert "vllm::moe_forward_shared" in cc.splitting_ops
+    # explicitly off: the same
+    cc = _resolve_graphs(monkeypatch, 2, "0")
+    assert cc.use_breakable_cudagraph is False
+    assert cc.cudagraph_mode == CUDAGraphMode.PIECEWISE
+    assert "vllm::moe_forward" in cc.splitting_ops
+
+
+def test_the_cpu_tier_with_breakable_forced_runs_without_graphs(monkeypatch, caplog):
+    import logging
+
+    from vllm.config import CUDAGraphMode
+
+    with caplog.at_level(logging.WARNING):
+        cc = _resolve_graphs(monkeypatch, 2, "1")
+    assert cc.use_breakable_cudagraph is True
+    assert cc.cudagraph_mode == CUDAGraphMode.NONE
+    assert "breakable CUDA graphs cannot leave the MoE op" in caplog.text
+
+
+def test_without_the_cpu_tier_breakable_is_auto_enabled_as_before(monkeypatch):
+    from vllm.config import CompilationMode
+
+    for pinned in (None, 8):  # unset, or not below the host budget
+        cc = _resolve_graphs(monkeypatch, pinned, None)
+        assert cc.use_breakable_cudagraph is True
+        assert cc.mode == CompilationMode.NONE
+    # not a breakable-by-default model: off, as before
+    cc = _resolve_graphs(monkeypatch, None, None, by_default=False)
+    assert cc.use_breakable_cudagraph is False
+
+
 def test_the_cpu_tier_needs_the_store_and_per_expert_offload():
     from vllm.config import VllmConfig
     from vllm.config.expert_store import ExpertStoreConfig
@@ -435,7 +526,7 @@ def test_the_layer_posts_before_the_card_and_adds_after():
                 output.fill_(self.value)
 
     class Cpu:
-        def post(self, tiers, h, ids, w):
+        def post(self, tiers, h, ids, w, weights=True):
             order.append("post")
             return "pending"
 

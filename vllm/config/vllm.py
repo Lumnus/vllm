@@ -819,6 +819,18 @@ class VllmConfig:
     def _maybe_enable_breakable_cudagraph(self) -> bool:
         if "VLLM_USE_BREAKABLE_CUDAGRAPH" in os.environ:
             enabled = envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+        elif self.offload_config.uva.host_experts_on():
+            # Experts computed on the CPU need the MoE op outside the captured
+            # graphs, which breakable graphs cannot do
+            # (_split_graphs_for_cpu_experts): keep the piecewise split. An
+            # explicit =1 is still honoured above.
+            enabled = False
+            logger.info_once(
+                "CPU experts (--cpu-offload-pinned-gb): not auto-enabling "
+                "VLLM_USE_BREAKABLE_CUDAGRAPH, the piecewise graphs split at the "
+                "MoE ops are kept. Set VLLM_USE_BREAKABLE_CUDAGRAPH=1 to force "
+                "breakable graphs (no CUDA graphs with the CPU experts)."
+            )
         elif self._uses_breakable_cudagraph_by_default():
             enabled = True
             logger.info_once(
