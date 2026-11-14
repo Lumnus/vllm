@@ -797,7 +797,8 @@ def _register_builtin() -> None:
         Param(
             "cpu.cpu_arith",
             "str",
-            "CPU experts' arithmetic: the card kernel's per call, or the GEMV's.",
+            "CPU experts' arithmetic: the card's exactly, the card kernel's "
+            "per call, or the GEMV's.",
             restart_reason="the self-check against the card's arithmetic runs at start",
             start="--expert-store-config cpu_arith",
         )

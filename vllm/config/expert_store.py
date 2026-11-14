@@ -130,8 +130,16 @@ class ExpertStoreConfig:
     arithmetic class, never automatic); ``scalar`` is the portable code
     (hundreds of times slower; for tests)."""
 
-    cpu_arith: Literal["card", "gemv"] = "card"
-    """The arithmetic of the CPU experts' dot products: ``card`` (default)
+    cpu_arith: Literal["card-exact", "card", "gemv"] = "card-exact"
+    """The arithmetic of the CPU experts' dot products: ``card-exact``
+    (default) computes the card's grouped GEMM exactly as the card does
+    (weights truncated to bf16(q * s), products summed exactly in blocks of
+    16, one fp32 rounding per block) with the card's own silu, taken on the
+    card at start as a table of all 65,536 bf16 inputs: an expert gives the
+    card's bits wherever it is computed, for every layer call the card runs
+    on its grouped GEMM (every call of a model with top-k above 8). Needs
+    kernels whose host op takes ``silu_table``; without them, or without a
+    card to take the table from, ``card`` with a warning. ``card``
     takes, per GEMM and layer call, the card kernel's that the card would run
     for the same call (its grouped GEMM, weights rounded to bf16(q * s), for
     every call of a model with top-k above 8; its int4 GEMV for a call of at
