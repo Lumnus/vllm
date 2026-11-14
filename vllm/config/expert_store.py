@@ -116,6 +116,19 @@ class ExpertStoreConfig:
     start without it; ``avx2`` the same; ``scalar`` the portable code (the
     same results, hundreds of times slower; for tests)."""
 
+    cpu_arith: Literal["card", "gemv"] = "card"
+    """The arithmetic of the CPU experts' dot products: ``card`` (default)
+    takes, per GEMM and layer call, the card kernel's that the card would run
+    for the same call (its grouped GEMM, weights rounded to bf16(q * s), for
+    every call of a model with top-k above 8; its int4 GEMV for a call of at
+    most 8 rows), so an expert gives the card's values wherever it is
+    computed, to the order of fp32 sums; ``gemv`` takes the GEMV's (scale per
+    32-element chunk sum) for every call: up to a third faster at one token
+    per expert, no farther from the unrounded weights, but most of an
+    expert's values then differ from the card's in the last bit, and a tier
+    move changes outputs. Needs kernels whose host op has ``arith``; with an
+    older op the GEMV's arithmetic is all there is."""
+
     host_promote_misses: int = Field(default=0, ge=0)
     """Removed (0 only): a CPU slot enters a pinned or a card row in EPLB's
     tier pass (``--eplb-config tier_interval``), planned from its load window,
@@ -275,6 +288,7 @@ class ExpertStoreConfig:
                 "host_cache_gib",
                 "cpu_threads",
                 "cpu_isa",
+                "cpu_arith",
                 "host_promote_misses",
                 "host_promote_window",
                 "host_promote_rows",

@@ -701,6 +701,8 @@ _NO_CPU_TIER = (
 _CPU_FIXED = {
     "cpu_isa": "the self-check against the card's arithmetic runs at start "
     "for the chosen code",
+    "cpu_arith": "the self-check against the card's arithmetic runs at start "
+    "for the chosen arithmetic",
     "host_promote_rows": "the pinned rows beyond the bound are sized at load",
     "host_promote_misses": "removed: CPU slots enter pinned and card rows in "
     "EPLB's tier pass (eplb.set tier_interval)",

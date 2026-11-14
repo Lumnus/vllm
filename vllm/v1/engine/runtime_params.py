@@ -672,6 +672,15 @@ def _register_builtin() -> None:
             start="--expert-store-config cpu_isa",
         )
     )
+    P(
+        Param(
+            "cpu.cpu_arith",
+            "str",
+            "CPU experts' arithmetic: the card kernel's per call, or the GEMV's.",
+            restart_reason="the self-check against the card's arithmetic runs at start",
+            start="--expert-store-config cpu_arith",
+        )
+    )
     V(Verb("store.set", "Expert store settings.", kind="set"))
     V(
         Verb(
