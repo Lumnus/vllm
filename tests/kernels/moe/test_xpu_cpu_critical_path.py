@@ -225,7 +225,13 @@ def test_a_wait_that_gives_up_fails_the_step(monkeypatch, tmp_path, op):
         cx.drain_async()
 
 
-def test_staging_and_large_calls_stay_on_the_model_thread(monkeypatch, tmp_path, op):
+def test_large_calls_stay_on_the_model_thread_and_staging_lists_there(
+    monkeypatch, tmp_path, op
+):
+    """Above the token bound a layer call runs on the model's thread. A call
+    that stages still hands its CPU part to the host thread; its staging
+    (routing wait, listing, copies) is on the model's thread before that
+    (``may_stage``)."""
     monkeypatch.setenv(cx._ASYNC_TOKENS_ENV, "4")
     env = _env(monkeypatch, tmp_path, "spin")
     tiers = env.tiers[0]
@@ -235,14 +241,16 @@ def test_staging_and_large_calls_stay_on_the_model_thread(monkeypatch, tmp_path,
     w = torch.ones(5, 2)
     assert not rt.takes_async(rt.post(tiers, x, ids, w, weights=False))
     small = rt.post(tiers, x[:4], ids[:4], w[:4], weights=False)
-    assert rt.takes_async(small)
+    assert rt.takes_async(small) and not rt.may_stage(small)
     rt.config.stage_min_calls = 2
-    assert not rt.takes_async(small)
+    assert rt.takes_async(small) and rt.may_stage(small)
     rt.config.stage_min_calls = 0
     rt.config.stage_min_tokens = 4
-    assert not rt.takes_async(small)
+    assert rt.takes_async(small) and rt.may_stage(small)
     rt.config.stage_min_tokens = 5
-    assert rt.takes_async(small)
+    assert rt.takes_async(small) and not rt.may_stage(small)
+    assert rt.stage(small, x.device) is None  # returns at once
+    rt.drain()
 
 
 def test_the_model_thread_path_and_the_step_hook_drain(monkeypatch, tmp_path, op):

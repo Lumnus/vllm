@@ -1675,16 +1675,24 @@ class CpuExpertRuntime:
 
     def takes_async(self, pending: Pending) -> bool:
         """Whether this layer call's CPU part runs on the host thread
-        (:meth:`finish_pairs_async`): VLLM_CPU_EXPERTS_ASYNC=spin, at most its
-        token bound, and no prefill staging for it (staging lists the calls
-        on the model's thread)."""
+        (:meth:`finish_pairs_async`): VLLM_CPU_EXPERTS_ASYNC=spin and at most
+        its token bound. A call that also stages (:meth:`may_stage`) is staged
+        on the model's thread first (after :meth:`drain`): the staged copies
+        and the card's call over the staging rows are enqueued before the
+        card's wait for the host word, and the host thread computes only the
+        pairs left to the CPU (``pending.staged``)."""
         a = self._async
-        if a is None or pending.num_tokens > a.max_tokens:
-            return False
+        return a is not None and pending.num_tokens <= a.max_tokens
+
+    def may_stage(self, pending: Pending) -> bool:
+        """Whether :meth:`stage` waits for this layer call's routing and lists
+        its calls (on the model's thread): ``stage_min_calls`` > 0, or a call
+        of at least ``stage_min_tokens`` (> 0) tokens. False: :meth:`stage`
+        returns None at once."""
         if int(self.config.stage_min_calls) > 0:
-            return False
+            return True
         min_tokens = int(getattr(self.config, "stage_min_tokens", 0))
-        return not 0 < min_tokens <= pending.num_tokens
+        return 0 < min_tokens <= pending.num_tokens
 
     def finish_pairs_async(self, pending: Pending, device: torch.device) -> HostPairs:
         """:meth:`finish_pairs` without waiting: the host thread computes the
@@ -1813,7 +1821,7 @@ class CpuExpertRuntime:
         min_tokens = int(getattr(self.config, "stage_min_tokens", 0))
         n, b = pending.num_tokens, pending.buffers
         by_cost = 0 < min_tokens <= n
-        if threshold <= 0 and not by_cost:
+        if not self.may_stage(pending):
             return None
         self._wait(pending)
         # the previous staging call's DMA is done (this routing comes after it)

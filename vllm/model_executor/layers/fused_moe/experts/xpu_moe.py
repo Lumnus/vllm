@@ -973,24 +973,20 @@ class XPUExperts(mk.FusedMoEExpertsModular):
                 if enqueued is not None:
                     enqueued(pending, output.device)
                 takes_async = getattr(cpu, "takes_async", None)
-                if takes_async is not None and takes_async(pending):
-                    # VLLM_CPU_EXPERTS_ASYNC: a host thread computes the
-                    # CPU's rows; the card waits for them, this thread does
-                    # not, and every pair's row slot and the map come over.
-                    host = cpu.finish_pairs_async(pending, output.device)
-                    sources.append((host.rows, host.row_map))
-                    if mode == "rank":
-                        sum_topk(output, topk_weights, sources)
-                    else:
-                        self._combine_exact(output, topk_weights, sources)
-                    return
+                on_host_thread = takes_async is not None and takes_async(pending)
+                may_stage = getattr(cpu, "may_stage", None)
+                lists_here = may_stage is None or may_stage(pending)
                 drain = getattr(cpu, "drain", None)
-                if drain is not None:
-                    drain()  # staging below lists on this thread
+                if drain is not None and (not on_host_thread or lists_here):
+                    # staging below lists on this thread, and a layer call
+                    # on this thread computes here: the host thread first
+                    drain()
                 # Prefill staging (stage_min_tokens / stage_min_calls) as in
                 # the per-tier sum:
                 # the staged experts' pairs come from the card's call over
-                # the staging rows, the CPU computes the others.
+                # the staging rows, the CPU computes the others. With the
+                # host thread, the staged copies and the call are enqueued
+                # before the card's wait for the host word.
                 stage = getattr(cpu, "stage", None)
                 staged = None if stage is None else stage(pending, output.device)
                 if staged is not None:
@@ -1004,7 +1000,14 @@ class XPUExperts(mk.FusedMoEExpertsModular):
                         **self.impl_apply_kwargs,
                     )
                     sources.append(hook.source())
-                host = cpu.finish_pairs(pending, output.device)
+                if on_host_thread:
+                    # VLLM_CPU_EXPERTS_ASYNC: a host thread computes the
+                    # CPU's rows (the pairs not staged); the card waits for
+                    # them, this thread does not, and every pair's row slot
+                    # and the map come over.
+                    host = cpu.finish_pairs_async(pending, output.device)
+                else:
+                    host = cpu.finish_pairs(pending, output.device)
                 if host is not None:
                     sources.append((host.rows, host.row_map))
             if mode == "rank":
@@ -1034,7 +1037,11 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             assert cpu is not None
             # Prefill staging (stage_min_tokens / stage_min_calls): CPU-tier
             # experts of this call go to the card through staging rows; the
-            # CPU computes the rest meanwhile.
+            # CPU computes the rest meanwhile. Staging lists on this thread:
+            # the host thread (VLLM_CPU_EXPERTS_ASYNC) finishes first.
+            drain = getattr(cpu, "drain", None)
+            if drain is not None:
+                drain()
             stage = getattr(cpu, "stage", None)
             staged = None if stage is None else stage(pending, output.device)
             if staged is not None:
