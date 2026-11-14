@@ -283,6 +283,16 @@ def _print_state(state: dict) -> None:
         f"{kv.get('release_chunk_mib')} MiB, grow floor {kv.get('grow_floor_mib')} "
         f"MiB, resize {resize.get('state', '-')}"
     )
+    fast = state.get("fast_tier") or {}
+    if fast.get("resizable"):
+        record = fast.get("record") or {}
+        print(
+            f"card tier: {fast['rows']} rows per layer (range {fast['range']}), "
+            f"last resize {record.get('from_rows', '-')} -> "
+            f"{record.get('to_rows', '-')} {record.get('state', '-')}"
+            f"{' (' + record['message'] + ')' if record.get('message') else ''}"
+            f"{'' if fast.get('ranks_agree') else '; RANKS DISAGREE'}"
+        )
     demand = state.get("kv_demand") or {}
     if demand:
         rate = demand.get("prefix_cache_hit_rate")
@@ -316,16 +326,6 @@ def _print_state(state: dict) -> None:
             f"scheduler: active seqs {sched['max_num_active_seqs']} of "
             f"{sched['max_num_seqs']}, tokens per step "
             f"{sched['max_num_scheduled_tokens']} of {sched['max_num_batched_tokens']}"
-        )
-    fast = state.get("fast_tier") or {}
-    if fast.get("resizable"):
-        record = fast.get("record") or {}
-        print(
-            f"card tier: {fast['rows']} rows per layer (range {fast['range']}), "
-            f"last resize {record.get('from_rows', '-')} -> "
-            f"{record.get('to_rows', '-')} {record.get('state', '-')}"
-            f"{' (' + record['message'] + ')' if record.get('message') else ''}"
-            f"{'' if fast.get('ranks_agree') else '; RANKS DISAGREE'}"
         )
     for name, tower in state.get("towers", {}).items():
         opts = tower["options"]

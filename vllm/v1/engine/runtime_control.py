@@ -57,6 +57,10 @@ ENGINE_OPS = (
     "tower.promote",
     "tower.demote",
     "tower.set",
+    # the card tier's size, with the KV cache giving or taking the memory
+    # (vllm/v1/engine/fast_tier.py); the workers' side is the worker op of
+    # the same name
+    "tiers.fast",
     "spec.set",
     "sched.set",
     "profile.define",
@@ -67,10 +71,6 @@ ENGINE_OPS = (
     "debug.set",
     "debug.state",
     "schema",
-    # the card tier's size, with the KV cache giving or taking the memory
-    # (vllm/v1/engine/fast_tier.py); the workers' side is the worker op of
-    # the same name
-    "tiers.fast",
 )
 # Answered by the API server process itself (request defaults it reads).
 SERVER_OPS = ("defaults.set", "defaults.state")
@@ -202,6 +202,8 @@ class RuntimeControl:
             "ranks": ranks,
             "ranks_agree": _agreement(ranks),
         }
+        if only is None or "fast" in only or "tiers" in only:
+            out["fast_tier"] = self._fast_tier_state(ranks)
         scheduler = getattr(engine, "scheduler", None)
         if scheduler is not None:
             out["kv_demand"] = kv_demand(engine)
@@ -210,8 +212,6 @@ class RuntimeControl:
         profiles = getattr(engine, "_serving_profiles", None)
         if profiles is not None:
             out["profile"] = profiles.summary()
-        if only is None or "fast" in only or "tiers" in only:
-            out["fast_tier"] = self._fast_tier_state(ranks)
         return out
 
     def _fast_tier_state(self, ranks: list[dict]) -> dict[str, Any]:
@@ -337,6 +337,17 @@ class RuntimeControl:
             f"unknown operation {op!r}; one of "
             f"{sorted(WORKER_OPS + ENGINE_OPS + SERVER_OPS)}"
         )
+
+    def _fast_tier(self) -> Any:
+        """The card tier's resize controller, made on first use and handed
+        to the engine core, whose busy loop advances it."""
+        from vllm.v1.engine.fast_tier import FastTierController
+
+        controller = getattr(self.engine, "_fast_tier", None)
+        if controller is None:
+            controller = FastTierController(self.engine, self)
+            self.engine._fast_tier = controller
+        return controller
 
     # ------------------------------------------------------------------
     # Serving profiles (vllm/v1/engine/serving_profiles.py)
@@ -654,16 +665,6 @@ class RuntimeControl:
             "changes": changes,
             "sched": self._sched_state(scheduler),
         }
-    def _fast_tier(self) -> Any:
-        """The card tier's resize controller, made on first use and handed
-        to the engine core, whose busy loop advances it."""
-        from vllm.v1.engine.fast_tier import FastTierController
-
-        controller = getattr(self.engine, "_fast_tier", None)
-        if controller is None:
-            controller = FastTierController(self.engine, self)
-            self.engine._fast_tier = controller
-        return controller
 
     def _kv_fit(self) -> dict[str, Any]:
         """Grow toward the reserved capacity: every rank votes the most its

@@ -681,15 +681,6 @@ class TierPlacement:
         self.check()
         return moved
 
-    def promote_host(self, slot: int, row: int) -> None:
-        """Host slot ``slot`` now holds pinned row ``row`` (taken from the
-        free rows and filled by the caller; the caller writes the maps)."""
-        assert self.tier[slot] == HOST, f"slot {slot} is not a host slot"
-        assert row not in self.row[self.tier == POOL], f"row {row} is in use"
-        self.tier[slot] = POOL
-        self.row[slot] = row
-        self.check()
-
     # -- planning ---------------------------------------------------------
 
     def plan(

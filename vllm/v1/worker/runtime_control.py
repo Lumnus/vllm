@@ -1044,32 +1044,6 @@ def _apply_fault_clear(worker: Any, args: dict) -> tuple[dict, dict, Any]:
     return changes, {"armed": after}, before
 
 
-# ---- debug tracing (vllm/v1/runtime_debug.py)
-
-
-def _check_debug_set(worker: Any, args: dict) -> str | None:
-    from vllm.v1 import runtime_debug
-
-    return runtime_debug.check(args)
-
-
-def _apply_debug_set(worker: Any, args: dict) -> tuple[dict, dict, Any]:
-    from vllm.v1 import runtime_debug
-
-    part = args["part"]
-    before = part in runtime_debug.state()["on"]
-    result = runtime_debug.apply(args)
-    after = part in result["on"]
-    changes = {part: [before, after]} if before != after else {}
-    return changes, {"debug": result}, (part, before)
-
-
-def _restore_debug_set(worker: Any, undo: tuple) -> None:
-    from vllm.v1 import runtime_debug
-
-    part, was_on = undo
-    if not was_on:
-        runtime_debug.disarm(part, "undone")
 # ---- the card tier's size (fast_rows_max)
 
 
@@ -1125,6 +1099,34 @@ def _restore_tiers_fast(worker: Any, old: int) -> None:
         resize_card_tier(_eplb(worker), int(old))
     finally:
         _after_fast_change(worker)
+
+
+# ---- debug tracing (vllm/v1/runtime_debug.py)
+
+
+def _check_debug_set(worker: Any, args: dict) -> str | None:
+    from vllm.v1 import runtime_debug
+
+    return runtime_debug.check(args)
+
+
+def _apply_debug_set(worker: Any, args: dict) -> tuple[dict, dict, Any]:
+    from vllm.v1 import runtime_debug
+
+    part = args["part"]
+    before = part in runtime_debug.state()["on"]
+    result = runtime_debug.apply(args)
+    after = part in result["on"]
+    changes = {part: [before, after]} if before != after else {}
+    return changes, {"debug": result}, (part, before)
+
+
+def _restore_debug_set(worker: Any, undo: tuple) -> None:
+    from vllm.v1 import runtime_debug
+
+    part, was_on = undo
+    if not was_on:
+        runtime_debug.disarm(part, "undone")
 
 
 OPS: dict[str, _Op] = {

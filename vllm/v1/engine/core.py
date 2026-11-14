@@ -977,10 +977,10 @@ class EngineCore:
     _kv_memory_holders: tuple[KVCacheMemoryHolder, ...] = ()
     _tower_residency: TowerResidencyController | None = None
     _expert_tier_stats: ExpertTierStatsPoller | None = None
-    _serving_profiles: ServingProfiles | None = None
     # A resize of the expert tiers' card tier (runtime control tiers.fast,
     # vllm/v1/engine/fast_tier.py), made on first use.
     _fast_tier: Any = None
+    _serving_profiles: ServingProfiles | None = None
     # Seconds between attempts to finish a release a worker failed.
     KV_RESIZE_RETRY_INTERVAL_S = 1.0
     # A shrink's default deadline for the drain, in seconds.
@@ -2324,16 +2324,6 @@ class EngineCoreProc(EngineCore):
             self._fail_kv_resize_executor()
             raise
 
-    def _advance_serving_profile(self) -> None:
-        assert self._serving_profiles is not None
-        try:
-            self._serving_profiles.advance()
-        except TimeoutError:
-            # A worker that did not answer may answer into the next call.
-            self._fail_kv_resize_executor()
-            raise
-        except Exception:
-            logger.exception("Serving profile: a step failed; serving goes on.")
     def _advance_fast_tier(self) -> None:
         """Move a card tier resize on; a failure ends the resize, never the
         engine (a worker RPC that times out fails the executor, as a KV
@@ -2348,6 +2338,17 @@ class EngineCoreProc(EngineCore):
             resize = self._fast_tier.resize
             if resize is not None and resize.state.active:
                 self._fast_tier._fail(resize, f"{type(e).__name__}: {e}")
+
+    def _advance_serving_profile(self) -> None:
+        assert self._serving_profiles is not None
+        try:
+            self._serving_profiles.advance()
+        except TimeoutError:
+            # A worker that did not answer may answer into the next call.
+            self._fail_kv_resize_executor()
+            raise
+        except Exception:
+            logger.exception("Serving profile: a step failed; serving goes on.")
 
     def _fail_kv_resize_executor(self) -> None:
         # The workers may still answer, and their replies would be read as

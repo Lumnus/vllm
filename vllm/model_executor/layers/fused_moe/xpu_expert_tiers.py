@@ -668,9 +668,9 @@ class ExpertTiers:
     @property
     def num_pool_rows(self) -> int:
         """Rows of each pinned tensor: the pinned slots, the spares, and the
-        rows for promotions of host slots (and, without host slots, the rows
-        a card tier that shrinks below its load size needs; or the rows a
-        relayout laid out, ``_pool_rows``)."""
+        rows a larger pinned bound may take (``host_promote_rows``) and,
+        without host slots, the rows a card tier that shrinks below its
+        load size needs; laid out again at run time with pinned_release."""
         if self._pool_rows is not None:
             return self._pool_rows
         spare = 0 if self.store_binding is None else self.store_binding.spare_rows
@@ -1067,7 +1067,6 @@ class ExpertTiers:
                     f"{self.layer_name}: an EPLB move is prepared; the pinned "
                     "rows can be laid out again once it is committed"
                 )
-            self._drop_promotion()
             # Rows in quarantine may still be read by the device or written
             # by a host read; both finish before the rows move.
             deadline = time.monotonic() + 30.0
@@ -1134,19 +1133,6 @@ class ExpertTiers:
             "rows_to": float(num_rows),
             "ms": (time.perf_counter() - start) * 1e3,
         }
-
-    def _drop_promotion(self) -> None:
-        """Forget a promotion being read: its row goes back once the read
-        that may still write it is done."""
-        if self._promotion is None:
-            return
-        assert self.placement is not None
-        _, row, future, _ = self._promotion
-        self._promotion = None
-        if future.done():
-            self.placement.pool.give_back_unused([row])
-        else:
-            self.placement.pool.release([row], future)
 
     def _fill_rows_cached(
         self, reads: Mapping[int, int], rows: Mapping[int, int]
@@ -1220,11 +1206,12 @@ class ExpertTiers:
         return min(lo, self._fast_capacity), self._fast_capacity
 
     def _heat_rank(self) -> np.ndarray:
-        """Each slot's place in the heat order (0 coldest): by the load of the
-        last rearrangement (or fill), then by how often the CPU served it."""
+        """Each slot's place in the heat order (0 coldest): by the load of
+        EPLB's last move or fill (its window), the one signal its tier passes
+        cut by; equal loads keep slot order."""
         load = np.zeros(self.num_local) if self._slot_load is None else self._slot_load
         rank = np.empty(self.num_local, dtype=np.int64)
-        rank[np.lexsort((self._host_count, load))] = np.arange(self.num_local)
+        rank[np.argsort(load, kind="stable")] = np.arange(self.num_local)
         return rank
 
     def _copy_fast(self, src: int, dst: int) -> None:
@@ -1342,7 +1329,6 @@ class ExpertTiers:
                     f"{self.layer_name}: an EPLB move is prepared; the card "
                     "tier can change once it is committed"
                 )
-            self._drop_promotion()
             old = int(placement.num_fast)
             mapped_before = rows.mapped_bytes
             if target > old:
