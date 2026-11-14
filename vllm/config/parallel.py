@@ -103,8 +103,9 @@ class EPLBConfig:
     interval_from_end: bool = False
     """Count `step_interval` from the end of the previous rearrangement (its
     last layer's commit) instead of from its start, so that a rearrangement
-    lasting longer than the interval is not followed by the next at once.
-    Changeable while serving."""
+    lasting longer than the interval is not followed by the next at once;
+    and `tier_interval` from the end of the previous tier pass, so that tier
+    passes do not run back to back. Changeable while serving."""
 
     num_redundant_experts: int = Field(default=None, ge=0)  # type: ignore[assignment]
     """Number of redundant experts to use for expert parallelism.
@@ -228,6 +229,28 @@ class EPLBConfig:
     slot entering a pinned row, or a card row from the CPU, is one read);
     None: the layer's spare rows, the most it can take."""
 
+    tier_min_gain: float | None = Field(default=None, ge=0.0)
+    """With `tier_interval`: a tier pass swaps two slots between tiers only
+    when the call cost the swap saves over the window's load (the load
+    difference times the per-call cost difference of the two tiers) repays
+    the swap's move (a read into a pinned row, a copy into a card row) at
+    least this many times. The tier pass's form of `move_min_gain`: near
+    experts of noisy load stay where they are. None or 0 (default): the
+    hysteresis alone. Changeable while serving."""
+
+    tier_min_changes: int = Field(default=0, ge=0)
+    """With `tier_interval`: a tier pass starts only when its cut would move
+    at least this many slots, summed over the layers and the EP ranks (the
+    tier pass's form of `min_imbalance`); below it the interval passes
+    without one (counted). A pass a tier's capacity change asks for always
+    runs. 0 (default): every interval. Changeable while serving."""
+
+    tier_window_moves: int | None = Field(default=None, ge=1)
+    """With `tier_interval`: experts the tier passes may read per layer and
+    rank over the last `window_size` steps; a pass's read budget is what is
+    left of it. None (default): no cap beyond `tier_max_moves` per pass.
+    Changeable while serving."""
+
     tier_hot: float = Field(default=1.5, gt=0)
     """Readout of the tiers: an expert whose load in the window is at least
     this many times the mean expert's is hot."""
@@ -314,6 +337,9 @@ class EPLBConfig:
                 "tier_hysteresis",
                 "tier_interval",
                 "tier_max_moves",
+                "tier_min_gain",
+                "tier_min_changes",
+                "tier_window_moves",
                 "tier_hot",
                 "tier_warm",
                 "seed_path",

@@ -126,10 +126,15 @@ def _pick_rows_kernel(
     HAS_B: tl.constexpr,
     BLOCK: tl.constexpr,
     HAS_C: tl.constexpr,
+    d_ptr=None,
+    d_rows_ptr=None,
+    HAS_D: tl.constexpr = False,
 ):
     """y[i] = a[a_rows[i]] if a_rows[i] >= 0, else b[b_rows[i]] if
-    b_rows[i] >= 0, else c[c_rows[i]] if c_rows[i] >= 0 (HAS_C: the rows
-    the CPU computed), else zeros; i runs over the (token, top-k) pairs."""
+    b_rows[i] >= 0, else c[c_rows[i]] if c_rows[i] >= 0, else d[d_rows[i]]
+    if d_rows[i] >= 0 (HAS_C, HAS_D: the CPU tier's rows, staged to the card
+    or computed on the CPU), else zeros; i runs over the (token, top-k)
+    pairs."""
     i = tl.program_id(0)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     m = offs < hidden
@@ -159,6 +164,15 @@ def _pick_rows_kernel(
             other=0.0,
         )
         v = tl.where(free, vc, v)
+        if HAS_D:
+            free = free & (rc < 0)
+            rd = tl.zeros([BLOCK], dtype=tl.int32) + tl.load(d_rows_ptr + i)
+            vd = tl.load(
+                d_ptr + tl.maximum(rd, 0).to(tl.int64) * hidden + offs,
+                mask=m & (rd >= 0) & free,
+                other=0.0,
+            )
+            v = tl.where(free, vd, v)
     tl.store(y_ptr + i.to(tl.int64) * hidden + offs, v, mask=m)
 
 
@@ -178,10 +192,13 @@ def _sum_topk_kernel(
     HAS_B: tl.constexpr,
     BLOCK: tl.constexpr,
     HAS_C: tl.constexpr,
+    d_ptr=None,
+    d_rows_ptr=None,
+    HAS_D: tl.constexpr = False,
 ):
     """out[t] = sum over k = 0 .. TOPK-1, in that order, of w[t, k] times the
     row of (t, k): row t*TOPK+k of a (DIRECT), or a[a_rows] / b[b_rows] /
-    c[c_rows] as in _pick_rows_kernel. fp32 accumulation, one store in out's
+    c[c_rows] / d[d_rows] as in _pick_rows_kernel. fp32 accumulation, one store in out's
     dtype. A pair no source holds adds an exact zero, so the order of the
     others, and the result, do not depend on which source held which pair."""
     t = tl.program_id(0)
@@ -219,6 +236,15 @@ def _sum_topk_kernel(
                     other=0.0,
                 )
                 v = tl.where(free, vc, v)
+                if HAS_D:
+                    free = free & (rc < 0)
+                    rd = tl.zeros([BLOCK], dtype=tl.int32) + tl.load(d_rows_ptr + i)
+                    vd = tl.load(
+                        d_ptr + tl.maximum(rd, 0).to(tl.int64) * hidden + offs,
+                        mask=m & (rd >= 0) & free,
+                        other=0.0,
+                    )
+                    v = tl.where(free, vd, v)
         acc += v.to(tl.float32) * wk
     tl.store(
         out_ptr + t.to(tl.int64) * hidden + offs,
@@ -240,7 +266,7 @@ def sum_topk(
 ) -> None:
     """``out[t] = sum_k topk_weights[t, k] * row(t, k)`` in k order, fp32
     accumulation, one rounding to ``out``'s dtype. ``sources`` are one to
-    three ``(rows, row_map)``: the expert-grouped outputs of a fused-MoE call
+    four ``(rows, row_map)``: the expert-grouped outputs of a fused-MoE call
     and its ``[tokens, top_k]`` map (-1: not computed there), or the rows the
     CPU computed and theirs; a pair is taken from the first source that
     holds it. The sum is the same bits whichever source held which pair."""
@@ -248,7 +274,7 @@ def sum_topk(
     if num_tokens == 0:
         return
     hidden = out.shape[-1]
-    (a, a_rows), (b, b_rows), (c, c_rows) = _three(sources)
+    (a, a_rows), (b, b_rows), (c, c_rows), (d, d_rows) = _four(sources)
     grid = (num_tokens, triton.cdiv(hidden, _COMBINE_BLOCK))
     _sum_topk_kernel[grid](
         out,
@@ -265,15 +291,19 @@ def sum_topk(
         HAS_B=len(sources) > 1,
         BLOCK=_COMBINE_BLOCK,
         HAS_C=len(sources) > 2,
+        d_ptr=d,
+        d_rows_ptr=d_rows.contiguous(),
+        HAS_D=len(sources) > 3,
     )
 
 
-def _three(
+def _four(
     sources: list[tuple[torch.Tensor, torch.Tensor]],
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """``sources`` padded to three with the first (unread: HAS_B / HAS_C)."""
-    assert 1 <= len(sources) <= 3, "one to three sources"
-    return list(sources) + [sources[0]] * (3 - len(sources))
+    """``sources`` padded to four with the first (unread: HAS_B / HAS_C /
+    HAS_D)."""
+    assert 1 <= len(sources) <= 4, "one to four sources"
+    return list(sources) + [sources[0]] * (4 - len(sources))
 
 
 def sum_topk_direct(
@@ -300,6 +330,9 @@ def sum_topk_direct(
         HAS_B=False,
         BLOCK=_COMBINE_BLOCK,
         HAS_C=False,
+        d_ptr=per_k,
+        d_rows_ptr=per_k,
+        HAS_D=False,
     )
 
 
@@ -311,7 +344,7 @@ def pick_rows(
     if per_k.shape[0] == 0:
         return
     hidden = per_k.shape[-1]
-    (a, a_rows), (b, b_rows), (c, c_rows) = _three(sources)
+    (a, a_rows), (b, b_rows), (c, c_rows), (d, d_rows) = _four(sources)
     grid = (per_k.shape[0], triton.cdiv(hidden, _COMBINE_BLOCK))
     _pick_rows_kernel[grid](
         per_k,
@@ -325,6 +358,9 @@ def pick_rows(
         HAS_B=len(sources) > 1,
         BLOCK=_COMBINE_BLOCK,
         HAS_C=len(sources) > 2,
+        d_ptr=d,
+        d_rows_ptr=d_rows.contiguous().view(-1),
+        HAS_D=len(sources) > 3,
     )
 
 
@@ -556,8 +592,11 @@ class XPUExperts(mk.FusedMoEExpertsModular):
     # Expert slots in device and host tiers, set by ExpertTiers.finalize.
     tiers: ExpertTiers | None = None
     # How a token's routed experts are summed (VLLM_XPU_MOE_COMBINE) and the
-    # debug placement trace; set per instance in __init__.
+    # debug placement trace; set per instance in __init__. combine_explicit:
+    # the variable is set (False: unset, and a layer with experts on the CPU
+    # takes one sum per rank, see _tiered_combine_mode).
     combine_mode: str = "split"
+    combine_explicit: bool = True
     placement_trace: "PlacementTrace | None" = None
     # apply() reads the weights of the XpuFusedMoe it builds on first use, and
     # stages those itself (staged_impl).
@@ -583,6 +622,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         self.ep_contract = ep_ids_contract_for(moe_config)
         # VLLM_XPU_MOE_COMBINE: "split" is the stock sum (see envs.py).
         self.combine_mode: str = envs.VLLM_XPU_MOE_COMBINE
+        self.combine_explicit = envs.is_set("VLLM_XPU_MOE_COMBINE")
         trace = envs.VLLM_XPU_MOE_PLACEMENT_TRACE
         self.placement_trace = (
             PlacementTrace(trace, moe_config.ep_rank) if trace else None
@@ -797,15 +837,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         mode = self.combine_mode
         if mode == "split":
             return mode
-        why = None
-        if not fused_moe_has_output_hook():
-            why = "the installed vllm-xpu-kernels' XpuFusedMoe.apply has no output_hook"
-        elif self.impl_apply_kwargs.get("w4a8"):
-            why = "the W4A8 experts path runs no output_hook"
-        elif a1q_scale is not None:
-            why = "the activations are quantized"
-        elif mode == "exact" and getattr(self.moe_config, "dp_size", 1) > 1:
-            why = "data parallelism: the ranks do not hold the same tokens"
+        why = self._combine_refusal(mode, a1q_scale)
         if why is not None:
             raise ValueError(f"VLLM_XPU_MOE_COMBINE={mode}: not available: {why}")
         logger.info_once(
@@ -818,6 +850,50 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             "and tier of every expert.",
         )
         return mode
+
+    def _combine_refusal(
+        self, mode: str, a1q_scale: torch.Tensor | None = None
+    ) -> str | None:
+        """Why the per-pair sums of ``mode`` ("rank" / "exact") cannot run
+        here, or None."""
+        if not fused_moe_has_output_hook():
+            return (
+                "the installed vllm-xpu-kernels' XpuFusedMoe.apply has no output_hook"
+            )
+        if self.impl_apply_kwargs.get("w4a8"):
+            return "the W4A8 experts path runs no output_hook"
+        if a1q_scale is not None:
+            return "the activations are quantized"
+        if mode == "exact" and getattr(self.moe_config, "dp_size", 1) > 1:
+            return "data parallelism: the ranks do not hold the same tokens"
+        return None
+
+    def _tiered_combine_mode(self, cpu: Any) -> str:
+        """The combine of a tiered layer. With experts computed on the CPU
+        and VLLM_XPU_MOE_COMBINE unset, one sum per rank ("rank"): the CPU's
+        pairs are summed with the card's in top-k order, in fp32, rounded
+        once, as the card-only layer sums them, so the result does not depend
+        on which tier holds which expert (the per-tier sums round each tier's
+        part and the CPU's part to bf16 and add them in bf16). Setting the
+        variable (split included) takes that mode as before; without the
+        CPU tier nothing changes."""
+        if cpu is None or self.combine_explicit or self.combine_mode != "split":
+            return self._combine_mode()
+        why = self._combine_refusal("rank")
+        if why is not None:
+            logger.warning_once(
+                "XPU MoE with experts computed on the CPU: the routed sum stays "
+                "per tier (%s), so a token's result depends on which tier holds "
+                "each of its experts.",
+                why,
+            )
+            return "split"
+        logger.info_once(
+            "XPU MoE with experts computed on the CPU: one sum per rank over "
+            "the card's, the pinned rows' and the CPU's experts, in top-k order "
+            "(VLLM_XPU_MOE_COMBINE unset; =split keeps the per-tier sums)."
+        )
+        return "rank"
 
     def _combine_exact(
         self,
@@ -860,25 +936,14 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             )
         if self.placement_trace is not None and self.placement_trace.active():
             self.placement_trace.record(tiers, topk_ids, topk_weights)
-        mode = self._combine_mode()
         cpu = getattr(tiers, "cpu", None)
+        mode = self._tiered_combine_mode(cpu)
         pending = (
             None
             if cpu is None
             else cpu.post(tiers, hidden_states, topk_ids, topk_weights)
         )
         if mode != "split":
-            if cpu is not None:
-                logger.warning_once(
-                    "XPU MoE combine %s with experts computed on the CPU: the "
-                    "CPU computes each of its pairs as its own row, summed with "
-                    "the card's rows in top-k order. The sum does not depend on "
-                    "the rank or the card tier of any expert; an expert that "
-                    "moves between the CPU and the card can change its own row "
-                    "in the last bit of some values (the CPU kernel adds its "
-                    "fp32 partial sums in another order than the card's).",
-                    mode,
-                )
             captured = (_Captured(), _Captured())
             fast.apply(
                 output=output,
@@ -901,6 +966,23 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             sources = [c.source() for c in captured]
             if pending is not None:
                 assert cpu is not None
+                # Prefill staging (stage_min_tokens / stage_min_calls) as in
+                # the per-tier sum:
+                # the staged experts' pairs come from the card's call over
+                # the staging rows, the CPU computes the others.
+                stage = getattr(cpu, "stage", None)
+                staged = None if stage is None else stage(pending, output.device)
+                if staged is not None:
+                    hook = _Captured()
+                    staged.apply(
+                        output=torch.empty_like(output),
+                        hidden_states=hidden_states,
+                        topk_weights=topk_weights,
+                        topk_ids=topk_ids,
+                        output_hook=hook,
+                        **self.impl_apply_kwargs,
+                    )
+                    sources.append(hook.source())
                 host = cpu.finish_pairs(pending, output.device)
                 if host is not None:
                     sources.append((host.rows, host.row_map))
@@ -929,8 +1011,8 @@ class XPUExperts(mk.FusedMoEExpertsModular):
         output.add_(slow_out)
         if pending is not None:
             assert cpu is not None
-            # Prefill staging (stage_min_calls): the CPU-tier experts this call
-            # routes many tokens to go to the card through staging rows; the
+            # Prefill staging (stage_min_tokens / stage_min_calls): CPU-tier
+            # experts of this call go to the card through staging rows; the
             # CPU computes the rest meanwhile.
             stage = getattr(cpu, "stage", None)
             staged = None if stage is None else stage(pending, output.device)

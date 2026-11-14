@@ -455,3 +455,60 @@ def test_the_layer_posts_before_the_card_and_adds_after():
     )  # fmt: skip
     assert order == ["post", "fast", "slow", "finish"]
     assert torch.equal(out, torch.full((2, 4), 111.0))
+
+
+def test_cpu_cores_for_rank(monkeypatch):
+    # unset: not pinned
+    assert cx.cpu_cores_for_rank("", 0, 2, 8) == []
+    # one list for every rank; a list per local rank
+    assert cx.cpu_cores_for_rank("0-3,8", 1, 2, 8) == [0, 1, 2, 3, 8]
+    assert cx.cpu_cores_for_rank("0-11;12-23", 1, 2, 12) == list(range(12, 24))
+    with pytest.raises(cx.CpuExpertError, match="2 core sets"):
+        cx.cpu_cores_for_rank("0-1;2-3", 2, 3, 2)
+    # auto: physical cores of the mask (SMT siblings 24-47 of 0-23), split
+    # in order between the ranks, the first cpu_threads of this rank's part
+    monkeypatch.setattr(cx.os, "sched_getaffinity", lambda pid: set(range(48)))
+    monkeypatch.setattr(
+        cx, "_physical_cores", lambda allowed: sorted(c for c in allowed if c < 24)
+    )
+    assert cx.cpu_cores_for_rank("auto", 0, 2, 12) == list(range(12))
+    assert cx.cpu_cores_for_rank("auto", 1, 2, 8) == list(range(12, 20))
+    with pytest.raises(cx.CpuExpertError, match="physical cores"):
+        cx.cpu_cores_for_rank("auto", 0, 30, 1)
+
+
+def test_the_op_threads_are_pinned_when_asked(monkeypatch, tmp_path, op):
+    calls = []
+    monkeypatch.setattr(cx, "_op_configure", lambda c, s: calls.append((c, s)) or True)
+    monkeypatch.setattr(cx, "_local_rank", lambda: (1, 2))
+    # unset: the op is left as it is
+    monkeypatch.delenv(cx._CORES_ENV, raising=False)
+    monkeypatch.delenv(cx._SPIN_ENV, raising=False)
+    env = _host_env(monkeypatch, tmp_path)
+    rt = env.tiers[0].cpu
+    assert calls == [] and rt.cores == [] and rt.threads == CPU_CFG["cpu_threads"]
+    # a set per rank: this rank's set, threads capped at one per core
+    monkeypatch.setenv(cx._CORES_ENV, "0;5")
+    monkeypatch.setenv(cx._SPIN_ENV, "4000")
+    rt._configure_threads()
+    assert calls[-1] == ([5], 4000) and rt.cores == [5] and rt.threads == 1
+    rt.set_threads(4)
+    assert rt.threads == 1 and calls[-1] == ([5], 4000)
+    # an op without the setting refuses rather than running unpinned
+    monkeypatch.setattr(cx, "_op_configure", lambda c, s: False)
+    with pytest.raises(cx.CpuExpertError, match="int4_moe_cpu_configure"):
+        rt._configure_threads()
+    tstore.reset_sessions()
+
+
+def test_the_op_is_found_in_a_host_only_library(monkeypatch):
+    class _Ns:
+        def __init__(self, has):
+            if has:
+                self.int4_moe_cpu = object()
+
+    fake = SimpleNamespace(_xpu_C=_Ns(False), _cpu_moe_C=_Ns(True))
+    monkeypatch.setattr(cx.torch, "ops", fake)
+    assert cx._ops() is fake._cpu_moe_C and cx.host_op_available()
+    fake._cpu_moe_C = _Ns(False)
+    assert cx._ops() is None and not cx.host_op_available()

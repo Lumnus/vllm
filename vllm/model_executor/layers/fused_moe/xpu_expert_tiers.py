@@ -64,6 +64,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# The weight group the kernels' W4A8 grouped GEMM takes (moe_w4a8.GROUP).
+W4A8_GROUP = 128
+
 # Decoder layers only: other MoE layers (e.g. MTP) keep their experts in VRAM, so
 # the budget below is exact.
 _LAYER_RE = re.compile(r"(?:^|\.)(?:model|language_model)\.layers\.(\d+)\.")
@@ -858,6 +861,32 @@ class ExpertTiers:
 
     # -- the CPU tier ---------------------------------------------------------
 
+    def _cpu_w4a8(self, experts: Any, hidden: int, inter: int, group: int) -> bool:
+        """Whether the card runs this layer's experts W4A8, so the CPU must
+        too: the experts ask for it (``XPUExpertsW4A8Int``) and the kernels'
+        W4A8 GEMM takes the layer by ``vllm_xpu_kernels.moe_w4a8.eligible``'s
+        rules (SiLU, no clamp, 128-element groups, N and K multiples of 64).
+        Otherwise the card keeps W4A16 for the layer, and so does the CPU."""
+        if not getattr(experts, "impl_apply_kwargs", {}).get("w4a8"):
+            return False
+        moe = getattr(experts, "moe_config", None)
+        activation = getattr(getattr(moe, "activation", None), "value", "silu")
+        why = None
+        if activation != "silu" or getattr(experts, "gemm1_clamp_limit", None):
+            why = f"activation {activation} with a clamp or not SiLU"
+        elif group != W4A8_GROUP:
+            why = f"group size {group}, not {W4A8_GROUP}"
+        elif hidden % 64 or inter % 64:
+            why = f"hidden {hidden} / intermediate {inter} not multiples of 64"
+        if why is not None:
+            logger.warning_once(
+                "CPU experts: W4A8 requested, but the card's W4A8 GEMM does not "
+                "take this layer (%s): the card keeps W4A16, and so does the CPU.",
+                why,
+            )
+            return False
+        return True
+
     def _start_cpu_tier(self, experts: Any) -> None:
         """Host slots exist: take the process's CPU tier and read their
         experts into its host cache ahead of the first step (as far as free
@@ -868,11 +897,6 @@ class ExpertTiers:
             get_runtime,
         )
 
-        if getattr(experts, "impl_apply_kwargs", {}).get("w4a8"):
-            raise NotImplementedError(
-                f"{self.layer_name}: CPU experts compute W4A16; this layer's "
-                "experts run W4A8 (int8 activations) on the card"
-            )
         binding = self.store_binding
         assert binding is not None
         if self.slow["w13_scales"].dtype != torch.bfloat16:
@@ -889,7 +913,12 @@ class ExpertTiers:
             group,
             {name: _u8(self.slow[name])[0].numel() for name in UNIT_TENSORS},
         )
-        self.cpu = get_runtime(binding.session.config, binding.session.store, layout)
+        self.cpu = get_runtime(
+            binding.session.config,
+            binding.session.store,
+            layout,
+            w4a8=self._cpu_w4a8(experts, hidden, inter, group),
+        )
         _register_runtime_settings()
         self._prefetch_host(evict=False)
         logger.info_once(
@@ -1920,14 +1949,17 @@ class ExpertTiers:
         *,
         timeout: float = 5.0,
         read_budget: int | None = None,
+        min_gain: float | None = None,
     ) -> "PreparedMove":
         """Plan the move to the experts ``new_logical`` (per local slot) with
         the tier choice for ``slot_load`` (the load of the expert each slot
         will hold), and read what it needs into free pool rows (from the CPU
         tier's host cache where it holds the expert, else the store), at most
-        ``read_budget`` experts (default: the spare rows). Runs on any thread;
-        touches no device state. Commit the result with :meth:`commit_move`
-        between two steps, on the thread that enqueues the forward."""
+        ``read_budget`` experts (default: the spare rows), each tier swap
+        passing the gain test ``min_gain`` (EPLB's tier pass). Runs on any
+        thread; touches no device state. Commit the result with
+        :meth:`commit_move` between two steps, on the thread that enqueues
+        the forward."""
         _, placement, _ = self._require_store()
         assert self.slot_logical is not None
         t0 = time.perf_counter()
@@ -1937,6 +1969,7 @@ class ExpertTiers:
             slot_load,
             hysteresis,
             read_budget=read_budget,
+            **({"min_gain": min_gain} if min_gain else {}),
         )
         move = placement.prepare(plan, self._fill_rows_cached, timeout=timeout)
         self._prepared_load = np.asarray(slot_load, dtype=np.float64).copy()
@@ -2040,12 +2073,14 @@ class ExpertTiers:
         logical_load: np.ndarray,
         hysteresis: float,
         read_budget: int | None = None,
+        min_gain: float | None = None,
     ) -> "PreparedMove":
         """EPLB's mover: the move from ``old_phys2log`` to ``new_phys2log``
         with the tiers cut from ``logical_load`` (its window). With the two
         maps equal it is a tier pass: no expert of the rank changes, the
         slots move between the card, the pinned rows and the CPU, at most
-        ``read_budget`` experts read."""
+        ``read_budget`` experts read, each swap passing the gain test
+        ``min_gain`` (``EPLBConfig.tier_min_gain``)."""
         old_logical, _ = self._local_view(old_phys2log, logical_load)
         new_logical, slot_load = self._local_view(new_phys2log, logical_load)
         assert self.slot_logical is not None
@@ -2063,11 +2098,33 @@ class ExpertTiers:
             self._prepared_mean = float(load.mean()) if load.size else None
             try:
                 return self.prepare_move(
-                    new_logical, slot_load, hysteresis, read_budget=read_budget
+                    new_logical,
+                    slot_load,
+                    hysteresis,
+                    read_budget=read_budget,
+                    min_gain=min_gain,
                 )
             except BaseException:
                 self._eplb_pending = False
                 raise
+
+    def tier_changes_wanted(
+        self,
+        phys2log: np.ndarray,
+        logical_load: np.ndarray,
+        hysteresis: float,
+        min_gain: float | None,
+        budget: int | None,
+    ) -> int:
+        """About how many of this rank's slots a tier pass would move now,
+        by the window ``logical_load`` (``TierPlacement.tier_changes_wanted``);
+        0 for a layer without the store's placement."""
+        if self.placement is None or self.store_binding is None:
+            return 0
+        _, slot_load = self._local_view(phys2log, logical_load)
+        return self.placement.tier_changes_wanted(
+            slot_load, hysteresis, min_gain, budget
+        )
 
     def commit(self, prepared: "PreparedMove") -> None:
         try:

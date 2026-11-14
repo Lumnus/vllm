@@ -15,12 +15,18 @@ server has one, is read from `VLLM_API_KEY`.
                                 [--tier-hot X] [--tier-warm X]
                                 [--min-imbalance X] [--move-min-gain X|none]
                                 [--interval-from-end on|off]
+                                [--tier-min-gain X|none] [--tier-min-changes N]
+                                [--tier-window-moves N|none]
     runtime_control.py eplb save [--path P] [--source last|window]
     runtime_control.py eplb load [--path P]
     runtime_control.py store scrub [--moved-only]
     runtime_control.py store set [--check-every N] [--scrub-every N]
                                  [--stats-interval S]
-    runtime_control.py tiers set --host-tier-bound N
+    runtime_control.py tiers set --host-tier-bound N [--deadline S]
+                                 (waits for an EPLB move in flight: 202 waiting)
+    runtime_control.py cpu set [--threads N] [--cache-gib G] [--stage-min-calls N]
+                               [--stage-min-tokens N] [--stage-copy-threads N]
+                               [--stage-card-us X]
     runtime_control.py tiers fast --rows N | --delta N [--deadline S] [--preempt]
                                   [--no-kv]
     runtime_control.py kv resize N [--deadline S] [--preempt]
@@ -147,6 +153,13 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
                 )
             if ns.interval_from_end is not None:
                 a["interval_from_end"] = ns.interval_from_end == "on"
+            if ns.tier_min_gain is not None:
+                a["tier_min_gain"] = (
+                    None if ns.tier_min_gain == "none" else float(ns.tier_min_gain)
+                )
+            _set(a, "tier_min_changes", ns.tier_min_changes)
+            if ns.tier_window_moves is not None:
+                a["tier_window_moves"] = _null_or_int(ns.tier_window_moves, "none")
         elif verb == "save":
             _set(a, "path", ns.path)
             a["source"] = ns.source
@@ -172,12 +185,16 @@ def _op_and_args(ns: argparse.Namespace) -> tuple[str, dict]:
                 a["from_kv"] = False
             return "tiers.fast", a
         _set(a, "host_tier_bound", ns.host_tier_bound)
+        _set(a, "deadline_s", ns.deadline)
         return "tiers.set", a
     if group == "cpu":
         if verb == "set":
             _set(a, "cpu_threads", ns.threads)
             _set(a, "host_cache_gib", ns.cache_gib)
             _set(a, "stage_min_calls", ns.stage_min_calls)
+            _set(a, "stage_min_tokens", ns.stage_min_tokens)
+            _set(a, "stage_copy_threads", ns.stage_copy_threads)
+            _set(a, "stage_card_us", ns.stage_card_us)
         return f"cpu.{verb}", a
     if group == "kv":
         if verb == "resize":
@@ -493,6 +510,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     es.add_argument("--move-min-gain", help="least gain per swap, or 'none'")
     es.add_argument("--interval-from-end", choices=("on", "off"))
+    es.add_argument(
+        "--tier-min-gain", help="tier swaps repay their move x times, or 'none'"
+    )
+    es.add_argument(
+        "--tier-min-changes", type=int, help="skip tier passes moving fewer slots"
+    )
+    es.add_argument(
+        "--tier-window-moves", help="tier reads per layer per window, or 'none'"
+    )
     sv = e.add_parser("save")
     sv.add_argument("--path")
     sv.add_argument("--source", choices=("last", "window"), default="last")
@@ -508,7 +534,11 @@ def _parser() -> argparse.ArgumentParser:
     ss.add_argument("--stats-interval", type=float)
 
     ti = groups.add_parser("tiers").add_subparsers(dest="verb", required=True)
-    ti.add_parser("set").add_argument("--host-tier-bound", type=int, required=True)
+    tset = ti.add_parser("set")
+    tset.add_argument("--host-tier-bound", type=int, required=True)
+    tset.add_argument(
+        "--deadline", type=float, help="seconds it may wait for EPLB (default 60)"
+    )
     tf = ti.add_parser("fast")
     rows = tf.add_mutually_exclusive_group(required=True)
     rows.add_argument("--rows", type=int, help="card rows per layer per rank")
@@ -526,6 +556,11 @@ def _parser() -> argparse.ArgumentParser:
     cs.add_argument("--threads", type=int)
     cs.add_argument("--cache-gib", type=float)
     cs.add_argument("--stage-min-calls", type=int)
+    cs.add_argument(
+        "--stage-min-tokens", type=int, help="stage by cost from this many tokens"
+    )
+    cs.add_argument("--stage-copy-threads", type=int)
+    cs.add_argument("--stage-card-us", type=float)
     cp.add_parser("stats")
 
     kv = groups.add_parser("kv").add_subparsers(dest="verb", required=True)
@@ -665,6 +700,13 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps(reply, indent=2))
     if op == "profile.apply" and status == 202 and getattr(ns, "wait", False):
         return _wait_for_profile(ns)
+    if op == "tiers.set" and status == 202:
+        record = reply.get("tiers_set") or {}
+        print(
+            f"tiers.set {record.get('state')}: {record.get('message')} "
+            "(state --only tiers shows when it applies)"
+        )
+        return 0
     return 0 if status == 200 else 1
 
 

@@ -313,6 +313,10 @@ def test_the_summary_reads_the_state(monkeypatch):
         "min_imbalance": 0.0,
         "move_min_gain": None,
         "interval_from_end": False,
+        # the tier pass's churn limiter (off by default)
+        "tier_min_gain": None,
+        "tier_min_changes": 0,
+        "tier_window_moves": None,
     }
     assert out["rearrangements"] == 1
     assert out["in_flight"] is None

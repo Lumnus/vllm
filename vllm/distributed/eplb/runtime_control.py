@@ -48,6 +48,9 @@ SETTINGS = (
     "min_imbalance",
     "move_min_gain",
     "interval_from_end",
+    "tier_min_gain",
+    "tier_min_changes",
+    "tier_window_moves",
 )
 
 
@@ -90,6 +93,9 @@ def settings(state: "EplbState") -> dict[str, Any]:
         "min_imbalance": config.min_imbalance,
         "move_min_gain": config.move_min_gain,
         "interval_from_end": config.interval_from_end,
+        "tier_min_gain": config.tier_min_gain,
+        "tier_min_changes": config.tier_min_changes,
+        "tier_window_moves": config.tier_window_moves,
     }
 
 
@@ -173,6 +179,10 @@ def summary(state: "EplbState") -> dict[str, Any]:
         "rearrangements": state.rearrangements,
         "tier_passes": getattr(state, "tier_passes", 0),
         "tier_step": getattr(state, "tier_step", 0),
+        # the tier pass's limiter (tier_min_changes, tier_window_moves)
+        "tier_pass_skips": getattr(state, "tier_pass_skips", 0),
+        "last_tier_changes": getattr(state, "last_tier_changes", None),
+        "tier_window_limited": getattr(state, "tier_window_limited", 0),
         "skipped": state.skipped_rearrangements,
         "last_sync_seconds": state.last_rearrange_seconds,
         "in_flight": in_flight(state),
@@ -255,12 +265,23 @@ def check_settings(state: "EplbState", changes: dict[str, Any]) -> str | None:
                 "tier passes move slots between the tiers of layers backed by "
                 "the expert store; no model here has them"
             )
-    if "tier_max_moves" in changes:
-        value = changes["tier_max_moves"]
+    for name in ("tier_max_moves", "tier_window_moves"):
+        if name in changes:
+            value = changes[name]
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 1
+            ):
+                return f"{name} must be a positive integer or null, got {value!r}"
+    if "tier_min_gain" in changes:
+        value = changes["tier_min_gain"]
         if value is not None and (
-            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            not isinstance(value, int | float) or isinstance(value, bool) or value < 0
         ):
-            return f"tier_max_moves must be a positive integer or null, got {value!r}"
+            return f"tier_min_gain must be a number >= 0 or null, got {value!r}"
+    if "tier_min_changes" in changes:
+        value = changes["tier_min_changes"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return f"tier_min_changes must be an integer >= 0, got {value!r}"
     config = state.parallel_config.eplb_config
     hot = changes.get("tier_hot", config.tier_hot)
     warm = changes.get("tier_warm", config.tier_warm)
@@ -345,6 +366,9 @@ def apply_settings(state: "EplbState", changes: dict[str, Any]) -> dict[str, lis
         "tier_warm",
         "min_imbalance",
         "interval_from_end",
+        "tier_min_gain",
+        "tier_min_changes",
+        "tier_window_moves",
     ):
         if name in changes:
             setattr(config, name, changes[name])

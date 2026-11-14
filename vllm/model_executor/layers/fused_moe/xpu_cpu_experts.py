@@ -25,15 +25,37 @@ the kernels' host op (``torch.ops._xpu_C.int4_moe_cpu``, AVX2), and copies the
 result to the card, where it is added to the output. The CPU's work overlaps
 the card's work on the same layer.
 
-What the CPU computes is the card's W4A16 decode arithmetic at the card's
-rounding points (bf16 after each GEMM and after the activation, fp32
-accumulation, scales applied per 32-element chunk partial sum); only the
-order of fp32 additions differs (see the op's source), so an expert's output
-can differ from the card's in the last bit of some bf16 values, like the card's
-own large-batch kernel does from its decode kernel.
+What the CPU computes is the card's W4A16 arithmetic at the card's rounding
+points (bf16 after each GEMM and after the activation, fp32 accumulation).
+Inside a dot product the card has two kernels: the int4 GEMV (a call of at
+most 8 rows: the scale applied to each 32-element chunk's partial sum) and
+the grouped GEMM (every larger call, so every call of a top-10 model: each
+weight dequantised to bf16(q * s), then bf16 x bf16 into fp32). They differ
+in most bf16 outputs, so the CPU takes, per GEMM, the one the card takes for
+the same layer call (``card_arith``), when the installed op has the
+``arith`` argument; then only the order of fp32 additions differs, and an
+expert's output differs from the card's in the last bit of a small share of
+its values. An op without it computes the GEMV's arithmetic for every call.
+
+How the CPU's part is added (``XPUExperts._apply_tiered``): with
+VLLM_XPU_MOE_COMBINE unset each pair the CPU computes is its own row, summed
+with the card's rows of the token in top-k order, fp32, rounded once, as the
+card-only layer does (``finish_pairs``); ``=split`` adds the CPU's own
+bf16-rounded per-token sum to the card's (``finish``).
+
+When the card runs the layer's experts W4A8 (int8 per-token activations,
+``XPUExpertsW4A8Int``), the CPU does too, with the host op
+``int4_moe_cpu_a8``: the same expert rows, the activations quantized on the
+host by the device's own quantization source, integer dot products per
+128-K group and the card's fp32 group sum, so an expert's output equals the
+card's bit for bit except where silu's exp (a hardware approximation on the
+card) moves a value across a rounding boundary. The W4A8 card path runs no
+output hook, so its layers keep the per-tier sums (``finish``).
 """
 
+import functools
 import mmap
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -68,20 +90,186 @@ class CpuExpertError(RuntimeError):
     """The CPU tier cannot serve an expert it was routed: the step fails."""
 
 
+# The op's library namespaces, in the order they are looked up: the XPU
+# kernels' extension carries it today; a host-only build of the same source
+# (no device code, loadable beside any accelerator's build) would register
+# it under the second name.
+_OP_NAMESPACES = ("_xpu_C", "_cpu_moe_C")
+
+
+def _ops() -> Any:
+    for name in _OP_NAMESPACES:
+        try:
+            ns = getattr(torch.ops, name)
+            if hasattr(ns, "int4_moe_cpu"):
+                return ns
+        except (AttributeError, RuntimeError):
+            continue
+    return None
+
+
 def host_op_available() -> bool:
-    try:
-        return hasattr(torch.ops._xpu_C, "int4_moe_cpu")
-    except (AttributeError, RuntimeError):
-        return False
+    return _ops() is not None
 
 
 def _op_isa(want: int) -> int:
     """What the host op resolves ``want`` (0 auto, 1 scalar, 2 AVX2) to."""
-    return int(torch.ops._xpu_C.int4_moe_cpu_isa(want))
+    return int(_ops().int4_moe_cpu_isa(want))
 
 
 def _op_run(*args: Any) -> None:
-    torch.ops._xpu_C.int4_moe_cpu(*args)
+    _ops().int4_moe_cpu(*args)
+
+
+def _op_configure(cores: list[int], spin_us: int) -> bool:
+    """Pin the op's pool workers to ``cores`` and set their spin time; False
+    when the loaded op is older than this setting."""
+    ns = _ops()
+    if ns is None or not hasattr(ns, "int4_moe_cpu_configure"):
+        return False
+    ns.int4_moe_cpu_configure(cores, spin_us)
+    return True
+
+
+# Where the op's threads run (environment, read once per process):
+#   VLLM_CPU_EXPERTS_CORES  unset or "": not pinned (the threads go where the
+#       kernel puts them). "auto": the physical cores of the process's CPU
+#       mask (one hardware thread each), split in order into as many equal
+#       parts as there are ranks on the host; this rank takes the first
+#       cpu_threads cores of its part (on EPYC the order is CCX after CCX, so
+#       the parts are whole CCXs when the counts allow). A list such as
+#       "0-11;12-23" gives each local rank its own set (rank r takes the r-th,
+#       one set for all ranks when only one is given).
+#   VLLM_CPU_EXPERTS_SPIN_US  how long a worker spins after a phase before
+#       it sleeps (unset: the op's default, 100). Spinning through the gap
+#       between two MoE layers (a few ms) saves the wake-ups of every layer
+#       call; worth it on cores given to the op alone.
+_CORES_ENV = "VLLM_CPU_EXPERTS_CORES"
+_SPIN_ENV = "VLLM_CPU_EXPERTS_SPIN_US"
+
+
+def _parse_cpu_list(text: str) -> list[int]:
+    cores: list[int] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, hi = part.split("-", 1)
+            cores.extend(range(int(lo), int(hi) + 1))
+        else:
+            cores.append(int(part))
+    return cores
+
+
+def _physical_cores(allowed: set[int]) -> list[int]:
+    """One hardware thread per physical core of ``allowed``, in order."""
+    seen: set[str] = set()
+    out = []
+    for cpu in sorted(allowed):
+        path = f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list"
+        try:
+            with open(path) as f:
+                key = f.read().strip()
+        except OSError:
+            key = str(cpu)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(cpu)
+    return out
+
+
+def cpu_cores_for_rank(
+    setting: str, local_rank: int, local_ranks: int, threads: int
+) -> list[int]:
+    """The cores this rank's op threads take (empty: not pinned)."""
+    setting = setting.strip()
+    if not setting:
+        return []
+    if setting == "auto":
+        cores = _physical_cores(set(os.sched_getaffinity(0)))
+        per = len(cores) // max(1, local_ranks)
+        if per < 1:
+            raise CpuExpertError(
+                f"{_CORES_ENV}=auto: {len(cores)} physical cores for "
+                f"{local_ranks} ranks"
+            )
+        part = cores[local_rank * per : (local_rank + 1) * per]
+        return part[:threads]
+    sets = [s for s in setting.split(";") if s.strip()]
+    if len(sets) > 1 and local_rank >= len(sets):
+        raise CpuExpertError(
+            f"{_CORES_ENV} names {len(sets)} core sets and this is local rank "
+            f"{local_rank}"
+        )
+    return _parse_cpu_list(sets[local_rank] if len(sets) > 1 else sets[0])
+
+
+def _local_rank() -> tuple[int, int]:
+    """(local rank, ranks on this host); (0, 1) outside a distributed run.
+    The host's rank count is the world group's size (one host)."""
+    try:
+        from vllm.distributed.parallel_state import get_world_group
+
+        world = get_world_group()
+        return int(world.local_rank), int(world.world_size)
+    except (AssertionError, AttributeError, ImportError, RuntimeError):
+        return 0, 1
+
+
+@functools.cache
+def op_takes_arith() -> bool:
+    """Whether the installed host op has the ``arith`` argument (the card
+    kernel's arithmetic per GEMM)."""
+    ns = _ops()
+    if ns is None:
+        return False
+    try:
+        schema = ns.int4_moe_cpu.default._schema
+    except (AttributeError, RuntimeError):
+        return False
+    return any(a.name == "arith" for a in schema.arguments)
+
+
+def card_arith(rows: int, hidden: int, inter: int, group: int) -> int:
+    """The op's ``arith`` for a layer call the card runs with ``rows``
+    (tokens x top_k) rows: per GEMM (bit 0 GEMM1 with K = hidden, bit 1
+    GEMM2 with K = inter) set when the card's XpuFusedMoe runs it on the
+    grouped GEMM (weights bf16(q * s)), clear when on its int4 GEMV. The
+    GEMV takes at most ``INT4_GEMV_MAX_ROWS`` rows, K a multiple of 512 and
+    a group a multiple of 32, unless switched off (``INT4_GEMV_ENV``); kernels
+    without it run the grouped GEMM always."""
+    try:
+        from vllm_xpu_kernels import fused_moe_interface as fmi
+
+        max_rows = int(fmi.INT4_GEMV_MAX_ROWS)
+        env = str(fmi.INT4_GEMV_ENV)
+    except (ImportError, AttributeError):
+        return 3
+    off = os.environ.get(env, "1").strip().upper() in ("0", "OFF", "FALSE", "NO", "N")
+
+    def grouped(k: int) -> bool:
+        return off or rows > max_rows or k % 512 != 0 or group % 32 != 0
+
+    return int(grouped(hidden)) | (int(grouped(inter)) << 1)
+
+
+def host_op_a8_available() -> bool:
+    """Whether the kernels have the W4A8 host op (int8 activations), in the
+    library that carries the W4A16 op."""
+    ns = _ops()
+    return ns is not None and hasattr(ns, "int4_moe_cpu_a8")
+
+
+def _op_run_a8(*args: Any) -> None:
+    _ops().int4_moe_cpu_a8(*args)
+
+
+# The card's W4A8 path (vllm_xpu_kernels.moe_w4a8.apply, fused_act off) in
+# the host op's scheme list: per-row int8 of both GEMM inputs with the
+# bf16-rounded scale, fused multiply-adds over the groups.
+W4A8_CARD_SCHEME: list[int] = []
 
 
 # --------------------------------------------------------------------------
@@ -108,17 +296,36 @@ def _int4_rows_dot(
     return (chunks * scale[None]).sum(-1)
 
 
+def _int4_rows_dot_bf16w(
+    w: torch.Tensor, s: torch.Tensor, a: torch.Tensor, group: int
+) -> torch.Tensor:
+    """The grouped GEMM's dot product: each weight dequantised to
+    bf16(q * s), times ``a`` [T, K], accumulated in float64 (the order of the
+    card's fp32 sums is the one thing not reproduced), returned in fp32."""
+    b = w.to(torch.int16)
+    q = torch.empty(w.shape[0], w.shape[1] * 2, dtype=torch.float32)
+    for half, nib in ((0, b & 0xF), (1, (b >> 4) & 0xF)):
+        q[:, half::2] = torch.where(nib >= 8, nib - 16, nib).float()
+    wq = (q * s.float().repeat_interleave(group, dim=1)).to(torch.bfloat16)
+    return (a.double() @ wq.double().T).float()
+
+
 def reference_int4_experts(
     x: torch.Tensor,
     units: Mapping[Any, Mapping[str, torch.Tensor]],
     calls: Sequence[tuple[Any, int, float]],
     inter: int,
     group: int,
+    arith: int = 0,
 ) -> torch.Tensor:
     """What the card computes for ``calls`` (unit key, token, weight) in
     token order: per call ``bf16(bf16(silu(g)) * u)`` between two bf16-rounded
     int4 GEMMs, summed per token in call order in fp32, rounded to bf16.
-    ``units[key]`` maps the four unit tensor names to their bytes (uint8)."""
+    ``units[key]`` maps the four unit tensor names to their bytes (uint8).
+    ``arith`` as the op's (``card_arith``): bit 0 / bit 1 set, GEMM1 / GEMM2
+    as the grouped GEMM computes it, clear as the int4 GEMV does."""
+    dot1 = _int4_rows_dot_bf16w if arith & 1 else _int4_rows_dot
+    dot2 = _int4_rows_dot_bf16w if arith & 2 else _int4_rows_dot
     hidden = x.shape[1]
     out = torch.zeros(x.shape[0], hidden, dtype=torch.float32)
 
@@ -131,11 +338,88 @@ def reference_int4_experts(
         w2 = u["w2"].view(torch.uint8).view(hidden, inter // 2)
         s13 = u["w13_scales"].view(torch.bfloat16).view(2 * inter, -1)
         s2 = u["w2_scales"].view(torch.bfloat16).view(hidden, -1)
-        h = bf16(_int4_rows_dot(w13, s13, x[token : token + 1].float(), group))
+        h = bf16(dot1(w13, s13, x[token : token + 1].float(), group))
         gate, up = h[:, :inter], h[:, inter:]
         act = bf16(bf16(gate / (1.0 + torch.exp(-gate))) * up)
-        y = bf16(_int4_rows_dot(w2, s2, act, group))
+        y = bf16(dot2(w2, s2, act, group))
         out[token] += y[0] * float(weight)
+    return out.to(torch.bfloat16)
+
+
+def _fma32(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """fp32 fused multiply-add: the products here (an int32 dot of at most
+    2^17 times a bf16 scale; a bf16 value times an fp32 weight) are exact in
+    float64, and one rounding of the float64 sum to fp32 is fma's."""
+    return (a.double() * b.double() + c.double()).float()
+
+
+def int8_per_token(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The card's ``dynamic_per_token_scaled_int8_quant`` on bf16 values
+    ``v`` [T, K]: scale ``bf16(max(amax / 127, 1e-5))``, ``q`` half to even
+    against the exact boundary, in [-128, 127]."""
+    amax = v.abs().amax(-1, keepdim=True)
+    s = torch.clamp(amax / 127.0, min=1e-5).to(torch.bfloat16).float()
+    f = torch.floor(v / s)
+    boundary = (f + 0.5) * s
+    even = torch.floor(f * 0.5) == f * 0.5
+    q = torch.where(
+        v > boundary, f + 1, torch.where(v < boundary, f, torch.where(even, f, f + 1))
+    )
+    return q.clamp(-128, 127).to(torch.int64), s
+
+
+def _w4a8_rows(
+    w: torch.Tensor, s: torch.Tensor, q: torch.Tensor, qs: torch.Tensor, group: int
+) -> torch.Tensor:
+    """int8 rows ``q`` [T, K] (scale ``qs`` [T, 1]) times the int4 rows
+    ``w`` [N, K/2] with bf16 scales ``s`` [N, K/G], the card's W4A8 GEMM:
+    an int32 dot per group, the fp32 sum over groups in order with fused
+    multiply-adds, times the token scale."""
+    b = w.to(torch.int16)
+    n, k = w.shape[0], w.shape[1] * 2
+    wq = torch.empty(n, k, dtype=torch.int64)
+    for half, nib in ((0, b & 0xF), (1, (b >> 4) & 0xF)):
+        wq[:, half::2] = torch.where(nib >= 8, nib - 16, nib).to(torch.int64)
+    F = torch.zeros(q.shape[0], n, dtype=torch.float32)
+    sf = s.float()
+    for g in range(k // group):
+        d = q[:, g * group : (g + 1) * group] @ wq[:, g * group : (g + 1) * group].T
+        F = _fma32(d.float(), sf[:, g][None, :].expand_as(F), F)
+    return F * qs
+
+
+def reference_w4a8_experts(
+    x: torch.Tensor,
+    units: Mapping[Any, Mapping[str, torch.Tensor]],
+    calls: Sequence[tuple[Any, int, float]],
+    inter: int,
+    group: int,
+) -> torch.Tensor:
+    """What the card's W4A8 path computes for ``calls`` (unit key, token,
+    weight) in token order, with silu's exp taken as fp32 of a float64 exp
+    (the host op's; the card's hardware exp can differ in the last bits):
+    int8 per token, W4A8 GEMM, bf16, ``bf16(bf16(silu(g)) * u)``, int8 per
+    row, W4A8 GEMM, bf16, summed per token in call order with fused
+    multiply-adds, bf16."""
+    hidden = x.shape[1]
+    out = torch.zeros(x.shape[0], hidden, dtype=torch.float32)
+
+    def bf16(t: torch.Tensor) -> torch.Tensor:
+        return t.to(torch.bfloat16).float()
+
+    for key, token, weight in calls:
+        u = units[key]
+        w13 = u["w13"].view(torch.uint8).view(2 * inter, hidden // 2)
+        w2 = u["w2"].view(torch.uint8).view(hidden, inter // 2)
+        s13 = u["w13_scales"].view(torch.bfloat16).view(2 * inter, -1)
+        s2 = u["w2_scales"].view(torch.bfloat16).view(hidden, -1)
+        q1, a1 = int8_per_token(x[token : token + 1].float())
+        h = bf16(_w4a8_rows(w13, s13, q1, a1, group))
+        gate, up = h[:, :inter], h[:, inter:]
+        silu = gate / (1.0 + torch.exp(-gate.double()).float())
+        q2, a2 = int8_per_token(bf16(bf16(silu) * up))
+        y = bf16(_w4a8_rows(w2, s2, q2, a2, group))
+        out[token] = _fma32(y[0], torch.tensor(float(weight)), out[token])
     return out.to(torch.bfloat16)
 
 
@@ -471,6 +755,9 @@ class Pending:
     event: Any
     buffers: _Buffers
     waited: bool = False
+    # The op's arith for this layer call (card_arith): the card kernel whose
+    # arithmetic each GEMM takes.
+    arith: int = 0
     # The layer's host calls, once listed (by `stage`), and the physical ids
     # staged to the card, which the CPU leaves out.
     selection: Any = None
@@ -508,6 +795,86 @@ class CpuExpertStats:
     stage_layers: int = 0
     stage_experts: int = 0
     stage_ms: float = 0.0
+    # of which copying units into the rows; layer calls that staged by the
+    # cost model (stage_min_tokens), and that it left on the CPU
+    stage_copy_ms: float = 0.0
+    stage_by_cost: int = 0
+    stage_declined: int = 0
+
+
+class StageCost:
+    """What the staging rule weighs, from this tier's own measurements.
+
+    CPU: one layer call's compute time ``y`` (µs) against its distinct
+    experts ``E`` and calls ``N``, ``y = a * E + b * N``, a ridge fit (decayed
+    sums, so it follows a change of threads or of the kernel) pulled towards
+    the prior ``A0_US``, ``B0_US`` (an AVX2 host at 8 threads: about 100 µs
+    per expert at one token, 34 µs per expert-token beyond) while the
+    data cannot separate the two (every call one token per expert, as in
+    decode). Copy: the measured µs per unit copied into the staging rows,
+    a moving mean; before the first copy, the unit's bytes at 8 GB/s per
+    copy thread up to 32 GB/s."""
+
+    A0_US = 100.0
+    B0_US = 34.0
+    DECAY = 0.99
+    PRIOR = 4.0  # weight of the prior, in layer calls of 10 experts
+
+    def __init__(self) -> None:
+        self.reset()
+        self._copy_us: float | None = None
+
+    def reset(self) -> None:
+        # decayed sums of E*E, E*N, N*N, E*y, N*y
+        self._s = [0.0] * 5
+        self.samples = 0
+
+    def observe(self, experts: int, calls: int, us: float) -> None:
+        e, n, d = float(experts), float(calls), self.DECAY
+        s = self._s
+        s[0] = d * s[0] + e * e
+        s[1] = d * s[1] + e * n
+        s[2] = d * s[2] + n * n
+        s[3] = d * s[3] + e * us
+        s[4] = d * s[4] + n * us
+        self.samples += 1
+
+    def coeffs(self) -> tuple[float, float]:
+        """(a, b) in µs: per expert and per call."""
+        lam = self.PRIOR * 100.0  # (10 experts)^2 per prior call
+        s = self._s
+        xx = np.array([[s[0] + lam, s[1]], [s[1], s[2] + lam]])
+        xy = np.array([s[3] + lam * self.A0_US, s[4] + lam * self.B0_US])
+        a, b = np.linalg.solve(xx, xy)
+        return max(float(a), 0.0), max(float(b), 0.0)
+
+    def cpu_us(self, calls: np.ndarray) -> np.ndarray:
+        a, b = self.coeffs()
+        return a + b * np.asarray(calls, dtype=np.float64)
+
+    def copied(self, units: int, us: float) -> None:
+        if units <= 0:
+            return
+        per = us / units
+        self._copy_us = (
+            per if self._copy_us is None else 0.8 * self._copy_us + 0.2 * per
+        )
+
+    def copy_us(self, unit_bytes: int, threads: int) -> float:
+        if self._copy_us is not None:
+            return self._copy_us
+        return unit_bytes / (min(8.0 * max(threads, 1), 32.0) * 1e3)
+
+    def readout(self) -> dict[str, float]:
+        a, b = self.coeffs()
+        return {
+            "cpu_us_per_expert": round(a, 1),
+            "cpu_us_per_call": round(b, 2),
+            "cpu_fit_samples": self.samples,
+            "copy_us_per_unit": None
+            if self._copy_us is None
+            else round(self._copy_us, 1),
+        }
 
 
 class CpuExpertRuntime:
@@ -519,6 +886,8 @@ class CpuExpertRuntime:
         config: "ExpertStoreConfig",
         store: Any,
         layout: UnitLayout,
+        *,
+        w4a8: bool = False,
     ):
         if not host_op_available():
             raise CpuExpertError(
@@ -527,6 +896,16 @@ class CpuExpertRuntime:
                 "kernels do not have: install kernels built with it, or drop "
                 "--cpu-offload-pinned-gb"
             )
+        if w4a8 and not host_op_a8_available():
+            raise CpuExpertError(
+                "the experts run W4A8 (int8 activations) on the card; computing "
+                "them on the CPU needs the vllm-xpu-kernels host op "
+                "int4_moe_cpu_a8, which the installed kernels do not have: "
+                "install kernels built with it, or drop --cpu-offload-pinned-gb"
+            )
+        # The card's arithmetic class this tier follows: W4A8 (int8
+        # activations) or W4A16.
+        self.w4a8 = bool(w4a8)
         self.config = config
         self.layout = layout
         self.threads = int(config.cpu_threads)
@@ -538,18 +917,26 @@ class CpuExpertRuntime:
                 "its scalar code, hundreds of times slower. Set "
                 "--expert-store-config cpu_isa to 'scalar' to accept that"
             )
+        self.cores: list[int] = []
+        self._configure_threads()
         rows = max(1, int(config.host_cache_gib * 2**30) // layout.row_bytes)
         self.cache = HostExpertCache(store, layout, rows, config.read_timeout_s)
         self.stats = CpuExpertStats()
+        # The arith of the layer call being computed (card_arith); 0 when the
+        # op has no such argument (it computes the GEMV's arithmetic).
+        self.arith = 0
+        # the staging rule's measurements (stage_min_tokens)
+        self.cost = StageCost()
         self._buffers: _Buffers | None = None
         self._last_stats = time.monotonic()
         self._first_logged = False
         self._self_check()
         logger.info(
-            "CPU experts: %s kernel, %d threads, host cache of %d experts "
+            "CPU experts: %s kernel (%s), %d threads, host cache of %d experts "
             "(%.2f GiB of ordinary memory, %d B per expert); experts not in it "
             "are read from the expert store when a step routes to them.",
             _ISA_NAME[self.isa],
+            "W4A8, int8 activations as the card's" if self.w4a8 else "W4A16",
             self.threads,
             rows,
             self.cache.gib,
@@ -560,11 +947,48 @@ class CpuExpertRuntime:
 
     def set_threads(self, threads: int) -> None:
         """Threads of the host op from the next call on (the op keeps one
-        pool per thread count)."""
+        pool per thread count; pinned, at most one per core of the set)."""
         if threads < 1:
             raise ValueError("cpu_threads must be at least 1")
-        self.threads = int(threads)
+        old = self.threads
         self.config.cpu_threads = int(threads)
+        self.threads = int(threads)
+        if self.cores:
+            self._configure_threads()
+        if self.threads != old:
+            self.cost.reset()  # the fit was of the old thread count
+
+    def _configure_threads(self) -> None:
+        """Pin the op's workers (``VLLM_CPU_EXPERTS_CORES``) and set their
+        spin time (``VLLM_CPU_EXPERTS_SPIN_US``); neither set: as the op
+        does by itself."""
+        setting = os.environ.get(_CORES_ENV, "")
+        spin_text = os.environ.get(_SPIN_ENV, "").strip()
+        if not setting.strip() and not spin_text:
+            return
+        spin = int(spin_text) if spin_text else -1
+        rank, ranks = _local_rank()
+        want = int(self.config.cpu_threads)
+        cores = cpu_cores_for_rank(setting, rank, ranks, want)
+        if cores and want > len(cores):
+            want = len(cores)  # one thread per core
+        if not _op_configure(cores, spin):
+            raise CpuExpertError(
+                f"{_CORES_ENV} / {_SPIN_ENV} need the host op's "
+                "int4_moe_cpu_configure, which the installed kernels do not "
+                "have: install kernels built with it, or unset them"
+            )
+        self.cores = cores
+        self.threads = want
+        logger.info_once(
+            "CPU experts: local rank %d of %d, %d op threads%s, workers spin "
+            "%s after a phase.",
+            rank,
+            ranks,
+            want,
+            f" pinned to cores {cores}" if cores else " (not pinned)",
+            f"{spin} us" if spin >= 0 else "the op's default",
+        )
 
     def resize_cache(self, gib: float) -> None:
         """The host cache to ``gib`` (rows of whole experts), between two
@@ -591,7 +1015,25 @@ class CpuExpertRuntime:
         call_token: torch.Tensor,
         call_weight: torch.Tensor,
     ) -> None:
-        _op_run(
+        if self.w4a8:
+            # One arithmetic for every layer call (the card's W4A8 GEMM has
+            # no GEMV); ``arith`` is the W4A16 op's.
+            _op_run_a8(
+                out,
+                x,
+                units,
+                call_unit,
+                call_token,
+                call_weight,
+                self.layout.inter,
+                self.layout.group,
+                self.layout.offsets,
+                W4A8_CARD_SCHEME,
+                self.threads,
+                self.isa,
+            )
+            return
+        args = [
             out,
             x,
             units,
@@ -603,7 +1045,10 @@ class CpuExpertRuntime:
             self.layout.offsets,
             self.threads,
             self.isa,
-        )
+        ]
+        if self.arith:
+            args.append(self.arith)
+        _op_run(*args)
 
     def _self_check(self) -> None:
         """The host op against the card's arithmetic in torch, at this
@@ -637,8 +1082,31 @@ class CpuExpertRuntime:
             }
             for u in (0, 1)
         }
-        want = reference_int4_experts(x, tensors, calls, L.inter, L.group)
+        reference = reference_w4a8_experts if self.w4a8 else reference_int4_experts
+        want = reference(x, tensors, calls, L.inter, L.group)
         steps = bf16_steps(out, want)
+        differ = int((out.view(torch.int16) != want.view(torch.int16)).sum())
+        grouped_steps = None
+        if not self.w4a8 and op_takes_arith() and self.config.cpu_arith == "card":
+            # The grouped GEMM's arithmetic (every call of a top-10 model).
+            grouped = torch.empty_like(x)
+            self.arith = 3
+            try:
+                self.run_op(
+                    grouped,
+                    x,
+                    units,
+                    torch.tensor([c[0] for c in calls], dtype=torch.int32),
+                    torch.tensor([c[1] for c in calls], dtype=torch.int32),
+                    torch.tensor([c[2] for c in calls], dtype=torch.float32),
+                )
+            finally:
+                self.arith = 0
+            grouped_want = reference_int4_experts(
+                x, tensors, calls, L.inter, L.group, arith=3
+            )
+            grouped_steps = bf16_steps(grouped, grouped_want)
+            steps = max(steps, grouped_steps)
         if self.isa == 2:
             # The vector code must take the scalar code's steps in its order
             # (the build keeps fp contraction and reassociation off): the two
@@ -669,12 +1137,35 @@ class CpuExpertRuntime:
                 f"card's arithmetic by {steps:.2f} bf16 steps on random experts: "
                 "refusing to compute experts with it"
             )
+        if self.w4a8 and differ:
+            # The W4A8 op reproduces the reference bit for bit (integer dots,
+            # the same fp32 chain, the same exp): any difference is a build
+            # or a scheme that is not the card's.
+            raise CpuExpertError(
+                f"the CPU expert kernel's W4A8 path ({_ISA_NAME[self.isa]}) "
+                f"differs from the card's W4A8 arithmetic in {differ} of "
+                f"{out.numel()} values on random experts: refusing to compute "
+                "experts with it"
+            )
         logger.info(
-            "CPU experts: self-check against the card's arithmetic passed "
-            "(%s, largest difference %.3f bf16 steps at the output's scale%s).",
+            "CPU experts: self-check against the card's %s arithmetic passed "
+            "(%s, %d of %d values differ, largest difference %.3f bf16 steps "
+            "at the output's scale%s%s).",
+            "W4A8" if self.w4a8 else "W4A16",
             _ISA_NAME[self.isa],
+            differ,
+            out.numel(),
             steps,
             "; AVX2 and scalar code bit-identical" if self.isa == 2 else "",
+            "; the card's W4A8 GEMM for every call"
+            if self.w4a8
+            else "; the card's grouped GEMM and GEMV, chosen per layer call"
+            if grouped_steps is not None
+            else "; the GEMV's arithmetic for every call (cpu_arith gemv)"
+            if op_takes_arith()
+            else "; the op has no arith argument: the card's GEMV arithmetic for "
+            "every call, which differs from its grouped GEMM (every call of a "
+            "model with top-k above 8) in most values",
         )
 
     # -- a layer ----------------------------------------------------------------
@@ -727,7 +1218,13 @@ class CpuExpertRuntime:
         mod = torch.get_device_module(hidden_states.device)
         event = mod.Event()
         event.record(mod.current_stream())
-        return Pending(tiers, tokens, event, b)
+        L = self.layout
+        arith = (
+            card_arith(tokens * topk, L.hidden, L.inter, L.group)
+            if not self.w4a8 and op_takes_arith() and self.config.cpu_arith == "card"
+            else 0
+        )
+        return Pending(tiers, tokens, event, b, arith=arith)
 
     def finish(self, pending: Pending, device: torch.device) -> torch.Tensor | None:
         """Wait for the routing only, compute the layer's host calls and
@@ -735,6 +1232,7 @@ class CpuExpertRuntime:
         Raises :class:`CpuExpertError` when an expert cannot be served."""
         n, b = pending.num_tokens, pending.buffers
         self._wait(pending)
+        self.arith = pending.arith
         if not self.compute(
             pending.tiers, b.ids[:n], b.weights[:n], b.x[:n], b.out[:n],
             selection=pending.selection, staged=pending.staged,
@@ -743,32 +1241,49 @@ class CpuExpertRuntime:
         return b.out[:n].to(device, non_blocking=True)
 
     def stage(self, pending: Pending, device: torch.device) -> Any:
-        """Prefill staging (``stage_min_calls``): wait for the routing, and
-        copy the CPU-tier experts this layer call routes at least that many
-        tokens to into the staging rows (most calls first, as far as the rows
-        go), with their map. Returns the layer's kernel call over the rows for
-        the caller to run on the card, or None (nothing staged); the CPU then
-        computes only the rest (:meth:`finish`)."""
+        """Prefill staging: wait for the routing, and copy CPU-tier experts
+        this layer call routes to into the staging rows, with their map.
+        Returns the layer's kernel call over the rows for the caller to run on
+        the card, or None (nothing staged); the CPU then computes only the
+        rest (:meth:`finish`).
+
+        Which experts: in a layer call of at least ``stage_min_tokens`` tokens
+        (> 0), the set the cost model gives (:meth:`_staged_by_cost`);
+        otherwise, with ``stage_min_calls`` > 0, the experts routed at least
+        that many tokens (most calls first, as far as the rows go). Both 0:
+        nothing, without waiting."""
         threshold = int(self.config.stage_min_calls)
-        if threshold <= 0:
-            return None
+        min_tokens = int(getattr(self.config, "stage_min_tokens", 0))
         n, b = pending.num_tokens, pending.buffers
+        by_cost = 0 < min_tokens <= n
+        if threshold <= 0 and not by_cost:
+            return None
         self._wait(pending)
         tiers = pending.tiers
         ids = b.ids[:n].numpy()
         selection = tiers._host_selection(ids)
         pending.selection = selection
         keys, tok, k, _ = selection
-        if not keys or len(keys) < threshold:
+        if not keys or (not by_cost and len(keys) < threshold):
             return None
         start = time.perf_counter()
         phys = ids[tok, k]
         uniq, counts = np.unique(phys, return_counts=True)
-        heavy = uniq[counts >= threshold]
+        rows = None
+        if by_cost:
+            rows = tiers.stage_rows(device)
+            heavy, plan = self._staged_by_cost(uniq, counts, rows.num_rows)
+            rule = f"by the cost model ({plan})"
+        else:
+            heavy = uniq[counts >= threshold]
+            rule = f"with at least {threshold} calls each"
         if heavy.size == 0:
+            if by_cost:
+                self.stats.stage_declined += 1
             return None
-        rows = tiers.stage_rows(device)
-        if heavy.size > rows.num_rows:  # the busiest ones
+        if rows is None:
+            rows = tiers.stage_rows(device)
+        if not by_cost and heavy.size > rows.num_rows:  # the busiest ones
             by_calls = counts[counts >= threshold]
             heavy = heavy[np.argsort(-by_calls, kind="stable")[: rows.num_rows]]
         assert tiers.slot_logical is not None and tiers.store_binding is not None
@@ -777,13 +1292,12 @@ class CpuExpertRuntime:
             (layer, int(tiers.slot_logical[tiers._slot_of_global[p]])) for p in heavy
         ]
         cache_rows = self.cache.acquire(heavy_keys)
+        copied = time.perf_counter()
         try:
-            for i, row in enumerate(cache_rows):
-                src = self.cache.dests(row)
-                for name in UNIT_TENSORS:
-                    rows.rows_u8(name)[i].copy_(src[name])
+            self._copy_to_stage(cache_rows, rows)
         finally:
             self.cache.release(cache_rows)
+        copy_s = time.perf_counter() - copied
         rows.map_host.fill_(-1)
         rows.map_host[torch.from_numpy(heavy.astype(np.int64))] = torch.arange(
             heavy.size, dtype=torch.int32
@@ -796,26 +1310,141 @@ class CpuExpertRuntime:
         st.stage_experts += int(heavy.size)
         st.per_tier["staged"] += staged_calls
         st.stage_ms += (time.perf_counter() - start) * 1e3
-        logger.info_once(
-            "CPU experts: a large step's CPU-tier experts were staged to the card "
-            "(%s: %d experts with at least %d calls each, %d calls; the CPU "
-            "computes the other %d).",
-            tiers.layer_name,
-            heavy.size,
-            threshold,
-            staged_calls,
-            len(keys) - staged_calls,
-        )
+        st.stage_copy_ms += copy_s * 1e3
+        self.cost.copied(int(heavy.size), copy_s * 1e6)
+        if by_cost:
+            st.stage_by_cost += 1
+            logger.info_once(
+                "CPU experts: a layer call of %d tokens (stage_min_tokens %d) "
+                "staged CPU-tier experts to the card by the cost model "
+                "(%s: %d of %d experts, %d calls; the CPU computes the other %d; "
+                "copies %.2f ms on %d threads).",
+                n,
+                min_tokens,
+                tiers.layer_name,
+                heavy.size,
+                uniq.size,
+                staged_calls,
+                len(keys) - staged_calls,
+                copy_s * 1e3,
+                self._copy_threads(),
+            )
+        else:
+            logger.info_once(
+                "CPU experts: a large step's CPU-tier experts were staged to the "
+                "card (%s: %d experts with at least %d calls each, %d calls; the "
+                "CPU computes the other %d).",
+                tiers.layer_name,
+                heavy.size,
+                threshold,
+                staged_calls,
+                len(keys) - staged_calls,
+            )
+        if runtime_debug.on("cpu"):
+            runtime_debug.emit(
+                "cpu",
+                logger,
+                "%s: %d tokens, staged %d of %d CPU-tier experts %s, %d of %d "
+                "calls; copies %.2f ms",
+                tiers.layer_name,
+                n,
+                heavy.size,
+                uniq.size,
+                rule,
+                staged_calls,
+                len(keys),
+                copy_s * 1e3,
+            )
         return tiers.stage_impl(rows)
+
+    def _copy_threads(self) -> int:
+        return max(1, int(getattr(self.config, "stage_copy_threads", 1)))
+
+    def _copy_to_stage(self, cache_rows: Sequence[int], rows: Any) -> None:
+        """The units in host cache rows ``cache_rows`` into staging rows
+        ``0..len-1``, tensor by tensor, split over ``stage_copy_threads``
+        threads (each a contiguous range of the rows; torch's copies leave
+        the GIL, so the threads copy at once)."""
+        L = self.layout
+        n = len(cache_rows)
+        index = torch.tensor(list(cache_rows), dtype=torch.int64)
+
+        def part(lo: int, hi: int) -> None:
+            idx = index[lo:hi]
+            for name, offset in zip(UNIT_TENSORS, L.offsets):
+                src = self.cache.slab[:, offset : offset + L.nbytes[name]]
+                torch.index_select(src, 0, idx, out=rows.rows_u8(name)[lo:hi])
+
+        threads = min(self._copy_threads(), n)
+        if threads <= 1:
+            part(0, n)
+            return
+        bounds = np.linspace(0, n, threads + 1).astype(int)
+        pool = self._copy_pool(threads)
+        futures = [
+            pool.submit(part, int(lo), int(hi))
+            for lo, hi in zip(bounds[:-1], bounds[1:])
+            if hi > lo
+        ]
+        for f in futures:
+            f.result()
+
+    def _copy_pool(self, threads: int) -> Any:
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = getattr(self, "_stage_pool", None)
+        if pool is None or pool._max_workers != threads:
+            if pool is not None:
+                pool.shutdown(wait=True)
+            pool = ThreadPoolExecutor(threads, thread_name_prefix="cpu-stage")
+            self._stage_pool = pool
+        return pool
+
+    def _staged_by_cost(
+        self, experts: np.ndarray, calls: np.ndarray, num_rows: int
+    ) -> tuple[np.ndarray, str]:
+        """Which of a layer call's CPU-tier ``experts`` (with their ``calls``)
+        go to the card through the staging rows: the busiest ``k`` for the
+        ``k`` that minimises the layer's host-side time
+
+            S(k) + max(G(k), C(k))
+
+        where the host first copies the k units into the rows (S, measured
+        per expert, the copies spread over ``stage_copy_threads``), then
+        computes the rest on the CPU (C = sum of a + b * calls over the
+        experts left, a and b fitted to this tier's own measured calls) while
+        the card reads the k from the rows through UVA (G = k *
+        ``stage_card_us``). S overlaps the card's own experts of the layer
+        and G the CPU's work, which is why the two are not simply added; S is
+        charged in full (the card's own time is not seen from the host), so
+        the rule errs towards the CPU."""
+        order = np.argsort(-calls, kind="stable")
+        cpu_us = self.cost.cpu_us(calls[order])  # per expert, busiest first
+        total = float(cpu_us.sum())
+        limit = min(int(num_rows), len(order))
+        k = np.arange(limit + 1)
+        left = total - np.concatenate(([0.0], np.cumsum(cpu_us[:limit])))
+        copy_us = self.cost.copy_us(self.layout.row_bytes, self._copy_threads())
+        card_us = float(getattr(self.config, "stage_card_us", 100.0))
+        objective = k * copy_us + np.maximum(k * card_us, left)
+        best = int(np.argmin(objective))  # the first minimum: fewest staged
+        plan = (
+            f"{best} staged: host {objective[best] / 1e3:.2f} ms against "
+            f"{total / 1e3:.2f} ms all on the CPU"
+        )
+        return experts[order[:best]], plan
 
     def finish_pairs(self, pending: Pending, device: torch.device) -> HostPairs | None:
         """:meth:`finish` for a sum that takes each pair's own row (the
-        combine modes rank and exact): one output row per (token, top-k)
-        pair the CPU computes, with its map. None: no host call."""
+        combine modes rank and exact, and the default with this tier): one
+        output row per (token, top-k) pair the CPU computes, with its map;
+        pairs of experts :meth:`stage` sent to the card are left out. None:
+        no host call."""
         from vllm.utils.platform_utils import is_pin_memory_available
 
         n, b = pending.num_tokens, pending.buffers
         self._wait(pending)
+        self.arith = pending.arith
         topk, hidden = b.ids.shape[1], b.x.shape[1]
         if b.pair_rows is None or b.pair_rows.shape[0] < n * topk:
             b.pair_rows = torch.empty(
@@ -823,7 +1452,9 @@ class CpuExpertRuntime:
                 dtype=torch.bfloat16,
                 pin_memory=is_pin_memory_available(),
             )
-        pair = self.compute_pairs(pending.tiers, b.ids[:n], b.x[:n], b.pair_rows)
+        pair = self.compute_pairs(
+            pending.tiers, b.ids[:n], b.x[:n], b.pair_rows, staged=pending.staged
+        )
         if pair is None:
             return None
         row_map = torch.full((n, topk), -1, dtype=torch.int32)
@@ -886,14 +1517,23 @@ class CpuExpertRuntime:
         ids: torch.Tensor,
         x: torch.Tensor,
         out_rows: torch.Tensor,
+        staged: np.ndarray | None = None,
     ) -> np.ndarray | None:
         """On the host: each call of ``ids`` [T, K] this rank computes on the
         CPU, as its own row of ``out_rows`` (call ``i`` in row ``i``, the
         expert's bf16 output without the router weight: a call alone in its
         row with weight 1 rounds to exactly that). Returns the flat pair
-        index ``token * K + k`` of each call, or None when there is none."""
+        index ``token * K + k`` of each call, or None when there is none.
+        ``staged``: physical ids the card computes from staging rows, left
+        out here (counted as staged)."""
         waited = time.perf_counter()
-        keys, pair, by_tier = tiers.host_pairs(ids.numpy())
+        ids_np = ids.numpy()
+        keys, pair, by_tier = tiers.host_pairs(ids_np)
+        if staged is not None and len(keys):
+            keep = ~np.isin(ids_np.reshape(-1)[pair], staged)
+            by_tier = dict(by_tier, cpu=by_tier["cpu"] - int((~keep).sum()))
+            keys = [key for key, kept in zip(keys, keep) if kept]
+            pair = pair[keep]
         n = len(keys)
         tokens = torch.from_numpy(pair // ids.shape[1])
         xs = x.index_select(0, tokens) if n else x[:0]
@@ -945,6 +1585,8 @@ class CpuExpertRuntime:
         st.max_experts = max(st.max_experts, distinct)
         st.read_ms += (read_done - waited) * 1e3
         st.compute_ms += (done - read_done) * 1e3
+        if getattr(self.config, "stage_min_tokens", 0) > 0:  # the staging fit
+            self.cost.observe(distinct, len(keys), (done - read_done) * 1e6)
         if not self._first_logged:
             self._first_logged = True
             logger.info(
@@ -1009,6 +1651,9 @@ class CpuExpertRuntime:
             "stage_layers": st.stage_layers,
             "stage_experts": st.stage_experts,
             "stage_ms": st.stage_ms,
+            "stage_copy_ms": st.stage_copy_ms,
+            "stage_by_cost": st.stage_by_cost,
+            "stage_declined": st.stage_declined,
         }
 
     def log_stats(self) -> None:
@@ -1072,17 +1717,28 @@ _RUNTIME_LOCK = threading.Lock()
 
 
 def get_runtime(
-    config: "ExpertStoreConfig", store: Any, layout: UnitLayout
+    config: "ExpertStoreConfig",
+    store: Any,
+    layout: UnitLayout,
+    *,
+    w4a8: bool = False,
 ) -> CpuExpertRuntime:
     """The process's CPU tier, created by the first layer that has host
-    slots (every layer of a model has the same expert shapes)."""
+    slots (every layer of a model has the same expert shapes and the same
+    arithmetic class: W4A8 when the card runs the experts with int8
+    activations, else W4A16)."""
     global _RUNTIME
     with _RUNTIME_LOCK:
         if _RUNTIME is None:
-            _RUNTIME = CpuExpertRuntime(config, store, layout)
+            _RUNTIME = CpuExpertRuntime(config, store, layout, w4a8=w4a8)
         elif _RUNTIME.layout != layout:
             raise CpuExpertError(
                 "CPU experts: MoE layers with different expert shapes in one "
+                "process are not supported"
+            )
+        elif _RUNTIME.w4a8 != bool(w4a8):
+            raise CpuExpertError(
+                "CPU experts: MoE layers with W4A8 and W4A16 experts in one "
                 "process are not supported"
             )
         return _RUNTIME
