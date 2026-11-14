@@ -497,6 +497,72 @@ def _register_builtin() -> None:
             start="--eplb-config use_async",
         )
     )
+    P(
+        Param(
+            "eplb.tier_interval",
+            "int",
+            "Steps between EPLB's tier passes (the card, pinned and CPU tiers re-cut by load inside each rank; 0 = off).",
+            "eplb.set",
+            unit="steps",
+            min=0,
+            start="--eplb-config tier_interval",
+            read=_rank0("eplb", "settings", "tier_interval"),
+        )
+    )
+    P(
+        Param(
+            "eplb.tier_max_moves",
+            "int",
+            "Experts a tier pass reads per layer (null = the layer's spare rows).",
+            "eplb.set",
+            min=1,
+            nullable=True,
+            restart_reason="above the spare rows set aside at load",
+            start="--eplb-config tier_max_moves",
+            read=_rank0("eplb", "settings", "tier_max_moves"),
+        )
+    )
+    P(
+        Param(
+            "eplb.tier_hot",
+            "float",
+            "Temperature (load over the mean expert's) from which an expert counts as hot.",
+            "eplb.set",
+            min=0,
+            start="--eplb-config tier_hot",
+            read=_rank0("eplb", "settings", "tier_hot"),
+        )
+    )
+    P(
+        Param(
+            "eplb.tier_warm",
+            "float",
+            "Temperature from which an expert counts as warm (at most tier_hot).",
+            "eplb.set",
+            min=0,
+            start="--eplb-config tier_warm",
+            read=_rank0("eplb", "settings", "tier_warm"),
+        )
+    )
+    P(
+        Param(
+            "eplb.tier_hysteresis",
+            "float",
+            "Load ratio before a tier choice or a class changes.",
+            min=1,
+            restart_reason="read into the EPLB state at start",
+            start="--eplb-config tier_hysteresis",
+        )
+    )
+    P(
+        Param(
+            "eplb.seed_path",
+            "str",
+            "Expert loads that place the tiers at boot when the state file has none (EPLB state, 0.32 rankings, learned state or a trace's loads).",
+            restart_reason="read once, at load",
+            start="--eplb-config seed_path",
+        )
+    )
     # -- tiers, store, CPU tier
     V(Verb("tiers.set", "Expert tier settings a tier component registers.", kind="set"))
     P(
@@ -539,25 +605,23 @@ def _register_builtin() -> None:
     )
     P(
         Param(
-            "cpu.host_promote_misses",
+            "cpu.stage_min_calls",
             "int",
-            "CPU calls of an expert within the window that bring it into a pinned row (0 = never).",
+            "Prefill staging: CPU-tier experts a layer call routes at least this many tokens to are computed on the card through staging rows (0 = off).",
             "cpu.set",
             min=0,
-            start="--expert-store-config host_promote_misses",
-            read=_rank0("cpu", "settings", "host_promote_misses"),
+            start="--expert-store-config stage_min_calls",
+            read=_rank0("cpu", "settings", "stage_min_calls"),
         )
     )
     P(
         Param(
-            "cpu.host_promote_window",
+            "cpu.stage_rows",
             "int",
-            "The window of host_promote_misses.",
-            "cpu.set",
-            unit="steps",
-            min=1,
-            start="--expert-store-config host_promote_window",
-            read=_rank0("cpu", "settings", "host_promote_window"),
+            "Staging rows (0 = a layer's CPU slots).",
+            min=0,
+            restart_reason="the staging rows are pinned memory allocated at first use",
+            start="--expert-store-config stage_rows",
         )
     )
     P(
@@ -1008,3 +1072,13 @@ def _register_builtin() -> None:
 
 
 _register_builtin()
+
+
+def _register_components() -> None:
+    """Components whose module registers its own verbs and parameters."""
+    from vllm.v1.engine import fast_tier
+
+    fast_tier.register_runtime_params(register_verb, register_param, Verb, Param)
+
+
+_register_components()

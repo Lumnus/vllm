@@ -76,7 +76,27 @@ def test_the_shipped_examples_are_profiles():
         profile = json.loads(path.read_text())
         assert sp.check_profile(profile) is None, path
         names.append(profile["name"])
-    assert names == ["agentic-coding", "long-sessions"]
+    assert names == ["agentic-coding", "cpu-tier-working-set", "long-sessions"]
+
+
+def test_every_example_setting_is_a_live_parameter_of_the_schema():
+    """A profile names parameters as the schema does (`<section>.<key>`):
+    every key the shipped profiles set, the card tier's, the working set's
+    and the CPU tier's included, is a parameter that changes live."""
+    from vllm.v1.engine import runtime_params as rp
+
+    for path in sorted(EXAMPLES.glob("*.json")):
+        profile = json.loads(path.read_text())
+        for section in sp.SECTIONS:
+            for key in profile.get(section) or {}:
+                if section == "kv" and key in ("deadline_s", "preempt"):
+                    continue  # arguments of the KV step, not parameters
+                if section == "tower" and key == "name":
+                    continue
+                name = f"{section}.{key}"
+                assert name in rp.PARAMS, (path.name, name)
+                assert rp.PARAMS[name].verb is not None, (path.name, name)
+                assert rp.PARAMS[name].verb in rp.VERBS, (path.name, name)
 
 
 # ---------------------------------------------------------------- order

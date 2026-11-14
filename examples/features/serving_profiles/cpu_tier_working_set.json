@@ -1,0 +1,13 @@
+{
+  "name": "cpu-tier-working-set",
+  "description": "An engine that computes cold experts on the CPU (--cpu-offload-pinned-gb): EPLB's tier passes keep the hottest experts of each rank on the card and the next in pinned rows, a large prefill stages its busiest CPU experts to the card, and a smaller host cache gives host memory back. Starting points, to be measured.",
+  "eplb": {
+    "window_size": 256,
+    "tier_interval": 64,
+    "tier_max_moves": 8,
+    "tier_hot": 1.5,
+    "tier_warm": 0.5
+  },
+  "tiers": {"host_tier_bound": 22},
+  "cpu": {"host_cache_gib": 8, "stage_min_calls": 12}
+}

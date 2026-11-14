@@ -20,6 +20,9 @@ nothing else while the part is off):
   preemption;
 * ``kv``: KV cache resizes, drains and releases, block-pool fences;
 * ``cpu``: each MoE layer call computed on the CPU (experts, tokens, ms);
+* ``tiers``: each commit of a layer's tiers (EPLB's rearrangements and tier
+  passes, the card tier's resize rounds), each card tier resize, each change
+  of the pinned bound and each pinned-row layout that follows it;
 * ``tower``: each request for a tower's modalities and each residency step
   that moves it;
 * ``placement``: the per-token placement trace of the fused MoE layers
@@ -43,6 +46,7 @@ PARTS = {
     "scheduler": "admissions and preemptions",
     "kv": "KV cache resize, drain and release events",
     "cpu": "MoE layer calls computed on the CPU",
+    "tiers": "expert tier commits, card tier resizes, pinned bound and rows",
     "tower": "encoder tower requests and residency steps",
     "placement": "per-token expert placement trace (eager steps only)",
     "logger:<name>": "a logger's DEBUG records, shown at INFO",

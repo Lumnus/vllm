@@ -65,6 +65,10 @@ class FastTierResize:
     rolled_back: bool | None = None
     # the KV cache resize this one waits for
     kv_resize: Any = None
+    # how long a commit waits for EPLB's rearrangement or tier pass in flight
+    deadline_s: float = 60.0
+    # when the commit first found EPLB moving experts (None: it did not)
+    eplb_wait_since: float | None = None
 
     def record(self, rows_now: int | None) -> dict[str, Any]:
         end = self.ended if self.ended is not None else time.monotonic()
@@ -175,7 +179,7 @@ class FastTierController:
         if from_kv and kv_active:
             raise ControlRefused("a KV cache resize is in progress; ask after it ends")
         if target < rows_now:
-            return self._shrink(rows_now, target, blocks, from_kv)
+            return self._shrink(rows_now, target, blocks, from_kv, float(deadline))
         return self._grow(rows_now, target, blocks, from_kv, float(deadline), preempt)
 
     def _reply(self) -> dict[str, Any]:
@@ -215,6 +219,7 @@ class FastTierController:
             bytes_per_rank=need,
             kv_blocks_before=blocks,
             from_kv=from_kv,
+            deadline_s=deadline,
         )
         if from_kv and need > 0:
             try:
@@ -267,10 +272,44 @@ class FastTierController:
                 )
                 return
             resize.state = FastTierState.COMMITTING
-        self._commit(resize)
+        if resize.direction == "shrink":
+            self._shrink_commit(resize)
+        else:
+            self._commit(resize)
+
+    # EPLB owns every expert move: a resize does not start while one of its
+    # rearrangements or tier passes is in flight, it waits for it.
+    _EPLB_BUSY = ("is in flight", "an EPLB move is prepared")
+
+    def _waits_for_eplb(self, resize: FastTierResize, reply: dict) -> bool:
+        """Whether a refused commit is EPLB moving experts on some rank and
+        the resize still has time to wait for it (then it stays committing
+        and the busy loop asks again between the next steps)."""
+        error = str(reply.get("error") or "")
+        if reply.get("rolled_back") is False or not any(
+            b in error for b in self._EPLB_BUSY
+        ):
+            return False
+        now = time.monotonic()
+        if resize.eplb_wait_since is None:
+            resize.eplb_wait_since = now
+            logger.info(
+                "Fast tier: card rows per layer %d -> %d waits for EPLB (%s); "
+                "at most %.0f s.",
+                resize.from_rows,
+                resize.to_rows,
+                error,
+                resize.deadline_s,
+            )
+        if resize.deadline_s > 0 and now - resize.eplb_wait_since > resize.deadline_s:
+            return False
+        resize.message = f"waiting for EPLB: {error}"
+        return True
 
     def _commit(self, resize: FastTierResize) -> None:
         reply = self.control._worker_op("tiers.fast", {"rows": resize.to_rows})
+        if reply["applied"] != "all" and self._waits_for_eplb(resize, reply):
+            return
         if reply["applied"] == "all":
             resize.state = FastTierState.FINISHED
             resize.ended = time.monotonic()
@@ -325,7 +364,12 @@ class FastTierController:
     # -- shrink -----------------------------------------------------------
 
     def _shrink(
-        self, rows_now: int, target: int, blocks: int, from_kv: bool
+        self,
+        rows_now: int,
+        target: int,
+        blocks: int,
+        from_kv: bool,
+        deadline: float = DEFAULT_DEADLINE_S,
     ) -> dict[str, Any]:
         resize = FastTierResize(
             "shrink",
@@ -334,9 +378,19 @@ class FastTierController:
             FastTierState.COMMITTING,
             kv_blocks_before=blocks,
             from_kv=from_kv,
+            deadline_s=deadline,
         )
         self.resize = resize
+        self._shrink_commit(resize)
+        return self._reply()
+
+    def _shrink_commit(self, resize: FastTierResize) -> None:
+        rows_now, target = resize.from_rows, resize.to_rows
+        blocks = resize.kv_blocks_before
+        from_kv = resize.from_kv
         reply = self.control._worker_op("tiers.fast", {"rows": target})
+        if reply["applied"] != "all" and self._waits_for_eplb(resize, reply):
+            return
         if reply["applied"] != "all":
             resize.rolled_back = reply.get("rolled_back", reply["applied"] == "none")
             resize.state = FastTierState.FAILED
@@ -349,7 +403,7 @@ class FastTierController:
                 target,
                 resize.message,
             )
-            return self._reply()
+            return
         released = [
             int((r.get("result") or {}).get("fast", {}).get("released_bytes", 0))
             for r in reply["ranks"]
@@ -380,4 +434,66 @@ class FastTierController:
             resize.kv_blocks_after,
         )
         self.engine._publish_scheduler_stats()
-        return self._reply()
+
+
+def register_runtime_params(register_verb, register_param, Verb, Param) -> None:
+    """This verb and the card tier's start settings, for the runtime control
+    surface's schema (``vllm/v1/engine/runtime_params.py``)."""
+    register_verb(
+        Verb(
+            "tiers.fast",
+            "Card rows per MoE layer per rank: grow (the KV cache gives the "
+            "memory) or shrink (the KV cache gets it); EPLB's load chooses the "
+            "experts that enter or leave.",
+            args={
+                "rows": "int, the target (or delta)",
+                "delta": "int, the change (or rows)",
+                "deadline_s": "float, the KV shrink's drain deadline and the "
+                "wait for EPLB (default 60)",
+                "preempt": "bool, preempt at the deadline instead of aborting",
+                "from_kv": "bool, take from / give to the KV cache (default true)",
+            },
+        )
+    )
+    start_only = "the device range is reserved at load"
+    for name, type_, doc, reason in (
+        (
+            "store.fast_rows_max",
+            "int",
+            (
+                "Card rows per layer the reserved range holds "
+                "(0 = the card tier is fixed)."
+            ),
+            start_only,
+        ),
+        (
+            "store.fast_rows_min",
+            "int",
+            "The fewest card rows per layer a resize may go to.",
+            "pinned rows for it are sized at load",
+        ),
+        (
+            "store.fast_chunk_mib",
+            "int",
+            "Granule of the card rows' mapped memory.",
+            start_only,
+        ),
+        (
+            "store.pinned_release",
+            "bool",
+            (
+                "Pinned rows follow the pinned bound (a lower bound gives "
+                "host memory back after EPLB's tier pass)."
+            ),
+            "the pinned arena's layout is chosen at load",
+        ),
+    ):
+        register_param(
+            Param(
+                name,
+                type_,
+                doc,
+                restart_reason=reason,
+                start="--expert-store-config " + name.split(".", 1)[1],
+            )
+        )

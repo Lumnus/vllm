@@ -47,6 +47,7 @@ from vllm.model_executor.layers.fused_moe.xpu_expert_temperature import (
     classify,
 )
 from vllm.platforms import current_platform
+from vllm.v1 import runtime_debug
 
 if TYPE_CHECKING:
     from vllm.config.expert_store import ExpertStoreConfig
@@ -343,18 +344,22 @@ def apply_host_tier_bound(value: int) -> None:
 
 def _set_bound_and_rows(t: "ExpertTiers", bound: int, arena: "_PinnedArena") -> None:
     """One layer to ``bound`` pinned slots with its pinned rows laid out
-    for it: lowering moves the slots first and then lays out fewer rows;
-    raising lays out more rows first and then reads the slots into them."""
+    for it. EPLB is the one writer of the placement, so neither direction
+    moves a slot here: raising lays out more rows and then raises the
+    capacity (EPLB's next tier pass reads the hottest CPU slots into them);
+    lowering lowers the capacity and lays out fewer rows only once EPLB's
+    tier pass has moved the slots over the bound to the CPU (at once when
+    they already fit)."""
     assert t.placement is not None
     rows = t.pool_rows_for(bound)
-    if bound <= int(t.placement.num_pinned):
+    if rows > t.num_pool_rows:
+        t._release_rows_to = None
+        t.relayout_pool_rows(rows, arena)
         t.set_pinned_bound(bound)
-        if rows != t.num_pool_rows:
-            t.relayout_pool_rows(rows, arena)
     else:
-        if rows != t.num_pool_rows:
-            t.relayout_pool_rows(rows, arena)
         t.set_pinned_bound(bound)
+        t._release_rows_to = None if rows == t.num_pool_rows else rows
+        t.release_pinned_rows_if_due(arena)
 
 
 def _apply_bound_releasing(tiers: list["ExpertTiers"], value: int, old: int) -> None:
@@ -390,15 +395,30 @@ def _apply_bound_releasing(tiers: list["ExpertTiers"], value: int, old: int) -> 
                 )
         _empty_host_cache()
         raise
+    waiting = sum(t._release_rows_to is not None for t in tiers)
+    if waiting:
+        logger.info(
+            "CPU experts: the pinned bound is %d of the %d slots per layer per "
+            "rank that are off the card (was %d); EPLB's next step runs a tier "
+            "pass that moves the slots to it, and %d layers then lay their "
+            "pinned rows out for it (%d per layer), giving the host memory "
+            "back (%.2f GiB pinned now).",
+            value,
+            tiers[0].num_slow,
+            old,
+            waiting,
+            tiers[0].pool_rows_for(value),
+            old_gib,
+        )
+        return
     logger.info(
-        "CPU experts: %d of the %d slots per layer per rank that are off the "
-        "card now hold pinned rows (was %d); the other %d are computed on the "
-        "CPU. Pinned rows laid out again: %d per layer, pinned host memory "
-        "%.2f -> %.2f GiB in %.2f s.",
+        "CPU experts: the pinned bound is %d of the %d slots per layer per "
+        "rank that are off the card (was %d); EPLB's next step runs a tier "
+        "pass that moves the slots to it. Pinned rows laid out again: %d per "
+        "layer, pinned host memory %.2f -> %.2f GiB in %.2f s.",
         value,
         tiers[0].num_slow,
         old,
-        tiers[0].num_slow - value,
         tiers[0].num_pool_rows,
         old_gib,
         arena.gib,
@@ -631,6 +651,10 @@ class ExpertTiers:
         # Pinned rows per layer laid out again at run time (pinned_release);
         # None: the rows sized at load.
         self._pool_rows: int | None = None
+        # With pinned_release, after a lower bound: the rows to lay out once
+        # EPLB's tier pass has moved the slots over the bound to the CPU
+        # (:meth:`release_pinned_rows_if_due`); None: nothing waits.
+        self._release_rows_to: int | None = None
         # Pinned rows beyond the spares that let the card tier shrink below
         # its size at load in a layer without host slots (fast_rows_min).
         self._extra_pool_rows = 0
@@ -1044,6 +1068,58 @@ class ExpertTiers:
         assert self.store_binding is not None
         return int(bound) + self.store_binding.spare_rows + self.promote_rows
 
+    def release_pinned_rows_if_due(self, arena: "_PinnedArena | None" = None) -> bool:
+        """With ``pinned_release`` after a lower bound: once no more slots
+        hold pinned rows than the bound (EPLB's tier pass moved the rest to
+        the CPU), lay the rows out for the bound, giving the others' host
+        memory back. A row relayout: no slot changes its tier or its expert.
+        Called where the bound is lowered and after each EPLB commit of the
+        layer, between two steps on the forward's thread. True when the rows
+        were laid out; a failure is logged and tried again at the next
+        commit."""
+        from vllm.model_executor.offloader.expert_tier_map import POOL
+
+        target = self._release_rows_to
+        placement = self.placement
+        if target is None or placement is None:
+            return False
+        if target == self.num_pool_rows:
+            self._release_rows_to = None
+            return False
+        used = int((placement.tier == POOL).sum())
+        if used + placement.spare > target:
+            return False  # EPLB's tier pass has not moved them yet
+        try:
+            stats = self.relayout_pool_rows(target, _ARENA if arena is None else arena)
+        except Exception as e:  # noqa: BLE001 - serving goes on; retried
+            logger.warning(
+                "%s: the pinned rows could not be laid out for the bound yet "
+                "(%s); tried again at EPLB's next commit of the layer.",
+                self.layer_name,
+                e,
+            )
+            return False
+        self._release_rows_to = None
+        _empty_host_cache()
+        if runtime_debug.on("tiers"):
+            runtime_debug.emit(
+                "tiers",
+                logger,
+                "%s: pinned rows %d -> %d after EPLB's pass (%.1f ms)",
+                self.layer_name,
+                int(stats["rows_from"]),
+                int(stats["rows_to"]),
+                stats["ms"],
+            )
+        if not any(t._release_rows_to is not None for t in _cpu_tiers()):
+            logger.info(
+                "CPU experts: every layer's pinned rows are laid out for the "
+                "bound (%d per layer); pinned host memory now %.2f GiB.",
+                target,
+                pinned_arena_gib(),
+            )
+        return True
+
     def relayout_pool_rows(self, num_rows: int, arena: "_PinnedArena") -> dict:
         """Between two steps, on the thread that enqueues the forward, in a
         layer with host slots (the MoE op then runs outside the captured
@@ -1177,8 +1253,19 @@ class ExpertTiers:
                     f"{self.layer_name}: an EPLB move is prepared; the bound "
                     "can change once it is committed"
                 )
+            old = int(placement.num_pinned)
             placement.set_pinned_capacity(bound)
             self.tier_pass_wanted = True
+        if runtime_debug.on("tiers"):
+            runtime_debug.emit(
+                "tiers",
+                logger,
+                "%s: pinned bound %d -> %d (capacity; EPLB's tier pass moves "
+                "the slots)",
+                self.layer_name,
+                old,
+                bound,
+            )
         return {
             "bound": float(bound),
             "pinned_now": float(int((placement.tier == POOL).sum())),
@@ -1361,6 +1448,22 @@ class ExpertTiers:
             ms=(time.perf_counter() - start) * 1e3,
         )
         self.move_log.append(dict(stats))
+        if runtime_debug.on("tiers"):
+            runtime_debug.emit(
+                "tiers",
+                logger,
+                "%s: card rows %d -> %d: %d commits, %d onto the card, %d off "
+                "it, %d moved down, %d units read, %.1f ms",
+                self.layer_name,
+                old,
+                target,
+                int(stats["commits"]),
+                int(stats["to_card"]),
+                int(stats["off_card"]),
+                int(stats["relocated"]),
+                int(stats["units_read"]),
+                stats["ms"],
+            )
         return stats
 
     def _check_views_alias(self) -> None:
@@ -1762,6 +1865,22 @@ class ExpertTiers:
             self._prefetch_host(np.flatnonzero(is_host & (~was_host | changed)))
         move.stats["commit_ms"] = (time.perf_counter() - t0) * 1e3
         self.move_log.append(move.stats)
+        if runtime_debug.on("tiers"):
+            tier = placement.tier
+            runtime_debug.emit(
+                "tiers",
+                logger,
+                "%s: commit: %d experts changed, %d onto the card, %d off it, "
+                "%d units read; card %d, pinned %d, CPU %d",
+                self.layer_name,
+                len(plan.changed),
+                len(plan.to_fast),
+                len(plan.demoted),
+                len(plan.reads),
+                int((tier == 0).sum()),
+                int((tier == 1).sum()),
+                int((tier == 2).sum()),
+            )
 
     def _set_fast(self, new_fast: np.ndarray) -> "PreparedMove":
         _, placement, _ = self._require_store()
@@ -1834,6 +1953,8 @@ class ExpertTiers:
             self.commit_move(prepared)
         finally:
             self._eplb_pending = False
+        if self._release_rows_to is not None:
+            self.release_pinned_rows_if_due()
 
     def discard(self, prepared: "PreparedMove") -> None:
         """A prepared move that will not be committed: its pool rows were only

@@ -369,7 +369,7 @@ class RuntimeControl:
     # ------------------------------------------------------------------
 
     # Parts whose lines come from the workers (the rest from the engine core).
-    _DEBUG_ON_WORKERS = ("eplb", "cpu")
+    _DEBUG_ON_WORKERS = ("eplb", "cpu", "tiers")
 
     def _debug_op(self, op: str, args: dict[str, Any]) -> dict[str, Any]:
         from vllm.v1 import runtime_debug

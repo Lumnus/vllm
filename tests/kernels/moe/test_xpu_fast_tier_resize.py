@@ -427,6 +427,11 @@ def test_lowering_the_bound_lays_the_pinned_rows_out_smaller(monkeypatch, tmp_pa
     assert tiers.pinned_bound_range() == (1, 5)
     weights = tiers.eplb_weights()
     xt.apply_host_tier_bound(1)
+    # EPLB is the one writer of the placement: the bound is a capacity, the
+    # slots move in its tier pass, and the rows go once the slots have
+    for t in env.tiers:
+        assert t.tier_pass_wanted
+    _tier_pass(env)
     for t in env.tiers:
         assert t.placement.num_pinned == 1
         assert t.num_pool_rows == t.pool_rows_for(1) == rows_at_load - 1
@@ -437,13 +442,15 @@ def test_lowering_the_bound_lays_the_pinned_rows_out_smaller(monkeypatch, tmp_pa
         assert slow.w13.shape[0] == t.num_pool_rows
         _assert_serves_the_store(env, t)
     assert np.flatnonzero(p.tier == POOL).tolist() == [4]
-    assert p.row[4] == 0  # laid out from row 0
+    assert p.row[4] < 2  # laid out from row 0 (slot order)
     # EPLB's weights keep their shapes and no longer hold the old rows
     assert weights[0].parts[1].device.type == "meta"
     assert weights[0].shape[0] == E
     # raising past the rows sized at load lays out more rows
     _settle(tiers.cpu.cache)
     xt.apply_host_tier_bound(5)
+    for _ in range(4):  # each pass reads within the spare rows
+        _tier_pass(env)
     for t in env.tiers:
         assert (
             t.placement.num_pinned == 5 and int((t.placement.tier == HOST).sum()) == 0
@@ -451,7 +458,17 @@ def test_lowering_the_bound_lays_the_pinned_rows_out_smaller(monkeypatch, tmp_pa
         assert t.num_pool_rows == t.pool_rows_for(5)
         _assert_serves_the_store(env, t)
     xt.apply_host_tier_bound(2)
+    _tier_pass(env)
     assert all(t.placement.num_pinned == 2 for t in env.tiers)
+    assert all(t.num_pool_rows == t.pool_rows_for(2) for t in env.tiers)
+
+
+def _tier_pass(env):
+    """One EPLB tier pass over every layer (old map = new map; the tiers cut
+    from the load), each layer prepared and committed as EPLB's cycle does."""
+    for t in env.tiers:
+        phys = np.arange(t.num_global)
+        t.commit(t.prepare(phys, phys, _load(t, [5, 6, 7, 4, 3, 2, 1, 0]), 1.1))
 
 
 def test_without_pinned_release_the_rows_stay(monkeypatch, tmp_path, op):

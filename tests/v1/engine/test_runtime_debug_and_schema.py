@@ -139,9 +139,20 @@ def test_the_schema_describes_verbs_and_parameters_with_values():
     assert "max_num_seqs" in p["restart_reason"]
     assert params["sched.max_num_seqs"]["live"] is False
     assert params["tower.policy"]["choices"] == ["dynamic", "host", "card"]
-    # the fast tier's verb is the fast tier's to register
-    assert params["tiers.fast_rows"]["live"] is False
-    assert "tiers.fast" in params["tiers.fast_rows"]["unavailable"]
+    # the fast tier's verb is registered by the fast tier's module
+    assert params["tiers.fast_rows"]["live"] is True
+    assert "tiers.fast_rows" in verbs["tiers.fast"]["params"]
+    assert {"delta", "deadline_s", "preempt", "from_kv"} <= set(
+        verbs["tiers.fast"]["args"]
+    )
+    # the working set's settings, live through EPLB's and the CPU tier's verbs
+    for name in ("eplb.tier_interval", "eplb.tier_max_moves", "eplb.tier_hot"):
+        assert params[name]["live"] is True and params[name]["verb"] == "eplb.set"
+    assert params["cpu.stage_min_calls"]["verb"] == "cpu.set"
+    assert params["eplb.seed_path"]["live"] is False
+    assert params["store.pinned_release"]["live"] is False
+    # the promotion between rearrangements is removed: not offered
+    assert "cpu.host_promote_misses" not in params
     assert "sched.long_prefill_token_threshold" in verbs["sched.set"]["params"]
     assert {"debug.set", "profile.apply", "defaults.set"} <= set(verbs)
     assert "kv" in schema["profile_sections"]
