@@ -18,6 +18,7 @@ import vllm.v1.worker.runtime_control as wrc
 from tests.v1.worker.test_xpu_extensible_kv_cache import (  # noqa: F401
     GRANULE,
     fake_xpu,
+    grow_ranks,
 )
 from vllm.model_executor.layers.fused_moe import xpu_cpu_experts as cx
 from vllm.model_executor.layers.fused_moe import xpu_expert_tiers as xt
@@ -50,6 +51,7 @@ def _fresh(monkeypatch, fake_xpu):  # noqa: F811
     monkeypatch.setattr(xt, "_LIVE_TIERS", weakref.WeakSet())
     # The fake VMM ops serve device 0 from host memory.
     monkeypatch.setattr(ft.FastRows, "device_override", torch.device("xpu", 0))
+    ft.reset_adoption_summary()
     yield
     tstore.reset_sessions()
 
@@ -413,6 +415,210 @@ def test_the_kv_cap_counts_the_card_tier_from_registration(monkeypatch):
     assert ExtensibleKVCache.refresh_torch_memory_limit(kv) == 700
     held["bytes"] = 160
     assert ExtensibleKVCache.refresh_torch_memory_limit(kv) == 640
+
+
+# -- what the card tier costs: the rows in use, once -----------------------------
+
+
+def _field_bytes(tiers):
+    fast = tiers._impls[0]
+    return [
+        getattr(fast, f)[: tiers.num_fast].numel() * getattr(fast, f).element_size()
+        for f, _ in xt._TIER_FIELDS
+    ]
+
+
+def test_the_move_at_load_gives_up_every_old_storage(monkeypatch, tmp_path, fake_xpu):  # noqa: F811
+    """Boot sizing: what the card tier holds after the move is the rows in
+    use (whole granules), not the reserved range, and every storage the rows
+    left is gone (nothing else keeps its memory)."""
+    env = _env(monkeypatch, tmp_path)
+    summary = ft.adoption_summary()
+    assert summary["layers"] == len(env.tiers) == 2 and summary["logged"]
+    assert summary["stale"] == 0 and summary["released"] == 0
+    assert summary["mapped"] == ft.mapped_bytes() == fake_xpu.ops.physical_bytes
+    # the old storages were the rows in use, field by field
+    assert summary["old"] == sum(sum(_field_bytes(t)) for t in env.tiers)
+    for tiers in env.tiers:
+        rows = tiers.fast_rows
+        assert rows.rows == LOAD_FAST < rows.capacity
+        per_field = [ft._round_up(LOAD_FAST * rb, GRANULE) for rb in rows.row_bytes]
+        assert rows.mapped_bytes == sum(per_field)
+
+
+def test_a_capacity_range_maps_only_the_rows_in_use(fake_xpu):  # noqa: F811
+    """1 MiB rows, capacity 130, 98 in use: 49 objects of 2 MiB for the
+    weights and one for the scales; the 32 rows above cost nothing."""
+    like = [
+        torch.zeros(1, 1 << 20, dtype=torch.uint8),
+        torch.zeros(1, 4096, dtype=torch.bfloat16),
+    ]
+    rows = ft.FastRows(like, 130, GRANULE)
+    rows.commit(98)
+    assert fake_xpu.ops.physical_bytes == rows.mapped_bytes == (49 + 1) * GRANULE
+    # a grow maps the rows it adds, once; a shrink gives the same back
+    assert rows.bytes_to(114) == 8 * GRANULE
+    rows.commit(114)
+    assert fake_xpu.ops.physical_bytes == (57 + 1) * GRANULE
+    assert rows.release_to(98) == 8 * GRANULE
+    assert fake_xpu.ops.physical_bytes == (49 + 1) * GRANULE
+    rows.buffer.free()
+
+
+def test_an_old_storage_another_tensor_holds_is_released_in_place(
+    monkeypatch,
+    tmp_path,
+    fake_xpu,  # noqa: F811
+):
+    """A tensor taken on the card rows before the move (an alias of w2) would
+    keep their old storage, and its device memory, for good: the move gives
+    it back in place and says who held it; the card tier still serves."""
+    held = []
+    adopt = xt.ExpertTiers._adopt_fast_rows
+
+    def alias_then_adopt(self, fast):
+        held.append(fast.w2.data)  # another holder of the old w2 storage
+        return adopt(self, fast)
+
+    monkeypatch.setattr(xt.ExpertTiers, "_adopt_fast_rows", alias_then_adopt)
+    env = _env(monkeypatch, tmp_path)
+    summary = ft.adoption_summary()
+    w2_bytes = sum(_field_bytes(t)[1] for t in env.tiers)
+    assert summary["stale"] == summary["released"] == w2_bytes > 0
+    assert all(h.untyped_storage().nbytes() == 0 for h in held)
+    assert "Tensor" in summary["holders"]
+    for tiers in env.tiers:
+        _assert_serves_the_store(env, tiers)
+
+
+def test_a_grow_maps_only_bytes_that_are_there():
+    """The ranks' memory check of a grow (before anything is mapped)."""
+    g = 1 << 30
+    room = dict(free=3 * g, reclaimable=0, floor=g, cap_room=None)
+    assert ft.grow_refusal(0, 0, **room) is None
+    # the KV cache released the bytes in this resize: no second charge
+    assert ft.grow_refusal(2 * g, 2 * g, **room) is None
+    # nothing released (a profile's step): torch keeps its floor
+    assert ft.grow_refusal(2 * g, 0, **room) is None
+    assert "floor" in ft.grow_refusal(3 * g, 0, **room)
+    # torch's unused cache is not room for the rows themselves
+    why = ft.grow_refusal(3 * g, 3 * g, free=2 * g, reclaimable=4 * g, floor=0,
+                          cap_room=None)  # fmt: skip
+    assert "2.00 GiB free" in why and "give them back first" in why
+    # under torch's cap
+    assert "cap" in ft.grow_refusal(g, 0, free=3 * g, reclaimable=0, floor=0,
+                                     cap_room=g // 2)  # fmt: skip
+    assert ft.grow_refusal(g, g, free=3 * g, reclaimable=0, floor=0,
+                           cap_room=0) is None  # fmt: skip
+
+
+def test_the_ranks_refuse_a_grow_the_device_cannot_back(monkeypatch, tmp_path):
+    env = _env(monkeypatch, tmp_path)
+    for tiers in env.tiers:
+        tiers.fill_to(np.arange(E), _load(tiers, [5, 6, 7, 4, 3, 2, 1, 0]), 1.1)
+    g = 1 << 30
+    kv = SimpleNamespace(
+        external_mapped_bytes=[],
+        refresh_torch_memory_limit=lambda: None,
+        buffer=SimpleNamespace(device=torch.device("cpu")),
+        reserved_headroom_bytes=g // 2,
+        torch_memory_budget=None,
+        physical_bytes=4 * g,
+    )
+    worker = SimpleNamespace(
+        rank=0,
+        model_runner=SimpleNamespace(eplb_state=None, extensible_kv_cache=kv),
+        cache_config=SimpleNamespace(),
+        vllm_config=SimpleNamespace(
+            cache_config=SimpleNamespace(kv_cache_grow_torch_floor_mib=None)
+        ),
+    )
+    monkeypatch.setattr(wrc, "_ep_rank", lambda w: 0)
+    monkeypatch.setattr(ft, "_free_device_bytes", lambda device: 1 << 40)
+    monkeypatch.setattr(ft, "bytes_to", lambda rows: g)
+    # 1 GiB of torch cache unused: not room for the rows
+    memory = {"free": g // 4, "reserved": g}
+    monkeypatch.setattr(
+        ft, "device_memory", lambda device: (memory["free"], 0, 0, memory["reserved"])
+    )
+    emptied = []
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: emptied.append(1))
+    refusal = wrc.handle(worker, "check", "tiers.fast", {"rows": 5})["refusal"]
+    assert "0.25 GiB free" in refusal and emptied  # the cache was given back first
+    # a precheck leaves the memory out (asked before the KV cache gives)
+    pre = wrc.handle(worker, "check", "tiers.fast", {"rows": 5, "precheck": True})
+    assert pre["refusal"] is None
+    # what the KV cache released for this resize is there: no floor on it
+    memory["free"] = g + g // 8
+    ok = wrc.handle(worker, "check", "tiers.fast", {"rows": 5, "kv_released": g})
+    assert ok["refusal"] is None
+    # the same bytes without the KV cache must also leave torch its floor
+    memory["reserved"] = 0
+    refusal = wrc.handle(worker, "check", "tiers.fast", {"rows": 5})["refusal"]
+    assert refusal is not None and "floor" in refusal
+    assert all(int((t.placement.tier == FAST).sum()) == 3 for t in env.tiers)
+
+
+def test_a_kv_fit_after_a_grow_leaves_the_card_rows_their_memory(monkeypatch):
+    """The KV grow floor after a card tier grow of N bytes taken from the KV
+    cache allows the same spare as before (not the rows' N), and after the
+    shrink back the KV cache may take the N again: charged once each way."""
+    from vllm.platforms import current_platform
+    from vllm.v1.worker import extensible_kv_cache as ekv
+
+    g, blk = 1 << 30, 1 << 20
+    held = {"bytes": 0}
+    kv = SimpleNamespace(
+        physical_bytes=6 * g,
+        external_mapped_bytes=[lambda: held["bytes"]],
+        torch_memory_budget=10 * g,
+        num_committed_blocks=6 * g // blk,
+    )
+    kv.physical_bytes_for = lambda n: n * blk
+    kv.blocks_within = lambda b: b // blk
+    monkeypatch.setattr(ekv, "_torch_memory_now", lambda device: (3 * g, 3 * g, 3 * g))
+    free = {"bytes": 4 * g}
+    monkeypatch.setattr(
+        current_platform, "free_device_memory", lambda device=None: free["bytes"]
+    )
+
+    def fit():
+        return ekv._grow_floor_at(kv, 1 << 30, g // 2, "test", torch.device("cpu"))
+
+    before = fit().max_blocks * blk - kv.physical_bytes
+    # the tier grows by 1 GiB that the KV cache gave: KV smaller, rows mapped
+    kv.physical_bytes -= g
+    kv.num_committed_blocks = kv.physical_bytes // blk
+    held["bytes"] = g
+    after_grow = fit().max_blocks * blk - kv.physical_bytes
+    assert after_grow == before == g // 2  # the same spare, not the rows'
+    # the tier shrinks back: the KV cache may take the 1 GiB again
+    held["bytes"] = 0
+    free["bytes"] += g
+    assert fit().max_blocks * blk - kv.physical_bytes == g + g // 2
+
+
+def test_a_kv_restore_maps_back_what_a_failed_resize_took(grow_ranks):  # noqa: F811
+    """After a card tier grow fails past its KV shrink, the KV cache goes back
+    to its size before as it was, not to what a new measurement allows."""
+    from vllm.v1.worker import extensible_kv_cache as ekv
+
+    ranks = grow_ranks([40])
+
+    def grow(target, restore):
+        return ekv.grow_kv_cache(
+            ranks.runners[0],
+            target,
+            init_free_memory=1024 << 20,
+            requested_memory=1024 << 20,
+            reduce_min=lambda v: v,
+            restore=restore,
+        )
+
+    assert grow(30, True) == 30  # below what fits: as an ordinary grow
+    assert grow(60, False) == 40  # the measurement binds an ordinary grow
+    assert grow(60, True) == 60  # a restore is the size before
+    assert ranks.caches[0].last_grow["vote_blocks"] == 60
 
 
 # -- the pinned rows follow the bound (pinned_release) ---------------------------

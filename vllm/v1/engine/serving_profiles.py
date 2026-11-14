@@ -54,7 +54,7 @@ SECTIONS = ("kv", "tiers", "cpu", "eplb", "spec", "sched", "tower", "defaults")
 _KV_KEYS = ("tokens", "blocks", "fit", "deadline_s", "preempt")
 _TIERS_KEYS = ("fast_rows", "host_tier_bound")
 _RESIZE_ACTIVE = ("draining", "releasing", "unfinished")
-_FAST_ACTIVE = ("draining", "committing")
+_FAST_ACTIVE = ("waiting", "draining", "committing")
 # How long a step may wait for the engine to settle (a tower move).
 TOWER_WAIT_S = 300.0
 

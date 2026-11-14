@@ -25,6 +25,9 @@ class Ranks:
         self.lo, self.hi, self.per_row = lo, hi, per_row
         self.fail_rank: int | None = None
         self.ops: list[tuple] = []
+        # what the ranks' check answers (precheck and the commit's check)
+        self.refusal: str | None = None
+        self.checks: list[dict] = []
 
     def fast(self, rank, targets):
         return {
@@ -38,6 +41,9 @@ class Ranks:
 
     def rpc(self, phase, op="", args=None):
         args = args or {}
+        if phase == "check":
+            self.checks.append(dict(args))
+            return [{"rank": r, "refusal": self.refusal} for r in range(2)]
         assert phase == "state"
         return [
             {
@@ -50,6 +56,10 @@ class Ranks:
 
     def worker_op(self, op, args):
         assert op == "tiers.fast"
+        self.checks.append(dict(args))
+        if self.refusal:
+            # as RuntimeControl._worker_op: a check refusal is raised
+            raise ControlRefused(f"rank 0: {self.refusal}")
         self.ops.append((op, args["rows"]))
         old = list(self.rows)
         replies = []
@@ -89,6 +99,7 @@ class Engine:
         self.drain_steps = drain_steps
         self.refuse: str | None = None
         self.resizes: list[int] = []
+        self.restores: list[bool] = []
         self.published = 0
 
     def request_kv_cache_release(self, bytes_per_rank, urgent=False, deadline_s=None):
@@ -114,8 +125,9 @@ class Engine:
         if state == KVCacheResizeState.FINISHED:
             self.vllm_config.cache_config.num_gpu_blocks = kv.to_blocks
 
-    def resize_kv_cache(self, target, deadline_s=None, preempt=False):
+    def resize_kv_cache(self, target, deadline_s=None, preempt=False, restore=False):
         self.resizes.append(target)
+        self.restores.append(restore)
         cur = self.vllm_config.cache_config.num_gpu_blocks
         self.vllm_config.cache_config.num_gpu_blocks = target
         self._kv_resize = KVCacheResize(
@@ -278,3 +290,153 @@ def test_the_engine_core_has_no_card_tier_resize_by_default():
     from vllm.v1.engine.core import EngineCore
 
     assert EngineCore._fast_tier is None
+
+
+# -- the exchange charged once, refusals before the KV cache gives -------------
+
+EPLB_BUSY = (
+    "an async rearrangement of m is in flight at layer 0 of 48; ask after it completes"
+)
+
+
+def test_a_grow_takes_its_bytes_from_the_kv_cache_once(setup):
+    """The KV shrink is the grow's bytes, and the ranks' commit is told so
+    (they then do not ask the device for the same bytes again)."""
+    engine, ranks, ctl = setup
+    engine.drain_steps = 1
+    ctl.start({"rows": 16})
+    engine.drain()
+    ctl.advance()
+    assert ranks.rows == [16, 16]
+    assert engine.vllm_config.cache_config.num_gpu_blocks == 4000 - GIB // PER_BLOCK
+    commit = ranks.checks[-1]
+    assert commit == {"rows": 16, "kv_released": GIB}
+    # precheck first, memory aside
+    assert ranks.checks[0] == {"rows": 16, "precheck": True}
+    assert engine.resizes == []  # no second charge, no grow back
+
+
+def test_a_shrink_gives_its_bytes_back_once(setup):
+    engine, ranks, ctl = setup
+    ctl.start({"rows": 4})
+    assert engine.resizes == [4000 + (GIB // 2) // PER_BLOCK]
+    ctl.advance()
+    ctl.advance()
+    assert len(engine.resizes) == 1 and engine.restores == [False]
+
+
+def test_a_grow_waits_for_eplb_before_the_kv_cache_gives(setup):
+    engine, ranks, ctl = setup
+    engine.drain_steps = 1
+    ranks.refusal = EPLB_BUSY
+    reply = ctl.start({"rows": 16})
+    assert reply["fast"]["state"] == "waiting"
+    assert engine._kv_resize is None  # nothing taken while EPLB moves
+    ctl.advance()
+    assert ctl.resize.state == FastTierState.WAITING and engine._kv_resize is None
+    ranks.refusal = None
+    ctl.advance()  # EPLB done: now the KV shrink starts
+    assert ctl.resize.state == FastTierState.DRAINING
+    engine.drain()
+    ctl.advance()
+    assert ctl.resize.state == FastTierState.FINISHED and ranks.rows == [16, 16]
+
+
+def test_a_grow_waits_for_eplb_that_starts_after_the_kv_shrink(setup):
+    """The ranks refuse at the commit's check (raised, as _worker_op does):
+    the resize waits for EPLB with the KV memory held, then commits."""
+    engine, ranks, ctl = setup
+    engine.drain_steps = 1
+    ctl.start({"rows": 16})
+    ranks.refusal = EPLB_BUSY
+    engine.drain()
+    ctl.advance()
+    assert ctl.resize.state == FastTierState.COMMITTING
+    assert "waiting for EPLB" in ctl.resize.message and ranks.ops == []
+    ranks.refusal = None
+    ctl.advance()
+    assert ctl.resize.state == FastTierState.FINISHED and engine.resizes == []
+
+
+def test_a_wait_past_the_deadline_restores_the_kv_cache_as_it_was(setup, monkeypatch):
+    import vllm.v1.engine.fast_tier as ftmod
+
+    engine, ranks, ctl = setup
+    engine.drain_steps = 1
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(ftmod.time, "monotonic", lambda: clock["t"])
+    ctl.start({"rows": 16, "deadline_s": 30})
+    ranks.refusal = EPLB_BUSY
+    engine.drain()
+    ctl.advance()
+    clock["t"] += 31
+    ctl.advance()
+    record = ctl.resize.record(8)
+    assert record["state"] == "failed" and "in flight" in record["message"]
+    # the KV cache back to its size before, as a restore (no measured vote)
+    assert engine.resizes == [4000] and engine.restores == [True]
+    assert record["kv_blocks_after"] == 4000 and ranks.rows == [8, 8]
+
+
+def test_a_refused_grow_with_nothing_taken_is_a_refusal(setup):
+    """A grow without the KV cache (a profile's step) that the ranks refuse
+    at their memory check: the verb is refused, nothing is mapped."""
+    engine, ranks, ctl = setup
+    ranks.refusal = None
+
+    def refuse_commit(op, args):
+        raise ControlRefused(
+            "rank 0: the device has 0.40 GiB free and the rows need 1.00 GiB: "
+            "the KV cache must give them back first"
+        )
+
+    ctl.control._worker_op = refuse_commit
+    with pytest.raises(ControlRefused, match="must give them back first"):
+        ctl.start({"rows": 16, "from_kv": False})
+    assert ctl.resize.state == FastTierState.FAILED and not ctl.resize.state.active
+    assert ranks.rows == [8, 8] and engine.resizes == [] and engine._kv_resize is None
+    with pytest.raises(ControlRefused, match="must give them back first"):
+        ctl.start({"rows": 4})  # a shrink refused the same way
+
+
+def test_any_other_precheck_refusal_changes_nothing(setup):
+    engine, ranks, ctl = setup
+    ranks.refusal = "an EPLB move is prepared on layer 3; ask after it commits"
+    reply = ctl.start({"rows": 16})  # prepared move: EPLB, waited for
+    assert reply["fast"]["state"] == "waiting"
+    ctl.resize.state = FastTierState.FAILED
+    ranks.refusal = "the card tier is fixed in this engine"
+    with pytest.raises(ControlRefused, match="fixed"):
+        ctl.start({"rows": 16})
+    assert engine._kv_resize is None and ranks.ops == []
+
+
+def test_a_refusal_is_logged_in_one_line(caplog_vllm):
+    """The engine core answers a refused runtime control call without an
+    ERROR and a traceback; other failures keep them."""
+    import logging
+
+    from vllm.v1.engine.core import EngineCoreProc
+
+    caplog = caplog_vllm
+    out = []
+
+    def call(exc):
+        output = SimpleNamespace(result=None, failure_message=None)
+
+        def raise_it():
+            raise exc
+
+        EngineCoreProc._invoke_utility_method(
+            "runtime_control", raise_it, output, out.append
+        )
+        return output
+
+    refused = call(ControlRefused("82 card rows per layer is outside 90..130"))
+    assert refused.failure_message.endswith("outside 90..130")
+    records = [r for r in caplog.records if "runtime_control" in r.getMessage()]
+    assert records and all(r.levelno < logging.WARNING for r in records)
+    assert all(r.exc_info is None for r in records)
+    caplog.clear()
+    call(RuntimeError("boom"))
+    assert any(r.levelno == logging.ERROR and r.exc_info for r in caplog.records)

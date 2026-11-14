@@ -1653,11 +1653,14 @@ class ExpertTiers:
         points at them; the kernels read an expert's weights only for experts
         with routed rows. The tensors keep their identity (their ``data`` is
         rebound), so the layer's parameters and the kernel see the new rows."""
+        from vllm.model_executor.layers.fused_moe import xpu_fast_tier
         from vllm.model_executor.layers.fused_moe.xpu_fast_tier import FastRows
 
         assert self.store_binding is not None, "a movable card tier needs the store"
         cfg = self.store_binding.session.config
         tensors = [getattr(fast, impl_field) for impl_field, _ in _TIER_FIELDS]
+        old_storages = xpu_fast_tier.OldStorages(tensors)
+        free_before = xpu_fast_tier.free_before_move(tensors[0].device)
         rows = FastRows(tensors, self._fast_capacity, int(cfg.fast_chunk_mib) << 20)
         rows.commit(self.num_fast)
         views = rows.views(tensors)
@@ -1677,10 +1680,21 @@ class ExpertTiers:
         fast.num_experts = self._fast_capacity
         fast.local_experts_num = self._fast_capacity
         _device_sync()
+        del tensor, view, views, old, others
         # The rows' old storage goes back to the device.
         if torch.accelerator.is_available():
             torch.accelerator.empty_cache()
         self.fast_rows = rows
+        # Every old storage must be gone now; one another tensor still holds
+        # is released in place (else it stays on the device for good).
+        xpu_fast_tier.finish_move(
+            self.layer_name,
+            old_storages,
+            rows.mapped_bytes,
+            rows.buffer.device,
+            free_before,
+            sum(1 for t in live_tiers() if t._fast_capacity),
+        )
         logger.info_once(
             "Expert tiers: the card tier of each layer sits in a device range "
             "reserved for %d rows (%d in use, %.2f GiB mapped per layer); it "

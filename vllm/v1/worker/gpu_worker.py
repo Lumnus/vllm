@@ -1025,11 +1025,13 @@ class Worker(WorkerBase):
         extend_kv_cache(self.model_runner, self._kv_cache_config, num_blocks)
         self.cache_config.num_gpu_blocks = num_blocks
 
-    def resize_kv_cache(self, target_num_blocks: int) -> int:
+    def resize_kv_cache(self, target_num_blocks: int, restore: bool = False) -> int:
         """Grow an extensible KV cache toward target_num_blocks while serving.
 
         Returns the block count in force, the same on every rank: the target
         or the most every rank's memory fits, and never fewer than before.
+        restore: the target is a size the cache had before an operation that
+        took memory from it and did not use it (see `grow_kv_cache`).
         """
         if getattr(self.model_runner, "extensible_kv_cache", None) is None:
             raise RuntimeError("The KV cache is not extensible.")
@@ -1039,6 +1041,7 @@ class Worker(WorkerBase):
             init_free_memory=self.init_free_memory,
             requested_memory=int(self.requested_memory),
             reduce_min=_min_across_ranks,
+            **({"restore": True} if restore else {}),
         )
         self.cache_config.num_gpu_blocks = num_blocks
         return num_blocks

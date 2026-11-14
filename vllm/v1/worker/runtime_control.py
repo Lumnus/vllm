@@ -1048,12 +1048,72 @@ def _apply_fault_clear(worker: Any, args: dict) -> tuple[dict, dict, Any]:
 
 
 def _check_tiers_fast(worker: Any, args: dict) -> str | None:
-    from vllm.distributed.eplb.runtime_control import check_card_tier
+    """The engine core asks before it takes KV memory for a grow
+    (``precheck``: EPLB and the range, not the memory), and every rank
+    checks again before it maps: then the rows' bytes must be on the device
+    (``kv_released``: what the KV cache released for this resize)."""
+    from vllm.distributed.eplb.runtime_control import check_card_tier, in_flight
 
-    unknown = sorted(set(args) - {"rows"})
+    unknown = sorted(set(args) - {"rows", "kv_released", "precheck"})
     if unknown:
         return f"unknown arguments {unknown}; tiers.fast takes rows"
-    return check_card_tier(_eplb(worker), args.get("rows"))
+    rows = args.get("rows")
+    if args.get("precheck"):
+        from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+
+        eplb = _eplb(worker)
+        why = None if eplb is None else in_flight(eplb)
+        if why is not None:
+            return f"{why}; ask after it completes"
+        return xpu_fast_tier.check(rows, memory=False)
+    why = check_card_tier(_eplb(worker), rows)
+    if why is not None:
+        return why
+    return _card_tier_memory_refusal(worker, rows, int(args.get("kv_released") or 0))
+
+
+def _card_tier_memory_refusal(worker: Any, rows: int, credit: int) -> str | None:
+    """Why this rank may not map the rows of a grow to ``rows`` now: the
+    bytes must be free on the device, and what the KV cache did not release
+    for this resize must leave torch the KV grow's floor, on the device and
+    under its cap (`xpu_fast_tier.grow_refusal`)."""
+    import torch
+
+    from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+
+    now = xpu_fast_tier.rows_now()
+    if now is None or rows <= now:
+        return None
+    need = xpu_fast_tier.bytes_to(rows)
+    if need <= 0:
+        return None
+    device = xpu_fast_tier.resizable_tiers()[0].fast_rows.buffer.device
+    free, allocated, peak, reserved = xpu_fast_tier.device_memory(device)
+    if need > free and reserved > allocated:
+        # Only whole free segments come back; read again after giving them.
+        torch.accelerator.empty_cache()
+        free, allocated, peak, reserved = xpu_fast_tier.device_memory(device)
+    floor = 0
+    cap_room = None
+    kv_cache = _kv_cache(worker)
+    if kv_cache is not None and hasattr(kv_cache, "reserved_headroom_bytes"):
+        from vllm.v1.worker.extensible_kv_cache import grow_torch_floor_bytes
+
+        floor, _ = grow_torch_floor_bytes(
+            kv_cache, getattr(worker, "vllm_config", None), allocated, peak
+        )
+        budget = getattr(kv_cache, "torch_memory_budget", None)
+        if budget is not None:
+            external = sum(m() for m in kv_cache.external_mapped_bytes)
+            cap_room = budget - kv_cache.physical_bytes - external - reserved - floor
+    return xpu_fast_tier.grow_refusal(
+        need,
+        credit,
+        free=free,
+        reclaimable=max(reserved - allocated, 0),
+        floor=floor,
+        cap_room=cap_room,
+    )
 
 
 def _after_fast_change(worker: Any) -> None:
