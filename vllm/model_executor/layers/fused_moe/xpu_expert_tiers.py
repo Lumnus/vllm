@@ -265,7 +265,20 @@ class StageRows:
     -> row, -1 elsewhere) the card's kernel call over them reads. Shared by
     the layers of a process: a layer writes them only after the host has
     seen its own routing, which the stream orders after every kernel of the
-    previous layer, so no kernel still reads what is written (R1)."""
+    previous layer, so no kernel still reads what is written (R1).
+
+    With ``device_rows`` > 0 (``stage_device_rows``) also that many rows in
+    device memory, filled by DMA on a side stream (:meth:`on_side`), so the
+    card's call reads device memory instead of host memory through UVA (where
+    each tile of tokens reads the expert's weights across PCIe). The DMA
+    reads the host cache directly where it is registered with the driver,
+    else the pinned rows (:meth:`to_device`, batch by batch); the ordering
+    of the pinned rows above holds for them too, since a layer's call waits
+    for its DMA."""
+
+    # rows per DMA batch: the host copies the next batch into the pinned rows
+    # while the previous one crosses to the card
+    DMA_BATCH = 16
 
     def __init__(
         self,
@@ -273,6 +286,7 @@ class StageRows:
         rows: int,
         num_global: int,
         device: torch.device,
+        device_rows: int = 0,
     ):
         from vllm.utils.platform_utils import is_pin_memory_available
         from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
@@ -290,9 +304,88 @@ class StageRows:
         self.map_host = torch.full(
             (num_global,), -1, dtype=torch.int32, pin_memory=is_pin_memory_available()
         )
+        # device staging rows (stage_device_rows): allocated here, at load
+        self.device_rows = min(int(device_rows), rows)
+        self.dev: dict[str, torch.Tensor] = {}
+        self._stream: Any = None
+        self._mod: Any = None
+        # the side stream's event after a layer call's last DMA, and the
+        # compute stream's after the card's call that read the rows
+        self.ready: Any = None
+        self.free: Any = None
+        if self.device_rows:
+            self.dev = {
+                k: torch.empty(
+                    (self.device_rows, *t.shape[1:]), dtype=t.dtype, device=device
+                )
+                for k, t in like.items()
+            }
+            if device.type != "cpu":
+                self._mod = torch.get_device_module(device)
+                self._stream = self._mod.Stream(device)
 
     def rows_u8(self, key: str) -> torch.Tensor:
         return _u8(self.host[key])
+
+    @property
+    def device_gib(self) -> float:
+        return sum(t.numel() * t.element_size() for t in self.dev.values()) / 2**30
+
+    def begin_dma(self) -> None:
+        """A layer call starts filling the device rows: the DMAs wait until
+        the card's previous call over them is done (``free``), not for the
+        kernels enqueued since, so they overlap this layer's own experts."""
+        self.ready = None
+        if self._stream is not None and self.free is not None:
+            self._stream.wait_event(self.free)
+
+    def to_device(self, lo: int, hi: int) -> None:
+        """DMA of pinned rows ``lo..hi-1`` into the same device rows, one
+        contiguous copy per tensor, on the side stream."""
+
+        def copy() -> None:
+            for key, dev in self.dev.items():
+                _u8(dev)[lo:hi].copy_(_u8(self.host[key])[lo:hi], non_blocking=True)
+
+        self.on_side(copy)
+
+    def on_side(self, enqueue: Any) -> None:
+        """Run ``enqueue`` (copies into the device rows) on the side stream
+        and record ``ready`` after it (CPU, in tests: run it)."""
+        if self._stream is None:
+            enqueue()
+            return
+        with self._mod.stream(self._stream):
+            enqueue()
+            self.ready = self._mod.Event()
+            self.ready.record(self._stream)
+
+    def end_dma(self) -> None:
+        """The compute stream waits for the layer call's last DMA (the
+        card's call over the rows is enqueued after this)."""
+        if self._stream is not None and self.ready is not None:
+            self._mod.current_stream().wait_event(self.ready)
+
+    def read_done(self) -> None:
+        """Recorded on the compute stream right after the card's call over
+        the device rows: the next layer call's DMAs wait for it."""
+        if self._stream is not None:
+            self.free = self._mod.Event()
+            self.free.record(self._mod.current_stream())
+
+
+class DeviceStagedCall:
+    """The card's call over the device staging rows: ``apply`` runs the
+    kernel and then marks the rows free for the next layer call's DMAs."""
+
+    def __init__(self, impl: Any, rows: StageRows):
+        self.impl = impl
+        self.rows = rows
+
+    def apply(self, *args: Any, **kwargs: Any) -> Any:
+        out = self.impl.apply(*args, **kwargs)
+        self.rows.read_done()
+        return out
 
 
 _STAGE_ROWS: StageRows | None = None
@@ -680,6 +773,7 @@ class ExpertTiers:
         self._topk: int | None = None
         self._impl_common: dict[str, Any] | None = None
         self._stage_impl: Any = None
+        self._stage_device_impl: DeviceStagedCall | None = None
         # Whether the layer has host slots (computed on the CPU), decided at
         # load; the slot counts may move later, this does not.
         self._host_tier = pinned < num_local - num_fast
@@ -885,6 +979,12 @@ class ExpertTiers:
             self._refresh_tiers()
             if self.num_host:
                 self._start_cpu_tier(experts)
+                if int(getattr(binding.session.config, "stage_device_rows", 0)):
+                    # Device staging rows are taken at load, before the KV
+                    # cache is sized, so the KV cache gives their memory; the
+                    # host cache is registered for DMA into them now too.
+                    self.stage_rows(device)
+                    self.cpu.direct_dma()
         experts.tiers = self
         _LIVE_TIERS.add(self)
 
@@ -1067,10 +1167,14 @@ class ExpertTiers:
         global _STAGE_ROWS
         if _STAGE_ROWS is None:
             binding = self.store_binding
-            want = 0 if binding is None else int(binding.session.config.stage_rows)
+            cfg = None if binding is None else binding.session.config
+            want = 0 if cfg is None else int(cfg.stage_rows)
             assert self.placement is not None
             rows = want or max(1, self.num_host)
-            _STAGE_ROWS = StageRows(self.slow, rows, self.num_global, device)
+            on_device = 0 if cfg is None else int(getattr(cfg, "stage_device_rows", 0))
+            _STAGE_ROWS = StageRows(
+                self.slow, rows, self.num_global, device, device_rows=on_device
+            )
             logger.info(
                 "CPU experts: %d staging rows (%.2f GiB pinned) for the experts "
                 "of the CPU tier that a large step routes many tokens to; the "
@@ -1078,6 +1182,16 @@ class ExpertTiers:
                 rows,
                 rows * self.slot_bytes() / 2**30,
             )
+            if _STAGE_ROWS.device_rows:
+                logger.info(
+                    "CPU experts: %d device staging rows (%.2f GiB on the card, "
+                    "reserved at load, so the KV cache gives it): a layer call "
+                    "that stages copies its staged experts there by DMA on a side "
+                    "stream, and the card's call reads them from device memory "
+                    "(stage_device_rows).",
+                    _STAGE_ROWS.device_rows,
+                    _STAGE_ROWS.device_gib,
+                )
         return _STAGE_ROWS
 
     def stage_impl(self, rows: "StageRows") -> Any:
@@ -1105,6 +1219,31 @@ class ExpertTiers:
             impl.w2._vllm_is_uva_offloaded = True
             self._stage_impl = impl
         return self._stage_impl
+
+    def stage_device_impl(self, rows: "StageRows") -> DeviceStagedCall:
+        """This layer's kernel call over the device staging rows
+        (``stage_device_rows``): the same kernel as :meth:`stage_impl`, the
+        same map, built over the device rows (its ``num_experts`` is their
+        number, so the map's entries must stay below it); built once."""
+        if self._stage_device_impl is None:
+            assert self._impl_common is not None and rows.device_rows
+            XpuFusedMoe = _xpu_fused_moe()
+            dw13, dw2 = rows.dev["w13"], rows.dev["w2"]
+            dw13.xpu_fused_moe = True  # type: ignore[attr-defined]
+            impl = XpuFusedMoe(
+                w13=dw13,
+                w13_scales=rows.dev["w13_scales"],
+                w13_bias=None,
+                w2=dw2,
+                w2_scales=rows.dev["w2_scales"],
+                w2_bias=None,
+                num_experts=rows.device_rows,
+                expert_map=rows.map,
+                **self._impl_common,
+            )
+            impl.w13, impl.w2 = dw13.view(torch.int8), dw2.view(torch.int8)
+            self._stage_device_impl = DeviceStagedCall(impl, rows)
+        return self._stage_device_impl
 
     # -- temperature and classes (readout of EPLB's load window) -------------
 
