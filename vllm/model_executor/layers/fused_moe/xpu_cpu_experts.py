@@ -1182,6 +1182,10 @@ class CpuExpertRuntime:
     """The CPU tier of one process: the host cache, the host op, the
     pinned staging buffers and the counters."""
 
+    # VLLM_CPU_EXPERTS_ASYNC's host thread (set in __init__; None also for a
+    # runtime made without it, as tests' stand-ins are)
+    _async: "_AsyncHost | None" = None
+
     def __init__(
         self,
         config: "ExpertStoreConfig",
