@@ -33,15 +33,25 @@ from .xpu_store_harness import E, expert_in_store, run
 pytestmark = pytest.mark.skip_global_cleanup
 
 
+# The real host op's library, taken at import: ``fake_xpu`` replaces
+# ``torch.ops._xpu_C`` (the namespace that also carries the host op) with
+# the fake VMM ops, so a lookup made during a test would not find the op.
+_REAL_OPS = cx._ops() if REAL_OP else None
+
+
 @pytest.fixture
 def op(monkeypatch):
-    if not REAL_OP:
+    if REAL_OP:
+        monkeypatch.setattr(cx, "_ops", lambda: _REAL_OPS)
+    else:
         monkeypatch.setattr(cx, "host_op_available", lambda: True)
         monkeypatch.setattr(cx, "_op_isa", lambda want: 1)
         monkeypatch.setattr(cx, "_op_run", _reference_op)
+    cx.op_takes_arith.cache_clear()
     cx.reset_runtime()
     yield REAL_OP
     cx.reset_runtime()
+    cx.op_takes_arith.cache_clear()
 
 
 @pytest.fixture(autouse=True)
