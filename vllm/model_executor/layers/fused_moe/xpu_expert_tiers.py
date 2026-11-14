@@ -64,6 +64,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# The weight group the kernels' W4A8 grouped GEMM takes (moe_w4a8.GROUP).
+W4A8_GROUP = 128
+
 # Decoder layers only: other MoE layers (e.g. MTP) keep their experts in VRAM, so
 # the budget below is exact.
 _LAYER_RE = re.compile(r"(?:^|\.)(?:model|language_model)\.layers\.(\d+)\.")
@@ -845,6 +848,32 @@ class ExpertTiers:
 
     # -- the CPU tier ---------------------------------------------------------
 
+    def _cpu_w4a8(self, experts: Any, hidden: int, inter: int, group: int) -> bool:
+        """Whether the card runs this layer's experts W4A8, so the CPU must
+        too: the experts ask for it (``XPUExpertsW4A8Int``) and the kernels'
+        W4A8 GEMM takes the layer by ``vllm_xpu_kernels.moe_w4a8.eligible``'s
+        rules (SiLU, no clamp, 128-element groups, N and K multiples of 64).
+        Otherwise the card keeps W4A16 for the layer, and so does the CPU."""
+        if not getattr(experts, "impl_apply_kwargs", {}).get("w4a8"):
+            return False
+        moe = getattr(experts, "moe_config", None)
+        activation = getattr(getattr(moe, "activation", None), "value", "silu")
+        why = None
+        if activation != "silu" or getattr(experts, "gemm1_clamp_limit", None):
+            why = f"activation {activation} with a clamp or not SiLU"
+        elif group != W4A8_GROUP:
+            why = f"group size {group}, not {W4A8_GROUP}"
+        elif hidden % 64 or inter % 64:
+            why = f"hidden {hidden} / intermediate {inter} not multiples of 64"
+        if why is not None:
+            logger.warning_once(
+                "CPU experts: W4A8 requested, but the card's W4A8 GEMM does not "
+                "take this layer (%s): the card keeps W4A16, and so does the CPU.",
+                why,
+            )
+            return False
+        return True
+
     def _start_cpu_tier(self, experts: Any) -> None:
         """Host slots exist: take the process's CPU tier and read their
         experts into its host cache ahead of the first step (as far as free
@@ -855,11 +884,6 @@ class ExpertTiers:
             get_runtime,
         )
 
-        if getattr(experts, "impl_apply_kwargs", {}).get("w4a8"):
-            raise NotImplementedError(
-                f"{self.layer_name}: CPU experts compute W4A16; this layer's "
-                "experts run W4A8 (int8 activations) on the card"
-            )
         binding = self.store_binding
         assert binding is not None
         if self.slow["w13_scales"].dtype != torch.bfloat16:
@@ -876,7 +900,12 @@ class ExpertTiers:
             group,
             {name: _u8(self.slow[name])[0].numel() for name in UNIT_TENSORS},
         )
-        self.cpu = get_runtime(binding.session.config, binding.session.store, layout)
+        self.cpu = get_runtime(
+            binding.session.config,
+            binding.session.store,
+            layout,
+            w4a8=self._cpu_w4a8(experts, hidden, inter, group),
+        )
         _register_runtime_settings()
         self._prefetch_host(evict=False)
         logger.info_once(
