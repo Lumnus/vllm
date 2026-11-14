@@ -735,8 +735,10 @@ def save_row_state(path: str, local_rows: np.ndarray, meta: dict) -> None:
     reader sees the old list or the new one, never a part.
     """
     rows = np.ascontiguousarray(local_rows, dtype="<i4")
+    # Buffers, not bytes copies: zlib and the file write let go of the GIL.
+    body = memoryview(rows).cast("B")
     header = json.dumps(
-        dict(meta, rows=int(rows.shape[0]), crc32=zlib.crc32(rows.tobytes()))
+        dict(meta, rows=int(rows.shape[0]), crc32=zlib.crc32(body))
     ).encode()
     directory = os.path.dirname(path)
     if directory:
@@ -747,7 +749,7 @@ def save_row_state(path: str, local_rows: np.ndarray, meta: dict) -> None:
             handle.write(_ROW_STATE_MAGIC)
             handle.write(len(header).to_bytes(8, "little"))
             handle.write(header)
-            handle.write(rows.tobytes())
+            handle.write(body)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(partial, path)

@@ -464,12 +464,17 @@ def test_warm_start_stages_the_same_bytes(
         )
         _load(ple, folder)
         table = cast(DiskRowTable, ple.row_table)
+        warm = extra.get("disk_page_cache") == "warm"
+        if warm:
+            # The tiny cache holds the whole share: every row is in, no step reads.
+            assert table.preloaded_rows == NUM_ROWS
+            monkeypatch.setattr(table._server.reader, "read_rows", None)
         for _ in range(2):
             _stage(ple)
             rows = ple.lookup(ROW_IDS.shape[0], torch.bfloat16)
             torch.testing.assert_close(rows, _expected_rows(fmt), rtol=0, atol=0)
             packed.append(table.packed.clone())
-        if boot == 2 and "disk_row_state_path" in fields:
+        if boot == 2 and "disk_row_state_path" in fields and not warm:
             # The second boot with the file preloaded every row the first held.
             assert table.preloaded_rows == np.unique(ROW_IDS.numpy()).shape[0]
         table.close()

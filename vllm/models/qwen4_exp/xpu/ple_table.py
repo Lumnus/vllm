@@ -434,7 +434,13 @@ class DiskRowTable(_RowTable):
                     range_bytes / 2**30,
                 )
                 warm = False
-        if rows is not None:
+        if warm and cache.capacity >= self.end - self.start:
+            # The cache holds the rank's whole share: every row goes in, so no
+            # step ever reads (the preload of the 0.32 line, cache sized to the
+            # table). The saved list adds nothing then.
+            local = np.arange(self.end - self.start, dtype=np.int64)
+            referenced = np.ones(local.shape[0], dtype=bool)
+        elif rows is not None:
             keep = rows[: cache.capacity]
             order = np.argsort(keep, kind="stable")
             local = keep[order]
@@ -500,7 +506,9 @@ class DiskRowTable(_RowTable):
                 "(%.1f %% of the cache)",
                 self.rank,
                 self.preloaded_rows,
-                self.row_state_path,
+                self.row_state_path
+                if self.preloaded_rows < self.end - self.start
+                else "the table (the rank's whole share)",
                 self.preload_s,
                 100.0 * self.preloaded_rows / cache.capacity,
             )
