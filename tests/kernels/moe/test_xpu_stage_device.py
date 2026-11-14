@@ -36,6 +36,9 @@ def host_op(monkeypatch):
         monkeypatch.setattr(cx, "host_op_available", lambda: True)
         monkeypatch.setattr(cx, "_op_isa", lambda want: 1)
         monkeypatch.setattr(cx, "_op_run", _reference_op)
+    # the host cache unregistrable: device rows filled through the pinned
+    # rows (the direct DMA tests register it)
+    monkeypatch.setattr(cx, "_host_register", lambda ptr, n: False)
     gc.collect()
     cx.reset_runtime()
     yield real
@@ -133,6 +136,76 @@ def test_the_rows_are_reserved_at_load_and_hold_the_staged_bytes(
         assert torch.equal(rows.rows_u8(name)[0], want)  # the DMA's source
     s = rt.snapshot()
     assert s["stage_device"] == 1 and s["routed_staged"] == 4
+    assert not rt.direct_dma() and not rt.cache._held  # the bounce path
+
+
+def _direct(monkeypatch, log=None):
+    """The host cache registers; the batched DMA is a memmove per triple."""
+    import ctypes
+
+    regs = []
+
+    def register(ptr, n):
+        regs.append(("register", ptr, n))
+        return True
+
+    def dma(src, dst, sizes):
+        if log is not None:
+            log.append(f"dma {src.numel()} copies")
+        for s_, d_, n_ in zip(src.numpy(), dst.numpy(), sizes.numpy()):
+            ctypes.memmove(int(d_), int(s_), int(n_))
+
+    monkeypatch.setattr(cx, "_host_register", register)
+    monkeypatch.setattr(cx, "_host_unregister", lambda p: regs.append(("un", p)))
+    monkeypatch.setattr(cx, "_dma_batch", dma)
+    return regs
+
+
+def test_a_direct_dma_reads_the_host_cache_and_holds_its_rows(
+    monkeypatch, tmp_path, host_op
+):
+    from vllm.v1.worker import runtime_control as wrc
+
+    log: list[str] = []
+    regs = _direct(monkeypatch, log)
+    env = _env(monkeypatch, tmp_path, stage_min_calls=1, stage_device_rows=3)
+    tiers = env.tiers[1]
+    rt = tiers.cpu
+    slab = rt.cache.slab
+    # registered at load, once, the whole mapping
+    assert regs == [("register", slab.data_ptr(), slab.numel())]
+    rows = xt._STAGE_ROWS
+    for name in cx.UNIT_TENSORS:
+        rows.rows_u8(name).zero_()
+    call = rt.stage(_call(tiers), CPU)
+    assert isinstance(call, xt.DeviceStagedCall)
+    assert log == ["dma 12 copies"]  # 3 experts x 4 tensors, one call
+    mapped = rows.map.tolist()
+    for e in (5, 6, 7):
+        for name, unit in expert_in_store(env, 1, e).items():
+            want = unit.reshape(-1).view(torch.uint8)
+            assert torch.equal(xt._u8(rows.dev[name])[mapped[e]], want)
+            assert not rows.rows_u8(name).any()  # no host copy
+    # the cache rows stay held until a later layer call has its routing
+    held = sorted(rt._dma_held)
+    assert sorted(rt.cache._held) == held and len(held) == 3
+    assert rt.cache.resize_refusal() is not None
+    rt.stage(_call(tiers), CPU)
+    assert all(rt.cache._held[r] == 1 for r in held)  # settled, then held again
+    assert rt.snapshot()["stage_device"] == 2 and rt.snapshot()["stage_layers"] == 2
+    # between steps the check of a host cache resize settles them
+    monkeypatch.setattr(wrc, "_cpu_runtime", lambda: rt)
+    assert wrc._check_cpu_set(None, {"host_cache_gib": 2e-3}) is None
+    assert not rt.cache._held and not rt._dma_held
+    # a resize takes the old mapping's registration off and registers the new
+    old = slab.data_ptr()
+    rt.resize_cache(2e-3)
+    new = rt.cache.slab
+    assert regs[1:] == [("un", old), ("register", new.data_ptr(), new.numel())]
+    call = rt.stage(_call(tiers), CPU)
+    for name, unit in expert_in_store(env, 1, 6).items():
+        want = unit.reshape(-1).view(torch.uint8)
+        assert torch.equal(xt._u8(rows.dev[name])[rows.map.tolist()[6]], want)
 
 
 def test_the_inputs_equal_the_uva_calls(monkeypatch, tmp_path, host_op):
@@ -298,6 +371,14 @@ def test_the_rule_with_device_rows():
     assert staged.tolist() == [11, 13]
     # bounded by the rows in use
     assert rt._staged_by_cost(experts, calls, 1, dma_batch=16)[0].tolist() == [11]
+    # a direct DMA: no host copy, so max(CPU's rest, k DMAs)
+    for _ in range(20):
+        calls = rng.integers(1, 60, size=int(rng.integers(1, 60)))
+        experts = np.arange(calls.size) + 100
+        staged, _ = rt._staged_by_cost(experts, calls, 64, dma_batch=16, direct=True)
+        cpu = 100.0 + 30.0 * np.sort(calls)[::-1]
+        times = [max(cpu[k:].sum(), k * 140.0) for k in range(min(calls.size, 64) + 1)]
+        assert staged.size == int(np.argmin(times))
 
 
 def test_unset_the_compile_keys_are_equal():

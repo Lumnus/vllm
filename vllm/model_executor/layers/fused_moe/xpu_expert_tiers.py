@@ -268,11 +268,13 @@ class StageRows:
     previous layer, so no kernel still reads what is written (R1).
 
     With ``device_rows`` > 0 (``stage_device_rows``) also that many rows in
-    device memory, filled from the pinned rows by DMA on a side stream
-    (:meth:`to_device`), so the card's call reads device memory instead of
-    reading host memory through UVA once per tile of tokens. The pinned rows
-    are then the DMA's source; the ordering of the pinned rows above holds
-    for them too, since a layer's call waits for its DMA."""
+    device memory, filled by DMA on a side stream (:meth:`on_side`), so the
+    card's call reads device memory instead of host memory through UVA (where
+    each tile of tokens reads the expert's weights across PCIe). The DMA
+    reads the host cache directly where it is registered with the driver,
+    else the pinned rows (:meth:`to_device`, batch by batch); the ordering
+    of the pinned rows above holds for them too, since a layer's call waits
+    for its DMA."""
 
     # rows per DMA batch: the host copies the next batch into the pinned rows
     # while the previous one crosses to the card
@@ -340,13 +342,21 @@ class StageRows:
     def to_device(self, lo: int, hi: int) -> None:
         """DMA of pinned rows ``lo..hi-1`` into the same device rows, one
         contiguous copy per tensor, on the side stream."""
-        if self._stream is None:  # CPU (tests): a plain copy
-            for key, dev in self.dev.items():
-                _u8(dev)[lo:hi].copy_(_u8(self.host[key])[lo:hi])
-            return
-        with self._mod.stream(self._stream):
+
+        def copy() -> None:
             for key, dev in self.dev.items():
                 _u8(dev)[lo:hi].copy_(_u8(self.host[key])[lo:hi], non_blocking=True)
+
+        self.on_side(copy)
+
+    def on_side(self, enqueue: Any) -> None:
+        """Run ``enqueue`` (copies into the device rows) on the side stream
+        and record ``ready`` after it (CPU, in tests: run it)."""
+        if self._stream is None:
+            enqueue()
+            return
+        with self._mod.stream(self._stream):
+            enqueue()
             self.ready = self._mod.Event()
             self.ready.record(self._stream)
 
@@ -971,8 +981,10 @@ class ExpertTiers:
                 self._start_cpu_tier(experts)
                 if int(getattr(binding.session.config, "stage_device_rows", 0)):
                     # Device staging rows are taken at load, before the KV
-                    # cache is sized, so the KV cache gives their memory.
+                    # cache is sized, so the KV cache gives their memory; the
+                    # host cache is registered for DMA into them now too.
                     self.stage_rows(device)
+                    self.cpu.direct_dma()
         experts.tiers = self
         _LIVE_TIERS.add(self)
 

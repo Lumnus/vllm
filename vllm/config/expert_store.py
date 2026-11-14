@@ -174,20 +174,23 @@ class ExpertStoreConfig:
 
     stage_device_rows: int = Field(default=0, ge=0)
     """0 (default): the card computes staged CPU-tier experts by reading the
-    pinned staging rows through UVA, and its grouped GEMM reads each expert's
-    weights across PCIe once per tile of tokens. N: device memory for N
-    staging rows (at most ``stage_rows``) is reserved at load, before the KV
-    cache is sized (so the KV cache gives it), and a layer call that stages
-    copies its staged experts there, one DMA per expert on a side stream,
-    before the card's call over them: the same kernel and inputs, reading
-    device memory. Runtime setting (``cpu.set stage_device_rows``) up to the
-    rows reserved at load (0 switches back to the UVA read; the memory
-    stays); more needs a restart."""
+    pinned staging rows through UVA, where its grouped GEMM's tiles of
+    tokens each read the expert's weights across PCIe. N: device memory for
+    N staging rows (at most ``stage_rows``) is reserved at load, before the
+    KV cache is sized (so the KV cache gives it), and a layer call that
+    stages copies its staged experts there by DMA on a side stream (straight
+    from the host cache, which is registered with the driver at load; where
+    that fails, through the pinned rows), before the card's call over them:
+    the same kernel and inputs, reading device memory. Runtime setting
+    (``cpu.set stage_device_rows``) up to the rows reserved at load (0
+    switches back to the UVA read; the memory stays); more needs a
+    restart."""
 
     stage_dma_us: float = Field(default=140.0, gt=0)
     """With ``stage_device_rows``: the time of one unit's host-to-card copy
     the staging cost model assumes (µs; 137–150 measured on a B70 for a
-    2.5 MB unit). Runtime setting."""
+    2.5 MB unit from pinned memory by a torch copy; the readout's
+    ``copy_us_per_unit`` is the host's side). Runtime setting."""
 
     fast_rows_max: int = Field(default=0, ge=0)
     """0 (default): the card tier of each layer is fixed at load, as many rows

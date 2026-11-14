@@ -128,6 +128,28 @@ def _op_run(*args: Any) -> None:
     _ops().int4_moe_cpu(*args)
 
 
+# Device staging rows filled straight from the host cache: the cache's
+# ordinary memory registered with the driver as DMA-capable (the KV offload's
+# helper), and one batched copy call over (source, destination, bytes)
+# triples on the current stream, reading registered sources in stream order.
+def _host_register(ptr: int, num_bytes: int) -> bool:
+    from vllm.v1.kv_offload.cpu.host_register import host_register
+
+    return host_register(ptr, num_bytes)
+
+
+def _host_unregister(ptr: int) -> None:
+    from vllm.v1.kv_offload.cpu.host_register import host_unregister
+
+    host_unregister(ptr)
+
+
+def _dma_batch(src: torch.Tensor, dst: torch.Tensor, sizes: torch.Tensor) -> None:
+    from vllm._custom_ops import swap_blocks_batch
+
+    swap_blocks_batch(src, dst, sizes, is_src_access_order_any=True)
+
+
 def _op_configure(cores: list[int], spin_us: int) -> bool:
     """Pin the op's pool workers to ``cores`` and set their spin time; False
     when the loaded op is older than this setting."""
@@ -769,6 +791,23 @@ class HostExpertCache:
                     self._held.pop(row, None)
         return True
 
+    def hold(self, rows: Sequence[int]) -> None:
+        """Keep ``rows`` in place (not evicted, not refilled) until
+        :meth:`unhold`: a DMA to the card reads them after the call that
+        enqueued it has returned."""
+        with self._lock:
+            for row in rows:
+                self._held[row] = self._held.get(row, 0) + 1
+
+    def unhold(self, rows: Sequence[int]) -> None:
+        with self._lock:
+            for row in rows:
+                left = self._held.get(row, 1) - 1
+                if left > 0:
+                    self._held[row] = left
+                else:
+                    self._held.pop(row, None)
+
     def rows_for_gib(self, gib: float) -> int:
         return max(1, int(gib * 2**30) // self.layout.row_bytes)
 
@@ -1033,6 +1072,14 @@ class CpuExpertRuntime:
         self.arith = 0
         # the staging rule's measurements (stage_min_tokens)
         self.cost = StageCost()
+        # device staging rows filled straight from the host cache: the slab
+        # registered with the driver (its address; None: not registered),
+        # a slab whose registration failed, and the cache rows the last
+        # layer call's DMA reads (held until a later layer call has waited
+        # for its routing, which the stream orders after that DMA)
+        self._slab_registered: int | None = None
+        self._slab_unregistrable: int | None = None
+        self._dma_held: list[int] = []
         self._buffers: _Buffers | None = None
         # the kernels' select op (VLLM_CPU_EXPERTS_SELECT), its kept outputs
         self._select_op = _select_op()
@@ -1107,7 +1154,16 @@ class CpuExpertRuntime:
         steps: the most recently used experts stay as far as they fit."""
         rows = self.cache.rows_for_gib(gib)
         old = self.cache.num_rows
+        # between two steps every DMA has completed: free their rows, and
+        # take the old mapping's registration off before it goes
+        self.settle_dma()
+        registered = self._slab_registered
+        if registered is not None:
+            _host_unregister(registered)
+            self._slab_registered = None
         self.cache.resize(rows)
+        if registered is not None:
+            self.direct_dma()  # the new mapping (or the old one, kept)
         self.config.host_cache_gib = float(gib)
         logger.info(
             "CPU experts: host cache %d -> %d experts (%.2f GiB of ordinary memory).",
@@ -1387,6 +1443,8 @@ class CpuExpertRuntime:
         if threshold <= 0 and not by_cost:
             return None
         self._wait(pending)
+        # the previous staging call's DMA is done (this routing comes after it)
+        self.settle_dma()
         tiers = pending.tiers
         ids = b.ids[:n].numpy()
         selection, _ = self._selection(tiers, b.ids[:n], ids, None, None)
@@ -1399,14 +1457,17 @@ class CpuExpertRuntime:
         uniq, counts = np.unique(phys, return_counts=True)
         rows = None
         on_device = 0
+        direct = False
         if by_cost:
             rows = tiers.stage_rows(device)
             on_device = self._device_rows(rows)
+            direct = bool(on_device) and self.direct_dma()
             heavy, plan = self._staged_by_cost(
                 uniq,
                 counts,
                 on_device or rows.num_rows,
                 dma_batch=rows.DMA_BATCH if on_device else 0,
+                direct=direct,
             )
             rule = f"by the cost model ({plan})"
         else:
@@ -1419,6 +1480,7 @@ class CpuExpertRuntime:
         if rows is None:
             rows = tiers.stage_rows(device)
             on_device = self._device_rows(rows)
+            direct = bool(on_device) and self.direct_dma()
         limit = on_device or rows.num_rows
         if not by_cost and heavy.size > limit:  # the busiest ones
             by_calls = counts[counts >= threshold]
@@ -1431,7 +1493,15 @@ class CpuExpertRuntime:
         cache_rows = self.cache.acquire(heavy_keys)
         copied = time.perf_counter()
         try:
-            if on_device:
+            if direct:
+                # one DMA per unit tensor straight from the host cache; the
+                # rows stay held until the DMA is known done (settle_dma)
+                rows.begin_dma()
+                self.cache.hold(cache_rows)
+                self._dma_held = list(cache_rows)
+                rows.on_side(lambda: self._dma_from_cache(cache_rows, rows))
+                rows.end_dma()
+            elif on_device:
                 # each batch of rows crosses to the card while the host
                 # copies the next one into the pinned rows
                 rows.begin_dma()
@@ -1454,12 +1524,20 @@ class CpuExpertRuntime:
         st.per_tier["staged"] += staged_calls
         st.stage_ms += (time.perf_counter() - start) * 1e3
         st.stage_copy_ms += copy_s * 1e3
-        # with device rows the host's copy time includes enqueueing the DMAs
-        # (asynchronous from pinned rows): still the host's time per unit
-        self.cost.copied(int(heavy.size), copy_s * 1e6)
+        if not direct:
+            # with device rows the host's copy time includes enqueueing the
+            # DMAs (asynchronous from pinned rows): still the host's time per
+            # unit; a direct DMA copies nothing on the host
+            self.cost.copied(int(heavy.size), copy_s * 1e6)
         if on_device:
             st.stage_device += 1
-        where = "device rows" if on_device else "pinned rows, read by UVA"
+        where = (
+            "device rows, DMA from the host cache"
+            if direct
+            else "device rows, DMA from the pinned rows"
+            if on_device
+            else "pinned rows, read by UVA"
+        )
         if by_cost:
             st.stage_by_cost += 1
             logger.info_once(
@@ -1515,6 +1593,66 @@ class CpuExpertRuntime:
             )
             return tiers.stage_device_impl(rows)
         return tiers.stage_impl(rows)
+
+    def direct_dma(self) -> bool:
+        """Whether the device staging rows can be filled straight from the
+        host cache: its memory registered with the driver as DMA-capable
+        (once per mapping; a failure falls back to the pinned rows as a
+        bounce, said once)."""
+        slab = self.cache.slab
+        ptr = int(slab.data_ptr())
+        if self._slab_registered == ptr:
+            return True
+        if self._slab_unregistrable == ptr:
+            return False
+        start = time.perf_counter()
+        if not _host_register(ptr, slab.numel() * slab.element_size()):
+            self._slab_unregistrable = ptr
+            logger.warning_once(
+                "CPU experts: the host cache could not be registered for DMA; "
+                "device staging rows are filled through the pinned rows."
+            )
+            return False
+        self._slab_registered = ptr
+        logger.info(
+            "CPU experts: host cache (%.2f GiB) registered for DMA in %.2f s: "
+            "device staging rows are filled straight from it.",
+            self.cache.gib,
+            time.perf_counter() - start,
+        )
+        return True
+
+    def settle_dma(self) -> None:
+        """Free the host cache rows the last direct DMA read. Called only
+        where that DMA is known done: after a later layer call's routing
+        arrived (the compute stream waited for the DMA before the card's call
+        over the rows), or between two steps."""
+        if self._dma_held:
+            self.cache.unhold(self._dma_held)
+            self._dma_held = []
+
+    def _dma_from_cache(self, cache_rows: Sequence[int], rows: Any) -> None:
+        """Units in host cache rows cache_rows into device staging rows
+        0..len-1: one batched copy call, a copy per unit tensor, on the
+        current (side) stream."""
+        L = self.layout
+        k = len(cache_rows)
+        base = np.uint64(self.cache.slab.data_ptr())
+        src_rows = np.asarray(cache_rows, dtype=np.uint64) * np.uint64(L.row_bytes)
+        at = np.arange(k, dtype=np.uint64)
+        src, dst, size = [], [], []
+        for name, offset in zip(UNIT_TENSORS, L.offsets):
+            nbytes = int(L.nbytes[name])
+            dev = rows.dev[name]
+            assert dev[0].numel() * dev.element_size() == nbytes
+            src.append(base + np.uint64(offset) + src_rows)
+            dst.append(np.uint64(dev.data_ptr()) + at * np.uint64(nbytes))
+            size.append(np.full(k, nbytes, dtype=np.uint64))
+        _dma_batch(
+            torch.from_numpy(np.concatenate(src)),
+            torch.from_numpy(np.concatenate(dst)),
+            torch.from_numpy(np.concatenate(size)),
+        )
 
     def _device_rows(self, rows: Any) -> int:
         """Device staging rows in use: ``stage_device_rows`` up to those
@@ -1591,6 +1729,7 @@ class CpuExpertRuntime:
         calls: np.ndarray,
         num_rows: int,
         dma_batch: int = 0,
+        direct: bool = False,
     ) -> tuple[np.ndarray, str]:
         """Which of a layer call's CPU-tier ``experts`` (with their ``calls``)
         go to the card through the staging rows: the busiest ``k`` for the
@@ -1620,7 +1759,9 @@ class CpuExpertRuntime:
         costs what its resident experts do (not charged, like the card's own
         experts). The layer's host-side
         time is then max(S(k) + C(k), R(k)): the CPU starts on the rest once
-        the host's copies are done, the card once the last DMA is."""
+        the host's copies are done, the card once the last DMA is. With
+        ``direct`` (the DMAs read the registered host cache) there is no host
+        copy: S = 0, one batch, so max(C(k), D(k))."""
         order = np.argsort(-calls, kind="stable")
         cpu_us = self.cost.cpu_us(calls[order])  # per expert, busiest first
         total = float(cpu_us.sum())
@@ -1628,6 +1769,8 @@ class CpuExpertRuntime:
         k = np.arange(limit + 1)
         left = total - np.concatenate(([0.0], np.cumsum(cpu_us[:limit])))
         copy_us = self.cost.copy_us(self.layout.row_bytes, self._copy_threads())
+        if direct:  # no host copy: one DMA batch straight from the host cache
+            copy_us, dma_batch = 0.0, max(limit, 1)
         if dma_batch > 0:
             dma_us = float(getattr(self.config, "stage_dma_us", 140.0))
             batch = int(dma_batch)

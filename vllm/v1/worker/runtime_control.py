@@ -760,6 +760,9 @@ def _check_cpu_set(worker: Any, args: dict) -> str | None:
     if "host_cache_gib" in args:
         rows = rt.cache.rows_for_gib(float(args["host_cache_gib"]))
         need = max(1, rt.stats.max_experts)
+        # between two steps the last direct DMA into the device staging rows
+        # has completed: its host cache rows need not stay held
+        rt.settle_dma()
         if rows < need:
             return (
                 f"host_cache_gib {args['host_cache_gib']} holds {rows} experts; "
