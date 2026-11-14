@@ -242,7 +242,7 @@ def test_the_layer_runs_the_staged_call_between_the_card_and_the_cpu():
             output.fill_(self.value)
 
     class Cpu:
-        def post(self, tiers, h, ids, w):
+        def post(self, tiers, h, ids, w, weights=True):
             order.append("post")
             return "pending"
 

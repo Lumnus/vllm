@@ -938,11 +938,14 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             self.placement_trace.record(tiers, topk_ids, topk_weights)
         cpu = getattr(tiers, "cpu", None)
         mode = self._tiered_combine_mode(cpu)
-        pending = (
-            None
-            if cpu is None
-            else cpu.post(tiers, hidden_states, topk_ids, topk_weights)
-        )
+        if cpu is None:
+            pending = None
+        elif mode == "split":
+            pending = cpu.post(tiers, hidden_states, topk_ids, topk_weights)
+        else:  # the per-pair sum: the router weights stay on the card
+            pending = cpu.post(
+                tiers, hidden_states, topk_ids, topk_weights, weights=False
+            )
         if mode != "split":
             captured = (_Captured(), _Captured())
             fast.apply(

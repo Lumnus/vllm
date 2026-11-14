@@ -138,6 +138,49 @@ def _op_configure(cores: list[int], spin_us: int) -> bool:
     return True
 
 
+# How a layer call's host calls are listed (environment, read when the tier
+# starts): VLLM_CPU_EXPERTS_SELECT unset or "op": by the kernels' select op
+# when the loaded kernels have it (one pass in C++), else with numpy;
+# "numpy": with numpy always. Both give the same lists.
+_SELECT_ENV = "VLLM_CPU_EXPERTS_SELECT"
+_NO_MAP = torch.empty(0, dtype=torch.int32)
+
+
+def _select_op() -> Any:
+    """The kernels' int4_moe_cpu_select, or None (not loaded, or
+    VLLM_CPU_EXPERTS_SELECT=numpy)."""
+    want = os.environ.get(_SELECT_ENV, "").strip().lower() or "op"
+    if want not in ("op", "numpy"):
+        raise CpuExpertError(f"{_SELECT_ENV} is 'op' or 'numpy', not {want!r}")
+    ns = _ops()
+    if want == "numpy" or ns is None or not hasattr(ns, "int4_moe_cpu_select"):
+        return None
+    return ns.int4_moe_cpu_select
+
+
+def _select_tables(tiers: Any) -> tuple[torch.Tensor, ...] | None:
+    """The layer's tier, slot and logical-expert tables as tensors sharing
+    the arrays' memory (the op reads them as they are now), made again when
+    an array is replaced; None when they are not the op's types."""
+    arrays = tuple(
+        getattr(tiers, name, None)
+        for name in ("_tier_of_global", "_slot_of_global", "slot_logical")
+    )
+    kept = getattr(tiers, "_cpu_select_tables", None)
+    if kept is not None and all(a is b for a, b in zip(kept[0], arrays)):
+        return kept[1]
+    if not (
+        isinstance(arrays[0], np.ndarray)
+        and arrays[0].dtype == np.int8
+        and all(isinstance(a, np.ndarray) and a.dtype == np.int64 for a in arrays[1:])
+        and all(a.flags.c_contiguous for a in arrays)
+    ):
+        return None
+    tensors = tuple(torch.from_numpy(a) for a in arrays)
+    tiers._cpu_select_tables = (arrays, tensors)
+    return tensors
+
+
 # Where the op's threads run (environment, read once per process):
 #   VLLM_CPU_EXPERTS_CORES  unset or "": not pinned (the threads go where the
 #       kernel puts them). "auto": the physical cores of the process's CPU
@@ -259,6 +302,19 @@ def _gemv_limits() -> tuple[int, str] | None:
         return None
     _GEMV_LIMITS = (fmi, limits)
     return limits
+
+
+def op_takes_x_row() -> bool:
+    """Whether the installed host op has ``call_x_row`` (one output row per
+    call reading its input row of x in place)."""
+    ns = _ops()
+    if ns is None:
+        return False
+    try:
+        schema = ns.int4_moe_cpu.default._schema
+    except (AttributeError, RuntimeError):
+        return False
+    return any(a.name == "call_x_row" for a in schema.arguments)
 
 
 def card_arith(rows: int, hidden: int, inter: int, group: int) -> int:
@@ -572,7 +628,20 @@ class HostExpertCache:
         reads: list[tuple[Key, int, Future]] = []
         waits: list[tuple[Key, int, Future]] = []
         with self._lock:
+            # The leading run of hits (every key, in a warm decode step) in one
+            # sweep; the rest key by key, as before.
+            lookup, touch = self._rows.get, self._rows.move_to_end
+            hit = 0
             for key in wanted:
+                row = lookup(key)
+                if row is None:
+                    break
+                touch(key)
+                rows[key] = row
+                hit += 1
+            self._busy.update(rows.values())
+            self.hits += hit
+            for key in wanted[hit:]:
                 row = self._rows.get(key)
                 if row is not None:
                     self._rows.move_to_end(key)
@@ -773,6 +842,8 @@ class _Buffers:
     # With it: the pair map [tokens, top_k] that goes to the device with
     # the rows.
     row_map: torch.Tensor | None = None
+    # ``x``'s bytes as int16 in numpy (the per-pair gather of its rows)
+    x_i16: np.ndarray | None = None
 
 
 @dataclass
@@ -784,6 +855,9 @@ class Pending:
     event: Any
     buffers: _Buffers
     waited: bool = False
+    # whether the router weights were copied (the per-pair sum does not
+    # read them: post(weights=False))
+    weights: bool = True
     # The op's arith for this layer call (card_arith): the card kernel whose
     # arithmetic each GEMM takes.
     arith: int = 0
@@ -957,6 +1031,12 @@ class CpuExpertRuntime:
         # the staging rule's measurements (stage_min_tokens)
         self.cost = StageCost()
         self._buffers: _Buffers | None = None
+        # the kernels' select op (VLLM_CPU_EXPERTS_SELECT), its kept outputs
+        self._select_op = _select_op()
+        self._select_out: tuple[Any, ...] | None = None
+        # the op reads each pair's input row of x in place (no gathered copy)
+        # (an op with it has arith too)
+        self._x_row = not self.w4a8 and op_takes_arith() and op_takes_x_row()
         self._last_stats = time.monotonic()
         self._first_logged = False
         self._self_check()
@@ -1043,7 +1123,11 @@ class CpuExpertRuntime:
         call_unit: torch.Tensor,
         call_token: torch.Tensor,
         call_weight: torch.Tensor,
+        x_row: torch.Tensor | None = None,
     ) -> None:
+        """The host op over the calls; ``x_row`` (an op with ``call_x_row``,
+        W4A16): call c reads x's row x_row[c] and writes out's row
+        call_token[c]."""
         if self.w4a8:
             # One arithmetic for every layer call (the card's W4A8 GEMM has
             # no GEMV); ``arith`` is the W4A16 op's.
@@ -1075,7 +1159,9 @@ class CpuExpertRuntime:
             self.threads,
             self.isa,
         ]
-        if self.arith:
+        if x_row is not None:  # positional, after arith (op_takes_x_row)
+            args += [self.arith, x_row]
+        elif self.arith:
             args.append(self.arith)
         _op_run(*args)
 
@@ -1217,6 +1303,7 @@ class CpuExpertRuntime:
                 x=torch.empty((n, hidden), dtype=torch.bfloat16, pin_memory=pin),
                 out=torch.empty((n, hidden), dtype=torch.bfloat16, pin_memory=pin),
             )
+            b.x_i16 = b.x.view(torch.int16).numpy()
             self._buffers = b
         return b
 
@@ -1226,9 +1313,12 @@ class CpuExpertRuntime:
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
+        weights: bool = True,
     ) -> Pending:
         """Enqueue the copies of a layer's routing and inputs to the host,
-        before the card's own experts of the layer."""
+        before the card's own experts of the layer. ``weights`` False: the
+        router weights stay on the device (:meth:`finish_pairs` and
+        :meth:`stage` do not read them; :meth:`finish` does)."""
         if (
             hidden_states.device.type != "cpu"
             and torch.accelerator.current_stream().is_capturing()
@@ -1242,7 +1332,8 @@ class CpuExpertRuntime:
         tokens, topk = topk_ids.shape
         b = self._buffers_for(tokens, topk, hidden_states.shape[1])
         b.ids[:tokens].copy_(topk_ids, non_blocking=True)
-        b.weights[:tokens].copy_(topk_weights, non_blocking=True)
+        if weights:
+            b.weights[:tokens].copy_(topk_weights, non_blocking=True)
         b.x[:tokens].copy_(hidden_states, non_blocking=True)
         mod = torch.get_device_module(hidden_states.device)
         event = mod.Event()
@@ -1253,13 +1344,18 @@ class CpuExpertRuntime:
             if not self.w4a8 and op_takes_arith() and self.config.cpu_arith == "card"
             else 0
         )
-        return Pending(tiers, tokens, event, b, arith=arith)
+        return Pending(tiers, tokens, event, b, arith=arith, weights=weights)
 
     def finish(self, pending: Pending, device: torch.device) -> torch.Tensor | None:
         """Wait for the routing only, compute the layer's host calls and
         return their summed contribution on the device (None: no host call).
         Raises :class:`CpuExpertError` when an expert cannot be served."""
         n, b = pending.num_tokens, pending.buffers
+        if not pending.weights:
+            raise CpuExpertError(
+                f"{pending.tiers.layer_name}: the per-token sum needs the router "
+                "weights, which this layer call did not copy (post(weights=False))"
+            )
         self._wait(pending)
         self.arith = pending.arith
         if not self.compute(
@@ -1290,7 +1386,7 @@ class CpuExpertRuntime:
         self._wait(pending)
         tiers = pending.tiers
         ids = b.ids[:n].numpy()
-        selection = tiers.host_selection(ids)
+        selection, _ = self._selection(tiers, b.ids[:n], ids, None, None)
         pending.selection = selection
         n_calls = int(selection.pair.size)
         if not n_calls or (not by_cost and n_calls < threshold):
@@ -1474,18 +1570,20 @@ class CpuExpertRuntime:
         topk = b.ids.shape[1]
         self._pair_buffers(b, n * topk)
         assert b.pair_rows is not None and b.row_map is not None
-        pair = self.compute_pairs(
+        # The map goes to the reused pinned buffer: written after this layer's
+        # routing arrived, so after the previous layer's copy of it left.
+        row_map = b.row_map[:n]
+        pair, mapped = self._compute_pairs(
             pending.tiers, b.ids[:n], b.x[:n], b.pair_rows,
-            staged=pending.staged, selection=pending.selection,
+            pending.staged, pending.selection, row_map,
+            None if b.x_i16 is None else b.x_i16[:n],
         )  # fmt: skip
         if pair is None:
             return None
-        # The map in the reused pinned buffer: written after this layer's
-        # routing arrived, so after the previous layer's copy of it left.
-        row_map = b.row_map[:n]
-        flat = row_map.numpy().reshape(-1)
-        flat.fill(-1)
-        flat[pair] = self._iota(len(pair)).numpy()
+        if not mapped:
+            flat = row_map.numpy().reshape(-1)
+            flat.fill(-1)
+            flat[pair] = self._iota(len(pair)).numpy()
         return HostPairs(
             b.pair_rows[: len(pair)].to(device, non_blocking=True),
             row_map.to(device, non_blocking=True),
@@ -1506,9 +1604,10 @@ class CpuExpertRuntime:
         )
         b.row_map = torch.empty((tokens, topk), dtype=torch.int32, pin_memory=pin)
 
-    def _pair_x(self, x: torch.Tensor, n: int) -> torch.Tensor:
+    def _pair_x(self, x: torch.Tensor, n: int) -> tuple[torch.Tensor, Any]:
         """A kept host buffer for ``n`` input rows like ``x``'s (the op's
-        input of a per-pair call), grown by a quarter when too small."""
+        input of a per-pair call), grown by a quarter when too small; with
+        its bytes as int16 in numpy when ``x`` is bf16 (else None)."""
         buf = getattr(self, "_pair_x_t", None)
         if (
             buf is None
@@ -1520,7 +1619,11 @@ class CpuExpertRuntime:
             rows = max(n, old + old // 4, 64)
             buf = torch.empty((rows, *x.shape[1:]), dtype=x.dtype)
             self._pair_x_t = buf
-        return buf[:n]
+            self._pair_x_np = (
+                buf.view(torch.int16).numpy() if x.dtype == torch.bfloat16 else None
+            )
+        view = self._pair_x_np
+        return buf[:n], None if view is None else view[:n]
 
     def _row_table(self, n: int) -> np.ndarray:
         """A kept int32 table of at least ``n`` entries, logical expert ->
@@ -1578,7 +1681,7 @@ class CpuExpertRuntime:
         out here."""
         waited = time.perf_counter()
         ids_np = ids.numpy()
-        sel = self._selection(tiers, ids_np, selection, staged)
+        sel, _ = self._selection(tiers, ids, ids_np, selection, staged)
         topk = ids_np.shape[1]
         tokens = (sel.pair // topk).astype(np.int32)
         call_w = weights.numpy().reshape(-1)[sel.pair].astype(np.float32, copy=False)
@@ -1604,36 +1707,133 @@ class CpuExpertRuntime:
         ``staged``: physical ids the card computes from staging rows, left
         out here (counted as staged); ``selection``: the layer's host calls
         if already listed."""
+        pair, _ = self._compute_pairs(tiers, ids, x, out_rows, staged, selection)
+        return None if pair is None else pair.copy()
+
+    def _compute_pairs(
+        self,
+        tiers: "ExpertTiers",
+        ids: torch.Tensor,
+        x: torch.Tensor,
+        out_rows: torch.Tensor,
+        staged: np.ndarray | None,
+        selection: "HostSelection | None",
+        row_map: torch.Tensor | None = None,
+        x_i16: np.ndarray | None = None,
+    ) -> tuple[np.ndarray | None, bool]:
+        """:meth:`compute_pairs`, and whether ``row_map`` (given: [T, K]
+        int32) was written as the pair map (the select op writes it as it
+        lists the calls). The pair array is valid until the next listing.
+        ``x_i16``: ``x``'s bytes as int16 in numpy (bf16 ``x``), for the
+        gather of the calls' input rows in numpy."""
         waited = time.perf_counter()
         ids_np = ids.numpy()
-        sel = self._selection(tiers, ids_np, selection, staged)
+        sel, mapped = self._selection(
+            tiers, ids, ids_np, selection, staged, row_map if staged is None else None
+        )
         pair = sel.pair
         n = int(pair.size)
-        tokens = torch.from_numpy(pair // ids_np.shape[1])
-        xs = torch.index_select(x, 0, tokens, out=self._pair_x(x, n)) if n else x[:0]
+        tokens = pair // ids_np.shape[1]
+        if n and self._x_row and x.dtype == torch.bfloat16:
+            # the op reads each call's row of x in place
+            ran = self._run_calls(
+                tiers, sel, x, out_rows[:n], self._iota(n), self._ones(n),
+                ids.shape[0], waited, torch.from_numpy(tokens.astype(np.int32)),
+            )  # fmt: skip
+            return (pair, mapped) if ran else (None, False)
+        if not n:
+            xs = x[:0]
+        elif x_i16 is not None and x.dtype == torch.bfloat16:
+            xs, xs_i16 = self._pair_x(x, n)
+            # tokens < T by construction: no bounds check needed (clip)
+            np.take(x_i16, tokens, axis=0, out=xs_i16, mode="clip")
+        else:
+            xs = torch.index_select(
+                x, 0, torch.from_numpy(tokens), out=self._pair_x(x, n)[0]
+            )
         ran = self._run_calls(
             tiers, sel, xs, out_rows[:n], self._iota(n), self._ones(n),
             ids.shape[0], waited,
         )  # fmt: skip
-        return pair if ran else None
+        return (pair, mapped) if ran else (None, False)
 
-    @staticmethod
     def _selection(
+        self,
         tiers: "ExpertTiers",
+        ids: torch.Tensor,
         ids_np: np.ndarray,
         selection: "HostSelection | None",
         staged: np.ndarray | None,
-    ) -> "HostSelection":
+        row_map: torch.Tensor | None = None,
+    ) -> tuple["HostSelection", bool]:
         """The layer's host calls (listed now unless given), without the
-        calls of ``staged`` physical ids, which are counted as staged."""
-        sel = tiers.host_selection(ids_np) if selection is None else selection
+        calls of ``staged`` physical ids, which are counted as staged; and
+        whether ``row_map`` was written (only by the select op, only when
+        listing now)."""
+        mapped = False
+        if selection is not None:
+            sel = selection
+        else:
+            sel = self._select(tiers, ids, ids_np, row_map)
+            if sel is None:
+                sel = tiers.host_selection(ids_np)
+            else:
+                mapped = row_map is not None
         if staged is not None and sel.pair.size:
             keep = ~np.isin(ids_np.reshape(-1)[sel.pair], staged)
             dropped = int(sel.pair.size - np.count_nonzero(keep))
             if dropped:
                 counts = dict(sel.counts, cpu=sel.counts["cpu"] - dropped)
                 sel = type(sel)(sel.pair[keep], sel.logical[keep], sel.layer, counts)
-        return sel
+        return sel, mapped
+
+    def _select(
+        self,
+        tiers: "ExpertTiers",
+        ids: torch.Tensor,
+        ids_np: np.ndarray,
+        row_map: torch.Tensor | None,
+    ) -> "HostSelection | None":
+        """The layer's host calls listed by the kernels' select op in one
+        pass (None: the op is not loaded, switched off, or the layer's tables
+        are not in the op's types; the caller lists them with numpy, the same
+        lists)."""
+        op = self._select_op
+        if op is None:
+            return None
+        tables = _select_tables(tiers)
+        if tables is None:
+            return None
+        n = ids_np.size
+        out = self._select_out
+        if out is None or out[0].shape[0] < n:
+            size = max(n, 1024)
+            ts = [torch.empty(size, dtype=torch.int64) for _ in range(3)]
+            out = self._select_out = (*ts, *(t.numpy() for t in ts))
+        if not ids.is_contiguous():
+            ids = ids.contiguous()
+        card, pinned, host, calls, distinct, bad = op(
+            ids, *tables, out[0], out[1], out[2],
+            _NO_MAP if row_map is None else row_map,
+        )  # fmt: skip
+        if bad >= 0:
+            raise CpuExpertError(
+                f"{tiers.layer_name}: a routed expert id is outside the "
+                f"{tiers.num_global} physical experts (min {int(ids_np.min())}, "
+                f"max {int(ids_np.max())})"
+            )
+        from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
+            HostSelection,
+        )
+
+        binding = tiers.store_binding
+        return HostSelection(
+            out[3][:calls],
+            out[4][:calls],
+            0 if binding is None else binding.store_layer,
+            {"card": card, "pinned": pinned, "cpu": host},
+            distinct=out[5][:distinct].tolist(),
+        )
 
     def _run_calls(
         self,
@@ -1645,6 +1845,7 @@ class CpuExpertRuntime:
         call_w: torch.Tensor,
         n: int,
         waited: float,
+        x_row: torch.Tensor | None = None,
     ) -> bool:
         st = self.stats
         per_tier = st.per_tier
@@ -1658,7 +1859,9 @@ class CpuExpertRuntime:
         # Each expert of the call once, in order of first use (the order the
         # cache saw the per-call list in): one batched acquire; each call's
         # row then by a gather through a table indexed by logical expert.
-        if calls <= _FEW_CALLS:
+        if sel.distinct is not None:
+            uniq = sel.distinct
+        elif calls <= _FEW_CALLS:
             uniq = list(dict.fromkeys(sel.logical.tolist()))
         else:
             u, first = np.unique(sel.logical, return_index=True)
@@ -1672,7 +1875,13 @@ class CpuExpertRuntime:
             table[uniq] = cache_rows
             call_rows = table[sel.logical]
             self.run_op(
-                out, x, self.cache.slab, torch.from_numpy(call_rows), tokens, call_w
+                out,
+                x,
+                self.cache.slab,
+                torch.from_numpy(call_rows),
+                tokens,
+                call_w,
+                x_row,
             )
         finally:
             self.cache.release(cache_rows)

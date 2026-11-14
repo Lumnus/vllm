@@ -80,12 +80,17 @@ class HostSelection:
     arrays: ``pair`` the flat (token * top_k + k) index of each call, in
     token order and top-k order inside a token; ``logical`` its logical
     expert; ``layer`` the store layer (store keys are ``(layer, logical)``);
-    ``counts`` the rank's routed calls per tier."""
+    ``counts`` the rank's routed calls per tier. Arrays listed by the
+    runtime's select op are views of its kept buffers, valid until its next
+    listing."""
 
     pair: np.ndarray
     logical: np.ndarray
     layer: int
     counts: dict[str, int]
+    # the distinct logical experts in order of first use, when the lister
+    # had them at hand (the select op); None: derived from ``logical``
+    distinct: list[int] | None = None
 
     def keys(self) -> list[tuple[int, int]]:
         return [(self.layer, int(e)) for e in self.logical]
@@ -1045,12 +1050,12 @@ class ExpertTiers:
             "cpu": int(bins[HOST + 1]),
         }
         pair = np.flatnonzero(tier == HOST)
-        layer = 0
+        binding = self.store_binding
+        layer = 0 if binding is None else binding.store_layer
         if pair.size == 0:
             logical = pair
         else:
-            assert self.slot_logical is not None and self.store_binding is not None
-            layer = self.store_binding.store_layer
+            assert self.slot_logical is not None and binding is not None
             logical = np.asarray(self.slot_logical)[self._slot_of_global[flat[pair]]]
         return HostSelection(pair, logical.astype(np.int64, copy=False), layer, counts)
 

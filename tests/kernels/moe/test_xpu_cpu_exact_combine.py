@@ -91,7 +91,7 @@ class Cpu:
         self.cpu_set, self.stage_set, self.log = cpu_set, stage_set, log
         self.finished = []
 
-    def post(self, tiers, h, ids, w):
+    def post(self, tiers, h, ids, w, weights=True):
         return SimpleNamespace(ids=ids, w=w, staged=None)
 
     def stage(self, pending, device):

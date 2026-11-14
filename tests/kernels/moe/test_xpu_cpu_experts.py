@@ -435,7 +435,7 @@ def test_the_layer_posts_before_the_card_and_adds_after():
                 output.fill_(self.value)
 
     class Cpu:
-        def post(self, tiers, h, ids, w):
+        def post(self, tiers, h, ids, w, weights=True):
             order.append("post")
             return "pending"
 
