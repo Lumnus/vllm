@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from functools import wraps
@@ -43,6 +44,13 @@ def draft_model_supports_eplb(
     return True
 
 
+def _drain_cpu_experts() -> None:
+    """The CPU expert tier's host thread, when its module is loaded."""
+    mod = sys.modules.get("vllm.model_executor.layers.fused_moe.xpu_cpu_experts")
+    if mod is not None:
+        mod.drain_async()
+
+
 def step_eplb_after(*, is_dummy: bool = False) -> Callable:
     """Step EPLB after a model runner method completes successfully."""
 
@@ -52,9 +60,15 @@ def step_eplb_after(*, is_dummy: bool = False) -> Callable:
             if kwargs.get("skip_eplb", False):
                 # The router kernel records load before step() is reached.
                 with self.eplb.suppress():
-                    return fn(self, *args, **kwargs)
+                    result = fn(self, *args, **kwargs)
+                _drain_cpu_experts()
+                return result
 
             result = fn(self, *args, **kwargs)
+            # Layer calls of experts on the CPU handed to a host thread
+            # (VLLM_CPU_EXPERTS_ASYNC) finish before EPLB and the tiers
+            # change anything between steps; a failed one fails the step.
+            _drain_cpu_experts()
             is_profile = kwargs.get("is_profile", False) if is_dummy else False
             self.eplb.step(is_dummy=is_dummy, is_profile=is_profile)
             return result

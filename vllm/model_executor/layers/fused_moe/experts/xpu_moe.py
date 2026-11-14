@@ -969,6 +969,24 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             sources = [c.source() for c in captured]
             if pending is not None:
                 assert cpu is not None
+                enqueued = getattr(cpu, "card_enqueued", None)
+                if enqueued is not None:
+                    enqueued(pending, output.device)
+                takes_async = getattr(cpu, "takes_async", None)
+                if takes_async is not None and takes_async(pending):
+                    # VLLM_CPU_EXPERTS_ASYNC: a host thread computes the
+                    # CPU's rows; the card waits for them, this thread does
+                    # not, and every pair's row slot and the map come over.
+                    host = cpu.finish_pairs_async(pending, output.device)
+                    sources.append((host.rows, host.row_map))
+                    if mode == "rank":
+                        sum_topk(output, topk_weights, sources)
+                    else:
+                        self._combine_exact(output, topk_weights, sources)
+                    return
+                drain = getattr(cpu, "drain", None)
+                if drain is not None:
+                    drain()  # staging below lists on this thread
                 # Prefill staging (stage_min_tokens / stage_min_calls) as in
                 # the per-tier sum:
                 # the staged experts' pairs come from the card's call over

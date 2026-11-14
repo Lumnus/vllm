@@ -20,6 +20,12 @@ nothing else while the part is off):
   preemption;
 * ``kv``: KV cache resizes, drains and releases, block-pool fences;
 * ``cpu``: each MoE layer call computed on the CPU (experts, tokens, ms);
+* ``cpustep``: each MoE layer call with CPU experts, where the host's time
+  went (since the previous layer call, posting, enqueuing the card's
+  experts, the wait for the routing, listing, the op, the results) and two
+  looks at the card the host takes without waiting: had it reached the
+  routing when the host waited, had it finished its own experts when the
+  CPU's were done;
 * ``tiers``: each commit of a layer's tiers (EPLB's rearrangements and tier
   passes, the card tier's resize rounds), each card tier resize, each change
   of the pinned bound and each pinned-row layout that follows it;
@@ -46,6 +52,7 @@ PARTS = {
     "scheduler": "admissions and preemptions",
     "kv": "KV cache resize, drain and release events",
     "cpu": "MoE layer calls computed on the CPU",
+    "cpustep": "each MoE layer call with CPU experts: the host's timeline",
     "tiers": "expert tier commits, card tier resizes, pinned bound and rows",
     "tower": "encoder tower requests and residency steps",
     "placement": "per-token expert placement trace (eager steps only)",
