@@ -1261,7 +1261,7 @@ class EplbState:
             "move (%s, EP rank %d): %s in %.2f s over %d steps; step period "
             "%.1f ms inside, %s outside. Worker: plan %.0f ms, flag exchange "
             "%.0f ms, prepare %.0f ms (%d units read, %.1f MiB), device wait "
-            "%.0f ms (mode %s). Serving thread: %d ready checks %.1f ms, commit "
+            "%.0f ms . Serving thread: %d ready checks %.1f ms, commit "
             "%.1f ms at %d steps. %d experts changed, %.1f MiB copied to card "
             "rows; verify %.0f ms.",
             model_state.model_name,
@@ -1277,7 +1277,6 @@ class EplbState:
             int(c.get("units", 0)),
             c.get("bytes", 0.0) / 2**20,
             c.get("device_wait_ms", 0.0),
-            self.parallel_config.eplb_config.worker_gpu_wait,
             int(c.get("ready_checks", 0)),
             c.get("ready_wait_ms", 0.0),
             c.get("commit_ms", 0.0),

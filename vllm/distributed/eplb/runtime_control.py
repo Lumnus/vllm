@@ -48,10 +48,7 @@ SETTINGS = (
     "min_imbalance",
     "move_min_gain",
     "interval_from_end",
-    "worker_gpu_wait",
 )
-
-WORKER_GPU_WAITS = ("block", "poll", "skip")
 
 
 # --------------------------------------------------------------------------
@@ -93,7 +90,6 @@ def settings(state: "EplbState") -> dict[str, Any]:
         "min_imbalance": config.min_imbalance,
         "move_min_gain": config.move_min_gain,
         "interval_from_end": config.interval_from_end,
-        "worker_gpu_wait": config.worker_gpu_wait,
     }
 
 
@@ -248,14 +244,6 @@ def check_settings(state: "EplbState", changes: dict[str, Any]) -> str | None:
     from_end = changes.get("interval_from_end", False)
     if not isinstance(from_end, bool):
         return f"interval_from_end must be true or false, got {from_end!r}"
-    if (
-        "worker_gpu_wait" in changes
-        and changes["worker_gpu_wait"] not in WORKER_GPU_WAITS
-    ):
-        return (
-            f"worker_gpu_wait must be one of {list(WORKER_GPU_WAITS)}, got "
-            f"{changes['worker_gpu_wait']!r}"
-        )
     if "tier_interval" in changes:
         value = changes["tier_interval"]
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
@@ -357,7 +345,6 @@ def apply_settings(state: "EplbState", changes: dict[str, Any]) -> dict[str, lis
         "tier_warm",
         "min_imbalance",
         "interval_from_end",
-        "worker_gpu_wait",
     ):
         if name in changes:
             setattr(config, name, changes[name])

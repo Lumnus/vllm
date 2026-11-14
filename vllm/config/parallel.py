@@ -39,7 +39,6 @@ DistributedExecutorBackend = Literal["ray", "mp", "uni", "external_launcher"]
 DataParallelBackend = Literal["ray", "mp"]
 EPLBPolicyOption = Literal["default", "incremental"]
 EPLBResidencyMaskOption = Literal["off", "nonresident", "coldest"]
-EPLBWorkerGpuWait = Literal["block", "poll", "skip"]
 DCPCommBackend = Literal["ag_rs", "a2a"]
 EPLBCommunicatorBackend = Literal[
     "torch_nccl", "torch_gloo", "torch_xccl", "nixl", "pynccl", "symm_mem"
@@ -106,17 +105,6 @@ class EPLBConfig:
     last layer's commit) instead of from its start, so that a rearrangement
     lasting longer than the interval is not followed by the next at once.
     Changeable while serving."""
-
-    worker_gpu_wait: EPLBWorkerGpuWait = "block"
-    """How the async worker waits, after each layer, for the serving thread's
-    commit of that layer: "block" (default) waits on the device for the
-    commit to have run (a host synchronize per layer, through most of every
-    step of a move); "poll" waits for the same thing by querying the event
-    with short sleeps (no blocking call into the device runtime); "skip", for
-    layers that fill their slots from the expert store, waits for the commit
-    on the host only (their next layer's reads use pool rows released by
-    their own events, so nothing waits on the device). Layers that move
-    weights between ranks always block. Changeable while serving."""
 
     num_redundant_experts: int = Field(default=None, ge=0)  # type: ignore[assignment]
     """Number of redundant experts to use for expert parallelism.
@@ -323,7 +311,6 @@ class EPLBConfig:
                 "min_imbalance",
                 "move_min_gain",
                 "interval_from_end",
-                "worker_gpu_wait",
                 "tier_hysteresis",
                 "tier_interval",
                 "tier_max_moves",

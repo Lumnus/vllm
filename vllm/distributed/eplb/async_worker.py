@@ -20,9 +20,6 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_POLL_S = 0.0005
-"""Sleep between two queries of a commit's event (`worker_gpu_wait` poll)."""
-
 
 def _add_ms(cost: dict[str, float], key: str, started: float) -> None:
     """Add the milliseconds since `started` to `cost[key]` (move counters)."""
@@ -260,20 +257,11 @@ def _transfer_cycle(
                 )
                 _add_ms(cost, "prepare_ms", started)
 
-            # How this layer waits for its commit (EPLBConfig.worker_gpu_wait):
-            # a layer that fills its slots from the expert store queued nothing
-            # on this stream and reads its next rows into pool rows released by
-            # their own events, so it may skip the device waits.
-            wait_mode = state.parallel_config.eplb_config.worker_gpu_wait
-            if mover is None and wait_mode == "skip":
-                wait_mode = "block"
-
             # Wait until all writes to expert_buffer have finished before making the
             # AsyncEplbLayerResult visible to the main thread.
-            if mover is None or wait_mode == "block":
-                started = time.perf_counter()
-                stream.synchronize()
-                _add_ms(cost, "device_wait_ms", started)
+            started = time.perf_counter()
+            stream.synchronize()
+            _add_ms(cost, "device_wait_ms", started)
 
             # This event guarantees that expert_buffer will not be overwritten by
             # subsequent iterations of this loop until the main thread has consumed
@@ -300,22 +288,12 @@ def _transfer_cycle(
             # Block this thread until the main thread and main stream
             # finish copying model_state.expert_buffer into
             # model_state.model.expert_weights[layer_idx]
-            consumed_event.wait_host()
+            consumed_event.wait_host()  # the serving thread's commit (not timed)
             started = time.perf_counter()
-            if wait_mode == "block":
-                consumed_event.wait(stream=stream)
-                # Host-issued writes into expert_buffer (e.g. NIXL RDMA reads)
-                # are not stream-ordered, so wait until move_from_buffer has
-                # run on the GPU.
-                stream.synchronize()
-            elif wait_mode == "poll":
-                # The same wait without a blocking call into the device
-                # runtime while the serving thread submits.
-                while not consumed_event.query():
-                    time.sleep(_POLL_S)
-                consumed_event.clear()
-            else:  # skip: the commit was enqueued; nothing here reads it
-                consumed_event.clear()
+            consumed_event.wait(stream=stream)
+            # Host-issued writes into expert_buffer (e.g. NIXL RDMA reads) are not
+            # stream-ordered, so wait until move_from_buffer has run on the GPU.
+            stream.synchronize()
             _add_ms(cost, "device_wait_ms", started)
             assert model_state.pending_result is None
             # Woken by an FT reset's record, not a normal consume.

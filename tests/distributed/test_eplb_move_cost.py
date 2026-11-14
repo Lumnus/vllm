@@ -3,8 +3,7 @@
 """What an EPLB rearrangement costs a serving engine, and the settings that
 bound it: periodic rearrangements off by default, a rearrangement started
 only when the window is imbalanced enough, a smallest gain per swap, the
-interval counted from the end of a move, how the async worker waits for a
-commit, and the per-move debug line."""
+interval counted from the end of a move, and the per-move debug line."""
 
 from types import SimpleNamespace
 
@@ -121,14 +120,12 @@ def test_min_imbalance_and_the_other_settings_change_and_go_back(monkeypatch):
             "min_imbalance": 0.1,
             "move_min_gain": 0.05,
             "interval_from_end": True,
-            "worker_gpu_wait": "poll",
         },
     )
     assert changes == {
         "min_imbalance": [0.0, 0.1],
         "move_min_gain": [None, 0.05],
         "interval_from_end": [False, True],
-        "worker_gpu_wait": ["block", "poll"],
     }
     assert state.policy.min_gain == 0.05
     assert state.policy.max_moves_per_rank == 8
@@ -138,7 +135,6 @@ def test_min_imbalance_and_the_other_settings_change_and_go_back(monkeypatch):
             "min_imbalance": 0.0,
             "move_min_gain": None,
             "interval_from_end": False,
-            "worker_gpu_wait": "block",
         },
     )
     assert back["move_min_gain"] == [0.05, None]
@@ -151,7 +147,6 @@ def test_min_imbalance_and_the_other_settings_change_and_go_back(monkeypatch):
         ({"min_imbalance": -0.1}, "min_imbalance"),
         ({"move_min_gain": "big"}, "move_min_gain"),
         ({"interval_from_end": 1}, "interval_from_end"),
-        ({"worker_gpu_wait": "spin"}, "worker_gpu_wait"),
     ],
 )
 def test_bad_new_settings_are_refused(monkeypatch, changes, refusal):
@@ -173,7 +168,6 @@ def test_the_new_settings_are_not_compile_factors():
         min_imbalance=0.1,
         move_min_gain=0.02,
         interval_from_end=True,
-        worker_gpu_wait="skip",
     ).compile_factors()
     assert base == tuned
 
@@ -223,23 +217,21 @@ def test_the_interval_counts_from_the_end_of_a_rearrangement(
 # -- the async worker's wait, and the move line ----------------------------
 
 
-def test_the_cpu_gpu_event_waits_on_the_host_only_when_asked(monkeypatch):
+def test_the_cpu_gpu_event_host_wait_then_wait_is_one_wait(monkeypatch):
     monkeypatch.setattr(torch, "Event", _Event)
     event = CpuGpuEvent()
     event.record()
     event.wait_host()  # returns: recorded
-    assert event.query() is True
-    event.clear()
+    assert event._recorded.is_set()
+    event.wait()  # the device part; clears
     assert not event._recorded.is_set()
     event.record()  # re-armed: a second record is allowed
-    event.wait()
 
 
-@pytest.mark.parametrize("mode", ["block", "poll", "skip"])
-def test_every_worker_wait_mode_lands_the_same_placement(monkeypatch, tmp_path, mode):
-    env, _, state, model_state, log = _build(
-        monkeypatch, tmp_path, spare=4, worker_gpu_wait=mode
-    )
+def test_an_async_move_fills_the_cost_counters_and_the_debug_line(
+    monkeypatch, tmp_path
+):
+    env, _, state, model_state, log = _build(monkeypatch, tmp_path, spare=4)
     loads = [[1, 1, 1, 0, 2, 40, 50, 60], [9, 8, 7, 1, 1, 1, 1, 1]]
     _window(model_state, loads)
     runtime_debug.arm("eplb", 60, 100)
@@ -258,7 +250,7 @@ def test_every_worker_wait_mode_lands_the_same_placement(monkeypatch, tmp_path, 
     assert "plan_ms" in cost and "prepare_ms" in cost and "flag_ms" in cost
     state._after_async_cycle(model_state, 0)
     line = next(x for x in log.lines if x.startswith("[debug eplb] move ("))
-    assert f"(mode {mode})" in line and "units read" in line
+    assert "device wait" in line and "units read" in line
     assert "ready checks" in line and "copied to card rows" in line
     assert model_state.move_cost == {}
     tstore.reset_sessions()

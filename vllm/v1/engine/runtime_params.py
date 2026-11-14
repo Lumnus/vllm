@@ -485,20 +485,6 @@ def _register_builtin() -> None:
     )
     P(
         Param(
-            "eplb.worker_gpu_wait",
-            "enum",
-            "How the async worker waits for each layer's commit: block (a device "
-            "synchronize), poll (event queries), skip (store-backed layers: host "
-            "only).",
-            "eplb.set",
-            choices=["block", "poll", "skip"],
-            default="block",
-            start="--eplb-config worker_gpu_wait",
-            read=_rank0("eplb", "settings", "worker_gpu_wait"),
-        )
-    )
-    P(
-        Param(
             "eplb.window_size",
             "int",
             "Steps of load a rearrangement plans from.",
