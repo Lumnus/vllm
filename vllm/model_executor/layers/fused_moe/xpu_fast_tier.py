@@ -90,6 +90,29 @@ class FastRows:
             out.append(span.view(dtype).view(self.capacity, *shape))
         return out
 
+    def views_as(self, like: Sequence[torch.Tensor], rows: int) -> list[torch.Tensor]:
+        """Views of the first ``rows`` rows of each segment in the dtype and
+        row shape of ``like`` (the same bytes per row as the range's)."""
+        full = self.buffer.full_view()
+        out = []
+        for i, (t, rb) in enumerate(zip(like, self.row_bytes)):
+            assert t[0].numel() * t.element_size() == rb, "another row size"
+            start = self.offsets[i]
+            span = full[start : start + rows * rb]
+            out.append(span.view(t.dtype).view(rows, *t.shape[1:]))
+        return out
+
+    def holds(self, tensors: Sequence[torch.Tensor]) -> bool:
+        """Whether each tensor starts at its segment of this range with this
+        range's row size (the rows were put here before the weights)."""
+        if len(tensors) != len(self.offsets):
+            return False
+        base = self.buffer.base_ptr
+        return all(
+            t.data_ptr() == base + off and t[0].numel() * t.element_size() == rb
+            for t, off, rb in zip(tensors, self.offsets, self.row_bytes)
+        )
+
     def _sizes(self, rows: int) -> list[int]:
         return [rows * rb for rb in self.row_bytes]
 
@@ -208,6 +231,9 @@ def state(targets: Sequence[int] = ()) -> dict[str, Any] | None:
         "row_bytes_all_layers": sum(sum(t.fast_rows.row_bytes) for t in tiers),
         "bytes_to": {str(int(r)): bytes_to(int(r)) for r in targets},
         "placement": placement_digest(),
+        # torch beside the rows: a reservation it cannot use (cached, under
+        # the cap) shows as allocation retries rising step by step
+        "torch": _torch_readout(first.buffer.device),
         "last": tiers[-1].move_log[-1] if tiers[-1].move_log else None,
     }
 
@@ -223,6 +249,18 @@ def _free_device_bytes(device: torch.device) -> int:
         0,
     )
     return free + reclaimable
+
+
+def _torch_readout(device: torch.device) -> dict[str, int] | None:
+    try:
+        stats = torch.accelerator.memory_stats(device)
+        return {
+            "allocated": int(stats.get("allocated_bytes.all.current", 0)),
+            "reserved": int(torch.accelerator.memory_reserved(device)),
+            "alloc_retries": int(stats.get("num_alloc_retries", 0)),
+        }
+    except Exception:  # noqa: BLE001 - no device to read (tests)
+        return None
 
 
 def device_memory(device: torch.device) -> tuple[int, int, int, int]:
@@ -491,17 +529,14 @@ def _holders(data_ptr: int) -> str:
     return "; ".join(found) or "no tensor found (the storage itself is held)"
 
 
-_ADOPTED: dict[str, Any] = {
-    "layers": 0,
-    "mapped": 0,
-    "old": 0,
-    "stale": 0,
-    "released": 0,
-    "free_delta": 0,
-    "free_known": True,
-    "logged": False,
-    "holders": None,
-}
+# One entry per layer (the last move of its rows wins): what the move
+# mapped, the storage it gave up, and the change of free device memory.
+_MOVES: dict[str, dict[str, Any]] = {}
+_LEDGER: dict[str, Any] = {"holders": None, "logged_at": None}
+
+# Free memory worse than rows and granules alone by more than this: the
+# freed storage did not go back to the device (torch keeps it cached).
+STRANDED_WARN_BYTES = int(0.3 * 2**30)
 
 
 def _free_or_none(device: torch.device) -> int | None:
@@ -513,9 +548,32 @@ def _free_or_none(device: torch.device) -> int | None:
         return None
 
 
+def _torch_or_none(device: torch.device) -> tuple[int, int] | None:
+    """Torch's allocated and reserved bytes on ``device``."""
+    try:
+        stats = torch.accelerator.memory_stats(device)
+        return (
+            int(stats.get("allocated_bytes.all.current", 0)),
+            int(torch.accelerator.memory_reserved(device)),
+        )
+    except Exception:  # noqa: BLE001 - no device to read (tests)
+        return None
+
+
 def free_before_move(device: torch.device) -> int | None:
     """Free device memory before one layer's move (see `finish_move`)."""
     return _free_or_none(device)
+
+
+def give_back_torch_cache() -> None:
+    """Torch's cached free segments back to the device: after a layer's rows
+    left torch's storage for the reserved range, and before anything else
+    can carve a long-lived tensor out of the freed blocks (a block shared
+    with a live tensor can never be returned, and the KV cache's sizing,
+    which reads free device memory, would pay for it)."""
+    if torch.accelerator.is_available():
+        torch.accelerator.synchronize()
+        torch.accelerator.empty_cache()
 
 
 def finish_move(
@@ -525,20 +583,22 @@ def finish_move(
     device: torch.device,
     free_before: int | None,
     expected_layers: int,
+    when: str = "at weight processing",
 ) -> None:
     """After a layer's rows moved into its range: give back on the spot any
     old storage another tensor still holds (its bytes cannot be reached by
     the kernels any more, and keeping them would take them from the KV
-    cache), then count the move. Once every layer has moved, one line says
-    what the moves did to the device: mapped bytes against the storage
-    given up and the change of free memory, so a boot shows at once whether
-    the card tier costs more than its rows."""
+    cache), give torch's freed cache back to the device, and record the
+    move. Once every layer has moved, one line says what the moves did to
+    the device: mapped bytes against the storage given up and the change of
+    free memory; a WARNING with torch's numbers when the device got back
+    less than the rows and granules alone explain."""
     alive = old.alive()
     stale = sum(n for _, n, _ in alive)
     released = 0
     if alive:
-        if _ADOPTED["holders"] is None:
-            _ADOPTED["holders"] = _holders(alive[0][2])
+        if _LEDGER["holders"] is None:
+            _LEDGER["holders"] = _holders(alive[0][2])
         in_use = _storages_in_use()
         for ref, n, ptr in alive:
             if ptr not in old.own or ptr in in_use:
@@ -560,62 +620,104 @@ def finish_move(
                     exc_info=True,
                 )
             del storage
-        if torch.accelerator.is_available():
-            torch.accelerator.empty_cache()
+    give_back_torch_cache()
     free_after = _free_or_none(device)
-    a = _ADOPTED
-    a["layers"] += 1
-    a["mapped"] += mapped
-    a["old"] += old.bytes
-    a["stale"] += stale
-    a["released"] += released
-    if free_before is None or free_after is None:
-        a["free_known"] = False
-    else:
-        a["free_delta"] += free_after - free_before
+    _MOVES[layer_name] = {
+        "mapped": mapped,
+        "old": old.bytes,
+        "stale": stale,
+        "released": released,
+        "free_delta": (
+            None
+            if free_before is None or free_after is None
+            else free_after - free_before
+        ),
+        "when": when,
+    }
     if alive:
         logger.warning_once(
             "Expert tiers: after the card rows moved into their reserved range, "
             "another tensor still held their old storage (%s); released in "
             "place on every layer where it happens. A reader of that tensor "
             "would read nothing now: it was not the card tier the kernels read.",
-            a["holders"],
+            _LEDGER["holders"],
         )
-    if a["layers"] >= expected_layers and not a["logged"]:
-        a["logged"] = True
-        gib = 2**30
-        logger.info(
-            "Expert tiers: the card rows of %d layers moved into their reserved "
-            "ranges: %.2f GiB mapped, %.2f GiB of storage given up (%.2f GiB of "
-            "it held by other tensors, %.2f GiB of that released in place); "
-            "device free memory %s over the moves (rows and granules alone: "
-            "%+.2f GiB).",
-            a["layers"],
-            a["mapped"] / gib,
-            a["old"] / gib,
-            a["stale"] / gib,
-            a["released"] / gib,
-            f"{a['free_delta'] / gib:+.2f} GiB" if a["free_known"] else "unknown",
-            (a["old"] - a["mapped"]) / gib,
+    if len(_MOVES) >= expected_layers:
+        _log_moves(device)
+
+
+def _log_moves(device: torch.device) -> None:
+    """The line of `finish_move`, once per complete set of moves (again if
+    a layer moved again: its entry replaced the earlier one)."""
+    key = tuple(sorted((name, id(e)) for name, e in _MOVES.items()))
+    if _LEDGER["logged_at"] == key:
+        return
+    _LEDGER["logged_at"] = key
+    s = adoption_summary()
+    gib = 2**30
+    alone = s["old"] - s["mapped"]
+    logger.info(
+        "Expert tiers: the card rows of %d layers moved into their reserved "
+        "ranges (%s): %.2f GiB mapped, %.2f GiB of storage given up (%.2f GiB "
+        "of it held by other tensors, %.2f GiB of that released in place); "
+        "device free memory %s over the moves (rows and granules alone: "
+        "%+.2f GiB).",
+        s["layers"],
+        ", ".join(sorted(s["when"])),
+        s["mapped"] / gib,
+        s["old"] / gib,
+        s["stale"] / gib,
+        s["released"] / gib,
+        "unknown" if s["free_delta"] is None else f"{s['free_delta'] / gib:+.2f} GiB",
+        alone / gib,
+    )
+    if s["free_delta"] is not None and s["free_delta"] < alone - STRANDED_WARN_BYTES:
+        numbers = _torch_or_none(device)
+        logger.warning(
+            "Expert tiers: the device got back %.2f GiB less than the card "
+            "rows' storage that the moves gave up (%.2f GiB): torch keeps it "
+            "cached (allocated %s GiB, reserved %s GiB), in segments it cannot "
+            "return while other tensors live in them, and the KV cache, sized "
+            "from free device memory, pays for it.",
+            (alone - s["free_delta"]) / gib,
+            s["old"] / gib,
+            "?" if numbers is None else f"{numbers[0] / gib:.2f}",
+            "?" if numbers is None else f"{numbers[1] / gib:.2f}",
         )
 
 
 def adoption_summary() -> dict[str, Any]:
-    return dict(_ADOPTED)
+    entries = list(_MOVES.values())
+    deltas = [e["free_delta"] for e in entries]
+    return {
+        "layers": len(entries),
+        "mapped": sum(e["mapped"] for e in entries),
+        "old": sum(e["old"] for e in entries),
+        "stale": sum(e["stale"] for e in entries),
+        "released": sum(e["released"] for e in entries),
+        "free_delta": None if None in deltas else sum(deltas),
+        "when": {e["when"] for e in entries},
+        "holders": _LEDGER["holders"],
+        "logged": _LEDGER["logged_at"] is not None,
+    }
+
+
+def moves_done(expected_layers: int, device: torch.device) -> None:
+    """A layer's rows found where its move at construction put them: the
+    line of `finish_move` once every layer is in its range."""
+    if len(_MOVES) >= expected_layers:
+        _log_moves(device)
+
+
+def forget_move(layer_name: str) -> None:
+    """A layer whose rows left the range again (see
+    `ExpertTiers._adopt_fast_rows`): its entry no longer stands."""
+    _MOVES.pop(layer_name, None)
 
 
 def reset_adoption_summary() -> None:
-    _ADOPTED.update(
-        layers=0,
-        mapped=0,
-        old=0,
-        stale=0,
-        released=0,
-        free_delta=0,
-        free_known=True,
-        logged=False,
-        holders=None,
-    )
+    _MOVES.clear()
+    _LEDGER.update(holders=None, logged_at=None)
 
 
 # --------------------------------------------------------------------------

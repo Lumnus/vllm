@@ -77,6 +77,14 @@ _EXPERT_PARAMS = (
     "w2_qzeros",
     "w2_bias",
 )
+# The card rows' parameters at construction, in the order of _TIER_FIELDS
+# (each by the names the quantization methods give it).
+_RESERVE_PARAMS = (
+    ("w13_qweight", "w13_weight"),
+    ("w2_qweight", "w2_weight"),
+    ("w13_scales",),
+    ("w2_scales",),
+)
 # The kernel tensors EPLB moves, in the order of the fast and the slow impl.
 _TIER_FIELDS = (
     ("w13", "w13"),
@@ -646,6 +654,9 @@ class ExpertTiers:
         # The card tier's rows in a reserved device range (fast_rows_max):
         # None while the card tier is fixed. See :meth:`resize_fast`.
         self.fast_rows: Any = None
+        # The range the card rows were put in at construction
+        # (reserve_card_rows), until the move at weight processing.
+        self._early_rows: Any = None
         self._num_fast_at_load = num_fast
         self._fast_capacity = 0
         # Pinned rows per layer laid out again at run time (pinned_release);
@@ -708,7 +719,9 @@ class ExpertTiers:
         return b is not None and b.session.mode == "fill"
 
     def attach_twins(self, layer: torch.nn.Module) -> None:
-        """A pageable CPU twin ``[num_slow, ...]`` for every per-expert param."""
+        """A pageable CPU twin ``[num_slow, ...]`` for every per-expert param
+        (and, with ``fast_rows_max``, the card rows put in their range)."""
+        self.reserve_card_rows(layer)
         if self.fills_from_store:
             return
         for name, param in layer.named_parameters(recurse=False):
@@ -1659,6 +1672,21 @@ class ExpertTiers:
         assert self.store_binding is not None, "a movable card tier needs the store"
         cfg = self.store_binding.session.config
         tensors = [getattr(fast, impl_field) for impl_field, _ in _TIER_FIELDS]
+        expected = sum(1 for t in live_tiers() if t._fast_capacity)
+        early, self._early_rows = self._early_rows, None
+        if early is not None and early.holds(tensors):
+            # Put in the range at construction (reserve_card_rows) and kept
+            # there by loading and post-load processing: point the kernel at
+            # the capacity, nothing to copy or free.
+            self._point_at_capacity(fast, tensors, early)
+            xpu_fast_tier.moves_done(expected, early.buffer.device)
+            return
+        if early is not None:
+            # Post-load processing put the rows in new storage: the range
+            # reserved at construction goes, the move below makes a new one.
+            early.release_to(0)
+            early.buffer.free()
+            xpu_fast_tier.forget_move(self.layer_name)
         old_storages = xpu_fast_tier.OldStorages(tensors)
         free_before = xpu_fast_tier.free_before_move(tensors[0].device)
         rows = FastRows(tensors, self._fast_capacity, int(cfg.fast_chunk_mib) << 20)
@@ -1693,8 +1721,85 @@ class ExpertTiers:
             rows.mapped_bytes,
             rows.buffer.device,
             free_before,
-            sum(1 for t in live_tiers() if t._fast_capacity),
+            expected,
         )
+        self._log_range(rows)
+
+    def _point_at_capacity(self, fast: Any, tensors: list[Any], rows: Any) -> None:
+        """The kernel tensors (and the layer's parameters on the same rows)
+        rebound to views of the whole reserved range, the fast kernel built
+        over the capacity."""
+        views = {
+            t.data_ptr(): v
+            for t, v in zip(tensors, rows.views_as(tensors, self._fast_capacity))
+        }
+        layer = None if self._layer_ref is None else self._layer_ref()
+        others = [] if layer is None else list(layer.parameters(recurse=False))
+        for tensor in [*tensors, *others]:
+            view = views.get(tensor.data_ptr())
+            if view is not None and tensor.shape[0] == self.num_fast:
+                rows_u8 = view.view(torch.uint8).view(view.shape[0], -1)
+                tensor.data = rows_u8.view(tensor.dtype).view(
+                    view.shape[0], *tensor.shape[1:]
+                )
+        fast.num_experts = self._fast_capacity
+        fast.local_experts_num = self._fast_capacity
+        self.fast_rows = rows
+        self._log_range(rows)
+
+    def reserve_card_rows(self, layer: torch.nn.Module) -> None:
+        """With ``fast_rows_max``: put the card rows' parameters into their
+        reserved range at construction, before the weights load, so that
+        their bytes never live in torch's allocator: freed there after
+        loading they end in segments shared with tensors that live on, which
+        torch cannot give back and the KV cache would pay for. Loading and
+        post-load processing then write into the range (the weights keep
+        their storage through both); `_adopt_fast_rows` finds them there.
+        Parameters it cannot place (another set of names or row sizes) are
+        left to the move at weight processing."""
+        from vllm.model_executor.layers.fused_moe import xpu_fast_tier
+        from vllm.model_executor.layers.fused_moe.xpu_fast_tier import FastRows
+
+        if not self._fast_capacity or self.store_binding is None:
+            return
+        params: list[torch.nn.Parameter] = []
+        for names in _RESERVE_PARAMS:
+            found = [
+                p
+                for p in (getattr(layer, n, None) for n in names)
+                if isinstance(p, torch.nn.Parameter)
+                and not p.is_meta
+                and p.ndim > 0
+                and p.shape[0] == self.num_fast
+                and p.is_contiguous()
+            ]
+            if not found:
+                return
+            params.append(found[0])
+        device = params[0].device
+        if device.type not in ("cuda", "xpu") and FastRows.device_override is None:
+            return
+        cfg = self.store_binding.session.config
+        old = xpu_fast_tier.OldStorages(params)
+        free_before = xpu_fast_tier.free_before_move(device)
+        rows = FastRows(params, self._fast_capacity, int(cfg.fast_chunk_mib) << 20)
+        rows.commit(self.num_fast)
+        for param, view in zip(params, rows.views_as(params, self.num_fast)):
+            view.copy_(param.data)
+            param.data = view
+        _device_sync()
+        xpu_fast_tier.finish_move(
+            self.layer_name,
+            old,
+            rows.mapped_bytes,
+            rows.buffer.device,
+            free_before,
+            expected_layers=1 << 30,  # the line comes at weight processing
+            when="at construction",
+        )
+        self._early_rows = rows
+
+    def _log_range(self, rows: Any) -> None:
         logger.info_once(
             "Expert tiers: the card tier of each layer sits in a device range "
             "reserved for %d rows (%d in use, %.2f GiB mapped per layer); it "

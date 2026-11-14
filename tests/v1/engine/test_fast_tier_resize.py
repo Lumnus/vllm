@@ -322,7 +322,21 @@ def test_a_shrink_gives_its_bytes_back_once(setup):
     assert engine.resizes == [4000 + (GIB // 2) // PER_BLOCK]
     ctl.advance()
     ctl.advance()
-    assert len(engine.resizes) == 1 and engine.restores == [False]
+    # once, and as a restore: what the rows released, not a measured vote
+    assert len(engine.resizes) == 1 and engine.restores == [True]
+
+
+def test_a_grow_and_its_shrink_move_the_same_blocks(setup):
+    """N rows up take N rows' blocks; N rows down give the same blocks back."""
+    engine, ranks, ctl = setup
+    engine.drain_steps = 1
+    ctl.start({"delta": 8})
+    engine.drain()
+    ctl.advance()
+    taken = 4000 - engine.vllm_config.cache_config.num_gpu_blocks
+    ctl.start({"delta": -8})
+    assert engine.vllm_config.cache_config.num_gpu_blocks == 4000
+    assert taken == GIB // PER_BLOCK and engine.restores == [True]
 
 
 def test_a_grow_waits_for_eplb_before_the_kv_cache_gives(setup):

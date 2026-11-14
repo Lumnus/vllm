@@ -446,6 +446,105 @@ def test_the_move_at_load_gives_up_every_old_storage(monkeypatch, tmp_path, fake
         assert rows.mapped_bytes == sum(per_field)
 
 
+def _process_in_place(self) -> None:
+    """The harness's post-load step done the way the real one is on this
+    model (the weights keep their storage: `replace_parameter` copies a
+    same-size result into the loaded storage, the int4 repack is in place),
+    so the card rows stay where construction put them."""
+    from types import SimpleNamespace as NS
+
+    for i, tiers in enumerate(self.tiers):
+        layer = self.layers[i]
+        for key in ("w13", "w2"):
+            q = getattr(layer, f"{key}_qweight").data
+            kernel = q.transpose(1, 2).contiguous().view(torch.uint8)
+            raw = q.view(-1).view(torch.uint8)
+            raw.copy_(kernel.reshape(-1))
+            setattr(
+                layer,
+                f"{key}_weight",
+                torch.nn.Parameter(raw.view(kernel.shape), requires_grad=False),
+            )
+            s = getattr(layer, f"{key}_scales")
+            t = s.data.transpose(1, 2).contiguous()
+            s.data.view(-1).copy_(t.reshape(-1))
+            s.data = s.data.view(-1).view(t.shape)
+        tiers.finalize(layer, NS(fused_experts=NS(tiers=None)))
+    for i, tiers in enumerate(self.tiers):
+        layer = self.layers[i]
+        tiers.impls(
+            layer.w13_weight, layer.w13_scales, layer.w2_weight, layer.w2_scales,
+            2, "silu", None,
+        )  # fmt: skip
+
+
+def _fake_kernel_in_place(self, w13, w13_scales, w13_bias, w2, w2_scales, w2_bias,
+                          **kw):  # fmt: skip
+    """The int4 relayout in place, as the kernels do it on xe2."""
+    if not hasattr(w13, "xpu_fused_moe"):
+        for w in (w13, w2):
+            w.data.copy_(w.data ^ 0x88)
+            w.data = w.data.view(torch.int8)
+        w13.xpu_fused_moe = True
+    self.w13, self.w2 = w13, w2
+    self.gemm1_wei_scales, self.gemm2_wei_scales = w13_scales, w2_scales
+    self.expert_map = kw["expert_map"]
+    self.num_experts = kw["num_experts"]
+
+
+def test_the_rows_go_into_the_range_before_the_weights_load(
+    monkeypatch,
+    tmp_path,
+    fake_xpu,  # noqa: F811
+):
+    """Construction puts the card rows' parameters into their range; loading
+    and the post-load step write there; weight processing finds them there
+    (nothing copied, no torch storage freed after loading), and the tier
+    serves the store, grows and shrinks."""
+    from . import xpu_store_harness as hx
+
+    monkeypatch.setattr(hx.Env, "process", _process_in_place)
+    monkeypatch.setattr(hx.FakeXpuFusedMoe, "__init__", _fake_kernel_in_place)
+    env = _env(monkeypatch, tmp_path)
+    summary = ft.adoption_summary()
+    assert summary["when"] == {"at construction"} and summary["logged"]
+    assert summary["layers"] == 2 and summary["stale"] == 0
+    assert fake_xpu.ops.physical_bytes == ft.mapped_bytes() == summary["mapped"]
+    for tiers, layer in zip(env.tiers, env.layers):
+        fast = tiers._impls[0]
+        kernel = [getattr(fast, f) for f, _ in xt._TIER_FIELDS]
+        assert tiers.fast_rows.holds(kernel)
+        assert all(t.shape[0] == tiers.fast_rows.capacity for t in kernel)
+        assert layer.w13_qweight.data_ptr() == fast.w13.data_ptr()
+        _assert_serves_the_store(env, tiers)
+    tiers = env.tiers[0]
+    tiers.fill_to(np.arange(E), _load(tiers, [5, 6, 7, 4, 3, 2, 1, 0]), 1.1)
+    tiers.fast_rows.commit(5)
+    tiers.resize_fast(5)
+    _assert_serves_the_store(env, tiers)
+    tiers.resize_fast(LOAD_FAST)
+    tiers.fast_rows.release_to(LOAD_FAST)
+    _assert_serves_the_store(env, tiers)
+
+
+def test_a_move_the_device_does_not_pay_back_is_named(monkeypatch, caplog_vllm):
+    """Free memory after the moves worse than rows and granules alone by
+    more than 0.3 GiB: a WARNING with torch's numbers."""
+    g = 1 << 30
+    old = ft.OldStorages([torch.zeros(1024, dtype=torch.uint8)])  # freed now
+    free = iter([10 * g - 4 * g])
+    monkeypatch.setattr(ft, "_free_or_none", lambda device: next(free))
+    monkeypatch.setattr(ft, "_torch_or_none", lambda device: (7 * g, 11 * g))
+    ft.finish_move("l0", old, 0, torch.device("cpu"), 10 * g, 1)
+    assert ft.adoption_summary()["free_delta"] == -4 * g
+    warned = [
+        r.getMessage()
+        for r in caplog_vllm.records
+        if "torch keeps it cached" in r.getMessage()
+    ]
+    assert warned and "reserved 11.00 GiB" in warned[0]
+
+
 def test_a_capacity_range_maps_only_the_rows_in_use(fake_xpu):  # noqa: F811
     """1 MiB rows, capacity 130, 98 in use: 49 objects of 2 MiB for the
     weights and one for the scales; the 32 rows above cost nothing."""
