@@ -658,7 +658,11 @@ class FastTierController:
             if per_block:
                 more = resize.bytes_per_rank // max(per_block)
                 try:
-                    resize.kv = self.engine.resize_kv_cache(blocks + more)
+                    # The rows' released bytes go back as a restore: a grow
+                    # of N rows took N rows' blocks unmeasured (the KV shrink),
+                    # so the shrink returns them the same way; the measured
+                    # vote and the torch floor would keep part of them.
+                    resize.kv = self.engine.resize_kv_cache(blocks + more, restore=True)
                 except Exception as e:  # noqa: BLE001 - reported in the record
                     resize.message = f"the KV cache did not grow: {e}"
         resize.state = FastTierState.FINISHED
