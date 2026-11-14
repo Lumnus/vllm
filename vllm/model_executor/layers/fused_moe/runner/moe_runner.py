@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -18,6 +18,7 @@ from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.forward_context import (
     ForwardContext,
     get_forward_context,
+    in_piecewise_cudagraph,
     is_forward_context_available,
 )
 from vllm.logger import init_logger
@@ -74,6 +75,84 @@ def register_layer_for_moe_forward_op(
         raise ValueError(f"Duplicate layer name: {prefix}")
     compilation_config.static_forward_context[prefix] = layer
     compilation_config.static_all_moe_layers.append(prefix)
+    layer.split_op_outputs = (
+        SplitOpOutputs() if moe_ops_split(compilation_config.splitting_ops) else None
+    )
+
+
+MOE_OPS = ("vllm::moe_forward", "vllm::moe_forward_shared")
+
+
+def moe_ops_split(splitting_ops: Iterable[str] | None) -> bool:
+    """Whether the piecewise graphs are split at the MoE ops (the CPU
+    experts' split, VllmConfig._split_graphs_for_cpu_experts)."""
+    return any(op in (splitting_ops or ()) for op in MOE_OPS)
+
+
+class SplitOpOutputs:
+    """Fixed-address outputs of a MoE op that runs eagerly between captured
+    piecewise graphs.
+
+    A captured piece reads its inputs at the addresses they had when it was
+    captured; a replay copies nothing in. Split at the MoE ops, the piece after
+    the op takes the op's outputs as inputs, and those are fresh tensors (the
+    modular kernel's output, the shared experts' output) whose addresses
+    follow the caching allocator: they differ between capture and replay as
+    soon as the eager code allocates differently (the CPU tier's host rows,
+    staging, a different routing), and the piece then reads whatever that
+    memory holds. So in a PIECEWISE forward (capture and replay) each output
+    is copied into a buffer of this layer, sliced from row 0: the same
+    address for a given token count at capture and at every replay. The
+    attention ops meet the same contract by writing into an output the
+    previous piece allocates (see eager_break_during_capture).
+
+    Buffers are only appended: a token count takes the first buffer it fits
+    (the largest graph is captured first, so normally one buffer per output),
+    and a count that fits an earlier buffer never moves to a later one."""
+
+    def __init__(self) -> None:
+        self._bufs: list[list[torch.Tensor]] = []
+
+    def hold(self, i: int, out: torch.Tensor) -> torch.Tensor:
+        while len(self._bufs) <= i:
+            self._bufs.append([])
+        n = out.shape[0]
+        for buf in self._bufs[i]:
+            if (
+                buf.shape[0] >= n
+                and buf.shape[1:] == out.shape[1:]
+                and buf.dtype == out.dtype
+                and buf.device == out.device
+            ):
+                return buf[:n].copy_(out)
+        buf = torch.empty(out.shape, dtype=out.dtype, device=out.device)
+        self._bufs[i].append(buf)
+        return buf.copy_(out)
+
+    def __call__(self, result: Any) -> Any:
+        if isinstance(result, tuple):
+            return tuple(
+                self.hold(i, out) if isinstance(out, torch.Tensor) else out
+                for i, out in enumerate(result)
+            )
+        if isinstance(result, torch.Tensor):
+            return self.hold(0, result)
+        return result
+
+
+def _fixed_address(layer: MoERunnerInterface, result: Any) -> Any:
+    """``result`` as the next captured piece must see it (SplitOpOutputs);
+    unchanged outside a PIECEWISE forward or when the MoE ops are not split
+    out of the graphs."""
+    held = getattr(layer, "split_op_outputs", None)
+    if held is None or not in_piecewise_cudagraph():
+        return result
+    logger.info_once(
+        "MoE ops split out of the piecewise graphs: their outputs are copied "
+        "into fixed per-layer buffers, so the next captured piece reads them "
+        "at the address it was captured with."
+    )
+    return held(result)
 
 
 def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
@@ -132,11 +211,14 @@ def _moe_forward(
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return cast(
         torch.Tensor,
-        layer._forward_impl(
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
+        _fixed_address(
+            layer,
+            layer._forward_impl(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            ),
         ),
     )
 
@@ -169,11 +251,14 @@ def _moe_forward_shared(
     layer = get_layer_from_name(_resolve_layer_name(layer_name))
     return cast(
         tuple[torch.Tensor, torch.Tensor],
-        layer._forward_impl(
-            hidden_states,
-            router_logits,
-            shared_experts_input,
-            input_ids,
+        _fixed_address(
+            layer,
+            layer._forward_impl(
+                hidden_states,
+                router_logits,
+                shared_experts_input,
+                input_ids,
+            ),
         ),
     )
 
@@ -253,6 +338,9 @@ class MoERunner(MoERunnerInterface):
     Eventually, this class may be split into more specialized implementations
     for different configurations (e.g., with/without shared experts, gates, etc.).
     """
+
+    # Set at registration (register_layer_for_moe_forward_op).
+    split_op_outputs: SplitOpOutputs | None = None
 
     def __init__(
         self,
