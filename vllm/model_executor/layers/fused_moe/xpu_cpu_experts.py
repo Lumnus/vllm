@@ -42,6 +42,15 @@ VLLM_XPU_MOE_COMBINE unset each pair the CPU computes is its own row, summed
 with the card's rows of the token in top-k order, fp32, rounded once, as the
 card-only layer does (``finish_pairs``); ``=split`` adds the CPU's own
 bf16-rounded per-token sum to the card's (``finish``).
+
+When the card runs the layer's experts W4A8 (int8 per-token activations,
+``XPUExpertsW4A8Int``), the CPU does too, with the host op
+``int4_moe_cpu_a8``: the same expert rows, the activations quantized on the
+host by the device's own quantization source, integer dot products per
+128-K group and the card's fp32 group sum, so an expert's output equals the
+card's bit for bit except where silu's exp (a hardware approximation on the
+card) moves a value across a rounding boundary. The W4A8 card path runs no
+output hook, so its layers keep the per-tier sums (``finish``).
 """
 
 import functools
@@ -246,6 +255,23 @@ def card_arith(rows: int, hidden: int, inter: int, group: int) -> int:
     return int(grouped(hidden)) | (int(grouped(inter)) << 1)
 
 
+def host_op_a8_available() -> bool:
+    """Whether the kernels have the W4A8 host op (int8 activations), in the
+    library that carries the W4A16 op."""
+    ns = _ops()
+    return ns is not None and hasattr(ns, "int4_moe_cpu_a8")
+
+
+def _op_run_a8(*args: Any) -> None:
+    _ops().int4_moe_cpu_a8(*args)
+
+
+# The card's W4A8 path (vllm_xpu_kernels.moe_w4a8.apply, fused_act off) in
+# the host op's scheme list: per-row int8 of both GEMM inputs with the
+# bf16-rounded scale, fused multiply-adds over the groups.
+W4A8_CARD_SCHEME: list[int] = []
+
+
 # --------------------------------------------------------------------------
 # The card's arithmetic, in torch (reference for the self-check and tests)
 # --------------------------------------------------------------------------
@@ -317,6 +343,83 @@ def reference_int4_experts(
         act = bf16(bf16(gate / (1.0 + torch.exp(-gate))) * up)
         y = bf16(dot2(w2, s2, act, group))
         out[token] += y[0] * float(weight)
+    return out.to(torch.bfloat16)
+
+
+def _fma32(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """fp32 fused multiply-add: the products here (an int32 dot of at most
+    2^17 times a bf16 scale; a bf16 value times an fp32 weight) are exact in
+    float64, and one rounding of the float64 sum to fp32 is fma's."""
+    return (a.double() * b.double() + c.double()).float()
+
+
+def int8_per_token(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The card's ``dynamic_per_token_scaled_int8_quant`` on bf16 values
+    ``v`` [T, K]: scale ``bf16(max(amax / 127, 1e-5))``, ``q`` half to even
+    against the exact boundary, in [-128, 127]."""
+    amax = v.abs().amax(-1, keepdim=True)
+    s = torch.clamp(amax / 127.0, min=1e-5).to(torch.bfloat16).float()
+    f = torch.floor(v / s)
+    boundary = (f + 0.5) * s
+    even = torch.floor(f * 0.5) == f * 0.5
+    q = torch.where(
+        v > boundary, f + 1, torch.where(v < boundary, f, torch.where(even, f, f + 1))
+    )
+    return q.clamp(-128, 127).to(torch.int64), s
+
+
+def _w4a8_rows(
+    w: torch.Tensor, s: torch.Tensor, q: torch.Tensor, qs: torch.Tensor, group: int
+) -> torch.Tensor:
+    """int8 rows ``q`` [T, K] (scale ``qs`` [T, 1]) times the int4 rows
+    ``w`` [N, K/2] with bf16 scales ``s`` [N, K/G], the card's W4A8 GEMM:
+    an int32 dot per group, the fp32 sum over groups in order with fused
+    multiply-adds, times the token scale."""
+    b = w.to(torch.int16)
+    n, k = w.shape[0], w.shape[1] * 2
+    wq = torch.empty(n, k, dtype=torch.int64)
+    for half, nib in ((0, b & 0xF), (1, (b >> 4) & 0xF)):
+        wq[:, half::2] = torch.where(nib >= 8, nib - 16, nib).to(torch.int64)
+    F = torch.zeros(q.shape[0], n, dtype=torch.float32)
+    sf = s.float()
+    for g in range(k // group):
+        d = q[:, g * group : (g + 1) * group] @ wq[:, g * group : (g + 1) * group].T
+        F = _fma32(d.float(), sf[:, g][None, :].expand_as(F), F)
+    return F * qs
+
+
+def reference_w4a8_experts(
+    x: torch.Tensor,
+    units: Mapping[Any, Mapping[str, torch.Tensor]],
+    calls: Sequence[tuple[Any, int, float]],
+    inter: int,
+    group: int,
+) -> torch.Tensor:
+    """What the card's W4A8 path computes for ``calls`` (unit key, token,
+    weight) in token order, with silu's exp taken as fp32 of a float64 exp
+    (the host op's; the card's hardware exp can differ in the last bits):
+    int8 per token, W4A8 GEMM, bf16, ``bf16(bf16(silu(g)) * u)``, int8 per
+    row, W4A8 GEMM, bf16, summed per token in call order with fused
+    multiply-adds, bf16."""
+    hidden = x.shape[1]
+    out = torch.zeros(x.shape[0], hidden, dtype=torch.float32)
+
+    def bf16(t: torch.Tensor) -> torch.Tensor:
+        return t.to(torch.bfloat16).float()
+
+    for key, token, weight in calls:
+        u = units[key]
+        w13 = u["w13"].view(torch.uint8).view(2 * inter, hidden // 2)
+        w2 = u["w2"].view(torch.uint8).view(hidden, inter // 2)
+        s13 = u["w13_scales"].view(torch.bfloat16).view(2 * inter, -1)
+        s2 = u["w2_scales"].view(torch.bfloat16).view(hidden, -1)
+        q1, a1 = int8_per_token(x[token : token + 1].float())
+        h = bf16(_w4a8_rows(w13, s13, q1, a1, group))
+        gate, up = h[:, :inter], h[:, inter:]
+        silu = gate / (1.0 + torch.exp(-gate.double()).float())
+        q2, a2 = int8_per_token(bf16(bf16(silu) * up))
+        y = bf16(_w4a8_rows(w2, s2, q2, a2, group))
+        out[token] = _fma32(y[0], torch.tensor(float(weight)), out[token])
     return out.to(torch.bfloat16)
 
 
@@ -783,6 +886,8 @@ class CpuExpertRuntime:
         config: "ExpertStoreConfig",
         store: Any,
         layout: UnitLayout,
+        *,
+        w4a8: bool = False,
     ):
         if not host_op_available():
             raise CpuExpertError(
@@ -791,6 +896,16 @@ class CpuExpertRuntime:
                 "kernels do not have: install kernels built with it, or drop "
                 "--cpu-offload-pinned-gb"
             )
+        if w4a8 and not host_op_a8_available():
+            raise CpuExpertError(
+                "the experts run W4A8 (int8 activations) on the card; computing "
+                "them on the CPU needs the vllm-xpu-kernels host op "
+                "int4_moe_cpu_a8, which the installed kernels do not have: "
+                "install kernels built with it, or drop --cpu-offload-pinned-gb"
+            )
+        # The card's arithmetic class this tier follows: W4A8 (int8
+        # activations) or W4A16.
+        self.w4a8 = bool(w4a8)
         self.config = config
         self.layout = layout
         self.threads = int(config.cpu_threads)
@@ -817,10 +932,11 @@ class CpuExpertRuntime:
         self._first_logged = False
         self._self_check()
         logger.info(
-            "CPU experts: %s kernel, %d threads, host cache of %d experts "
+            "CPU experts: %s kernel (%s), %d threads, host cache of %d experts "
             "(%.2f GiB of ordinary memory, %d B per expert); experts not in it "
             "are read from the expert store when a step routes to them.",
             _ISA_NAME[self.isa],
+            "W4A8, int8 activations as the card's" if self.w4a8 else "W4A16",
             self.threads,
             rows,
             self.cache.gib,
@@ -899,6 +1015,24 @@ class CpuExpertRuntime:
         call_token: torch.Tensor,
         call_weight: torch.Tensor,
     ) -> None:
+        if self.w4a8:
+            # One arithmetic for every layer call (the card's W4A8 GEMM has
+            # no GEMV); ``arith`` is the W4A16 op's.
+            _op_run_a8(
+                out,
+                x,
+                units,
+                call_unit,
+                call_token,
+                call_weight,
+                self.layout.inter,
+                self.layout.group,
+                self.layout.offsets,
+                W4A8_CARD_SCHEME,
+                self.threads,
+                self.isa,
+            )
+            return
         args = [
             out,
             x,
@@ -948,10 +1082,12 @@ class CpuExpertRuntime:
             }
             for u in (0, 1)
         }
-        want = reference_int4_experts(x, tensors, calls, L.inter, L.group)
+        reference = reference_w4a8_experts if self.w4a8 else reference_int4_experts
+        want = reference(x, tensors, calls, L.inter, L.group)
         steps = bf16_steps(out, want)
+        differ = int((out.view(torch.int16) != want.view(torch.int16)).sum())
         grouped_steps = None
-        if op_takes_arith() and self.config.cpu_arith == "card":
+        if not self.w4a8 and op_takes_arith() and self.config.cpu_arith == "card":
             # The grouped GEMM's arithmetic (every call of a top-10 model).
             grouped = torch.empty_like(x)
             self.arith = 3
@@ -1001,13 +1137,29 @@ class CpuExpertRuntime:
                 f"card's arithmetic by {steps:.2f} bf16 steps on random experts: "
                 "refusing to compute experts with it"
             )
+        if self.w4a8 and differ:
+            # The W4A8 op reproduces the reference bit for bit (integer dots,
+            # the same fp32 chain, the same exp): any difference is a build
+            # or a scheme that is not the card's.
+            raise CpuExpertError(
+                f"the CPU expert kernel's W4A8 path ({_ISA_NAME[self.isa]}) "
+                f"differs from the card's W4A8 arithmetic in {differ} of "
+                f"{out.numel()} values on random experts: refusing to compute "
+                "experts with it"
+            )
         logger.info(
-            "CPU experts: self-check against the card's arithmetic passed "
-            "(%s, largest difference %.3f bf16 steps at the output's scale%s%s).",
+            "CPU experts: self-check against the card's %s arithmetic passed "
+            "(%s, %d of %d values differ, largest difference %.3f bf16 steps "
+            "at the output's scale%s%s).",
+            "W4A8" if self.w4a8 else "W4A16",
             _ISA_NAME[self.isa],
+            differ,
+            out.numel(),
             steps,
             "; AVX2 and scalar code bit-identical" if self.isa == 2 else "",
-            "; the card's grouped GEMM and GEMV, chosen per layer call"
+            "; the card's W4A8 GEMM for every call"
+            if self.w4a8
+            else "; the card's grouped GEMM and GEMV, chosen per layer call"
             if grouped_steps is not None
             else "; the GEMV's arithmetic for every call (cpu_arith gemv)"
             if op_takes_arith()
@@ -1069,7 +1221,7 @@ class CpuExpertRuntime:
         L = self.layout
         arith = (
             card_arith(tokens * topk, L.hidden, L.inter, L.group)
-            if op_takes_arith() and self.config.cpu_arith == "card"
+            if not self.w4a8 and op_takes_arith() and self.config.cpu_arith == "card"
             else 0
         )
         return Pending(tiers, tokens, event, b, arith=arith)
@@ -1565,17 +1717,28 @@ _RUNTIME_LOCK = threading.Lock()
 
 
 def get_runtime(
-    config: "ExpertStoreConfig", store: Any, layout: UnitLayout
+    config: "ExpertStoreConfig",
+    store: Any,
+    layout: UnitLayout,
+    *,
+    w4a8: bool = False,
 ) -> CpuExpertRuntime:
     """The process's CPU tier, created by the first layer that has host
-    slots (every layer of a model has the same expert shapes)."""
+    slots (every layer of a model has the same expert shapes and the same
+    arithmetic class: W4A8 when the card runs the experts with int8
+    activations, else W4A16)."""
     global _RUNTIME
     with _RUNTIME_LOCK:
         if _RUNTIME is None:
-            _RUNTIME = CpuExpertRuntime(config, store, layout)
+            _RUNTIME = CpuExpertRuntime(config, store, layout, w4a8=w4a8)
         elif _RUNTIME.layout != layout:
             raise CpuExpertError(
                 "CPU experts: MoE layers with different expert shapes in one "
+                "process are not supported"
+            )
+        elif _RUNTIME.w4a8 != bool(w4a8):
+            raise CpuExpertError(
+                "CPU experts: MoE layers with W4A8 and W4A16 experts in one "
                 "process are not supported"
             )
         return _RUNTIME

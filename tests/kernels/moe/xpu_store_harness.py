@@ -149,8 +149,11 @@ class Env:
         reset=True,
         pinned=None,
         store_extra=None,
+        w4a8=False,
     ):
         self.mp = monkeypatch
+        # the experts ask for W4A8 (int8 activations), as XPUExpertsW4A8Int
+        self.w4a8 = w4a8
         self.fast = fast
         self.rank, self.ep_size = rank, ep_size
         self.local = E // ep_size
@@ -304,7 +307,9 @@ class Env:
                         requires_grad=False,
                     ),
                 )
-            experts = SimpleNamespace(tiers=None)
+            experts = SimpleNamespace(
+                tiers=None, impl_apply_kwargs={"w4a8": True} if self.w4a8 else {}
+            )
             tiers.finalize(layer, SimpleNamespace(fused_experts=experts))
         for i, tiers in enumerate(self.tiers):
             layer = self.layers[i]
