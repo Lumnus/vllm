@@ -99,23 +99,53 @@ class HostSelection:
 # Decoder layers only: other MoE layers (e.g. MTP) keep their experts in VRAM, so
 # the budget below is exact.
 _LAYER_RE = re.compile(r"(?:^|\.)(?:model|language_model)\.layers\.(\d+)\.")
-_EXPERT_PARAMS = (
-    "w13_qweight",
-    "w13_scales",
-    "w13_qzeros",
-    "w13_bias",
-    "w2_qweight",
-    "w2_scales",
-    "w2_qzeros",
-    "w2_bias",
+
+
+@dataclass(frozen=True)
+class ExpertFormat:
+    """How a quantization method holds int4 group-quantized routed experts
+    between loading and the tiers' repack: its parameter names and the axis
+    order of what the loader writes. After the method's post-load step both
+    formats are the same bytes (``[E, out, in/2]`` uint4 pairs with the
+    zero point 8, low nibble first; ``[E, out, groups]`` scales), which the
+    kernels and the tiers take; only the way there differs."""
+
+    name: str
+    weights: tuple[str, str]  # w13, w2: int32, 8 nibbles per word along in
+    scales: tuple[str, str]  # w13, w2: one scale per group of ``in``
+    # Loaded as ``[E, in/8, out]`` / ``[E, groups, out]`` (GPTQ), else as
+    # ``[E, out, in/8]`` / ``[E, out, groups]`` (compressed-tensors).
+    k_first: bool
+    # Tensors per expert that the loader writes and the repack drops.
+    extra: tuple[str, ...] = ()
+
+
+GPTQ_INT4 = ExpertFormat(
+    "gptq",
+    ("w13_qweight", "w2_qweight"),
+    ("w13_scales", "w2_scales"),
+    k_first=True,
+    extra=("w13_qzeros", "w2_qzeros", "w13_bias", "w2_bias"),
+)
+CT_PACKED_INT4 = ExpertFormat(
+    "compressed-tensors pack-quantized",
+    ("w13_weight_packed", "w2_weight_packed"),
+    ("w13_weight_scale", "w2_weight_scale"),
+    k_first=False,
+    extra=("w13_weight_shape", "w2_weight_shape", "w13_bias", "w2_bias"),
+)
+_FORMATS = (GPTQ_INT4, CT_PACKED_INT4)
+# Every per-expert parameter that gets a slow-slot twin, in either format.
+_EXPERT_PARAMS = tuple(
+    dict.fromkeys(name for f in _FORMATS for name in (*f.weights, *f.scales, *f.extra))
 )
 # The card rows' parameters at construction, in the order of _TIER_FIELDS
 # (each by the names the quantization methods give it).
 _RESERVE_PARAMS = (
-    ("w13_qweight", "w13_weight"),
-    ("w2_qweight", "w2_weight"),
-    ("w13_scales",),
-    ("w2_scales",),
+    ("w13_qweight", "w13_weight_packed", "w13_weight"),
+    ("w2_qweight", "w2_weight_packed", "w2_weight"),
+    ("w13_scales", "w13_weight_scale"),
+    ("w2_scales", "w2_weight_scale"),
 )
 # The kernel tensors EPLB moves, in the order of the fast and the slow impl.
 _TIER_FIELDS = (
@@ -179,6 +209,15 @@ def _tier_config() -> "OffloadConfig | None":
     return config.offload_config
 
 
+def _int4_geometry(quant_method: Any) -> tuple[int, int]:
+    """(group size, values per int32) of a method's int4 experts: GPTQ keeps
+    them on its quant config, compressed-tensors on the method itself."""
+    if hasattr(quant_method, "weight_quant"):
+        return int(quant_method.group_size), int(quant_method.packed_factor)
+    quant_config = quant_method.quant_config
+    return int(quant_config.group_size), int(getattr(quant_config, "pack_factor", 8))
+
+
 def expert_bytes(
     quant_method: Any,
     hidden_size: int,
@@ -186,15 +225,15 @@ def expert_bytes(
     params_dtype: torch.dtype,
 ) -> int:
     """One routed expert's packed weights and scales, as
-    ``AutoGPTQMoEMethod.create_weights`` lays them out (int32-packed qweight,
-    ``params_dtype`` scales per group)."""
-    quant_config = quant_method.quant_config
+    ``AutoGPTQMoEMethod.create_weights`` (or the compressed-tensors WNA16
+    method, the same numbers N-first) lays them out: int32-packed weights,
+    ``params_dtype`` scales per group."""
     w13_out = quant_method.moe.w13_num_shards * intermediate_size_per_partition
-    pack = quant_config.pack_factor
+    group_size, pack = _int4_geometry(quant_method)
     groups13 = groups2 = 1
-    if quant_config.group_size != -1:
-        groups13 = hidden_size // quant_config.group_size
-        groups2 = intermediate_size_per_partition // quant_config.group_size
+    if group_size != -1:
+        groups13 = hidden_size // group_size
+        groups2 = intermediate_size_per_partition // group_size
     qweight = (
         hidden_size // pack * w13_out
         + intermediate_size_per_partition // pack * hidden_size
@@ -612,9 +651,13 @@ def tier_classes_state(
 
 
 def _repack_int4_pinned(
-    qweight: torch.Tensor, device: torch.device, rows: int | None = None
+    qweight: torch.Tensor,
+    device: torch.device,
+    rows: int | None = None,
+    k_first: bool = True,
 ) -> torch.Tensor:
-    """GPTQ int32 ``[E, in/8, out]`` (CPU) -> signed-int4 bytes ``[E, out, in/2]``.
+    """int32 ``[E, in/8, out]`` (GPTQ, ``k_first``) or ``[E, out, in/8]``
+    (compressed-tensors) on the CPU -> signed-int4 bytes ``[E, out, in/2]``.
 
     The layout transform of the method's post-load step plus ``implement_zp``,
     run on ``device`` a few experts at a time into pinned host memory, so device
@@ -623,13 +666,18 @@ def _repack_int4_pinned(
     """
     from vllm_xpu_kernels.fused_moe_interface import implement_zp
 
-    e, k8, n = qweight.shape
+    if k_first:
+        e, k8, n = qweight.shape
+    else:
+        e, n, k8 = qweight.shape
     out = _ARENA.empty((max(e, rows or 0), n, k8 * 4), torch.uint8)
     out[e:].zero_()
     step = 16
     for i in range(0, e, step):
         chunk = qweight[i : i + step].to(device)
-        packed = chunk.transpose(1, 2).contiguous().view(torch.uint8)
+        if k_first:
+            chunk = chunk.transpose(1, 2)
+        packed = chunk.contiguous().view(torch.uint8)
         out[i : i + chunk.shape[0]].copy_(implement_zp(packed))
     return out
 
@@ -705,9 +753,12 @@ class ExpertTiers:
         num_fast: int,
         store: StoreBinding | None = None,
         num_pinned: int | None = None,
+        expert_format: ExpertFormat = GPTQ_INT4,
     ):
         assert 0 < num_fast < num_local
         self.layer_name = layer_name
+        # The parameter names and loaded axis order of the method's experts.
+        self.expert_format = expert_format
         self.local_of = local_of  # physical expert id -> local slot, -1 elsewhere
         self.num_global = num_global
         self.num_local = num_local
@@ -918,14 +969,15 @@ class ExpertTiers:
         device: torch.device = getattr(layer, "w13_weight").device  # noqa: B009
         binding = self.store_binding
         rows = self.num_pool_rows if binding is not None else None
+        fmt = self.expert_format
         if self.fills_from_store:
             # No twins: the host tier's rows come from the store, in the shape
             # of the fast tier's tensors.
             assert rows is not None
-            for key in ("w13", "w2"):
+            for key, scales_name in zip(("w13", "w2"), fmt.scales):
                 fast_w = getattr(layer, f"{key}_weight").data.view(torch.uint8)
                 self.slow[key] = _ARENA.empty((rows, *fast_w.shape[1:]), torch.uint8)
-                fast_s = getattr(layer, f"{key}_scales")
+                fast_s = getattr(layer, scales_name)
                 self.slow[f"{key}_scales"] = _ARENA.empty(
                     (rows, *fast_s.shape[1:]), fast_s.dtype
                 )
@@ -933,15 +985,28 @@ class ExpertTiers:
                 tensor[self.num_pinned :].zero_()
             self._fill_host_tier()
         else:
-            for key in ("w13", "w2"):
+            for key, weight_name, scales_name in zip(
+                ("w13", "w2"), fmt.weights, fmt.scales
+            ):
                 self.slow[key] = _repack_int4_pinned(
-                    twins.pop(f"{key}_qweight").data, device, rows
+                    twins.pop(weight_name).data, device, rows, k_first=fmt.k_first
                 )
-                scales = twins.pop(f"{key}_scales").data.transpose(1, 2).contiguous()
+                scales = twins.pop(scales_name).data
+                if fmt.k_first:
+                    scales = scales.transpose(1, 2)
                 self.slow[f"{key}_scales"] = _pin(
-                    scales.to(getattr(layer, f"{key}_scales").dtype), rows
+                    scales.contiguous().to(getattr(layer, scales_name).dtype), rows
                 )
-        del twins  # qzeros: symmetric int4 has none on XPU
+        # qzeros: symmetric int4 has none on XPU; weight_shape: the shapes the
+        # loader checked, not kernel material
+        del twins
+        if fmt is not GPTQ_INT4:
+            logger.info_once(
+                "Expert tiers: %s int4 experts; pinned rows laid out from the "
+                "loaded [E, out, in/8] words without a transpose, the bytes the "
+                "card rows get.",
+                fmt.name,
+            )
         for key, tensor in self.slow.items():
             view = get_accelerator_view_from_cpu_tensor(tensor)
             # Host memory seen from the device.
@@ -2642,12 +2707,12 @@ def slot_tensor_bytes(
 ) -> dict[str, int]:
     """Bytes of each of the four tensors of one expert in kernel layout
     (signed int4 pairs per byte, ``params_dtype`` scales), in unit order."""
-    quant_config = quant_method.quant_config
     w13_out = quant_method.moe.w13_num_shards * intermediate_size_per_partition
+    group_size, _ = _int4_geometry(quant_method)
     groups13 = groups2 = 1
-    if quant_config.group_size != -1:
-        groups13 = hidden_size // quant_config.group_size
-        groups2 = intermediate_size_per_partition // quant_config.group_size
+    if group_size != -1:
+        groups13 = hidden_size // group_size
+        groups2 = intermediate_size_per_partition // group_size
     itemsize = params_dtype.itemsize
     return {
         "w13": w13_out * hidden_size // 2,
@@ -2663,24 +2728,29 @@ def kernel_layout_unit(
     w2_qweight: torch.Tensor,
     w2_scales: torch.Tensor,
     scales_dtype: torch.dtype,
+    k_first: bool = True,
 ) -> dict[str, torch.Tensor]:
-    """One expert's GPTQ tensors as the checkpoint holds them (int32
-    ``[in/8, out]`` qweight, ``[groups, out]`` scales, ``w13`` already
+    """One expert's tensors as the checkpoint holds them (``w13`` already
     stacked over its shards) as the four tensors of the expert's store unit,
     computed on the host: the bytes the tiers write at the first load, for a
     slot of either tier. For building a store outside the engine (the unit
-    source of the store's build tool)."""
+    source of the store's build tool).
+
+    ``k_first``: GPTQ, int32 ``[in/8, out]`` qweight and ``[groups, out]``
+    scales; else compressed-tensors pack-quantized, ``[out, in/8]`` and
+    ``[out, groups]``, which are already the kernels' axis order."""
     from vllm_xpu_kernels.fused_moe_interface import implement_zp
+
+    def order(t: torch.Tensor) -> torch.Tensor:
+        t = t.cpu()
+        return (t.transpose(0, 1) if k_first else t).contiguous()
 
     unit: dict[str, torch.Tensor] = {}
     scales = {"w13": w13_scales, "w2": w2_scales}
     for key, qweight in (("w13", w13_qweight), ("w2", w2_qweight)):
-        packed = qweight.cpu().transpose(0, 1).contiguous().view(torch.uint8)
-        unit[key] = implement_zp(packed)
+        unit[key] = implement_zp(order(qweight).view(torch.uint8))
     for key in ("w13", "w2"):
-        unit[f"{key}_scales"] = (
-            scales[key].cpu().transpose(0, 1).contiguous().to(scales_dtype)
-        )
+        unit[f"{key}_scales"] = order(scales[key]).to(scales_dtype)
     return unit
 
 
@@ -2784,6 +2854,52 @@ def _store_binding(
     return StoreBinding(session, int(match.group(1)), spare, initial, num_logical)
 
 
+def tier_expert_format(quant_method: Any) -> tuple[ExpertFormat | None, str]:
+    """(the format, "") when the tiers can hold this method's experts, else
+    (None, why not).
+
+    1. GPTQ / AutoRound int4 (``AutoGPTQMoEMethod``, 4 bits): as before.
+    2. compressed-tensors ``pack-quantized`` int4 (``CompressedTensorsWNA16MoEMethod``
+       on the XPU backend; also what a checkpoint that declares int8 per-token
+       activations, or the ``int8_per_token`` serve-time setting, runs as):
+       symmetric, group strategy, no expert bias. Its words are the GPTQ words
+       transposed (``[out, in/8]``, value + 8, low nibble first), so after the
+       method's post-load step the card rows hold the same bytes as for GPTQ,
+       and the pinned rows, the store and the CPU tier take them unchanged.
+    """
+    from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQMoEMethod
+
+    if isinstance(quant_method, AutoGPTQMoEMethod):
+        if quant_method.quant_config.weight_bits != 4:
+            return None, f"{quant_method.quant_config.weight_bits}-bit weights"
+        return GPTQ_INT4, ""
+    try:
+        from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+            WNA16MoEBackend,
+        )
+        from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (  # noqa: E501
+            CompressedTensorsWNA16MoEMethod,
+        )
+    except ImportError:  # compressed-tensors is not installed
+        return None, ""
+    if not isinstance(quant_method, CompressedTensorsWNA16MoEMethod):
+        return None, ""
+    why = None
+    if quant_method.num_bits != 4:
+        why = f"{quant_method.num_bits}-bit weights"
+    elif not quant_method.symmetric:
+        why = "asymmetric weights (zero points)"
+    elif quant_method.strategy != "group" or int(quant_method.group_size) <= 0:
+        why = f"strategy {quant_method.strategy}, not group"
+    elif quant_method.wna16_backend != WNA16MoEBackend.XPU:
+        why = f"backend {quant_method.wna16_backend}, not XPU"
+    elif getattr(quant_method.moe, "has_bias", False):
+        why = "experts with a bias"
+    if why is not None:
+        return None, why
+    return CT_PACKED_INT4, ""
+
+
 def maybe_tier(
     layer_name: str,
     moe_config: Any,
@@ -2795,18 +2911,22 @@ def maybe_tier(
     config = _tier_config()
     if config is None:
         return None
-    from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQMoEMethod
-
-    if (
-        not isinstance(quant_method, AutoGPTQMoEMethod)
-        or quant_method.quant_config.weight_bits != 4
-    ):
+    expert_format, refusal = tier_expert_format(quant_method)
+    if expert_format is None:
         logger.warning_once(
-            "--cpu-offload-per-expert supports int4 GPTQ experts only; %s "
-            "experts stay in VRAM",
+            "--cpu-offload-per-expert supports int4 GPTQ and compressed-tensors "
+            "pack-quantized int4 experts only; %s experts stay in VRAM%s",
             type(quant_method).__name__,
+            f" ({refusal})" if refusal else "",
         )
         return None
+    if expert_format is not GPTQ_INT4:
+        logger.info_once(
+            "--cpu-offload-per-expert: %s int4 experts (group %d) enter the "
+            "expert tiers",
+            expert_format.name,
+            _int4_geometry(quant_method)[0],
+        )
     if _LAYER_RE.search(layer_name) is None:
         logger.info_once(
             "--cpu-offload-per-expert: %s is not a decoder layer; its experts "
@@ -2885,6 +3005,7 @@ def maybe_tier(
         num_local - num_slow,
         binding,
         num_pinned=num_pinned,
+        expert_format=expert_format,
     )
 
 

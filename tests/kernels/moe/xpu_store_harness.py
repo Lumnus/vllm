@@ -33,6 +33,40 @@ class _GPTQ(AutoGPTQMoEMethod):
         self.moe = SimpleNamespace(w13_num_shards=2)
 
 
+def ct_method(
+    bits: int = 4,
+    symmetric: bool = True,
+    strategy: str = "group",
+    group_size: int = GROUP,
+    backend=None,
+    has_bias: bool = False,
+):
+    """The compressed-tensors WNA16 MoE method's create_weights and the
+    fields the tiers read, without its backend selection (XPU unless
+    ``backend``)."""
+    from fractions import Fraction
+
+    from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+        WNA16MoEBackend,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_wna16 import (  # noqa: E501
+        CompressedTensorsWNA16MoEMethod,
+    )
+
+    class _CT(CompressedTensorsWNA16MoEMethod):
+        def __init__(self):
+            self.weight_quant = SimpleNamespace(num_bits=bits, symmetric=symmetric)
+            self.num_bits, self.symmetric = bits, symmetric
+            self.strategy, self.group_size = strategy, group_size
+            self.packed_factor = Fraction(32, bits)
+            self.wna16_backend = WNA16MoEBackend.XPU if backend is None else backend
+            self.moe = SimpleNamespace(
+                w13_num_shards=2, has_bias=has_bias, is_act_and_mul=True
+            )
+
+    return _CT()
+
+
 class _Linear:
     """ExpertMapManager stand-in: linear placement, E // ep_size slots per rank."""
 
@@ -135,6 +169,47 @@ def raw_gptq(t: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     }
 
 
+def raw_ct(t: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """The same expert as compressed-tensors ``pack-quantized`` holds it:
+    int32 [out, in/8] ``weight_packed`` (8 values along ``in`` per word, low
+    nibble first), [out, groups] ``weight_scale``, and ``weight_shape``."""
+    return {
+        "w13_weight_packed": t["w13"].contiguous().view(torch.int32),
+        "w2_weight_packed": t["w2"].contiguous().view(torch.int32),
+        "w13_weight_scale": t["w13_scales"],
+        "w2_weight_scale": t["w2_scales"],
+        "w13_weight_shape": torch.tensor([N13, HIDDEN], dtype=torch.float32),
+        "w2_weight_shape": torch.tensor([HIDDEN, INTER], dtype=torch.float32),
+    }
+
+
+# Per format: the method, the fast params the loader writes (shape, dtype), the
+# checkpoint form, and the scales' parameter name after the post-load step.
+def _fmt_params(fmt: str, f: int) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+    bf = torch.bfloat16
+    if fmt == "ct":
+        return {
+            "w13_weight_packed": ((f, N13, HIDDEN // 8), torch.int32),
+            "w2_weight_packed": ((f, HIDDEN, INTER // 8), torch.int32),
+            "w13_weight_scale": ((f, N13, HIDDEN // GROUP), bf),
+            "w2_weight_scale": ((f, HIDDEN, INTER // GROUP), bf),
+            "w13_weight_shape": ((f, 2), torch.float32),
+            "w2_weight_shape": ((f, 2), torch.float32),
+        }
+    return {
+        "w13_qweight": ((f, HIDDEN // 8, N13), torch.int32),
+        "w2_qweight": ((f, INTER // 8, HIDDEN), torch.int32),
+        "w13_scales": ((f, HIDDEN // GROUP, N13), bf),
+        "w2_scales": ((f, INTER // GROUP, HIDDEN), bf),
+    }
+
+
+def scales_names(fmt: str) -> tuple[str, str]:
+    if fmt == "ct":
+        return "w13_weight_scale", "w2_weight_scale"
+    return "w13_scales", "w2_scales"
+
+
 class Env:
     def __init__(
         self,
@@ -150,8 +225,12 @@ class Env:
         pinned=None,
         store_extra=None,
         w4a8=False,
+        fmt="gptq",
     ):
         self.mp = monkeypatch
+        # the checkpoint format of the experts: "gptq" or "ct"
+        # (compressed-tensors pack-quantized)
+        self.fmt = fmt
         # the experts ask for W4A8 (int8 activations), as XPUExpertsW4A8Int
         self.w4a8 = w4a8
         self.fast = fast
@@ -194,7 +273,7 @@ class Env:
             model_config=SimpleNamespace(
                 model="synthetic-ckpt",
                 revision=None,
-                quantization="gptq",
+                quantization="compressed-tensors" if fmt == "ct" else "gptq",
                 dtype=torch.bfloat16,
                 hf_text_config=SimpleNamespace(num_hidden_layers=LAYERS),
             ),
@@ -246,7 +325,7 @@ class Env:
                 NAME.format(i),
                 moe_config,
                 _Linear(self.rank, self.ep_size),
-                _GPTQ(),
+                ct_method() if self.fmt == "ct" else _GPTQ(),
                 params,
             )
             assert tiers is not None and tiers.num_fast == self.fast
@@ -256,15 +335,10 @@ class Env:
         """Create the fast params and twins, and run the loader's routing for
         every slot of every layer, as ``weight_loader`` does."""
         f = self.fast
+        raw_form = raw_ct if self.fmt == "ct" else raw_gptq
         for i, tiers in enumerate(self.tiers):
             layer = torch.nn.Module()
-            bf = torch.bfloat16
-            shapes = {
-                "w13_qweight": ((f, HIDDEN // 8, N13), torch.int32),
-                "w2_qweight": ((f, INTER // 8, HIDDEN), torch.int32),
-                "w13_scales": ((f, HIDDEN // GROUP, N13), bf),
-                "w2_scales": ((f, INTER // GROUP, HIDDEN), bf),
-            }
+            shapes = _fmt_params(self.fmt, f)
             for name, (shape, dtype) in shapes.items():
                 layer.register_parameter(
                     name,
@@ -274,7 +348,7 @@ class Env:
                 )
             tiers.attach_twins(layer)
             for slot in range(self.local):
-                raw = raw_gptq(checkpoint(i, self.rank * self.local + slot))
+                raw = raw_form(checkpoint(i, self.rank * self.local + slot))
                 for name, value in raw.items():
                     param = getattr(layer, name)
                     target, row = tiers.route(param, slot)
@@ -285,6 +359,9 @@ class Env:
 
     def process(self) -> None:
         """The method's post-load step, ``finalize`` and the experts' impls."""
+        if self.fmt == "ct":
+            _env_process_ct(self)
+            return
         for i, tiers in enumerate(self.tiers):
             layer = self.layers[i]
             # fast params in kernel layout (N-first uint8 / transposed scales)
@@ -319,6 +396,52 @@ class Env:
             )  # fmt: skip
             if tiers.ops is not None:
                 tiers.ops = ImmediateOps()
+
+
+def _process_ct_layer(layer: torch.nn.Module) -> None:
+    """The compressed-tensors method's post-load step on XPU: the oracle's own
+    ``_process_weights_xpu`` (N-first words viewed as bytes, scales as they
+    are), the results under the method's names and the kernel aliases."""
+    from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
+        _process_weights_xpu,
+    )
+
+    w13, w2, s13, s2, _, _ = _process_weights_xpu(
+        layer,
+        None,
+        layer.w13_weight_packed.data,
+        layer.w2_weight_packed.data,
+        layer.w13_weight_scale.data,
+        layer.w2_weight_scale.data,
+    )
+    for name, value in (
+        ("w13_weight_packed", w13),
+        ("w2_weight_packed", w2),
+        ("w13_weight_scale", s13),
+        ("w2_weight_scale", s2),
+    ):
+        setattr(layer, name, torch.nn.Parameter(value, requires_grad=False))
+    layer.w13_weight = layer.w13_weight_packed
+    layer.w2_weight = layer.w2_weight_packed
+
+
+def _env_process_ct(self: "Env") -> None:
+    """``Env.process`` for compressed-tensors experts."""
+    for i, tiers in enumerate(self.tiers):
+        layer = self.layers[i]
+        _process_ct_layer(layer)
+        experts = SimpleNamespace(
+            tiers=None, impl_apply_kwargs={"w4a8": True} if self.w4a8 else {}
+        )
+        tiers.finalize(layer, SimpleNamespace(fused_experts=experts))
+    for i, tiers in enumerate(self.tiers):
+        layer = self.layers[i]
+        tiers.impls(
+            layer.w13_weight, layer.w13_weight_scale, layer.w2_weight,
+            layer.w2_weight_scale, 2, "silu", None,
+        )  # fmt: skip
+        if tiers.ops is not None:
+            tiers.ops = ImmediateOps()
 
 
 def run(monkeypatch, tmp_path, store=True, build="auto", fast=FAST, **kw) -> Env:
