@@ -345,6 +345,7 @@ if TYPE_CHECKING:
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
     VLLM_XPU_MOE_COMBINE: Literal["split", "rank", "exact"] = "split"
+    VLLM_XPU_INT8_ONEDNN_MIN_ROWS: int = 64
     VLLM_XPU_MOE_PLACEMENT_TRACE: str = ""
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -2384,6 +2385,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_MOE_COMBINE": env_with_choices(
         "VLLM_XPU_MOE_COMBINE", "split", ["split", "rank", "exact"]
     ),
+    # XPU W8A8 INT8 linears: batches of at most this many rows run the Triton
+    # kernel (triton_scaled_mm and its XPU tiles), larger ones oneDNN's
+    # int8_gemm_w8a8. 0 sends every row count to oneDNN; a value above the
+    # largest batch keeps every row count on Triton. Read once at import.
+    "VLLM_XPU_INT8_ONEDNN_MIN_ROWS": lambda: int(
+        os.getenv("VLLM_XPU_INT8_ONEDNN_MIN_ROWS", "64")
+    ),
     # Serving profiles at start (vllm/v1/engine/serving_profiles.py): a JSON
     # file {"profiles": [...], "boot": "<name>"}; the boot profile is applied
     # in the first steps. Empty (default): none until profile.define.
@@ -2611,6 +2619,9 @@ def compile_factors() -> dict[str, object]:
         # as an opaque op.
         "VLLM_XPU_MOE_COMBINE",
         "VLLM_XPU_MOE_PLACEMENT_TRACE",
+        # Read inside the XPU INT8 linear custom op, which the compiled graph
+        # calls as an opaque op.
+        "VLLM_XPU_INT8_ONEDNN_MIN_ROWS",
         # Runtime settings applied between steps; no compiled code reads it.
         "VLLM_SERVING_PROFILES",
     }

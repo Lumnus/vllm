@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
     triton_scaled_mm,
@@ -302,8 +303,13 @@ class XPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
 
 # Row counts at or below this keep the Triton kernel: its small-M tiles beat
-# oneDNN there.
-XPU_INT8_ONEDNN_MIN_ROWS = 64
+# oneDNN there. VLLM_XPU_INT8_ONEDNN_MIN_ROWS moves the split (default 64).
+XPU_INT8_ONEDNN_MIN_ROWS = envs.VLLM_XPU_INT8_ONEDNN_MIN_ROWS
+if XPU_INT8_ONEDNN_MIN_ROWS < 0:
+    raise ValueError(
+        "VLLM_XPU_INT8_ONEDNN_MIN_ROWS must be 0 or more, "
+        f"got {XPU_INT8_ONEDNN_MIN_ROWS}."
+    )
 
 
 def xpu_int8_onednn_gemm_available() -> bool:
