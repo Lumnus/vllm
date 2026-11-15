@@ -156,3 +156,94 @@ def make_checkpoint(
             )
         )
     return ck
+
+
+# The routed experts' scheme of a compressed-tensors checkpoint as our
+# calibration writes it (int4 symmetric group 128 there; the group here is the
+# fixture's), the other modules left out.
+def ct_quantization_config(group: int) -> dict:
+    return {
+        "quant_method": "compressed-tensors",
+        "format": "mixed-precision",
+        "config_groups": {
+            "group_1": {
+                "targets": [
+                    (
+                        "re:^(?!(.*\\.)?mtp\\.)(.*\\.)?layers\\.\\d+\\.mlp\\.experts"
+                        "\\.\\d+\\.(gate_proj|up_proj|down_proj)$"
+                    )
+                ],
+                "weights": {
+                    "num_bits": 4,
+                    "type": "int",
+                    "symmetric": True,
+                    "group_size": group,
+                    "strategy": "group",
+                    "block_structure": None,
+                    "dynamic": False,
+                    "actorder": None,
+                    "observer": "minmax",
+                    "observer_kwargs": {},
+                },
+                "input_activations": None,
+                "output_activations": None,
+                "format": "pack-quantized",
+            }
+        },
+        "ignore": [],
+    }
+
+
+def make_ct_checkpoint(gptq: Checkpoint, path: pathlib.Path) -> Checkpoint:
+    """The same experts as ``gptq`` in compressed-tensors ``pack-quantized``
+    form: ``weight_packed`` = qweight transposed ([out, in/8]; a GPTQ word and
+    a compressed-tensors word both hold 8 consecutive ``in`` values, value + 8,
+    low nibble first), ``weight_scale`` = scales transposed, ``weight_shape``
+    = [out, in] as int32, no zero points; one shard, an index, config.json."""
+    path.mkdir(parents=True, exist_ok=True)
+    ck = Checkpoint(
+        path, gptq.layers, gptq.experts, gptq.hidden, gptq.inter, gptq.group,
+        prefix=gptq.prefix, projs=gptq.projs,
+        kinds=("weight_packed", "weight_shape", "weight_scale"),
+    )  # fmt: skip
+    gate, up, down = gptq.projs
+    for layer in range(gptq.layers):
+        for expert in range(gptq.experts):
+            for proj in (gate, up, down):
+                q = gptq.tensor(layer, expert, proj, "qweight")
+                s = gptq.tensor(layer, expert, proj, "scales")
+                out, k = q.shape[1], q.shape[0] * 8
+                ck.tensors[ck.name(layer, expert, proj, "weight_packed")] = (
+                    q.t().contiguous()
+                )
+                ck.tensors[ck.name(layer, expert, proj, "weight_scale")] = (
+                    s.t().contiguous()
+                )
+                ck.tensors[ck.name(layer, expert, proj, "weight_shape")] = torch.tensor(
+                    [out, k], dtype=torch.int32
+                )
+    name = "model-00001-of-00001.safetensors"
+    save_file(dict(ck.tensors), str(path / name))
+    (path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 0},
+                "weight_map": dict.fromkeys(ck.tensors, name),
+            }
+        )
+    )
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Synthetic"],
+                "quantization_config": ct_quantization_config(gptq.group),
+                "text_config": {
+                    "hidden_size": gptq.hidden,
+                    "moe_intermediate_size": gptq.inter,
+                    "num_experts": gptq.experts,
+                    "num_hidden_layers": gptq.layers,
+                },
+            }
+        )
+    )
+    return ck
