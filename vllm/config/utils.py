@@ -354,11 +354,16 @@ def normalize_value(x):
             raise
 
     # Dataclasses: represent as (FQN, sorted(field,value) tuple) for stability.
+    # A config may name fields that stay out while they hold their default
+    # (`_omit_from_factors_at_default`), so adding such a switch keeps the key
+    # of every config that does not set it.
     if is_dataclass(x):
         type_fqn = f"{x.__class__.__module__}.{x.__class__.__qualname__}"
+        omit = getattr(x, "_omit_from_factors_at_default", ())
         items = tuple(
             (f.name, normalize_value(getattr(x, f.name)))
             for f in sorted(fields(x), key=lambda f: f.name)
+            if not (f.name in omit and getattr(x, f.name) == f.default)
         )
         return (type_fqn, items)
 

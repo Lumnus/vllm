@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import field
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, ClassVar, cast
 
 import regex as re
 from pydantic import (
@@ -208,6 +208,11 @@ class QuantizationConfigArgs:
     the checkpoint has them, so online quantization cannot undo a calibration;
     only their activation follows the online spec. A different format (e.g.
     fp8 on an int8 layer) is always re-quantized, with a warning."""
+
+    # Hashed only when set, so a config without it keeps its compile key.
+    _omit_from_factors_at_default: ClassVar[tuple[str, ...]] = (
+        "requantize_prequantized",
+    )
 
     @field_validator("linear", "moe", mode="before")
     @classmethod
