@@ -1476,6 +1476,9 @@ def grow_kv_cache(
         wanted = min(target_num_blocks, fits, kv_cache.capacity_blocks)
         floor = grow_floor(kv_cache, vllm_config, runner.device, wanted)
         vote = min(wanted, floor.max_blocks)
+        # The count the vote falls short of, for the record: what the
+        # measurement allows, or for a restore the size before.
+        asked = wanted
         if restore:
             # Back toward the size before, past the measurement but never
             # past the floor: torch must keep its headroom whatever the KV
@@ -1500,24 +1503,31 @@ def grow_kv_cache(
                     restored,
                     vote,
                 )
-            vote = wanted = max(vote, restored)
+            vote = max(vote, restored)
+        allocated_now, peak_now, _ = _torch_memory_now(runner.device)
+        serving = _serving_transient(kv_cache, allocated_now, peak_now)
         kv_cache.last_grow = {
             "target_blocks": target_num_blocks,
             "committed_blocks": kv_cache.num_committed_blocks,
             "capacity_blocks": kv_cache.capacity_blocks,
-            "wanted_blocks": wanted,
+            "wanted_blocks": asked,
             "measured_blocks": fits,
             "floor_blocks": floor.max_blocks,
             "vote_blocks": vote,
             "floor_bytes": floor.floor,
             "floor_source": floor.source,
+            "startup_transient_bytes": kv_cache.reserved_headroom_bytes,
+            "serving_transient_bytes": serving,
             "torch_allocated_bytes": floor.allocated,
             "torch_reserved_bytes": floor.reserved,
+            # The block count the headroom, cap and free memory after are for.
+            "headroom_at_blocks": floor.asked,
             "headroom_after_bytes": floor.headroom_after,
             "cap_after_bytes": floor.cap_after,
             "free_after_bytes": floor.free_after,
         }
-        log = logger.warning if vote < wanted else logger.info
+        # A restore that falls short has said so above.
+        log = logger.warning if vote < asked and not restore else logger.info
         log(
             "KV cache grow floor: torch keeps at least %s GiB it can still "
             "reserve (%s); allocated %s GiB, reserved %s GiB; a grow to %d "
@@ -1527,10 +1537,13 @@ def grow_kv_cache(
             format_gib(floor.floor),
             "kv_cache_grow_torch_floor_mib"
             if floor.source == "setting"
-            else "startup transient or serving peak",
+            else (
+                f"startup transient {format_gib(kv_cache.reserved_headroom_bytes)} "
+                f"GiB, serving transient {format_gib(serving)} GiB"
+            ),
             format_gib(floor.allocated),
             format_gib(floor.reserved),
-            wanted,
+            floor.asked,
             format_gib(floor.headroom_after),
             "none" if floor.cap_after is None else f"{format_gib(floor.cap_after)} GiB",
             format_gib(floor.free_after),

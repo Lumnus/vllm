@@ -305,6 +305,32 @@ def test_the_tier_return_is_a_restore_that_keeps_the_floor(monkeypatch):
     assert abs(room_at_asked - gib(0.63)) < gib(0.02)
 
 
+def test_a_restore_cut_by_the_floor_is_reported_as_the_floor(monkeypatch):
+    """The tier's return logged "Grew from 2003 to 2106 blocks of the 2253
+    asked: the memory measurement on rank 0 fits 2252 blocks" and "a grow to
+    2106 blocks would leave 0.64 GiB": the restore had overwritten the count
+    the floor was measured at. The record keeps both counts apart, and the
+    engine's message names the floor."""
+    from vllm.v1.engine.kv_cache_resize import grow_message
+
+    card = Card(monkeypatch, CardKV, 2254)
+    t = card.torch
+    card.kv.record_sizing_baseline(DEV)
+    t.step(gib(1.02))
+    t.stuck = gib(7.77) - gib(7.27)
+    t.empty_cache()
+    card.kv.shrink_to(2003)
+    tier_return = card.grow(2253, restore=True)
+    assert 2100 <= tier_return <= 2110
+    report = card.kv.last_grow
+    assert report["wanted_blocks"] == 2253
+    assert report["headroom_at_blocks"] == report["measured_blocks"]
+    assert report["startup_transient_bytes"] == STARTUP
+    message = grow_message(2253, 2003, tier_return, [report])
+    assert "keeps torch able to reserve 1.13 GiB more" in message
+    assert f"at {report['measured_blocks']} blocks it would have" in message
+
+
 def test_a_transient_serving_showed_stays_in_the_floor(monkeypatch):
     """A load that needed more than the startup transient (1.5 GiB above the
     steady allocation) keeps the floor there through a tower round trip: the

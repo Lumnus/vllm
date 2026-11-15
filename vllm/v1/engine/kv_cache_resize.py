@@ -115,7 +115,8 @@ def grow_message(
         return (
             f"{head}: rank {rank} keeps torch able to reserve "
             f"{_gib(rep['floor_bytes'])} more ({rep['floor_source']}); at "
-            f"{rep['wanted_blocks']} blocks it would have "
+            f"{rep.get('headroom_at_blocks', rep['wanted_blocks'])} blocks it "
+            "would have "
             f"{_gib(rep['headroom_after_bytes'])} (torch reserved "
             f"{_gib(rep['torch_reserved_bytes'])}, allocated "
             f"{_gib(rep['torch_allocated_bytes'])}; cap after the grow "
