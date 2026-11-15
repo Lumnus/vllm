@@ -355,7 +355,9 @@ def keeps_checkpoint_weights(
     request (a float format on an int layer, a finer int) is a genuinely
     different format and goes through requantization.
     """
-    if checkpoint_format is None or requested_format is None:
+    if not isinstance(checkpoint_format, tuple) or not isinstance(
+        requested_format, tuple
+    ):
         return False
     ckpt_kind, ckpt_bits = checkpoint_format
     req_kind, req_bits = requested_format
@@ -418,10 +420,13 @@ def resolve_quant_method(
     if online_target is not None and not getattr(
         online_config.args, "requantize_prequantized", False
     ):
-        # Duck-typed configs (tests, out-of-tree) may not define the hook.
-        get_format = getattr(quant_config, "get_checkpoint_weight_format", None)
-        checkpoint_format = get_format(layer, prefix) if get_format else None
         requested_format = quant_key_weight_format(online_target[3].weight)
+        checkpoint_format = None
+        # Only an integer request can keep a layer; ask the checkpoint only
+        # then. Duck-typed configs (tests, out-of-tree) may not define the hook.
+        if requested_format is not None and requested_format[0] == "int":
+            get_format = getattr(quant_config, "get_checkpoint_weight_format", None)
+            checkpoint_format = get_format(layer, prefix) if get_format else None
         if keeps_checkpoint_weights(checkpoint_format, requested_format):
             # The checkpoint already holds this layer in the requested integer
             # format (or a finer one): keep its weights and scales as they are.
