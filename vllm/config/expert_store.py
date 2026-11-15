@@ -7,10 +7,27 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import Field, model_validator
 
 from vllm.config.utils import CompileFactors, config, get_compile_factors
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config.offload import OffloadConfig
     from vllm.config.parallel import ParallelConfig
+
+logger = init_logger(__name__)
+
+# Earlier names of cpu_arith values, still accepted.
+CPU_ARITH_ALIASES = {"card-exact": "exact", "card": "fast"}
+CPU_ARITH_WORDS = {
+    "exact": "exact (bit-identical to the card)",
+    "fast": "fast (within the floor)",
+    "gemv": "gemv (the GEMV's arithmetic for every call)",
+}
+
+
+def cpu_arith_name(value: str) -> str:
+    """``cpu_arith`` by its current name (``card-exact`` is ``exact``,
+    ``card`` is ``fast``)."""
+    return CPU_ARITH_ALIASES.get(str(value), str(value))
 
 
 @config
@@ -130,18 +147,26 @@ class ExpertStoreConfig:
     arithmetic class, never automatic); ``scalar`` is the portable code
     (hundreds of times slower; for tests)."""
 
-    cpu_arith: Literal["card", "gemv"] = "card"
-    """The arithmetic of the CPU experts' dot products: ``card`` (default)
-    takes, per GEMM and layer call, the card kernel's that the card would run
-    for the same call (its grouped GEMM, weights rounded to bf16(q * s), for
-    every call of a model with top-k above 8; its int4 GEMV for a call of at
-    most 8 rows), so an expert gives the card's values wherever it is
-    computed, to the order of fp32 sums; ``gemv`` takes the GEMV's (scale per
-    32-element chunk sum) for every call: up to a third faster at one token
-    per expert, no farther from the unrounded weights, but most of an
-    expert's values then differ from the card's in the last bit, and a tier
-    move changes outputs. Needs kernels whose host op has ``arith``; with an
-    older op the GEMV's arithmetic is all there is."""
+    cpu_arith: Literal["exact", "fast", "gemv", "card-exact", "card"] = "exact"
+    """The arithmetic of the CPU experts' dot products: ``exact`` (default;
+    bit-identical to the card) computes the card's grouped GEMM exactly as the card
+    does (weights truncated to bf16(q * s), products summed exactly in blocks of 16,
+    one fp32 rounding per block) with the card's own silu, taken on the card at
+    start as a table of all 65,536 bf16 inputs: an expert gives the card's bits
+    wherever it is computed, for every layer call the card runs on its grouped GEMM
+    (every call of a model with top-k above 8). Needs kernels whose host op takes
+    ``silu_table``; without them, or without a card to take the table from, ``fast``
+    with a warning. ``fast`` (within the floor) takes, per GEMM and layer call, the
+    card kernel's that the card would run for the same call (its grouped GEMM,
+    weights rounded to bf16(q * s), for every call of a model with top-k above 8;
+    its int4 GEMV for a call of at most 8 rows), so an expert gives the card's
+    values wherever it is computed, to the order of fp32 sums; ``gemv`` takes the
+    GEMV's (scale per 32-element chunk sum) for every call: up to a third faster at
+    one token per expert, no farther from the unrounded weights, but most of an
+    expert's values then differ from the card's in the last bit, and a tier move
+    changes outputs. Needs kernels whose host op has ``arith``; with an older op the
+    GEMV's arithmetic is all there is. ``card-exact`` and ``card`` are accepted as
+    the earlier names of ``exact`` and ``fast`` (a one-time deprecation line)."""
 
     host_promote_misses: int = Field(default=0, ge=0)
     """Removed (0 only): a CPU slot enters a pinned or a card row in EPLB's
@@ -242,6 +267,15 @@ class ExpertStoreConfig:
 
     @model_validator(mode="after")
     def _check_dirs(self) -> "ExpertStoreConfig":
+        name = cpu_arith_name(self.cpu_arith)
+        if name != self.cpu_arith:
+            logger.warning_once(
+                "--expert-store-config cpu_arith %s is the earlier name of "
+                "%s; it is accepted and will be removed.",
+                self.cpu_arith,
+                CPU_ARITH_WORDS[name],
+            )
+            self.cpu_arith = name  # type: ignore[assignment]
         if len(set(self.dirs)) != len(self.dirs):
             raise ValueError("expert store dirs must be distinct")
         if self.host_promote_misses:
