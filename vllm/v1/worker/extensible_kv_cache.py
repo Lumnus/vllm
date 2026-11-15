@@ -79,6 +79,44 @@ KV_CACHE_NON_TORCH_RESERVE_BYTES = (2 if current_platform.is_rocm() else 1) << 2
 KV_CACHE_WARMUP_RESERVE_FRACTION = 0.1
 
 
+class ServingTransient:
+    """The most serving has needed above torch's steady allocation (bytes).
+
+    Torch's peak statistics give the highest allocation since their last
+    reset, and peak - allocated is a transient only while the steady
+    allocation is what it was at the peak. A move that changes the steady
+    allocation for good (an encoder tower's copy taken off the device) would
+    leave its own bytes in that difference: the grow floor would rise with
+    every such move and never come down. So the statistics are read in
+    windows. A window opens at sizing and after each such move (the peak
+    statistics reset, the allocation then is its base) and closes before the
+    next move, with peak - min(base, allocation then). The largest closed
+    window is kept for good: a load serving has shown can come again. While
+    no window is open (inside a move, or a cache never sized) the transient
+    is peak - allocated, as it was before windows."""
+
+    def __init__(self) -> None:
+        # The largest transient of the windows closed so far.
+        self.closed_bytes = 0
+        # Torch's allocation when the open window began; None: none is open.
+        self.base: int | None = None
+
+    def open(self, allocated: int) -> None:
+        self.base = allocated
+
+    def close(self, allocated: int, peak: int) -> None:
+        self.closed_bytes = self.bytes(allocated, peak)
+        self.base = None
+
+    def bytes(self, allocated: int, peak: int) -> int:
+        """The transient to keep, from torch's allocated and peak bytes now."""
+        if self.base is None:
+            window = peak - allocated
+        else:
+            window = peak - min(self.base, allocated)
+        return max(self.closed_bytes, window, 0)
+
+
 class ExtensibleKVCache:
     """Growable backing allocation for the KV cache.
 
@@ -125,6 +163,10 @@ class ExtensibleKVCache:
         # Memory to keep free while committing before the final sizing, e.g.
         # the profiled activation peak the warmup steps are about to hit.
         self.reserved_headroom_bytes = 0
+        # What serving has needed above torch's steady allocation, read in
+        # windows between moves of torch-held memory (see `ServingTransient`
+        # and `steady_allocation_change`); the grow floor keeps it.
+        self.serving_transient = ServingTransient()
         # Blocks warmup may commit: the minimum of `committable_blocks()` over
         # ranks when the cache is created.
         self.warmup_committable_blocks = 0
@@ -272,6 +314,43 @@ class ExtensibleKVCache:
         self.torch_reserved_at_sizing = torch.accelerator.memory_reserved(device)
         self.torch_allocated_at_sizing = torch.accelerator.memory_allocated(device)
         torch.accelerator.reset_peak_memory_stats(device)
+        self.serving_transient.open(self.torch_allocated_at_sizing)
+
+    def serving_transient_bytes(self, allocated: int, peak: int) -> int:
+        """What serving has needed above torch's steady allocation, from
+        torch's allocated and peak bytes now (`ServingTransient`)."""
+        return self.serving_transient.bytes(allocated, peak)
+
+    @contextmanager
+    def steady_allocation_change(
+        self, device: torch.device, what: str
+    ) -> Iterator[None]:
+        """Around a move that changes what torch holds for good (an encoder
+        tower's copy put on the device or taken off it): the serving window
+        before it closes with its own transient, and a new one opens after
+        it from the allocation then. Neither the move's own peak nor the step
+        it makes in the steady allocation is a transient serving needs."""
+        allocated, peak, _ = _torch_memory_now(device)
+        self.serving_transient.close(allocated, peak)
+        try:
+            yield
+        finally:
+            _, move_peak, _ = _torch_memory_now(device)
+            torch.accelerator.reset_peak_memory_stats(device)
+            after = torch.accelerator.memory_allocated(device)
+            self.serving_transient.open(after)
+            logger.info(
+                "KV cache grow floor: %s moved torch's steady allocation from "
+                "%s to %s GiB (the move's own peak, %s GiB, is not a serving "
+                "transient); serving has needed %s GiB above its steady "
+                "allocation so far, the startup transient is %s GiB.",
+                what,
+                format_gib(allocated),
+                format_gib(after),
+                format_gib(move_peak),
+                format_gib(self.serving_transient.closed_bytes),
+                format_gib(self.reserved_headroom_bytes),
+            )
 
     def zero_blocks(self, start: int, end: int) -> None:
         """Zero the committed blocks from start up to end."""
@@ -1008,6 +1087,16 @@ def _torch_memory_now(device: torch.device) -> tuple[int, int, int]:
     )
 
 
+def _serving_transient(kv_cache: Any, allocated: int, peak: int) -> int:
+    """What serving has needed above torch's steady allocation: the cache's
+    windows (`ServingTransient`), or peak - allocated for a cache without
+    them."""
+    transient = getattr(kv_cache, "serving_transient_bytes", None)
+    if transient is None:
+        return max(peak - allocated, 0)
+    return transient(allocated, peak)
+
+
 def _measure_kv_cache_serving(
     kv_cache: ExtensibleKVCache,
     vllm_config: "VllmConfig",
@@ -1041,12 +1130,14 @@ def _measure_kv_cache_serving(
     budget = kv_cache.torch_memory_budget
     free_memory = current_platform.free_device_memory(device)
     allocated, peak, reserved = _torch_memory_now(device)
+    # The room keeps what serving has needed above the steady allocation, not
+    # the all-time peak less today's allocation (`ServingTransient`).
     room = serving_kv_room(
         free_memory=free_memory,
         mapped_bytes=mapped + external,
         torch_allocated=allocated,
         torch_reserved=reserved,
-        torch_peak=peak,
+        torch_peak=allocated + _serving_transient(kv_cache, allocated, peak),
         startup_reserve=startup_reserve,
         torch_budget=budget,
     )
@@ -1068,7 +1159,7 @@ def _measure_kv_cache_serving(
                 mapped_bytes=mapped + external,
                 torch_allocated=allocated,
                 torch_reserved=reserved,
-                torch_peak=peak,
+                torch_peak=allocated + _serving_transient(kv_cache, allocated, peak),
                 startup_reserve=startup_reserve,
                 torch_budget=budget,
             )
@@ -1100,7 +1191,7 @@ def _measure_kv_cache_serving(
         "KV cache resize measurement: %s GiB free%s, %s GiB mapped for the KV "
         "cache, %d blocks committed; torch allocated %s GiB, reserved %s GiB "
         "(%s reclaimable), peak %s GiB, cap %s GiB of budget %s GiB; keep %s "
-        "GiB above the allocation (%s at startup, %s by the peak); room %s GiB "
+        "GiB above the allocation (%s at startup, %s by serving); room %s GiB "
         "on the device, %s under the cap, %s by the request; %d blocks fit. "
         "Cap fraction total %s GiB, device properties total %s GiB.",
         format_gib(free_memory),
@@ -1115,7 +1206,7 @@ def _measure_kv_cache_serving(
         "no" if budget is None else format_gib(budget),
         format_gib(room.keep),
         format_gib(startup_reserve),
-        format_gib(max(peak - allocated, 0)),
+        format_gib(_serving_transient(kv_cache, allocated, peak)),
         format_gib(room.device_room),
         "no limit" if room.cap_room is None else format_gib(room.cap_room),
         format_gib(max(requested - mapped, 0)),
@@ -1164,13 +1255,14 @@ def grow_torch_floor_bytes(
     """The headroom a grow must leave torch: kv_cache_grow_torch_floor_mib
     when set, else the transient the startup sizing kept free for torch
     (the profiled activation peak, or warmup's transient if larger:
-    `reserved_headroom_bytes`) or the higher allocation serving has shown
-    since, whichever is larger."""
+    `reserved_headroom_bytes`) or the most serving has needed above its
+    steady allocation since (`ServingTransient`), whichever is larger."""
     cache_config = getattr(vllm_config, "cache_config", None)
     setting = getattr(cache_config, "kv_cache_grow_torch_floor_mib", None)
     if setting is not None:
         return int(setting) << 20, "setting"
-    return max(kv_cache.reserved_headroom_bytes, peak - allocated, 0), "transient"
+    serving = _serving_transient(kv_cache, allocated, peak)
+    return max(kv_cache.reserved_headroom_bytes, serving, 0), "transient"
 
 
 def grow_floor(

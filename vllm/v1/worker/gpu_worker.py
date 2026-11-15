@@ -1110,11 +1110,23 @@ class Worker(WorkerBase):
     def tower_residency_poll(self, name: str) -> dict:
         return self._card_tower(name).poll()
 
+    def _steady_allocation_change(self, what: str) -> AbstractContextManager[None]:
+        """A tower's copy is torch memory held for good: the KV cache's grow
+        floor reads serving's transient in windows around its moves
+        (`ExtensibleKVCache.steady_allocation_change`)."""
+        kv_cache = getattr(self.model_runner, "extensible_kv_cache", None)
+        if kv_cache is None:
+            return nullcontext()
+        device = getattr(self.model_runner, "device", None) or self.device
+        return kv_cache.steady_allocation_change(device, what)
+
     def tower_residency_commit(self, name: str, wait_s: float | None = None) -> dict:
-        return self._card_tower(name).commit(wait_s)
+        with self._steady_allocation_change(f"tower {name} put on the device"):
+            return self._card_tower(name).commit(wait_s)
 
     def tower_residency_release(self, name: str) -> dict:
-        return self._card_tower(name).release()
+        with self._steady_allocation_change(f"tower {name} taken off the device"):
+            return self._card_tower(name).release()
 
     def tower_residency_discard(self, name: str) -> None:
         self._card_tower(name).discard()
