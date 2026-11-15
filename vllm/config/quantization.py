@@ -201,6 +201,14 @@ class QuantizationConfigArgs:
     Mutually exclusive with `linear` and `moe`.
     """
 
+    requantize_prequantized: bool = False
+    """With a pre-quantized checkpoint: also re-round layers the checkpoint
+    already holds in the requested integer format or a finer one (e.g. int8 on
+    an int8 layer, int8 on int4 experts). By default such layers are kept as
+    the checkpoint has them, so online quantization cannot undo a calibration;
+    only their activation follows the online spec. A different format (e.g.
+    fp8 on an int8 layer) is always re-quantized, with a warning."""
+
     @field_validator("linear", "moe", mode="before")
     @classmethod
     def _coerce_spec(cls, v: Any, info: ValidationInfo) -> Any:
@@ -415,6 +423,9 @@ def merge_quantization_config(
         moe=merge_spec(base.moe, override.moe),
         ignore=override.ignore or base.ignore,
         targets=override.targets or base.targets,
+        requantize_prequantized=(
+            override.requantize_prequantized or base.requantize_prequantized
+        ),
     )
 
 

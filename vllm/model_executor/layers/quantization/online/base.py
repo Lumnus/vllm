@@ -220,6 +220,12 @@ class OnlineQuantizationConfig(QuantizationConfig):
         self.args = args
         self.ignored_layers: list[str] = args.ignore
         self.quantized_layers: dict[str, tuple[str, str, str | None]] = {}
+        # Checkpoint-quantized layers an online spec matched, by prefix:
+        # (checkpoint format or method, requested spec). Kept: left as the
+        # checkpoint has them (same or coarser integer request). Requantized:
+        # dequantized and quantized again into a different format.
+        self.kept_checkpoint_layers: dict[str, tuple[str, str]] = {}
+        self.requantized_checkpoint_layers: dict[str, tuple[str, str]] = {}
         self.online_quantization_time = 0.0
 
     @property
@@ -250,6 +256,18 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 f"(from {source}: {pattern_prefix}{quant_key_str})"
             )
         return summaries
+
+    @staticmethod
+    def checkpoint_layer_summaries(layers: dict[str, tuple[str, str]]) -> list[str]:
+        """`layer_type: count (checkpoint -> requested)` per kind of layer."""
+        counts: dict[tuple[str, str, str], int] = {}
+        for layer_name, (checkpoint, requested) in layers.items():
+            key = (get_layer_name_after_index(layer_name), checkpoint, requested)
+            counts[key] = counts.get(key, 0) + 1
+        return [
+            f"{layer_type}: {count} ({checkpoint} -> {requested})"
+            for (layer_type, checkpoint, requested), count in sorted(counts.items())
+        ]
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:

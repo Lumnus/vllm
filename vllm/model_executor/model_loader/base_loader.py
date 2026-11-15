@@ -166,6 +166,26 @@ def log_online_quantization(vllm_config: VllmConfig) -> None:
         len(quant_config.quantized_layers),
         "; ".join(quant_config.quantized_layer_summaries),
     )
+    kept = quant_config.kept_checkpoint_layers
+    if kept:
+        logger.info(
+            "Online quantization skipped %d layers already quantized in the "
+            "checkpoint in the requested integer format or a finer one (kept "
+            "as calibrated; set quantization_config.requantize_prequantized "
+            "to re-round them): %s",
+            len(kept),
+            "; ".join(quant_config.checkpoint_layer_summaries(kept)),
+        )
+    requantized = quant_config.requantized_checkpoint_layers
+    if requantized:
+        logger.warning(
+            "Online quantization re-quantizes %d layers that the checkpoint "
+            "already quantized (dequantized, then rounded again into the "
+            "requested format; any checkpoint calibration of these layers is "
+            "replaced): %s",
+            len(requantized),
+            "; ".join(quant_config.checkpoint_layer_summaries(requantized)),
+        )
 
 
 def log_online_quantization_time(vllm_config: VllmConfig) -> None:

@@ -219,6 +219,42 @@ class CompressedTensorsConfig(QuantizationConfig):
             )
         return None
 
+    def get_checkpoint_weight_format(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> tuple[str, int] | None:
+        if isinstance(layer, RoutedExperts):
+            # Resolved like `get_moe_method`: through the unfused projections.
+            self._add_fused_moe_to_target_scheme_map()
+            names = [
+                f"{prefix}.0.{proj}"
+                for proj in (
+                    layer.ckpt_gate_proj_name,
+                    layer.ckpt_up_proj_name,
+                    layer.ckpt_down_proj_name,
+                )
+            ]
+        elif isinstance(layer, (LinearBase, ParallelLMHead)):
+            names = [prefix]
+        else:
+            return None
+        formats = set()
+        for name in names:
+            try:
+                scheme_dict = self.get_scheme_dict(layer, name)
+            except ValueError:
+                return None
+            weight_quant = scheme_dict.get("weights") if scheme_dict else None
+            if not isinstance(weight_quant, QuantizationArgs):
+                return None
+            if weight_quant.type == QuantizationType.INT:
+                kind = "int"
+            elif weight_quant.type == QuantizationType.FLOAT:
+                kind = "float"
+            else:
+                return None
+            formats.add((kind, int(weight_quant.num_bits)))
+        return formats.pop() if len(formats) == 1 else None
+
     def _add_fused_moe_to_target_scheme_map(self):  # XXXXXXXXXXXXXXXXXXXXXX
         """Helper function to update target_scheme_map
         since linear layers get fused into RoutedExperts
