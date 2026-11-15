@@ -12,6 +12,7 @@ import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed.eplb.expert_weights import ExpertWeight
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe import xpu_eddy
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -938,6 +939,16 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             self.placement_trace.record(tiers, topk_ids, topk_weights)
         cpu = getattr(tiers, "cpu", None)
         mode = self._tiered_combine_mode(cpu)
+        if cpu is not None and mode != "split":
+            # VLLM_CPU_EXPERTS_EDDY: while a step's book is open, rows that
+            # need the CPU park here instead of the batch waiting.
+            book = xpu_eddy.current_book()
+            if book is not None:
+                book.moe_layer(
+                    self, fast, slow, output, hidden_states, topk_weights, topk_ids
+                )
+                return
+            xpu_eddy.drain_host_for_sync_path()
         if cpu is None:
             pending = None
         elif mode == "split":

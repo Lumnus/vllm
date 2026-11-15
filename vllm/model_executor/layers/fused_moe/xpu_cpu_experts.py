@@ -37,7 +37,8 @@ the same layer call (``card_arith``), when the installed op has the
 expert's output differs from the card's in the last bit of a small share of
 its values. An op without it computes the GEMV's arithmetic for every call.
 
-``cpu_arith card-exact`` (the default) removes that last difference for the
+``cpu_arith exact`` (the default; bit-identical to the card; earlier
+name ``card-exact``) removes that last difference for the
 grouped GEMM: the op's arith 7 computes it as the card does, measured on the
 card (weights truncated to bf16(q * s), products summed exactly in blocks of
 16, one fp32 rounding per block), with the card's own silu, taken on the
@@ -77,6 +78,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from vllm.config.expert_store import cpu_arith_name
 from vllm.logger import init_logger
 from vllm.v1 import runtime_debug
 
@@ -1387,11 +1389,11 @@ class CpuExpertRuntime:
         # The arith of the layer call being computed (card_arith); 0 when the
         # op has no such argument (it computes the GEMV's arithmetic).
         self.arith = 0
-        # cpu_arith card-exact: the card's silu table (taken on the card) and
+        # cpu_arith exact: the card's silu table (taken on the card) and
         # whether the op computes the card's grouped GEMM exactly
         self.silu_table: torch.Tensor | None = None
         self.card_exact = False
-        if not self.w4a8 and config.cpu_arith == "card-exact":
+        if not self.w4a8 and cpu_arith_name(config.cpu_arith) == "exact":
             self._take_card_exact()
         # the staging rule's measurements (stage_min_tokens)
         self.cost = StageCost()
@@ -1404,6 +1406,9 @@ class CpuExpertRuntime:
         self._slab_unregistrable: int | None = None
         self._dma_held: list[int] = []
         self._buffers: _Buffers | None = None
+        # Buffer sets of their own, by key (VLLM_CPU_EXPERTS_EDDY: one per
+        # layer and ring slot, since nothing waits for one to drain)
+        self._keyed_buffers: dict[Any, _Buffers] = {}
         # the kernels' select op (VLLM_CPU_EXPERTS_SELECT), its kept outputs
         self._select_op = _select_op()
         self._select_out: tuple[Any, ...] | None = None
@@ -1450,14 +1455,16 @@ class CpuExpertRuntime:
         )
 
     def _take_card_exact(self) -> None:
-        """cpu_arith card-exact: the op's arith 7 with the card's silu table,
-        or ``card`` with a warning when the op or the card cannot give it."""
+        """cpu_arith exact: the op's arith 7 with the card's silu table,
+        or ``fast`` with a warning when the op or the card cannot give it."""
         if not (op_takes_arith() and op_takes_silu_table()):
             logger.warning_once(
-                "CPU experts: cpu_arith card-exact needs vllm-xpu-kernels whose "
+                "CPU experts: cpu_arith exact (bit-identical to the card) needs "
+                "vllm-xpu-kernels whose "
                 "host op takes silu_table (the card's grouped GEMM and silu, "
                 "exactly); the installed op does not. Computing the card "
-                "kernel's arithmetic per call instead (cpu_arith card): a small "
+                "kernel's arithmetic per call instead (cpu_arith fast, within the "
+                "floor): a small "
                 "share of an expert's values differ from the card's in the last "
                 "bit, so a tier move can change outputs."
             )
@@ -1465,10 +1472,11 @@ class CpuExpertRuntime:
         table = capture_card_silu_table()
         if table is None:
             logger.warning_once(
-                "CPU experts: cpu_arith card-exact takes the card's silu as a "
+                "CPU experts: cpu_arith exact (bit-identical to the card) takes the "
+                "card's silu as a "
                 "table from the card at start; no card (or no activation op of "
                 "the kernels) is available here. Computing the card kernel's "
-                "arithmetic per call instead (cpu_arith card)."
+                "arithmetic per call instead (cpu_arith fast, within the floor)."
             )
             return
         if table.numel() != _SILU_TABLE_LEN or table.element_size() != 2:
@@ -1480,11 +1488,12 @@ class CpuExpertRuntime:
         self.card_exact = True
 
     def arith_mode(self) -> str:
-        """The arithmetic in effect: cpu_arith, with card-exact falling back
-        to card when the op or the card could not give it."""
-        mode = str(self.config.cpu_arith)
-        if mode == "card-exact" and not self.card_exact:
-            return "card"
+        """The arithmetic in effect: cpu_arith (by its current name), with
+        exact falling back to fast when the op or the card could not give
+        it."""
+        mode = cpu_arith_name(self.config.cpu_arith)
+        if mode == "exact" and not self.card_exact:
+            return "fast"
         return mode
 
     # -- settings a running engine may change (runtime control: cpu.set) -------
@@ -1653,7 +1662,7 @@ class CpuExpertRuntime:
         if (
             not self.w4a8
             and op_takes_arith()
-            and self.arith_mode() in ("card", "card-exact")
+            and self.arith_mode() in ("fast", "exact")
         ):
             # The grouped GEMM's arithmetic (every call of a top-10 model).
             grouped = torch.empty_like(x)
@@ -1775,10 +1784,10 @@ class CpuExpertRuntime:
         calls: Sequence[tuple[int, int, float]],
         tensors: Mapping[Any, Mapping[str, torch.Tensor]],
     ) -> None:
-        """cpu_arith card-exact: the op's arith 7 against the card's model in
+        """cpu_arith exact: the op's arith 7 against the card's model in
         torch with the card's silu table, 0 differing values required; every
         level against the scalar code bit for bit; the CPU cost per
-        expert-token against the card kernel's arithmetic (``card``)."""
+        expert-token against the card kernel's arithmetic (``fast``)."""
         L = self.layout
         got = torch.empty_like(x)
         self._run_check_calls(got, x, units, calls, ARITH_CARD_EXACT)
@@ -1794,7 +1803,7 @@ class CpuExpertRuntime:
         differ = int((got.view(torch.int16) != want.view(torch.int16)).sum())
         if differ:
             raise CpuExpertError(
-                f"the CPU expert kernel's card-exact arithmetic "
+                f"the CPU expert kernel's exact arithmetic "
                 f"({_ISA_NAME[self.isa]}) differs from the card's model in "
                 f"{differ} of {got.numel()} values on random experts: refusing "
                 "to compute experts with it"
@@ -1804,17 +1813,18 @@ class CpuExpertRuntime:
             self._run_check_calls(scalar, x, units, calls, ARITH_CARD_EXACT, isa=1)
             if not torch.equal(scalar.view(torch.int16), got.view(torch.int16)):
                 raise CpuExpertError(
-                    f"the CPU expert kernel's card-exact {_ISA_NAME[self.isa]} "
+                    f"the CPU expert kernel's exact {_ISA_NAME[self.isa]} "
                     "code and its scalar code disagree: refusing to compute "
                     "experts with it"
                 )
         exact_us, card_us, n = self._cost_per_expert_token()
         logger.info(
-            "CPU experts: card-exact (the card's grouped GEMM and silu, "
+            "CPU experts: exact (bit-identical to the card: its grouped GEMM "
+            "and silu, "
             "exactly; silu table of %d entries taken on the card): self-check "
             "0 of %d values differ from the card's model%s. CPU cost per "
             "expert-token at decode (%d experts x 1 token, %d threads): "
-            "%.1f us card-exact, %.1f us card (%.2fx).",
+            "%.1f us exact, %.1f us fast (within the floor) (%.2fx).",
             self.silu_table.numel(),
             got.numel(),
             f"; {_ISA_NAME[self.isa]} and scalar code bit-identical"
@@ -1831,7 +1841,7 @@ class CpuExpertRuntime:
         self, experts: int = 8, reps: int = 5
     ) -> tuple[float, float, int]:
         """Median microseconds per expert-token of the op at decode (one
-        token through ``experts`` random experts), card-exact and card."""
+        token through ``experts`` random experts), exact and fast."""
         L = self.layout
         gen = torch.Generator().manual_seed(20261114)
         units = torch.randint(
@@ -1860,10 +1870,12 @@ class CpuExpertRuntime:
 
     # -- a layer ----------------------------------------------------------------
 
-    def _buffers_for(self, tokens: int, topk: int, hidden: int) -> _Buffers:
+    def _buffers_for(
+        self, tokens: int, topk: int, hidden: int, key: Any = None
+    ) -> _Buffers:
         from vllm.utils.platform_utils import is_pin_memory_available
 
-        b = self._buffers
+        b = self._buffers if key is None else self._keyed_buffers.get(key)
         if (
             b is None
             or b.x.shape[0] < tokens
@@ -1879,7 +1891,10 @@ class CpuExpertRuntime:
                 out=torch.empty((n, hidden), dtype=torch.bfloat16, pin_memory=pin),
             )
             b.x_i16 = b.x.view(torch.int16).numpy()
-            self._buffers = b
+            if key is None:
+                self._buffers = b
+            else:
+                self._keyed_buffers[key] = b
         return b
 
     def post(
@@ -1889,11 +1904,14 @@ class CpuExpertRuntime:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
         weights: bool = True,
+        buffers_key: Any = None,
     ) -> Pending:
         """Enqueue the copies of a layer's routing and inputs to the host,
         before the card's own experts of the layer. ``weights`` False: the
         router weights stay on the device (:meth:`finish_pairs` and
-        :meth:`stage` do not read them; :meth:`finish` does)."""
+        :meth:`stage` do not read them; :meth:`finish` does). ``buffers_key``:
+        a pinned buffer set of its own for that key instead of the shared
+        one (the eddy's layer calls, which no one waits for)."""
         if (
             hidden_states.device.type != "cpu"
             and torch.accelerator.current_stream().is_capturing()
@@ -1910,7 +1928,7 @@ class CpuExpertRuntime:
         if runtime_debug.on("cpustep"):
             times = {"post": time.perf_counter()}
         tokens, topk = topk_ids.shape
-        b = self._buffers_for(tokens, topk, hidden_states.shape[1])
+        b = self._buffers_for(tokens, topk, hidden_states.shape[1], buffers_key)
         b.ids[:tokens].copy_(topk_ids, non_blocking=True)
         if weights:
             b.weights[:tokens].copy_(topk_weights, non_blocking=True)
@@ -1922,18 +1940,18 @@ class CpuExpertRuntime:
         mode = self.arith_mode() if not self.w4a8 and op_takes_arith() else "gemv"
         arith = (
             card_arith(tokens * topk, L.hidden, L.inter, L.group)
-            if mode in ("card", "card-exact")
+            if mode in ("fast", "exact")
             else 0
         )
-        if mode == "card-exact":
+        if mode == "exact":
             if arith == 3:
                 arith = ARITH_CARD_EXACT
             else:
                 logger.info_once(
                     "CPU experts: a layer call of %d rows runs the card's int4 "
-                    "GEMV for a GEMM; card-exact covers the card's grouped GEMM, "
+                    "GEMV for a GEMM; exact covers the card's grouped GEMM, "
                     "so such calls take the card kernel's arithmetic per call "
-                    "(cpu_arith card).",
+                    "(cpu_arith fast, within the floor).",
                     tokens * topk,
                 )
         pending = Pending(tiers, tokens, event, b, arith=arith, weights=weights)

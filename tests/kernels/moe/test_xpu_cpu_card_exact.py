@@ -145,8 +145,8 @@ def test_the_default_computes_the_cards_bits(monkeypatch, tmp_path, exact_op):
     _fake_kernels(monkeypatch)
     env = _env(monkeypatch, tmp_path)
     rt = env.tiers[1].cpu
-    assert rt.config.cpu_arith == "card-exact"
-    assert rt.card_exact and rt.arith_mode() == "card-exact"
+    assert rt.config.cpu_arith == "exact"
+    assert rt.card_exact and rt.arith_mode() == "exact"
     assert taken == [1]
     assert (cx.ARITH_CARD_EXACT, True) in seen  # the start check
     tiers = env.tiers[1]
@@ -187,11 +187,11 @@ def test_the_start_check_logs_no_differing_value_and_the_cost(
 
     monkeypatch.setattr(cx.logger, "info", info)
     _env(monkeypatch, tmp_path)
-    exact = [line for line in lines if "card-exact" in line]
+    exact = [line for line in lines if "exact (bit-identical to the card" in line]
     assert len(exact) == 1
     assert "0 of 768 values differ from the card's model" in exact[0]
     assert "CPU cost per expert-token at decode (8 experts x 1 token" in exact[0]
-    assert "us card-exact" in exact[0] and "us card (" in exact[0]
+    assert "us exact" in exact[0] and "us fast (within the floor)" in exact[0]
 
 
 def test_an_op_that_is_not_the_cards_is_refused(monkeypatch, tmp_path, exact_op):
@@ -222,7 +222,7 @@ def test_an_op_without_the_table_falls_back_to_card(monkeypatch, tmp_path, exact
     _fake_kernels(monkeypatch)
     env = _env(monkeypatch, tmp_path)
     rt = env.tiers[1].cpu
-    assert not rt.card_exact and rt.arith_mode() == "card"
+    assert not rt.card_exact and rt.arith_mode() == "fast"
     assert taken == []
     assert all(arith != cx.ARITH_CARD_EXACT for arith, _ in seen)
     assert len([m for m in warned if "silu_table" in m]) == 1
@@ -241,7 +241,7 @@ def test_no_card_to_take_the_table_from_falls_back_to_card(
     _fake_kernels(monkeypatch)
     env = _env(monkeypatch, tmp_path)
     rt = env.tiers[1].cpu
-    assert not rt.card_exact and rt.arith_mode() == "card"
+    assert not rt.card_exact and rt.arith_mode() == "fast"
     assert len([m for m in warned if "no card" in m]) == 1
     ids, w, x = _inputs()
     assert rt.post(env.tiers[1], x, ids, w).arith == 3
@@ -250,7 +250,8 @@ def test_no_card_to_take_the_table_from_falls_back_to_card(
 def test_cpu_arith_card_and_gemv_are_unchanged(monkeypatch, tmp_path, exact_op):
     seen, taken, _ = exact_op
     _fake_kernels(monkeypatch)
-    for mode, want in (("card", 3), ("gemv", 0)):
+    # "card" is the earlier name of "fast", still accepted
+    for mode, want in (("fast", 3), ("card", 3), ("gemv", 0)):
         cx.reset_runtime()
         seen.clear()
         env = _env(monkeypatch, tmp_path, cpu_arith=mode)
