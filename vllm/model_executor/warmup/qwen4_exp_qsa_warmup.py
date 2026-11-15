@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# `qsa_prepare` picks its query tile by this step size.
+_PREPARE_SMALL_STEP_TOKENS = 4096
+
 
 def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
     """Warm every reachable QSA specialization: indexer decode-query-length
@@ -84,9 +87,29 @@ def qwen4_exp_qsa_triton_warmup(worker: "Worker") -> None:
             num_query_heads=attention.num_heads,
             selection_width=indexer.output_width,
             head_dim=attention.head_dim,
+            int8_dot=getattr(attention.impl, "int8_dot", 0),
         )
         logger.info(
             "Warmed up Qwen4Exp QSA sparse attention kernels (%s): %s.",
             attention.kv_cache_dtype,
             attention_profiles,
         )
+
+    # The fused prepare kernel takes a wider query tile above 4,096 scheduled
+    # tokens, and only a step that large reaches it: run one when the step
+    # budget allows such steps.
+    max_step_tokens = min(runner.max_num_tokens, worker.model_config.max_model_len)
+    if max_step_tokens > _PREPARE_SMALL_STEP_TOKENS:
+        from vllm.v1.worker.gpu.warmup import run_mixed_prefill_decode_warmup
+
+        if run_mixed_prefill_decode_warmup(
+            runner,
+            worker.execute_model,
+            worker.sample_tokens,
+            max_step_tokens,
+            req_id_prefix="_qsa_prepare_warmup",
+        ):
+            logger.info(
+                "Warmed up the Qwen4Exp QSA prepare kernel on a step of %d tokens.",
+                max_step_tokens,
+            )

@@ -694,9 +694,13 @@ def qsa_sparse_paged_attention(
     output_gate: torch.Tensor,
     k_scale_cache: torch.Tensor | None = None,
     v_scale_cache: torch.Tensor | None = None,
+    int8_dot: int = 0,
 ) -> torch.Tensor:
     """Run sparse GQA directly over paged BF16, FP8-e4m3 or int8 per-token-head
     K/V caches.
+
+    ``int8_dot`` (XPU, int8 per-token-head caches): 1 runs Q.K in int8, 2 also
+    P.V; see the XPU tile kernel.
 
     An int8 per-token-head cache (``int8_per_token_head``) comes as the int8
     K/V views of ``qsa_pth_kv_views`` plus ``k_scale_cache``/``v_scale_cache``,
@@ -807,6 +811,7 @@ def qsa_sparse_paged_attention(
         softmax_scale,
         output_scale,
         pth_scales,
+        int8_dot,
     )
 
 
@@ -823,6 +828,7 @@ def _qsa_sparse_paged_splitk(
     softmax_scale: float,
     output_scale: float,
     pth_scales: dict,
+    int8_dot: int = 0,
 ) -> torch.Tensor:
     """The split-K kernel (and merge) at _select_config's config.
 
@@ -848,7 +854,9 @@ def _qsa_sparse_paged_splitk(
             output_scale,
             block_m,
             pth_scales=pth_scales,
+            int8_dot=int8_dot,
         )
+    assert not int8_dot, "the int8 dot is an XPU attn2 path"
     selection_width = logical_indices.shape[1] - 1  # trailing column is the count
     block_n, partial_warps, num_tiles, num_splits = _select_config(
         q.shape[0], k_cache.shape[2], use_prefill_config, selection_width, is_fp8
@@ -1042,6 +1050,7 @@ def warmup_qsa_sparse_paged_attention(
     num_query_heads: int,
     selection_width: int,
     head_dim: int | None = None,
+    int8_dot: int = 0,
 ) -> tuple[tuple[int | str, ...], ...]:
     """Compile every production-reachable split-K/merge and decode
     specialization.
@@ -1060,6 +1069,7 @@ def warmup_qsa_sparse_paged_attention(
             num_query_heads=num_query_heads,
             selection_width=selection_width,
             head_dim=head_dim,
+            int8_dot=int8_dot,
         )
     pth_scales: dict = {}
     if kv_cache.dtype == torch.int8:

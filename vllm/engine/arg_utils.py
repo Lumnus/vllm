@@ -847,6 +847,9 @@ class EngineArgs:
     mamba_cache_dtype: MambaDType = CacheConfig.mamba_cache_dtype
     mamba_ssm_cache_dtype: MambaDType = CacheConfig.mamba_ssm_cache_dtype
     mamba_block_size: int | None = get_field(CacheConfig, "mamba_block_size")
+    packed_kv_repeats_per_group: int | None = get_field(
+        CacheConfig, "packed_kv_repeats_per_group"
+    )
     prefix_match_unit: int | None = get_field(CacheConfig, "prefix_match_unit")
     mamba_cache_mode: MambaCacheMode | None = None
     enable_mamba_shared_prefix_checkpoint: bool = (
@@ -1491,6 +1494,10 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--mamba-block-size", **cache_kwargs["mamba_block_size"]
+        )
+        cache_group.add_argument(
+            "--packed-kv-repeats-per-group",
+            **cache_kwargs["packed_kv_repeats_per_group"],
         )
         cache_group.add_argument(
             "--prefix-match-unit", **cache_kwargs["prefix_match_unit"]
@@ -2431,6 +2438,7 @@ class EngineArgs:
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,
             mamba_block_size=self.mamba_block_size,
+            packed_kv_repeats_per_group=self.packed_kv_repeats_per_group,
             prefix_match_unit=self.prefix_match_unit,
             enable_mamba_shared_prefix_checkpoint=(
                 self.enable_mamba_shared_prefix_checkpoint

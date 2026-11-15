@@ -3,6 +3,7 @@
 """KV cache planning: grouping, sizing, and memory-fit logic."""
 
 import math
+import re
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import replace
@@ -1066,6 +1067,11 @@ def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -
     return best_d
 
 
+def _layer_order_key(layer_name: str) -> tuple[tuple[int, ...], str]:
+    """Order layer names by the indices they carry, then by name."""
+    return tuple(int(index) for index in re.findall(r"\d+", layer_name)), layer_name
+
+
 def _get_packed_kv_cache_groups(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -1078,6 +1084,9 @@ def _get_packed_kv_cache_groups(
     repeats (picked by `_approximate_gcd` to minimize padding), so all
     groups pack into the same per-block layout. Mamba buckets are additionally
     split to fit the block the attention buckets already need.
+    `CacheConfig.packed_kv_repeats_per_group` sets the repeats per group, which
+    lets a balanced mixed-page bucket split into narrower groups; state buckets
+    then hold as many states per group as that narrower block fits.
     Returns None when the layout is not block-outermost or all layers already
     share one page size.
     """
@@ -1132,6 +1141,23 @@ def _get_packed_kv_cache_groups(
         if min_repeats_per_group
         else None
     )
+    # An explicit repeat count splits the mixed-page buckets too. Every group
+    # reserves whole blocks per request and a block is as wide as the widest
+    # group, so narrower groups cut what each running request reserves.
+    requested_repeats = vllm_config.cache_config.packed_kv_repeats_per_group
+    split_requested = (
+        repeats_per_group is not None
+        and requested_repeats is not None
+        and requested_repeats < repeats_per_group
+    )
+    if split_requested:
+        logger.info_once(
+            "Packed KV cache groups: %d repeat(s) of the layer pattern per "
+            "group (planner default %d).",
+            requested_repeats,
+            repeats_per_group,
+        )
+        repeats_per_group = requested_repeats
 
     def num_groups_for(spec: UniformTypeKVCacheSpecs, balanced: bool) -> int:
         if balanced and repeats_per_group is not None:
@@ -1174,14 +1200,27 @@ def _get_packed_kv_cache_groups(
         # it widen the block.
         if anchor_bytes and is_state_bucket(spec):
             states_per_block = max(anchor_bytes // spec.first_spec.page_size_bytes, 1)
-            num_groups = max(
-                num_groups, cdiv(len(spec.kv_cache_specs), states_per_block)
+            fitted_groups = cdiv(len(spec.kv_cache_specs), states_per_block)
+            # With an explicit split the repeat count describes the attention
+            # pattern only: a state group holds what the block fits, so small
+            # states (e.g. circular buffers) do not take one block per layer.
+            num_groups = (
+                fitted_groups if split_requested else max(num_groups, fitted_groups)
             )
         if num_groups == 1:
             groups.append(KVCacheGroupSpec(list(spec.kv_cache_specs), spec))
             continue
 
-        pattern_repeats = list(zip(*page_size_layers.values()))
+        # Pair the layers of one repeat by layer index, not by registration
+        # order, so a split group holds each layer with its own side caches.
+        pattern_repeats = list(
+            zip(
+                *(
+                    sorted(names, key=_layer_order_key)
+                    for names in page_size_layers.values()
+                )
+            )
+        )
         for i in range(num_groups):
             group_layer_names = [
                 name for repeat in pattern_repeats[i::num_groups] for name in repeat

@@ -1493,6 +1493,10 @@ class SamplingParams(
             logprobs=5,
             prompt_logprobs=1,
             watermarking=True,
+            # Compiles the thinking-budget kernels where a reasoning config
+            # enables them; the warm-up prompts hold no reasoning marker, so
+            # nothing is forced.
+            thinking_token_budget=1,
         )
 
 

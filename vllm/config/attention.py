@@ -93,6 +93,14 @@ class AttentionConfig:
     use_prefill_query_quantization: bool = False
     """If set, quantize query for attention in prefill."""
 
+    qsa_int8_dot: Literal["off", "qk", "qk_pv"] = "off"
+    """Qwen4Exp QSA sparse attention over an int8 per-token-head KV cache on
+    XPU: run the dots in int8. "qk" quantizes the query to int8 per (token,
+    head) and computes Q.K as an int8 x int8 -> int32 dot, scaled afterwards;
+    "qk_pv" also quantizes the attention weights per head row of a tile and
+    computes P.V in int8. "off" widens the int8 K/V rows to the query dtype for
+    the dots."""
+
     trtllm_ragged_backend: Literal["trtllm-gen", "cute-dsl"] = "trtllm-gen"
     """Kernel backend for cached-context TRTLLM_RAGGED MLA prefill.
     CuTe DSL requires FP8 queries for head dimension 192 and does not support
