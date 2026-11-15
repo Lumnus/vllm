@@ -281,7 +281,11 @@ class AttentionConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        return get_compile_factors(self, set())
+        # qsa_int8_dot selects the QSA kernels when set; "off" (the default)
+        # keeps the key of a config without the field, so a def that does not
+        # set it reuses its compiled graphs.
+        ignored = {"qsa_int8_dot"} if self.qsa_int8_dot == "off" else set()
+        return get_compile_factors(self, ignored)
 
     @field_validator("backend", mode="before")
     @classmethod
