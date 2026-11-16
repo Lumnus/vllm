@@ -112,6 +112,17 @@ class AttentionConfig:
     without a sliding window or sinks only; "off" (the default) keeps the BF16
     scratch."""
 
+    int8_decode_dot: Literal["off", "qk"] = "off"
+    """Decode and speculative-decode verify rows (query length up to the
+    kernels' spec-decode bound, 16) over an int8_per_token_head KV cache on the
+    XPU FlashAttention backend: "qk" makes the paged decode kernel quantize the
+    query to int8 per (token, head) itself, with the rule int8_prefill_dot
+    uses, and compute Q.K as an int8 x int8 -> int32 dot on the matrix engine,
+    scaled by the query and K scales afterwards; softmax and P.V are unchanged.
+    Prefilled and decoded tokens then attend with the same query rounding.
+    BF16 models with head size up to 256; "off" (the default) multiplies the
+    widened K codes by the BF16 query."""
+
     trtllm_ragged_backend: Literal["trtllm-gen", "cute-dsl"] = "trtllm-gen"
     """Kernel backend for cached-context TRTLLM_RAGGED MLA prefill.
     CuTe DSL requires FP8 queries for head dimension 192 and does not support
@@ -292,12 +303,13 @@ class AttentionConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        # qsa_int8_dot and int8_prefill_dot select attention kernels when set;
+        # qsa_int8_dot, int8_prefill_dot and int8_decode_dot select attention
+        # kernels when set;
         # "off" (the default) keeps the key of a config without the field, so
         # a def that does not set it reuses its compiled graphs.
         ignored = {
             name
-            for name in ("qsa_int8_dot", "int8_prefill_dot")
+            for name in ("qsa_int8_dot", "int8_prefill_dot", "int8_decode_dot")
             if getattr(self, name) == "off"
         }
         return get_compile_factors(self, ignored)
