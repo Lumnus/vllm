@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""A unit source for GPTQ / AutoRound int4 MoE checkpoints in safetensors.
+"""A unit source for int4 MoE checkpoints in safetensors: GPTQ / AutoRound
+(``qweight`` / ``qzeros`` / ``scales``, K-first) and compressed-tensors
+``pack-quantized`` (``weight_packed`` / ``weight_scale`` / ``weight_shape``,
+N-first), told apart by the tensor names.
 
 It lets the expert store be built outside the engine, on the CPU, straight
 from a model's weight files: ``UnitSource`` for
@@ -53,6 +56,19 @@ DEFAULT_NAME_FORMATS = (
 )
 GATE, UP, DOWN = "gate_proj", "up_proj", "down_proj"
 QWEIGHT, QZEROS, SCALES = "qweight", "qzeros", "scales"
+WEIGHT_PACKED, WEIGHT_SHAPE, WEIGHT_SCALE = (
+    "weight_packed",
+    "weight_shape",
+    "weight_scale",
+)
+GPTQ, CT_PACKED = "gptq", "compressed-tensors"
+# Per checkpoint format, the tensor kinds of one projection in the roles
+# (weight, checked-only, scales), and whether weights and scales are K-first.
+_KINDS = {
+    GPTQ: (QWEIGHT, QZEROS, SCALES),
+    CT_PACKED: (WEIGHT_PACKED, WEIGHT_SHAPE, WEIGHT_SCALE),
+}
+_K_FIRST = {GPTQ: True, CT_PACKED: False}
 
 _DTYPES: dict[str, torch.dtype] = {
     "I32": torch.int32,
@@ -314,14 +330,25 @@ def _read_config(path: str) -> dict[str, Any]:
                     return src[key]
         return None
 
+    bits, group_size, sym = quant.get("bits"), quant.get("group_size"), quant.get("sym")
+    if quant.get("quant_method") == "compressed-tensors":
+        # the scheme of the config group that targets the routed experts
+        for group in (quant.get("config_groups") or {}).values():
+            targets = " ".join(str(t) for t in group.get("targets") or ())
+            weights = group.get("weights") or {}
+            if "experts" in targets and weights:
+                bits = weights.get("num_bits")
+                group_size = weights.get("group_size")
+                sym = weights.get("symmetric")
+                break
     return {
         "hidden_size": first("hidden_size"),
         "moe_intermediate_size": first("moe_intermediate_size"),
         "num_experts": first("num_experts", "num_local_experts", "n_routed_experts"),
         "num_hidden_layers": first("num_hidden_layers"),
-        "bits": quant.get("bits"),
-        "group_size": quant.get("group_size"),
-        "sym": quant.get("sym"),
+        "bits": bits,
+        "group_size": group_size,
+        "sym": sym,
         "quant_method": quant.get("quant_method"),
     }
 
@@ -419,32 +446,33 @@ class CheckpointExperts:
 
     def _discover(self, name_format: str | None) -> None:
         projs = self.proj_names
-        kinds = (QWEIGHT, QZEROS, SCALES)
         formats = [name_format] if name_format else list(DEFAULT_NAME_FORMATS)
         names = list(self.files.refs)
-        best: tuple[int, str, re.Pattern, dict[tuple[int, int], int]] | None = None
-        for fmt in formats:
-            rx = _name_regex(fmt, projs, kinds)
-            present: dict[tuple[int, int], int] = {}
-            hits = 0
-            for name in names:
-                m = rx.fullmatch(name)
-                if m is None:
-                    continue
-                key = (int(m["layer"]), int(m["expert"]))
-                bit = 1 << (projs.index(m["proj"]) * 3 + kinds.index(m["kind"]))
-                present[key] = present.get(key, 0) | bit
-                hits += 1
-            if hits and (best is None or hits > best[0]):
-                best = (hits, fmt, rx, present)
-            if hits and name_format is None:
-                break
+        best: tuple[int, str, str, re.Pattern, dict[tuple[int, int], int]] | None = None
+        for layout, kinds in _KINDS.items():
+            for fmt in formats:
+                rx = _name_regex(fmt, projs, kinds)
+                present: dict[tuple[int, int], int] = {}
+                hits = 0
+                for name in names:
+                    m = rx.fullmatch(name)
+                    if m is None:
+                        continue
+                    key = (int(m["layer"]), int(m["expert"]))
+                    bit = 1 << (projs.index(m["proj"]) * 3 + kinds.index(m["kind"]))
+                    present[key] = present.get(key, 0) | bit
+                    hits += 1
+                if hits and (best is None or hits > best[0]):
+                    best = (hits, layout, fmt, rx, present)
+                if hits and name_format is None:
+                    break
         if best is None:
             raise CheckpointError(
                 f"{self.model}: no routed-expert tensors match "
                 f"{formats if len(formats) > 1 else formats[0]!r} (set name_format)"
             )
-        self.tensors_used, self.name_format, rx, present = best
+        self.tensors_used, self.layout, self.name_format, rx, present = best
+        self._kind_w, self._kind_x, self._kind_s = _KINDS[self.layout]
         self._rx = rx
         full = (1 << 9) - 1
         partial = [k for k, bits in present.items() if bits != full]
@@ -493,7 +521,7 @@ class CheckpointExperts:
             elif "shared_expert" in pattern:
                 reason = "shared expert: not a routed expert, it stays in the layer"
             elif pattern.endswith((".weight", ".bias")):
-                reason = "unquantized tensor: not int4 GPTQ material"
+                reason = "unquantized tensor: not int4 material"
             else:
                 reason = (
                     "name does not match the pattern (set name_format if these "
@@ -517,8 +545,8 @@ class CheckpointExperts:
     def _derive_shapes(self) -> None:
         refs = self.files.refs
         n = self._name
-        gate_q = refs[n(0, 0, self._gate, QWEIGHT)]
-        gate_s = refs[n(0, 0, self._gate, SCALES)]
+        gate_q = refs[n(0, 0, self._gate, self._kind_w)]
+        gate_s = refs[n(0, 0, self._gate, self._kind_s)]
         cfg = self.config
         bits = cfg.get("bits") or 4
         if bits != 4:
@@ -526,9 +554,13 @@ class CheckpointExperts:
                 f"{bits}-bit weights: the engine's store is int4 only"
             )
         pack = 32 // bits
-        k8, inter = gate_q.shape
+        if _K_FIRST[self.layout]:
+            k8, inter = gate_q.shape
+            groups = gate_s.shape[0]
+        else:
+            inter, k8 = gate_q.shape
+            groups = gate_s.shape[1]
         hidden = k8 * pack
-        groups = gate_s.shape[0]
         if cfg.get("group_size") is not None:
             group_size = int(cfg["group_size"])
         else:
@@ -559,6 +591,11 @@ class CheckpointExperts:
                     f"config.json says {field} {want}, the tensors say {have}"
                 )
         if cfg.get("sym") is False:
+            if self.layout == CT_PACKED:
+                raise CheckpointError(
+                    "config.json says the experts are not symmetric: the engine "
+                    "keeps asymmetric compressed-tensors experts in VRAM"
+                )
             self._sym_note = "config.json says sym=false"
         else:
             self._sym_note = ""
@@ -582,6 +619,17 @@ class CheckpointExperts:
         g13, g2 = self.groups13, self.groups2
         i32 = ("I32",)
         out: dict[tuple[str, str], _Expect] = {}
+        if self.layout == CT_PACKED:
+            # N-first words and scales; weight_shape is the [out, in] pair
+            ints = ("I32", "I64")
+            for proj in (self._gate, self._up):
+                out[(proj, WEIGHT_PACKED)] = (i32, (n, k // p))
+                out[(proj, WEIGHT_SHAPE)] = (ints, (2,))
+                out[(proj, WEIGHT_SCALE)] = (_SCALE_DTYPES, (n, g13))
+            out[(self._down, WEIGHT_PACKED)] = (i32, (k, n // p))
+            out[(self._down, WEIGHT_SHAPE)] = (ints, (2,))
+            out[(self._down, WEIGHT_SCALE)] = (_SCALE_DTYPES, (k, g2))
+            return out
         for proj in (self._gate, self._up):
             out[(proj, QWEIGHT)] = (i32, (k // p, n))
             out[(proj, QZEROS)] = (i32, (g13, n // p))
@@ -607,21 +655,38 @@ class CheckpointExperts:
         if self.check_qzeros:
             self._check_qzeros(key, get)
         # gate then up, along the output dimension: the loader's w1 / w3 order
-        w13_qweight = torch.cat([get(self._gate, QWEIGHT), get(self._up, QWEIGHT)], 1)
-        w13_scales = torch.cat([get(self._gate, SCALES), get(self._up, SCALES)], 1)
+        # (dim 1 of the K-first GPTQ tensors, dim 0 of the N-first ones)
+        k_first = _K_FIRST[self.layout]
+        out_dim = 1 if k_first else 0
+        w, s = self._kind_w, self._kind_s
+        w13_qweight = torch.cat([get(self._gate, w), get(self._up, w)], out_dim)
+        w13_scales = torch.cat([get(self._gate, s), get(self._up, s)], out_dim)
         unit = self._xt.kernel_layout_unit(
             w13_qweight,
             w13_scales,
-            get(self._down, QWEIGHT),
-            get(self._down, SCALES),
+            get(self._down, w),
+            get(self._down, s),
             self.scales_dtype,
+            k_first=k_first,
         )
         return {k: v.reshape(-1).view(torch.uint8) for k, v in unit.items()}
 
     def _check_qzeros(self, key: tuple[int, int], get: Any) -> None:
+        """GPTQ: the zero points are the symmetric value (the engine ignores
+        them on XPU). compressed-tensors: each ``weight_shape`` is the
+        projection's [out, in] (there are no zero points in a symmetric
+        scheme)."""
         odd = False
         for proj in (self._gate, self._up, self._down):
-            flat = get(proj, QZEROS).flatten()
+            flat = get(proj, self._kind_x).flatten()
+            if self.layout == CT_PACKED:
+                want = (
+                    (self.hidden, self.inter)
+                    if proj == self._down
+                    else (self.inter, self.hidden)
+                )
+                odd = odd or tuple(int(v) for v in flat.tolist()) != want
+                continue
             first = int(flat[0])
             odd = odd or first not in _SYM_QZEROS or not bool((flat == first).all())
         with self._lock:
@@ -629,10 +694,13 @@ class CheckpointExperts:
             if odd:
                 self._qz_odd.append(key)
         if odd and self.strict_qzeros:
-            raise CheckpointError(
-                f"unit {key}: zero points are not the symmetric int4 value; the "
-                "engine ignores them on XPU (strict_qzeros)"
+            what = (
+                "weight_shape is not the projection's [out, in]"
+                if self.layout == CT_PACKED
+                else "zero points are not the symmetric int4 value; the engine "
+                "ignores them on XPU"
             )
+            raise CheckpointError(f"unit {key}: {what} (strict_qzeros)")
 
     def info(self) -> dict[str, Any]:
         """What was found, what is skipped and why, what the store will be."""
@@ -641,6 +709,7 @@ class CheckpointExperts:
         layout = es._Layout(self.schema, 1, self.identity)
         return {
             "model": self.model,
+            "layout": self.layout,
             "name_format": self.name_format,
             "files_read": self.files.files,
             "files_ignored_not_in_index": self.files.ignored_files,

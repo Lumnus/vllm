@@ -806,7 +806,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         g.add_argument(
             "--strict-qzeros",
             action="store_true",
-            help="refuse a checkpoint whose zero points are not symmetric int4",
+            help="refuse a checkpoint whose zero points are not symmetric int4 "
+            "(compressed-tensors: whose weight_shape is not [out, in])",
         )
 
     def source_from(args: argparse.Namespace) -> UnitSource:
