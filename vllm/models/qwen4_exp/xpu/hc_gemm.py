@@ -20,6 +20,7 @@ from pathlib import Path
 
 import torch
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 
@@ -376,6 +377,282 @@ def int8_up_mix(
         block_n,
         128,
         num_warps=4,
+    )
+    return out
+
+
+# The same GEMM and mix as _hc_up_mix_i8_kernel, laid out for the decode rows.
+# That kernel loads its operands through pointer tensors: the [BLOCK_K, BLOCK_N]
+# int64 address and mask tensors of every weight tile stay live across the HC
+# streams' unrolled K loops, the tiles reach the DPAS layout through shared
+# local memory, and the grid is 2560 / 64 = 40 work-groups for 32 Xe-cores.
+# Here the int8 tiles come in through tensor descriptors (2D block loads
+# straight into the DPAS operand layout, as triton_scaled_mm loads them on
+# XPU); the four streams' weight tiles of one K step are loaded together into
+# four int32 accumulators, so a work-group keeps four loads in flight; and the
+# column tile is narrow, so the grid is 2560 / BLOCK_N work-groups.
+#
+# The bits are those of the unfused path for the same reason as before: the
+# int32 dot is exact, so the K tiling does not reach the result; the epilogue
+# is triton_scaled_mm's ((scale_a * acc) * scale_b, rounded to BF16) and the
+# mix kernel's (sigmoid of the BF16 gate times x, summed from zero in stream
+# order in FP32, divided by HC, stored BF16).
+
+
+@triton.jit
+def _hc_up_mix_term(
+    dot,
+    scale_a,
+    sb_ptr,
+    x_ptr,
+    rows,
+    cols,
+    n0,
+    stride_x,
+    mask,
+    cmask,
+    SB_PER_COL: tl.constexpr,
+):
+    """One stream's ``sigmoid(bf16(scale_b * (scale_a * dot))) * x`` in FP32."""
+    n = n0 + cols
+    if SB_PER_COL:  # noqa: SIM108 (constexpr branch)
+        scale_b = tl.load(sb_ptr + n, cmask)[None, :]
+    else:
+        scale_b = tl.load(sb_ptr)
+    gate = scale_a * dot.to(tl.float32)
+    gate = scale_b * gate
+    g = gate.to(tl.bfloat16)
+    x = tl.load(x_ptr + rows[:, None] * stride_x + n[None, :], mask, other=0.0)
+    return tl.sigmoid(g.to(tl.float32)) * x.to(tl.float32)
+
+
+@triton.jit
+def _hc_up_mix_i8_td_kernel(
+    a_ptr,
+    b_ptr,
+    sa_ptr,
+    sb_ptr,
+    x_ptr,
+    y_ptr,
+    M,
+    K,
+    stride_am,
+    stride_b,
+    stride_x,
+    stride_y,
+    SB_PER_COL: tl.constexpr,
+    B_T: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """``hc_gate_mix(x, triton_scaled_mm(a, b, sa, sb), 4)`` for HC = 4 streams.
+    ``b`` is the ``[K, DIM]`` int8 weight: with ``B_T`` a view of ``[DIM, K]``
+    rows (``stride_b`` is the row stride of those rows), else ``K`` rows of
+    ``DIM`` (``stride_b`` their stride). Program ``(n, m)`` writes output
+    columns ``[n * BLOCK_N, (n + 1) * BLOCK_N)`` of rows ``[m * BLOCK_M, ...)``."""
+    HC: tl.constexpr = 4
+    HC_DIM: tl.constexpr = DIM // HC
+    m0 = tl.program_id(1) * BLOCK_M
+    c0 = tl.program_id(0) * BLOCK_N
+    a_desc = tl.make_tensor_descriptor(
+        a_ptr, shape=[M, K], strides=[stride_am, 1], block_shape=[BLOCK_M, BLOCK_K]
+    )
+    if B_T:
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr, shape=[DIM, K], strides=[stride_b, 1], block_shape=[BLOCK_N, BLOCK_K]
+        )
+    else:
+        b_desc = tl.make_tensor_descriptor(
+            b_ptr, shape=[K, DIM], strides=[stride_b, 1], block_shape=[BLOCK_K, BLOCK_N]
+        )
+    d0 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+    d1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+    d2 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+    d3 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        kk = k * BLOCK_K
+        a = a_desc.load([m0, kk])
+        if B_T:
+            b0 = tl.trans(b_desc.load([c0, kk]))
+            b1 = tl.trans(b_desc.load([HC_DIM + c0, kk]))
+            b2 = tl.trans(b_desc.load([2 * HC_DIM + c0, kk]))
+            b3 = tl.trans(b_desc.load([3 * HC_DIM + c0, kk]))
+        else:
+            b0 = b_desc.load([kk, c0])
+            b1 = b_desc.load([kk, HC_DIM + c0])
+            b2 = b_desc.load([kk, 2 * HC_DIM + c0])
+            b3 = b_desc.load([kk, 3 * HC_DIM + c0])
+        d0 = tl.dot(a, b0, d0, out_dtype=tl.int32)
+        d1 = tl.dot(a, b1, d1, out_dtype=tl.int32)
+        d2 = tl.dot(a, b2, d2, out_dtype=tl.int32)
+        d3 = tl.dot(a, b3, d3, out_dtype=tl.int32)
+    rows = m0 + tl.arange(0, BLOCK_M).to(tl.int64)
+    cols = c0 + tl.arange(0, BLOCK_N).to(tl.int64)
+    rmask = rows < M
+    cmask = cols < HC_DIM
+    mask = rmask[:, None] & cmask[None, :]
+    scale_a = tl.load(sa_ptr + rows, rmask)[:, None]
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc += _hc_up_mix_term(
+        d0, scale_a, sb_ptr, x_ptr, rows, cols, 0, stride_x, mask, cmask, SB_PER_COL
+    )
+    acc += _hc_up_mix_term(
+        d1,
+        scale_a,
+        sb_ptr,
+        x_ptr,
+        rows,
+        cols,
+        HC_DIM,
+        stride_x,
+        mask,
+        cmask,
+        SB_PER_COL,
+    )
+    acc += _hc_up_mix_term(
+        d2,
+        scale_a,
+        sb_ptr,
+        x_ptr,
+        rows,
+        cols,
+        2 * HC_DIM,
+        stride_x,
+        mask,
+        cmask,
+        SB_PER_COL,
+    )
+    acc += _hc_up_mix_term(
+        d3,
+        scale_a,
+        sb_ptr,
+        x_ptr,
+        rows,
+        cols,
+        3 * HC_DIM,
+        stride_x,
+        mask,
+        cmask,
+        SB_PER_COL,
+    )
+    acc /= HC
+    tl.store(y_ptr + rows[:, None] * stride_y + cols[None, :], acc, mask)
+
+
+# (BLOCK_N, BLOCK_K, num_warps) of the fast kernel; VLLM_XPU_HC_UP_TILE
+# ("bn,bk,warps") overrides it for a measurement. 2560 / 16 = 160 work-groups,
+# five per Xe-core on the B70. At 64 rows it takes 8 warps: with 4 the
+# compiled kernel spills (2,240 B per thread for Xe2), with 8 it keeps the
+# 192 B of the smaller tiles.
+FAST_UP_TILE = (16, 128, 4)
+FAST_UP_WARPS_64 = 8
+_TD_DEVICES: set = set()
+
+
+def _fast_up_tile() -> tuple[int, int, int]:
+    spec = envs.VLLM_XPU_HC_UP_TILE.strip()
+    if not spec:
+        return FAST_UP_TILE
+    bn, bk, warps = (int(v) for v in spec.split(","))
+    assert bn >= 16 and bk >= 32 and (bn & (bn - 1)) == 0 and (bk & (bk - 1)) == 0
+    return bn, bk, warps
+
+
+def takes_fast_up(q: torch.Tensor, weight: torch.Tensor, hc_count: int) -> bool:
+    """Whether ``int8_up_mix_fast`` serves these operands: four streams and the
+    tensor-descriptor rules ``triton_scaled_mm`` applies (unit inner strides,
+    16-byte aligned rows and bases), plus 16-byte aligned stream starts along a
+    weight's inner dimension when its rows run along N."""
+    inner = q.shape[1]
+    b_t = weight.stride(1) != 1 and weight.stride(0) == 1
+    b_row = weight.stride(1) if b_t else weight.stride(0)
+    return (
+        hc_count == 4
+        and (b_t or (weight.shape[1] // hc_count) % 16 == 0)
+        and q.dtype == weight.dtype == torch.int8
+        and q.stride(1) == 1
+        and (weight.stride(1) == 1 or b_t)
+        and (q.stride(0) * q.element_size()) % 16 == 0
+        and (b_row * weight.element_size()) % 16 == 0
+        and inner % 16 == 0
+        and q.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+    )
+
+
+def int8_up_mix_fast(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    xn: torch.Tensor,
+    hc_count: int,
+    tile: tuple[int, int, int] | None = None,
+) -> torch.Tensor:
+    """``int8_up_mix`` with tensor-descriptor loads, the four streams' tiles of a
+    K step in flight together and a narrow column tile; the same bits.
+    Operands it does not take (``takes_fast_up``) go to ``int8_up_mix``."""
+    rows, inner = q.shape
+    dim = weight.shape[1]
+    assert xn.shape == (rows, dim) and dim % hc_count == 0
+    assert xn.stride(1) == 1 and rows <= UP_MIX_I8_MAX_ROWS
+    if not takes_fast_up(q, weight, hc_count):
+        logger.warning_once(
+            "HC up + gated mix: operands outside the fast kernel's layout "
+            "(q %s stride %s, weight stride %s, hc %d); the first fused kernel runs.",
+            tuple(q.shape),
+            q.stride(),
+            weight.stride(),
+            hc_count,
+        )
+        return int8_up_mix(q, scale, weight, weight_scale, xn, hc_count)
+    out = torch.empty((rows, dim // hc_count), dtype=xn.dtype, device=xn.device)
+    if rows == 0:
+        return out
+    bm = triton.next_power_of_2(rows)
+    if tile is None and not envs.VLLM_XPU_HC_UP_TILE.strip():
+        bn, bk, warps = FAST_UP_TILE
+        if bm >= 64:
+            warps = FAST_UP_WARPS_64
+    else:
+        bn, bk, warps = tile or _fast_up_tile()
+    b_t = weight.stride(1) != 1 and weight.stride(0) == 1
+    if q.device.type != "cpu" and q.device not in _TD_DEVICES:
+        from vllm.triton_utils.allocation import set_triton_allocator
+
+        set_triton_allocator(q.device)
+        _TD_DEVICES.add(q.device)
+    logger.info_once(
+        "HC up + gated mix: INT8 fast fused kernel (tensor-descriptor loads, four "
+        "streams per K step), first launch: %d rows, tile (%d, %d, %d), %d warps.",
+        rows,
+        bm,
+        bn,
+        bk,
+        warps,
+    )
+    _hc_up_mix_i8_td_kernel[(triton.cdiv(dim // hc_count, bn), triton.cdiv(rows, bm))](
+        q,
+        weight,
+        scale.reshape(-1),
+        weight_scale.reshape(-1),
+        xn,
+        out,
+        rows,
+        inner,
+        q.stride(0),
+        weight.stride(1) if b_t else weight.stride(0),
+        xn.stride(0),
+        out.stride(0),
+        weight_scale.numel() != 1,
+        b_t,
+        dim,
+        bm,
+        bn,
+        bk,
+        num_warps=warps,
     )
     return out
 

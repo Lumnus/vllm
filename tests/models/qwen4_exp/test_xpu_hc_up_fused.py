@@ -9,7 +9,10 @@
 2. The INT8 up GEMM with the gated mix in its epilogue equals
    ``triton_scaled_mm`` and then ``hc_gate_mix``, bit for bit, at 1-64 rows,
    with per-column and scalar weight scales.
-3. The two ops a folded HyperConnection calls equal the unfolded pieces.
+3. The fast fused kernel (``int8_up_mix_fast``, mode 3) equals the same pieces
+   and the first fused kernel, bit for bit, at 1-64 rows, both weight
+   orientations, per-column and scalar scales, over several tiles.
+4. The two ops a folded HyperConnection calls equal the unfolded pieces.
 
 This proves the composition and the rule; the device bits are the card check."""
 
@@ -188,6 +191,57 @@ def _check_up_mix() -> None:
         print(f"up GEMM + gated mix (per-column scale {per_col}): bitwise 1-64 rows")
 
 
+FAST_TILES = ((16, 128, 4), (32, 64, 4), (16, 32, 2), (64, 128, 8), (32, 128, 1))
+
+
+def _check_up_mix_fast() -> None:
+    from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
+        triton_scaled_mm,
+    )
+    from vllm.models.qwen4_exp.nvidia.ops.hc import hc_gate_mix
+    from vllm.models.qwen4_exp.xpu import hc_gemm
+
+    _faithful_bf16_cast()
+    torch.manual_seed(6)
+    # 648 columns per stream: not a multiple of any column tile.
+    for n_embd in (640, 648):
+        dim = HC * n_embd
+        w_nk = torch.randint(-127, 128, (dim, LOWRANK), dtype=torch.int8)
+        weights = (
+            ("[K, N] view of [N, K]", w_nk.t()),
+            ("[K, N] rows", w_nk.t().contiguous()),
+        )
+        for name, w_kn in weights:
+            for per_col in (True, False):
+                w_s = (
+                    torch.rand(dim, 1) * 1e-3 + 1e-4
+                    if per_col
+                    else torch.tensor([[3e-4]], dtype=torch.float32)
+                )
+                for rows in (1, 2, 5, 8, 13, 16, 33, 64):
+                    lora = (torch.randn(rows, LOWRANK) * 0.3).to(torch.bfloat16)
+                    q, s = _ref_quant(lora)
+                    xn = torch.randn(rows, dim).to(torch.bfloat16)
+                    if rows == 13:
+                        xn[3] = 0.0  # zero row of x: the -0 / +0 sum order
+                        xn[4] = -0.0
+                    # [K, N] rows with 648-column streams: the stream starts are
+                    # not 16-byte aligned for a descriptor; the first fused
+                    # kernel serves them.
+                    fast = n_embd == 640 or name.endswith("[N, K]")
+                    assert hc_gemm.takes_fast_up(q, w_kn, HC) == fast, name
+                    gate = triton_scaled_mm(q, w_kn, s, w_s, torch.bfloat16)
+                    ref = hc_gate_mix(xn, gate, HC)
+                    old = hc_gemm.int8_up_mix(q, s, w_kn, w_s, xn, HC)
+                    assert torch.equal(old.view(torch.int16), ref.view(torch.int16))
+                    tiles = (None, *FAST_TILES) if rows in (1, 13, 64) else (None,)
+                    for tile in tiles:
+                        out = hc_gemm.int8_up_mix_fast(q, s, w_kn, w_s, xn, HC, tile)
+                        same = torch.equal(out.view(torch.int16), ref.view(torch.int16))
+                        assert same, (n_embd, name, rows, per_col, tile)
+            print(f"fast up GEMM + gated mix ({name}, {n_embd} per stream): bitwise")
+
+
 def _check_ops() -> None:
     """The ops a folded module calls against the unfolded pieces (fp32 down,
     which takes the stock route; the BF16 split-K route is checked above)."""
@@ -211,7 +265,7 @@ def _check_ops() -> None:
         assert torch.equal(q, rq) and torch.equal(s, rs)
         assert torch.equal(inject_q, inject)
         xb = xn.to(torch.bfloat16)
-        for fused in (True, False):
+        for fused in (1, 0, 3):
             mixed = hcm.hc_up_mix_q(q, s, w_kn, w_s, xb, HC, 0, fused)
             gate = torch.ops.vllm.int8_scaled_mm_func(
                 q, w_kn, s, w_s, torch.bfloat16, None
@@ -249,6 +303,10 @@ def test_quant_rule_corners() -> None:
 
 def test_up_gemm_with_gated_mix() -> None:
     _run("_check_up_mix")
+
+
+def test_fast_up_gemm_with_gated_mix() -> None:
+    _run("_check_up_mix_fast")
 
 
 def test_folded_ops_equal_pieces() -> None:
@@ -292,7 +350,7 @@ def test_module_routes_through_the_folded_ops(monkeypatch):
     monkeypatch.setattr(hcm, "_down_lora_q_op", down_q)
     monkeypatch.setattr(hcm, "_up_mix_q_op", up_q)
     monkeypatch.setattr(hcm, "_norm_op", lambda x, w, eps, hc: x)
-    for mode, folded in (("0", False), ("1", True), ("2", True)):
+    for mode, folded in (("0", False), ("1", True), ("2", True), ("3", True)):
         monkeypatch.setenv("VLLM_XPU_HC_UP_FUSED", mode)
         target = _Target(_ct_config([_UP, _MIXER_UP]))
         w = _weights(torch.float32, seed=3)
@@ -312,7 +370,7 @@ def test_module_routes_through_the_folded_ops(monkeypatch):
                 up.weight.data_ptr(),
                 up.weight_scale.data_ptr(),
                 1,
-                mode == "1",
+                {"1": 1, "2": 0, "3": 3}[mode],
             )
             assert mixed.shape == (3, module.n_embd)
 
@@ -328,7 +386,7 @@ def _xpu_quant_available() -> bool:
 @pytest.mark.skipif(
     not _xpu_quant_available(), reason="needs an XPU card and the native quant op"
 )
-@pytest.mark.parametrize("rows", [1, 2, 4, 8, 13, 16, 32])
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 13, 16, 32, 64])
 def test_device_bits(rows: int) -> None:
     """The card check: on the device, the folded finish kernel against
     _hc_finish_silu and the native quant op, and the fused up GEMM + mix
@@ -368,3 +426,16 @@ def test_device_bits(rows: int) -> None:
     ref = hc_gate_mix(xn, triton_scaled_mm(q, w_kn, s, w_s, torch.bfloat16), HC)
     out = hc_gemm.int8_up_mix(q, s, w_kn, w_s, xn, HC)
     assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+    # The fast kernel (mode 3) at its default tile and the tiles a sweep may
+    # pick; per-column and scalar weight scales; both weight orientations.
+    w_s1 = torch.tensor([[3e-4]], dtype=torch.float32, device=dev)
+    ref1 = hc_gate_mix(xn, triton_scaled_mm(q, w_kn, s, w_s1, torch.bfloat16), HC)
+    w_rows = w_kn.contiguous()
+    for tile in (None, *FAST_TILES):
+        for w, ws, r in ((w_kn, w_s, ref), (w_kn, w_s1, ref1), (w_rows, w_s, ref)):
+            out = hc_gemm.int8_up_mix_fast(q, s, w, ws, xn, HC, tile)
+            assert torch.equal(out.view(torch.int16), r.view(torch.int16)), (
+                tile,
+                w.stride(),
+                ws.numel(),
+            )

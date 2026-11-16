@@ -351,6 +351,7 @@ if TYPE_CHECKING:
     VLLM_XPU_MOE_PLACEMENT_TRACE: str = ""
     VLLM_XPU_MOE_EPLB_OP_IDS: bool = False
     VLLM_XPU_HC_UP_FUSED: int = 0
+    VLLM_XPU_HC_UP_TILE: str = ""
     VLLM_XPU_ATTN_META_ONCE: bool = False
     VLLM_XPU_MOE_ROUTE_FUSED: bool = False
     VLLM_ROUTER_INT8_SHADOW: str = ""
@@ -2440,11 +2441,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # symmetric per-token activations on the Triton INT8 GEMM). 1: the up
     # linear's activation quant runs inside the down projection's finish kernel
     # and the INT8 up GEMM carries the gated mix in its epilogue (one kernel,
-    # up to 64 rows where the linear runs Triton); 2: the quant fold only. The
-    # int8 rows, scales and outputs are those of the unfused path. 0 (default)
-    # keeps the linear's own quant, GEMM and the separate gated mix. Read when
-    # the weights load.
+    # up to 64 rows where the linear runs Triton); 2: the quant fold only; 3:
+    # as 1 with the fast fused kernel (tensor-descriptor loads, the four
+    # streams' weight tiles of a K step in flight together, a narrow column
+    # tile). The int8 rows, scales and outputs are those of the unfused path.
+    # 0 (default) keeps the linear's own quant, GEMM and the separate gated
+    # mix. Read when the weights load.
     "VLLM_XPU_HC_UP_FUSED": lambda: int(os.getenv("VLLM_XPU_HC_UP_FUSED", "0")),
+    # The fast fused HC up kernel's tile (VLLM_XPU_HC_UP_FUSED=3), for a
+    # measurement: "bn,bk,warps" (column tile per stream, K tile, warps).
+    # Empty (default): 16,128 with 4 warps, 8 at 64 rows. The bits do not
+    # depend on it. Read per call.
+    "VLLM_XPU_HC_UP_TILE": lambda: os.getenv("VLLM_XPU_HC_UP_TILE", ""),
     # Debug: a MoE router gate loaded as checkpoint INT8 W8A8 also runs a BF16
     # evaluation and logs how many routed slots (top-k experts per token)
     # differ. "dequant" uses the INT8 weight times its scales; a checkpoint
