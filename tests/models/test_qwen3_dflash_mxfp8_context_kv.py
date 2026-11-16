@@ -100,7 +100,7 @@ def _build_model(mode: str, has_bias: bool) -> tuple[DFlashQwen3Model, list]:
     # from construction and loads the checkpoint's K/V rows.
     model._context_kv_proj = None
     if mode == "mxfp8":
-        model._context_kv_proj = model._make_mxfp8_context_kv_proj(attentions)
+        model._context_kv_proj = model._make_context_kv_proj(attentions)
         for i, tensors in enumerate(checkpoint):
             for name, tensor in tensors.items():
                 model._load_context_kv(i, "k", name, tensor[Q_SIZE : Q_SIZE + KV_SIZE])

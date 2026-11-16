@@ -346,6 +346,7 @@ if TYPE_CHECKING:
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
     VLLM_XPU_MOE_COMBINE: Literal["split", "rank", "exact"] = "split"
     VLLM_XPU_INT8_ONEDNN_MIN_ROWS: int = 64
+    VLLM_XPU_DFLASH_CONTEXT_KV_INT8: bool = True
     VLLM_XPU_MOE_PLACEMENT_TRACE: str = ""
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -2391,6 +2392,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # largest batch keeps every row count on Triton. Read once at import.
     "VLLM_XPU_INT8_ONEDNN_MIN_ROWS": lambda: int(
         os.getenv("VLLM_XPU_INT8_ONEDNN_MIN_ROWS", "64")
+    ),
+    # DFlash drafters with compressed-tensors W8A8 INT8 attention (per-channel
+    # weights, dynamic symmetric per-token activations): the context K/V
+    # precompute runs one INT8 GEMM over the K/V rows of every layer instead of
+    # each layer's full QKV GEMM with the Q columns dropped. The K/V values are
+    # the same. 0 keeps the per-layer QKV GEMMs. Read when the drafter is built.
+    "VLLM_XPU_DFLASH_CONTEXT_KV_INT8": lambda: bool(
+        int(os.getenv("VLLM_XPU_DFLASH_CONTEXT_KV_INT8", "1"))
     ),
     # Serving profiles at start (vllm/v1/engine/serving_profiles.py): a JSON
     # file {"profiles": [...], "boot": "<name>"}; the boot profile is applied
