@@ -5,9 +5,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -21,6 +23,11 @@ from .qwen3_dflash import (
     DFlashQwen3Model,
 )
 from .utils import maybe_prefix
+
+logger = init_logger(__name__)
+
+# Read once at import: the device check runs inside compiled forwards.
+XPU_DFLASH2_TRITON = envs.VLLM_XPU_DFLASH2_TRITON
 
 
 @triton.jit
@@ -91,6 +98,7 @@ def dflash2_grouped_conv_impl(
     output = torch.empty_like(x)
     if num_rows == 0:
         return output
+    logger.info_once("DFlash2 grouped convolution: Triton kernel on %s.", x.device.type)
 
     element_block = 1024 if num_rows >= 128 and num_channels % 1024 == 0 else 512
     grid = (num_rows * triton.cdiv(num_channels, element_block),)
@@ -142,6 +150,13 @@ def dflash2_grouped_conv(
     return torch.ops.vllm.dflash2_grouped_conv(x, delta, base, block_size, group_size)
 
 
+def _use_triton(tensor: torch.Tensor) -> bool:
+    """Whether the DFlash2 Triton kernels run for tensors on this device: CUDA,
+    and XPU unless VLLM_XPU_DFLASH2_TRITON=0. Other devices take the torch
+    reference."""
+    return tensor.is_cuda or (tensor.is_xpu and XPU_DFLASH2_TRITON)
+
+
 def _grouped_conv(
     hidden_states: torch.Tensor,
     delta: torch.Tensor,
@@ -151,7 +166,7 @@ def _grouped_conv(
     group_size: int,
     taps: int,
 ) -> torch.Tensor:
-    if hidden_states.is_cuda:
+    if _use_triton(hidden_states):
         return dflash2_grouped_conv(hidden_states, delta, base, block_size, group_size)
 
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
@@ -365,6 +380,10 @@ def dflash2_score_edges_impl(
     if num_reqs * steps == 0:
         return output
     vocab_size, rank = predecessor_table.shape
+    logger.info_once(
+        "DFlash2 candidate edge scoring: Triton kernel on %s.",
+        candidate_ids.device.type,
+    )
     _dflash2_score_edges_kernel[(num_reqs * steps,)](
         predecessor_table,
         successor_table,
@@ -412,7 +431,7 @@ def _score_edges(
     anchor_token_ids: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
-    if candidate_ids.is_cuda:
+    if _use_triton(candidate_ids):
         return torch.ops.vllm.dflash2_score_edges(
             predecessor_table,
             successor_table,

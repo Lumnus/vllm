@@ -347,6 +347,7 @@ if TYPE_CHECKING:
     VLLM_XPU_MOE_COMBINE: Literal["split", "rank", "exact"] = "split"
     VLLM_XPU_INT8_ONEDNN_MIN_ROWS: int = 64
     VLLM_XPU_DFLASH_CONTEXT_KV_INT8: bool = True
+    VLLM_XPU_DFLASH2_TRITON: bool = True
     VLLM_XPU_MOE_PLACEMENT_TRACE: str = ""
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -2400,6 +2401,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the same. 0 keeps the per-layer QKV GEMMs. Read when the drafter is built.
     "VLLM_XPU_DFLASH_CONTEXT_KV_INT8": lambda: bool(
         int(os.getenv("VLLM_XPU_DFLASH_CONTEXT_KV_INT8", "1"))
+    ),
+    # DFlash2 drafters on XPU: the grouped convolution and the candidate
+    # selector's edge scoring run their Triton kernels, as on CUDA, instead of
+    # the eager torch reference. 0 keeps the torch reference. Read once at
+    # import.
+    "VLLM_XPU_DFLASH2_TRITON": lambda: bool(
+        int(os.getenv("VLLM_XPU_DFLASH2_TRITON", "1"))
     ),
     # Serving profiles at start (vllm/v1/engine/serving_profiles.py): a JSON
     # file {"profiles": [...], "boot": "<name>"}; the boot profile is applied
