@@ -13,6 +13,10 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils import checkpoint_int8
+from vllm.model_executor.layers.quantization.utils.checkpoint_int8 import (
+    checkpoint_int8_quant_config,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.worker.gpu.spec_decode.dflash2.config import DFlash2SpeculatorConfig
@@ -478,6 +482,32 @@ def _score_edges_reference(
     )
 
 
+def build_selector_projection(
+    hidden_size: int,
+    rank: int,
+    params_dtype: torch.dtype,
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> ReplicatedLinear:
+    """The candidate selector's hidden projection. BF16 unless the drafter
+    checkpoint carries it as calibrated INT8 W8A8; never rounded at load."""
+    layer = ReplicatedLinear(
+        hidden_size,
+        rank,
+        bias=False,
+        params_dtype=params_dtype,
+        quant_config=checkpoint_int8_quant_config(
+            quant_config, prefix, "drafter selector projection"
+        ),
+        prefix=prefix,
+        return_bias=False,
+    )
+    layer = checkpoint_int8.mark(layer, "drafter selector projection")
+    if getattr(layer, checkpoint_int8.INT8_ATTR, False):
+        logger.info_once("DFlash2 candidate selector projection: INT8 W8A8.")
+    return layer
+
+
 @support_torch_compile
 class CandidateSelector(nn.Module):
     def __init__(
@@ -488,6 +518,7 @@ class CandidateSelector(nn.Module):
         top_k: int,
         params_dtype: torch.dtype,
         prefix: str,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.top_k = top_k
@@ -497,14 +528,12 @@ class CandidateSelector(nn.Module):
         self.successor_codebook = nn.Parameter(
             torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
         )
-        self.hidden_projection = ReplicatedLinear(
+        self.hidden_projection = build_selector_projection(
             hidden_size,
             rank,
-            bias=False,
-            params_dtype=params_dtype,
-            quant_config=None,
-            prefix=maybe_prefix(prefix, "hidden_projection"),
-            return_bias=False,
+            params_dtype,
+            quant_config,
+            maybe_prefix(prefix, "hidden_projection"),
         )
 
     def forward(
@@ -554,6 +583,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 top_k=int(draft_config["selector_top_k"]),
                 params_dtype=vllm_config.model_config.dtype,
                 prefix=maybe_prefix(prefix, "candidate_selector"),
+                quant_config=getattr(vllm_config, "quant_config", None),
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

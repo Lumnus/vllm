@@ -353,6 +353,7 @@ if TYPE_CHECKING:
     VLLM_XPU_HC_UP_FUSED: int = 0
     VLLM_XPU_ATTN_META_ONCE: bool = False
     VLLM_XPU_MOE_ROUTE_FUSED: bool = False
+    VLLM_ROUTER_INT8_SHADOW: str = ""
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2444,6 +2445,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keeps the linear's own quant, GEMM and the separate gated mix. Read when
     # the weights load.
     "VLLM_XPU_HC_UP_FUSED": lambda: int(os.getenv("VLLM_XPU_HC_UP_FUSED", "0")),
+    # Debug: a MoE router gate loaded as checkpoint INT8 W8A8 also runs a BF16
+    # evaluation and logs how many routed slots (top-k experts per token)
+    # differ. "dequant" uses the INT8 weight times its scales; a checkpoint
+    # directory uses that checkpoint's router of the same layer. Empty
+    # (default) or "0": off. Read at model construction.
+    "VLLM_ROUTER_INT8_SHADOW": lambda: os.getenv("VLLM_ROUTER_INT8_SHADOW", ""),
     # XPU attention on vllm-xpu-kernels' FA: 1 builds the spec-decode fast
     # path's metadata (14 small integer kernels) once per forward and shares it
     # across the attention layers that pass the same query starts, KV lengths
