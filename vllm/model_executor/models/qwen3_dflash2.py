@@ -583,7 +583,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 top_k=int(draft_config["selector_top_k"]),
                 params_dtype=vllm_config.model_config.dtype,
                 prefix=maybe_prefix(prefix, "candidate_selector"),
-                quant_config=vllm_config.quant_config,
+                quant_config=getattr(vllm_config, "quant_config", None),
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
