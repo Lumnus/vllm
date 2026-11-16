@@ -155,6 +155,23 @@ def _fixed_address(layer: MoERunnerInterface, result: Any) -> Any:
     return held(result)
 
 
+def can_fuse_gate_weights(
+    gate: torch.nn.Module | None, shared_expert_gate: torch.nn.Module | None
+) -> bool:
+    """Whether the router and shared-expert gate weights can be concatenated
+    into one BF16 GEMM: both present and both unquantized (an INT8 gate keeps
+    its own quantized GEMM)."""
+    if gate is None or shared_expert_gate is None:
+        return False
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    return all(
+        isinstance(getattr(m, "quant_method", None), UnquantizedLinearMethod)
+        or getattr(m, "quant_method", None) is None
+        for m in (gate, shared_expert_gate)
+    )
+
+
 def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
     forward_context: ForwardContext = get_forward_context()
     if not _USE_LAYERNAME and layer_name == "from_forward_context":
@@ -374,7 +391,7 @@ class MoERunner(MoERunnerInterface):
         # GEMM produces combined logits. The topk kernel can then
         # apply routing softmax and shared expert activation (sigmoid)
         # in a single launch.
-        self._fse_fuse_gate = gate is not None and shared_expert_gate is not None
+        self._fse_fuse_gate = can_fuse_gate_weights(gate, shared_expert_gate)
         self._combined_gate_weight: torch.Tensor | None = None
 
         self._shared_experts: SharedExperts | None = None

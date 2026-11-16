@@ -109,6 +109,8 @@ class GateLinear(ReplicatedLinear):
         self.out_dtype = out_dtype
         self.is_gfx950 = is_gfx950
         self.is_hopper = is_hopper
+        # Debug only: a BF16 evaluation beside a quantized gate (int8_shadow).
+        self.routing_shadow = None
 
         # A quantized gate exposes no plain ``weight``, so every specialized
         # tier below is disabled and forward falls back to ReplicatedLinear.
@@ -397,7 +399,20 @@ class GateLinear(ReplicatedLinear):
             output = base_output
         if self.out_dtype is not None and output.dtype != self.out_dtype:
             output = output.to(self.out_dtype)
+        if self.routing_shadow is not None:
+            self.routing_shadow.observe(self, x, output)
         return output if not self.return_bias else (output, output_bias)
+
+    def enable_routing_shadow(self, top_k: int) -> None:
+        """Count routed slots against a BF16 shadow when the gate is quantized
+        and ``VLLM_ROUTER_INT8_SHADOW`` is set (see ``int8_shadow``)."""
+        if self.is_unquantized:
+            return
+        from vllm.model_executor.layers.fused_moe.router.int8_shadow import (
+            make_shadow,
+        )
+
+        self.routing_shadow = make_shadow(top_k, self.prefix)
 
 
 class _GateLinearMethod(UnquantizedLinearMethod):
