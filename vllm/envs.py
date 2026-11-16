@@ -351,6 +351,7 @@ if TYPE_CHECKING:
     VLLM_XPU_MOE_PLACEMENT_TRACE: str = ""
     VLLM_XPU_MOE_EPLB_OP_IDS: bool = False
     VLLM_XPU_HC_UP_FUSED: int = 0
+    VLLM_XPU_ATTN_META_ONCE: bool = False
     VLLM_XPU_MOE_ROUTE_FUSED: bool = False
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -2443,6 +2444,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keeps the linear's own quant, GEMM and the separate gated mix. Read when
     # the weights load.
     "VLLM_XPU_HC_UP_FUSED": lambda: int(os.getenv("VLLM_XPU_HC_UP_FUSED", "0")),
+    # XPU attention on vllm-xpu-kernels' FA: 1 builds the spec-decode fast
+    # path's metadata (14 small integer kernels) once per forward and shares it
+    # across the attention layers that pass the same query starts, KV lengths
+    # and block table, instead of in every layer. The values are the same. 0
+    # (default) builds it in each layer. Read inside the attention custom op.
+    "VLLM_XPU_ATTN_META_ONCE": lambda: bool(
+        int(os.getenv("VLLM_XPU_ATTN_META_ONCE", "0"))
+    ),
     # XPU fused MoE with expert parallelism and EPLB: 1 has the router's EPLB
     # mapping kernel write the experts' unowned sentinel for unrouted ids in
     # the same launch, so the per-layer sentinel kernel does not run (with a
@@ -2669,6 +2678,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_XPU_MOE_COMBINE",
         "VLLM_XPU_MOE_PLACEMENT_TRACE",
         "VLLM_XPU_MOE_EPLB_OP_IDS",
+        # Read inside the attention custom op at call time.
+        "VLLM_XPU_ATTN_META_ONCE",
         "VLLM_XPU_MOE_ROUTE_FUSED",
         # Read inside the XPU INT8 linear custom op, which the compiled graph
         # calls as an opaque op.
