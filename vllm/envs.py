@@ -356,6 +356,7 @@ if TYPE_CHECKING:
     VLLM_XPU_MOE_ENTRY_QUANT: bool = False
     VLLM_XPU_MOE_SHARED_IN_GATHER: int = 0
     VLLM_XPU_MOE_GATES_MERGED: bool = False
+    VLLM_XPU_MOE_TOPK_ROUTE: bool = False
     VLLM_ROUTER_INT8_SHADOW: str = ""
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -2497,6 +2498,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_MOE_GATES_MERGED": lambda: bool(
         int(os.getenv("VLLM_XPU_MOE_GATES_MERGED", "0"))
     ),
+    # XPU MoE with EPLB: 1 runs the softmax top-k with the EPLB logical to
+    # physical mapping, the expert-load record and (with
+    # VLLM_XPU_MOE_ROUTE_FUSED=1) the unowned sentinel in one kernel
+    # (vllm-xpu-kernels' topk_softmax_route). Same weights, ids and record.
+    "VLLM_XPU_MOE_TOPK_ROUTE": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_TOPK_ROUTE", "0"))
+    ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
@@ -2717,6 +2725,7 @@ def compile_factors() -> dict[str, object]:
         # Read inside the attention custom op at call time.
         "VLLM_XPU_ATTN_META_ONCE",
         "VLLM_XPU_MOE_ROUTE_FUSED",
+        "VLLM_XPU_MOE_TOPK_ROUTE",
         # Read inside the XPU INT8 linear custom op, which the compiled graph
         # calls as an opaque op.
         "VLLM_XPU_INT8_ONEDNN_MIN_ROWS",

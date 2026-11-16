@@ -31,6 +31,8 @@ cannot fold (another experts path), the MoE op does the multiply and add
 itself, as the layer did. ``=2`` (tier 2, different bits) rounds
 ``routed + gate * shared`` once in fp32.
 
+``VLLM_XPU_MOE_TOPK_ROUTE=1``: see ``topk_route``.
+
 The layer decides at load (``resolve``) and logs one line naming what each
 piece covers; the first forward logs which consumers read the rows."""
 
@@ -445,3 +447,125 @@ def resolve(runner, force_platform: bool = False) -> EntryPlan | None:
         (". Not applied: " + "; ".join(why)) if why else "",
     )
     return plan if plan.active else None
+
+
+# ----------------------------------------------------------- top-k route
+def _topk_route_eligible(router) -> str | None:
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_router import (
+        FusedTopKRouter,
+    )
+
+    if type(router) is not FusedTopKRouter:
+        return f"router {type(router).__name__}"
+    if router.scoring_func != "softmax":
+        return f"scoring {router.scoring_func}"
+    if router.eplb_state is None:
+        return "no EPLB"
+    if rocm_aiter_ops.is_fused_moe_enabled():
+        return "AITER"
+    if _route_op() is None:
+        return "vllm-xpu-kernels has no topk_softmax_route"
+    if router.global_num_experts not in (
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        192,
+        320,
+        384,
+        448,
+        576,
+    ):
+        return f"{router.global_num_experts} experts"
+    return None
+
+
+def _route_op():
+    """vllm-xpu-kernels' ``_moe_C.topk_softmax_route``, or None."""
+    try:
+        return torch.ops._moe_C.topk_softmax_route
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def topk_route(
+    router,
+    router_logits: torch.Tensor,
+    indices_type: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``VLLM_XPU_MOE_TOPK_ROUTE=1``: the router's softmax top-k, EPLB
+    mapping + load record and (with VLLM_XPU_MOE_ROUTE_FUSED=1) the unowned
+    sentinel as one kernel (vllm-xpu-kernels ``topk_softmax_route``):
+    ``(topk_weights, physical topk_ids)`` as ``FusedTopKRouter`` followed by
+    ``_apply_eplb_mapping`` gives them, or None to run those."""
+    from vllm.model_executor.layers.fused_moe.router.base_router import (
+        get_moe_padding_mask,
+    )
+
+    why = getattr(router, "_xpu_topk_route_why", False)
+    if why is False:
+        why = None if envs.VLLM_XPU_MOE_TOPK_ROUTE else "off"
+        if why is None and not current_platform.is_xpu() and not _TEST_NATIVE:
+            why = "not XPU"
+        if why is None:
+            why = _topk_route_eligible(router)
+        router._xpu_topk_route_why = why
+        if envs.VLLM_XPU_MOE_TOPK_ROUTE:
+            if why is None:
+                logger.info_once(
+                    "XPU MoE routing (VLLM_XPU_MOE_TOPK_ROUTE=1): softmax top-k, "
+                    "EPLB map and load record%s in one kernel.",
+                    " and the unowned sentinel"
+                    if router._xpu_ids_sentinel() is not None
+                    else "",
+                )
+            else:
+                logger.warning_once(
+                    "VLLM_XPU_MOE_TOPK_ROUTE=1, but %s: top-k and the EPLB "
+                    "mapping run as before.",
+                    why,
+                )
+    if why is not None:
+        return None
+    if (
+        router.capture_fn is not None
+        or indices_type not in (None, torch.int32)
+        or router_logits.dtype not in (torch.bfloat16, torch.float32)
+        or router_logits.dim() != 2
+        or router_logits.shape[-1] != router.global_num_experts
+    ):
+        return None
+    st = router.eplb_state
+    m = router_logits.shape[0]
+    dev = router_logits.device
+    weights = torch.empty((m, router.top_k), dtype=torch.float32, device=dev)
+    ids = torch.empty((m, router.top_k), dtype=torch.int32, device=dev)
+    tei = torch.empty((m, router.top_k), dtype=torch.int32, device=dev)
+    sentinel = router._xpu_ids_sentinel()
+    from vllm.v1.worker.ubatching import dbo_current_ubatch_id
+
+    _route_op()(
+        weights,
+        ids,
+        tei,
+        router_logits.contiguous(),
+        router.renormalize,
+        get_moe_padding_mask(m),
+        st.logical_to_physical_map,
+        st.logical_replica_count,
+        st.expert_load_view,
+        st.should_record_tensor,
+        st.num_unpadded_tokens_tensors[dbo_current_ubatch_id()],
+        0 if sentinel is None else sentinel,
+        sentinel is not None,
+    )
+    if sentinel is not None:
+        ids.xpu_ids_sentinel = sentinel
+    return weights, ids

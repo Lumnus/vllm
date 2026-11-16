@@ -9,6 +9,8 @@
    EP 4 and EP 4 with a moved placement, with and without INT8 gates in the
    checkpoint; with the quant, GEMM and fold counts of each piece.
 2. The merged gate GEMM against triton_scaled_mm per gate, bitwise.
+3. VLLM_XPU_MOE_TOPK_ROUTE against today's top-k + EPLB mapping kernel
+   (xpu_topk_route_check.py).
 
 The Triton kernels run under the interpreter in subprocesses, so the
 interpreter setting stays out of this session."""
@@ -168,6 +170,12 @@ def test_merged_gates_gemm_bitwise(tmp_path):
     assert run.returncode == 0 and "GATES-MM-OK" in run.stdout, run.stderr[-4000:]
 
 
+def test_topk_route_matches_topk_and_eplb_map():
+    out = _run("xpu_topk_route_check.py", marker="XPU-TOPK-ROUTE-OK")
+    n = int(out.split("XPU-TOPK-ROUTE-OK")[1].split()[0])
+    assert n == 3 * 8 * 2 * 2 * 3, n
+
+
 def test_switches_default_off():
     import vllm.envs as envs
 
@@ -175,6 +183,7 @@ def test_switches_default_off():
         "VLLM_XPU_MOE_ENTRY_QUANT",
         "VLLM_XPU_MOE_SHARED_IN_GATHER",
         "VLLM_XPU_MOE_GATES_MERGED",
+        "VLLM_XPU_MOE_TOPK_ROUTE",
     ):
         if name in os.environ:
             pytest.skip(f"{name} set in the environment")
