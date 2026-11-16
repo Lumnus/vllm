@@ -350,6 +350,7 @@ if TYPE_CHECKING:
     VLLM_XPU_DFLASH2_TRITON: bool = True
     VLLM_XPU_MOE_PLACEMENT_TRACE: str = ""
     VLLM_XPU_MOE_EPLB_OP_IDS: bool = False
+    VLLM_XPU_HC_UP_FUSED: int = 0
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2432,6 +2433,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_MOE_EPLB_OP_IDS": lambda: bool(
         int(os.getenv("VLLM_XPU_MOE_EPLB_OP_IDS", "0"))
     ),
+    # XPU Qwen4-Exp hyper-connections with an INT8 up projection (dynamic
+    # symmetric per-token activations on the Triton INT8 GEMM). 1: the up
+    # linear's activation quant runs inside the down projection's finish kernel
+    # and the INT8 up GEMM carries the gated mix in its epilogue (one kernel,
+    # up to 64 rows where the linear runs Triton); 2: the quant fold only. The
+    # int8 rows, scales and outputs are those of the unfused path. 0 (default)
+    # keeps the linear's own quant, GEMM and the separate gated mix. Read when
+    # the weights load.
+    "VLLM_XPU_HC_UP_FUSED": lambda: int(os.getenv("VLLM_XPU_HC_UP_FUSED", "0")),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
