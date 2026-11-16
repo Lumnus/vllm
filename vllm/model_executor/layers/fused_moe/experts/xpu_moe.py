@@ -563,14 +563,27 @@ def fused_moe_ep_contract() -> EPIdsContract:
 def ep_ids_contract_for(moe_config: FusedMoEConfig) -> EPIdsContract:
     """The contract an expert-parallel layer uses. With EPLB the layer keeps
     rewriting the ids itself: rebalancing changes which experts a rank owns,
-    and that path was not validated with the op filtering them."""
+    and that path was not validated with the op filtering them.
+    VLLM_XPU_MOE_EPLB_OP_IDS=1 lets the op filter them under EPLB too (no
+    sentinel kernel per layer)."""
     contract = fused_moe_ep_contract()
+    eplb_op_ids = False
     if (
         contract is EPIdsContract.OP_HANDLES_IDS
         and moe_config.moe_parallel_config.enable_eplb
     ):
-        contract = EPIdsContract.IDS_VALID
+        if envs.VLLM_XPU_MOE_EPLB_OP_IDS:
+            eplb_op_ids = True
+        else:
+            contract = EPIdsContract.IDS_VALID
     if moe_config.ep_size <= 1:
+        return contract
+    if eplb_op_ids:
+        logger.info_once(
+            "XPU MoE expert parallelism with EPLB: the fused MoE filters "
+            "unowned ids and clears its expert counts; no sentinel kernel "
+            "(VLLM_XPU_MOE_EPLB_OP_IDS=1)."
+        )
         return contract
     logger.info_once(
         "XPU MoE expert parallelism: %s.",
@@ -1196,6 +1209,27 @@ def xpu_w4a8_moe_available() -> bool:
     )
 
 
+def w4a8_prep() -> str:
+    """What the installed vllm-xpu-kernels' W4A8 apply runs around its GEMMs,
+    for the boot log."""
+    try:
+        from vllm_xpu_kernels import moe_w4a8
+    except ImportError:
+        return "unknown (no vllm_xpu_kernels.moe_w4a8)"
+    stock_prep = getattr(moe_w4a8, "stock_prep", None)
+    if stock_prep is None:
+        return (
+            "padding mask, own zeroed counts and a torch re-count of "
+            "rows_per_expert (this vllm-xpu-kernels has no lean prep)"
+        )
+    if stock_prep():
+        return (
+            "padding mask, own zeroed counts and a torch re-count of "
+            "rows_per_expert (VLLM_XPU_W4A8_STOCK_PREP=1)"
+        )
+    return "no padding mask, the remap fills rows_per_expert (lean prep)"
+
+
 class XPUExpertsW4A8Int(XPUExpertsWNA16):
     """INT4 symmetric g128 experts with dynamic per-token INT8 activations.
 
@@ -1235,6 +1269,7 @@ class XPUExpertsW4A8Int(XPUExpertsWNA16):
                 "XPU MoE W4A8: int4 g128 experts with dynamic per-token int8 "
                 "activations (s8 x s4 grouped GEMM)."
             )
+            logger.info_once("XPU MoE W4A8 prep around the GEMMs: %s.", w4a8_prep())
         else:
             logger.warning_once(
                 "XPU MoE W4A8 requested, but %s: this layer keeps W4A16.", reason

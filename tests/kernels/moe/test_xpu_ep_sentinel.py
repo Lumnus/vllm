@@ -127,6 +127,55 @@ def test_ep_ids_contract(monkeypatch, stub, expected, eplb):
     assert contract is xpu_moe.EPIdsContract[expected]
 
 
+@pytest.mark.parametrize(
+    "stub, expected",
+    [
+        (_FusedMoeOpHandlesIds, "OP_HANDLES_IDS"),
+        (_FusedMoeOneMarker, "IDS_VALID"),
+        (_FusedMoePlain, "PADDING_MASK"),
+    ],
+)
+@pytest.mark.parametrize("ep_size", [1, 4])
+def test_ep_ids_contract_eplb_op_ids(monkeypatch, stub, expected, ep_size):
+    """VLLM_XPU_MOE_EPLB_OP_IDS=1: under EPLB a fused MoE that filters the ids
+    itself gets them as they are (no sentinel kernel); other kernels keep
+    their contract."""
+    from vllm.model_executor.layers.fused_moe.experts import xpu_moe
+
+    monkeypatch.setenv("VLLM_XPU_MOE_EPLB_OP_IDS", "1")
+    monkeypatch.setattr(xpu_moe, "XpuFusedMoe", stub, raising=False)
+    xpu_moe.fused_moe_ep_contract.cache_clear()
+    try:
+        moe_config = SimpleNamespace(
+            ep_size=ep_size, moe_parallel_config=SimpleNamespace(enable_eplb=True)
+        )
+        contract = xpu_moe.ep_ids_contract_for(moe_config)
+    finally:
+        xpu_moe.fused_moe_ep_contract.cache_clear()
+    assert contract is xpu_moe.EPIdsContract[expected]
+
+
+def test_w4a8_prep_report(monkeypatch):
+    """The boot line names what the installed W4A8 apply runs around its
+    GEMMs: a wheel without the lean prep, the lean prep, or the stock prep
+    restored by VLLM_XPU_W4A8_STOCK_PREP=1."""
+    import types
+
+    from vllm.model_executor.layers.fused_moe.experts import xpu_moe
+
+    pkg = types.ModuleType("vllm_xpu_kernels")
+    mod = types.ModuleType("vllm_xpu_kernels.moe_w4a8")
+    pkg.moe_w4a8 = mod
+    monkeypatch.setitem(sys.modules, "vllm_xpu_kernels", pkg)
+    monkeypatch.setitem(sys.modules, "vllm_xpu_kernels.moe_w4a8", mod)
+    assert "no lean prep" in xpu_moe.w4a8_prep()
+    mod.stock_prep = lambda: False
+    assert "lean prep" in xpu_moe.w4a8_prep()
+    assert "no padding mask" in xpu_moe.w4a8_prep()
+    mod.stock_prep = lambda: True
+    assert "VLLM_XPU_W4A8_STOCK_PREP=1" in xpu_moe.w4a8_prep()
+
+
 @pytest.mark.parametrize("contract", ["OP_HANDLES_IDS", "IDS_VALID", "PADDING_MASK"])
 @pytest.mark.parametrize("ep_rank", [0, 2])
 def test_expert_parallel_apply(monkeypatch, contract, ep_rank):

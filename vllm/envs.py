@@ -349,6 +349,7 @@ if TYPE_CHECKING:
     VLLM_XPU_DFLASH_CONTEXT_KV_INT8: bool = True
     VLLM_XPU_DFLASH2_TRITON: bool = True
     VLLM_XPU_MOE_PLACEMENT_TRACE: str = ""
+    VLLM_XPU_MOE_EPLB_OP_IDS: bool = False
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2420,6 +2421,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_MOE_PLACEMENT_TRACE": lambda: os.getenv(
         "VLLM_XPU_MOE_PLACEMENT_TRACE", ""
     ),
+    # XPU expert parallelism with EPLB, on a vllm-xpu-kernels whose fused MoE
+    # filters unowned ids and clears its own expert counts: 1 passes the
+    # routed ids to it as they are, as without EPLB, so the per-layer sentinel
+    # kernel does not run. 0 (default) keeps the sentinel rewrite under EPLB.
+    # Rows of real tokens are the same either way; a padding row (all ids -1)
+    # differs only where the sentinel is an expert the rank owns after a
+    # placement move (the sentinel path computes it, this one returns zeros).
+    # Read when the experts are built.
+    "VLLM_XPU_MOE_EPLB_OP_IDS": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_EPLB_OP_IDS", "0"))
+    ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
@@ -2636,6 +2648,7 @@ def compile_factors() -> dict[str, object]:
         # as an opaque op.
         "VLLM_XPU_MOE_COMBINE",
         "VLLM_XPU_MOE_PLACEMENT_TRACE",
+        "VLLM_XPU_MOE_EPLB_OP_IDS",
         # Read inside the XPU INT8 linear custom op, which the compiled graph
         # calls as an opaque op.
         "VLLM_XPU_INT8_ONEDNN_MIN_ROWS",
