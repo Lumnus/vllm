@@ -353,6 +353,12 @@ if TYPE_CHECKING:
     VLLM_XPU_HC_UP_FUSED: int = 0
     VLLM_XPU_ATTN_META_ONCE: bool = False
     VLLM_XPU_MOE_ROUTE_FUSED: bool = False
+    VLLM_XPU_MAILBOX_ALLREDUCE: bool = False
+    VLLM_XPU_MAILBOX_ALLREDUCE_MAX_BYTES: int = 65536
+    VLLM_XPU_MAILBOX_ALLREDUCE_PARTIALS: Literal["fp32", "input"] = "fp32"
+    VLLM_XPU_MAILBOX_ALLREDUCE_ORDER: str = "3,1"
+    VLLM_XPU_MAILBOX_ALLREDUCE_TIMEOUT_S: float = 20.0
+    VLLM_XPU_MAILBOX_ALLREDUCE_ON_FAIL: Literal["exit", "log"] = "exit"
     VLLM_ROUTER_INT8_SHADOW: str = ""
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -2468,6 +2474,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_MOE_ROUTE_FUSED": lambda: bool(
         int(os.getenv("VLLM_XPU_MOE_ROUTE_FUSED", "0"))
     ),
+    # XPU tensor parallelism on 2 or 4 cards: 1 routes the TP group's
+    # all-reduces of contiguous bf16/fp16 tensors up to _MAX_BYTES through the
+    # mailbox all-reduce kernel (recursive doubling over PCIe peer-to-peer,
+    # one launch per call) instead of XCCL. Every rank computes the same bits;
+    # they differ from XCCL's. _PARTIALS: fp32 sums the tree in fp32 and
+    # rounds once; input rounds the stage-1 sums to the input type. _ORDER:
+    # the two partner masks (stage 1, stage 2) at 4 ranks. A wait longer than
+    # _TIMEOUT_S fails the call; _ON_FAIL=exit stops the process with one
+    # CRITICAL line, log only logs (tests).
+    "VLLM_XPU_MAILBOX_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_XPU_MAILBOX_ALLREDUCE", "0"))
+    ),
+    "VLLM_XPU_MAILBOX_ALLREDUCE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_XPU_MAILBOX_ALLREDUCE_MAX_BYTES", "65536")
+    ),
+    "VLLM_XPU_MAILBOX_ALLREDUCE_PARTIALS": env_with_choices(
+        "VLLM_XPU_MAILBOX_ALLREDUCE_PARTIALS", "fp32", ["fp32", "input"]
+    ),
+    "VLLM_XPU_MAILBOX_ALLREDUCE_ORDER": lambda: os.getenv(
+        "VLLM_XPU_MAILBOX_ALLREDUCE_ORDER", "3,1"
+    ),
+    "VLLM_XPU_MAILBOX_ALLREDUCE_TIMEOUT_S": lambda: float(
+        os.getenv("VLLM_XPU_MAILBOX_ALLREDUCE_TIMEOUT_S", "20")
+    ),
+    "VLLM_XPU_MAILBOX_ALLREDUCE_ON_FAIL": env_with_choices(
+        "VLLM_XPU_MAILBOX_ALLREDUCE_ON_FAIL", "exit", ["exit", "log"]
+    ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
@@ -2688,6 +2721,14 @@ def compile_factors() -> dict[str, object]:
         # Read inside the attention custom op at call time.
         "VLLM_XPU_ATTN_META_ONCE",
         "VLLM_XPU_MOE_ROUTE_FUSED",
+        # Read when the TP communicator is built; the compiled graph calls
+        # the all-reduce as an opaque op.
+        "VLLM_XPU_MAILBOX_ALLREDUCE",
+        "VLLM_XPU_MAILBOX_ALLREDUCE_MAX_BYTES",
+        "VLLM_XPU_MAILBOX_ALLREDUCE_PARTIALS",
+        "VLLM_XPU_MAILBOX_ALLREDUCE_ORDER",
+        "VLLM_XPU_MAILBOX_ALLREDUCE_TIMEOUT_S",
+        "VLLM_XPU_MAILBOX_ALLREDUCE_ON_FAIL",
         # Read inside the XPU INT8 linear custom op, which the compiled graph
         # calls as an opaque op.
         "VLLM_XPU_INT8_ONEDNN_MIN_ROWS",

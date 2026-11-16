@@ -60,6 +60,21 @@ class XpuCommunicator(DeviceCommunicatorBase):
                 self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
                 logger.info("Using AgRs manager on XPU device.")
 
+        # Mailbox all-reduce for the TP group (VLLM_XPU_MAILBOX_ALLREDUCE=1);
+        # None keeps every all-reduce on XCCL.
+        self.mailbox_ar = None
+        if (
+            envs.VLLM_XPU_MAILBOX_ALLREDUCE
+            and unique_name.startswith("tp:")
+            and self.world_size > 1
+            and isinstance(cpu_group, ProcessGroup)
+        ):
+            from .xpu_mailbox_all_reduce import XpuMailboxAllReduce
+
+            self.mailbox_ar = XpuMailboxAllReduce.create(
+                self.cpu_group, self.device, self.rank_in_group, self.world_size
+            )
+
     def _fixed_rank_sum(self, input_: torch.Tensor) -> torch.Tensor:
         flat_input = input_.reshape(-1)
         gathered = torch.empty(
@@ -80,18 +95,29 @@ class XpuCommunicator(DeviceCommunicatorBase):
             return self._fixed_rank_sum(input_)
 
         output = input_.clone()
+        if self.mailbox_ar is not None and self.mailbox_ar.should_use(output):
+            return self.mailbox_ar.all_reduce_inplace(output)
         dist.all_reduce(output, group=self.device_group)
         return output
 
     def all_reduce_inplace(self, input_: torch.Tensor) -> torch.Tensor:
-        """The same XCCL all-reduce on ``input_`` itself (no clone).
+        """The same all-reduce on ``input_`` itself (no clone): XCCL, or the
+        mailbox all-reduce when it is on and takes the tensor.
 
         Only for a buffer the caller owns and never reads again unreduced.
         Batch-invariant mode keeps its gather."""
         if envs.VLLM_BATCH_INVARIANT or not input_.is_contiguous():
             return self.all_reduce(input_)
+        if self.mailbox_ar is not None and self.mailbox_ar.should_use(input_):
+            return self.mailbox_ar.all_reduce_inplace(input_)
         dist.all_reduce(input_, group=self.device_group)
         return input_
+
+    def destroy(self):
+        if self.mailbox_ar is not None:
+            self.mailbox_ar.close()
+            self.mailbox_ar = None
+        super().destroy()
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
