@@ -12,12 +12,20 @@ layer writes its K/V before it attends). Paths, per call of one layer:
    of vllm-xpu-kernels over it);
 2. `fa_only`: the same FlashAttention call over an already dequantized scratch
    (the dequantization's share);
-3. `qk` / `qk_pv`: `xpu_int8_prefill_attention.int8_prefill_attention`.
+3. `qk` / `qk_pv`: `xpu_int8_prefill_attention.int8_prefill_attention` (the
+   engine's Triton kernel, the numerical reference); `qk_pv32`: the same with
+   KV tiles of 32 slots, the P quantization groups of `sycl_qk_pv`;
+4. `sycl_bf16` / `sycl_qk` / `sycl_qk_pv`: the vllm-xpu-kernels chunk-prefill
+   kernel over the int8 cache in place
+   (`xpu_int8_per_token_head.forward_prefill_sycl`, `int8_prefill` 1, 2, 3).
 
 `--check` compares each path's output, on sampled query rows, with a float32
 reference of the decode contract (BF16 query, K/V = cached codes x scales) and
 with the native INT8 decode kernel run on the same rows (prefill and decode on
-the same cached tokens). `--sweep` times the int8 paths over launch configs.
+the same cached tokens; with int8_dot for the int8-query paths), and prints
+the SYCL paths against their Triton references (`sycl_qk` vs `qk`,
+`sycl_qk_pv` vs `qk_pv32`) over the whole chunk. `--sweep` times the Triton
+int8 paths over launch configs.
 `--full-prompt` times every chunk of an L-token prompt (the whole prefill's
 attention for one layer) instead of the last chunk only.
 
@@ -41,6 +49,9 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
 from vllm.v1.kv_cache_interface import KVQuantMode
+
+# --modes name -> int8_prefill of the vllm-xpu-kernels chunk-prefill kernel.
+SYCL_MODES = {"sycl_bf16": 1, "sycl_qk": 2, "sycl_qk_pv": 3}
 
 SWEEP = [
     (64, 64, 64, 4, 1, 16),
@@ -207,7 +218,7 @@ def run_context(args, L: int, dev) -> list[dict]:
         )
         for launch in launches:
             for mode in args.modes.split(","):
-                if mode not in ("qk", "qk_pv"):
+                if mode not in ("qk", "qk_pv", "qk_pv32"):
                     continue
                 name = mode if not args.sweep else f"{mode}{tuple(launch)}"
                 outs[name] = torch.empty_like(q)
@@ -223,9 +234,30 @@ def run_context(args, L: int, dev) -> list[dict]:
                     seq_lens,
                     table,
                     scale,
-                    pv_int8=mode == "qk_pv",
-                    launch=launch,
+                    pv_int8=mode != "qk",
+                    launch=launch._replace(block_n=32) if mode == "qk_pv32" else launch,
                 )
+        for mode in args.modes.split(","):
+            if mode not in SYCL_MODES:
+                continue
+            outs[mode] = torch.empty_like(q)
+            paths[mode] = functools.partial(
+                int8_kv.forward_prefill_sycl,
+                q,
+                key,
+                value,
+                k_scale,
+                v_scale,
+                outs[mode],
+                cu,
+                q_len,
+                seq_lens,
+                e,
+                table,
+                scale,
+                SYCL_MODES[mode],
+                int8_dot=mode != "sycl_bf16",
+            )
         ops = 4 * hq * hd * q_len * (ctx + (q_len + 1) / 2)
         for name, fn in paths.items():
             if name not in ("scratch", "fa_only") or "scratch" in args.modes:
@@ -249,30 +281,44 @@ def run_context(args, L: int, dev) -> list[dict]:
             ref = reference_rows(
                 q, key, value, k_scale, v_scale, table, args.block, rows, ctx, scale
             )
-            # The native decode kernel on the same rows.
+            # The native decode kernel on the same rows, BF16 query and
+            # int8_dot (the int8-query paths' decode counterpart).
             dq = q[rows].contiguous()
-            dout = torch.empty_like(dq)
             n = rows.numel()
-            int8_kv.forward_decode(
-                dq,
-                key,
-                value,
-                k_scale,
-                v_scale,
-                dout,
-                torch.arange(n + 1, dtype=torch.int32, device=dev),
-                1,
-                (ctx + rows + 1).to(torch.int32),
-                e,
-                table.expand(n, -1).contiguous(),
-                scale,
-                None,
-                None,
-            )
-            check = {"L": L, "decode_vs_ref": metrics(dout, ref)}
+            douts = {}
+            for dot in (False, True):
+                douts[dot] = torch.empty_like(dq)
+                int8_kv.forward_decode(
+                    dq,
+                    key,
+                    value,
+                    k_scale,
+                    v_scale,
+                    douts[dot],
+                    torch.arange(n + 1, dtype=torch.int32, device=dev),
+                    1,
+                    (ctx + rows + 1).to(torch.int32),
+                    e,
+                    table.expand(n, -1).contiguous(),
+                    scale,
+                    None,
+                    None,
+                    int8_dot=dot,
+                )
+            dout = douts[False]
+            check = {
+                "L": L,
+                "decode_vs_ref": metrics(dout, ref),
+                "decode_int8_vs_ref": metrics(douts[True], ref),
+            }
             for name, o in outs.items():
+                int8_q = name not in ("scratch", "sycl_bf16")
                 check[f"{name}_vs_ref"] = metrics(o[rows], ref)
-                check[f"{name}_vs_decode"] = metrics(o[rows], dout)
+                check[f"{name}_vs_decode"] = metrics(o[rows], douts[int8_q])
+                check[f"{name}_finite"] = bool(torch.isfinite(o).all())
+            for a, b in (("sycl_qk", "qk"), ("sycl_qk_pv", "qk_pv32")):
+                if a in outs and b in outs:
+                    check[f"{a}_vs_{b}"] = metrics(outs[a], outs[b])
             print("CHECK " + json.dumps(check), flush=True)
     if args.full_prompt:
         for name, ms in totals.items():
@@ -303,7 +349,12 @@ def main():
         default=4,
         help="K channels scaled by 8 (outlier channels)",
     )
-    p.add_argument("--modes", default="scratch,qk,qk_pv")
+    p.add_argument(
+        "--modes",
+        default="scratch,qk,qk_pv,qk_pv32,sycl_bf16,sycl_qk,sycl_qk_pv",
+        help="scratch (and fa_only), the Triton qk / qk_pv / qk_pv32, the "
+        "SYCL sycl_bf16 / sycl_qk / sycl_qk_pv",
+    )
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)

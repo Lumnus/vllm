@@ -1116,6 +1116,7 @@ class xpu_ops:
         mask_mod: Callable | None = None,
         aux_tensors: list | None = None,
         int8_dot: bool = False,
+        int8_prefill: int = 0,
         **kwargs,
     ):
         assert cu_seqlens_k is not None or seqused_k is not None, (
@@ -1173,6 +1174,9 @@ class xpu_ops:
             # INT8 Q.K in the paged decode (int8 KV); only passed when set, so
             # kernels builds without the argument keep working when it is off.
             **({"int8_dot": True} if int8_dot else {}),
+            # INT8 KV prefill in the chunk-prefill kernel (1-3); only passed
+            # when set, as int8_dot.
+            **({"int8_prefill": int8_prefill} if int8_prefill else {}),
         )
 
     @staticmethod
