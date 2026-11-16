@@ -20,8 +20,9 @@ per side when the spec pads the slots); the rest stays unused.
 
 The kernel has no INT8 prefill. Prefill and mixed batches dequantize the blocks
 their sequences reference into a bf16/fp16 paged scratch (one layer, sized to
-`max_model_len`, taken from the workspace manager) and run the stock kernel
-over it. The grouping reads only host copies the scheduler already has. With
+`max_model_len` in the layer's own cache block, taken from the workspace
+manager) and run the stock kernel over it. The grouping reads only host copies
+the scheduler already has. With
 `AttentionConfig.int8_prefill_dot` set, causal prefill attends over the int8
 cache in place instead, with int8 dots and no scratch
 (`xpu_int8_prefill_attention`). With `AttentionConfig.int8_decode_dot` set, the
@@ -443,10 +444,27 @@ def warmup_dequant_blocks(
 
 
 def prefill_scratch_tokens(max_model_len: int, block_size: int) -> int:
-    """Tokens of one layer's K (or V) prefill scratch: a `max_model_len`
-    sequence in blocks of `block_size` or of any smaller kernel block
-    size."""
-    return (cdiv(max_model_len, block_size) + 1) * block_size
+    """Tokens of one layer's K (or V) prefill scratch: one `max_model_len`
+    sequence in whole blocks of `block_size`, the layer's cache block (the
+    unit `plan_prefill_groups` counts in). It also holds that sequence in
+    any block size dividing `block_size`, never in a larger one."""
+    return cdiv(max_model_len, block_size) * block_size
+
+
+def check_prefill_scratch(
+    capacity_blocks: int, max_model_len: int, block_size: int
+) -> None:
+    """Raise ValueError unless a scratch of `capacity_blocks` blocks of
+    `block_size` holds a `max_model_len` sequence, the longest the scheduler
+    admits. Called once the layer's cache block is known, before serving, so
+    a short scratch fails the boot instead of a request."""
+    need = cdiv(max_model_len, block_size)
+    if capacity_blocks < need:
+        raise ValueError(
+            f"the INT8 KV prefill scratch holds {capacity_blocks} blocks of "
+            f"{block_size} tokens; a max_model_len={max_model_len} sequence "
+            f"needs {need}"
+        )
 
 
 def forward_prefill(

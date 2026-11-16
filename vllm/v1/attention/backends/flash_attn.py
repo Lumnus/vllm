@@ -1206,7 +1206,14 @@ class FlashAttentionImpl(AttentionImpl):
                 "--attention-backend TRITON_ATTN or upgrade vllm-xpu-kernels."
             )
         self._int8_kv_max_model_len = vllm_config.model_config.max_model_len
+        # Layers are built before the platform aligns the block size for hybrid
+        # models and before KV planning picks each layer's block, so this is
+        # not the layer's cache block. It serves only the int8_prefill_dot
+        # launch check; the prefill scratch is sized in the layer's own block
+        # (_int8_kv_prefill_scratch) and the profiling claim reads the live
+        # cache config.
         self._int8_kv_block_size = vllm_config.cache_config.block_size
+        self._int8_kv_cache_config = vllm_config.cache_config
         self._int8_kv_scratch_dtype = model_dtype
         self._int8_kv_views: tuple[tuple, tuple[torch.Tensor, ...]] | None = None
         self._int8_prefill_dot = 0
@@ -1294,16 +1301,18 @@ class FlashAttentionImpl(AttentionImpl):
     def _int8_kv_prefill_scratch(
         self, block_size: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One layer's K and V scratch in blocks of `block_size`, from the
-        workspace sized in the profiling run (cache block size, which bounds
-        the kernel block size from above)."""
+        """One layer's K and V scratch in blocks of `block_size`, the layer's
+        cache block (`key_cache.shape[1]`, the unit plan_prefill_groups counts
+        in): room for one max_model_len sequence, the longest the scheduler
+        admits. The profiling run claims it in the aligned cache block size;
+        KV planning may still give a full-attention layer a larger block (pages
+        unified with other layers), so the kernel warm-up claims it again in
+        the layer's final block before the workspace locks."""
         from vllm.v1.attention.ops.xpu_int8_per_token_head import (
             prefill_scratch_tokens,
         )
 
-        tokens = prefill_scratch_tokens(
-            self._int8_kv_max_model_len, self._int8_kv_block_size
-        )
+        tokens = prefill_scratch_tokens(self._int8_kv_max_model_len, block_size)
         shape = (tokens, self.num_kv_heads, self.head_size)
         key_flat, value_flat = current_workspace_manager().get_simultaneous(
             (shape, self._int8_kv_scratch_dtype),
@@ -1353,7 +1362,21 @@ class FlashAttentionImpl(AttentionImpl):
                 pv_int8=self._int8_prefill_dot == 2,
             )
             return
-        key_scratch, value_scratch = self._int8_kv_prefill_scratch(key_cache.shape[1])
+        block_size = key_cache.shape[1]
+        key_scratch, value_scratch = self._int8_kv_prefill_scratch(block_size)
+        int8_kv.check_prefill_scratch(
+            key_scratch.shape[0], self._int8_kv_max_model_len, block_size
+        )
+        logger.info_once(
+            "FlashAttention int8_per_token_head KV prefill scratch: %d blocks of "
+            "%d tokens (max_model_len %d; profiling claimed it in blocks of %d), "
+            "%d bytes for K and V.",
+            key_scratch.shape[0],
+            block_size,
+            self._int8_kv_max_model_len,
+            self._int8_kv_cache_config.block_size,
+            2 * key_scratch.numel() * key_scratch.element_size(),
+        )
         int8_kv.warmup_dequant_blocks(
             key_cache,
             value_cache,
@@ -1456,6 +1479,11 @@ class FlashAttentionImpl(AttentionImpl):
             if seq_ub is not None
             else [attn_metadata.max_seq_len] * num_seqs
         )
+        # The host bound sizes scratch strides only (the device seq_lens drive
+        # the dequant); the scheduler keeps every position within
+        # max_model_len, which the scratch is sized for.
+        max_len = self._int8_kv_max_model_len
+        seq_lens_ub = [min(int(s), max_len) for s in seq_lens_ub]
         key_scratch, value_scratch = self._int8_kv_prefill_scratch(key_cache.shape[1])
         int8_kv.forward_prefill(
             query[:n],
@@ -1547,8 +1575,10 @@ class FlashAttentionImpl(AttentionImpl):
                 self.kv_cache_dtype == "int8_per_token_head"
                 and not self._int8_prefill_dot
             ):
-                # Claim the prefill scratch so KV cache sizing accounts for it.
-                self._int8_kv_prefill_scratch(self._int8_kv_block_size)
+                # Claim the prefill scratch so KV cache sizing accounts for it,
+                # in the block size the platform aligned after the layers
+                # were built.
+                self._int8_kv_prefill_scratch(self._int8_kv_cache_config.block_size)
             return output.fill_(0)
 
         attn_type = self.attn_type
