@@ -11,9 +11,11 @@ the cache in place and runs the dots on the matrix engine in int8.
 
 Numerical contract (`pv_int8=False`, AttentionConfig `int8_prefill_dot="qk"`):
 
-1. Q is quantized per (token, query head) with the KV writer's rounding:
-   scale = absmax / 127, x * (1 / scale), half away from zero, clamped to
-   [-127, 127] (`quantize_query_int8`).
+1. Q is quantized per (token, query head): scale = absmax / 127,
+   x * (1 / scale), half away from zero, clamped to [-127, 127], every step
+   exactly rounded (`quantize_query_int8`). The paged decode kernel applies
+   the same rule in-kernel with `AttentionConfig.int8_decode_dot`, so prefill
+   and decode round a token's query identically.
 2. Q.K is an int8 x int8 -> int32 dot over the whole head (exact: at most
    head_dim * 127 * 127 < 2**31), then S = int32 * q_scale * k_scale in FP32.
    The K codes and scales are the cached ones, the same the decode kernel
@@ -34,8 +36,10 @@ cache (no BF16 rounding of code * scale); the query gains an int8 rounding
 (relative step 1/127 of the row's absmax) and, with "qk_pv", the attention
 weights one (step 1/127 of the tile row's maximum, so weights below half a
 step of their tile's maximum drop to zero). Decode on the same cached tokens
-keeps a BF16 query, so prefill and decode agree on K/V exactly and differ by
-the query rounding.
+reads the same K/V codes and scales; with `int8_decode_dot="qk"` it also takes
+the same int8 query and the same exact int32 Q.K, so "qk" prefill and decode
+differ only by fp32 order and the online-softmax tiling of the BF16 P.V (with
+it off, decode keeps a BF16 query and the two differ by the query rounding).
 
 Tiles: one program = BLOCK_M query tokens of one sequence x one query head x
 the output columns of its `dv_split` part. A KV tile is BLOCK_N consecutive
@@ -150,17 +154,24 @@ def _quant_query_kernel(
     NUM_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ) -> None:
-    """Symmetric int8 Q, one fp32 scale per (token, query head), with the
-    per-token-head KV writer's rounding. Writes contiguous [rows, heads,
-    head_dim] int8 and [rows, heads] fp32."""
+    """Symmetric int8 Q, one fp32 scale per (token, query head): the rule
+    the paged decode kernel applies in-kernel with int8_dot (vllm-xpu-kernels
+    `int8_attn_query_scale` / `int8_attn_query_code`), so a token's query is
+    rounded the same way whether it is prefilled here or decoded there.
+    scale = max(absmax / 127, 1e-10) and 1 / scale are exactly rounded
+    divisions; codes round half away from zero exactly:
+    floor(|y| + 1/2) = (trunc(2 |y|) + 1) >> 1, with 2 |y| exact, so no fp
+    addition (or its contraction into an FMA) can move a code. Writes
+    contiguous [rows, heads, head_dim] int8 and [rows, heads] fp32."""
     row = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     dims = tl.arange(0, HEAD_DIM)
     x = tl.load(q_ptr + row * stride_q_row + head * stride_q_head + dims).to(tl.float32)
-    scale = tl.maximum(tl.max(tl.abs(x), axis=0) / 127.0, 1.0e-10)
-    y = x * (1.0 / scale)
-    y = tl.where(y >= 0, tl.floor(y + 0.5), tl.ceil(y - 0.5))
-    y = tl.minimum(tl.maximum(y, -127.0), 127.0)
+    scale = tl.maximum(tl.math.div_rn(tl.max(tl.abs(x), axis=0), 127.0), 1.0e-10)
+    y = x * tl.math.div_rn(1.0, scale)
+    c = (tl.minimum(tl.abs(y) * 2.0, 255.0).to(tl.int32) + 1) >> 1
+    c = tl.minimum(c, 127)
+    y = tl.where(y < 0, -c, c)
     out_row = row * NUM_HEADS + head
     tl.store(q_i8_ptr + out_row * HEAD_DIM + dims, y.to(tl.int8))
     tl.store(q_scale_ptr + out_row, scale)

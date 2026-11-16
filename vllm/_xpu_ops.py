@@ -1115,6 +1115,7 @@ class xpu_ops:
         dynamic_causal: torch.Tensor | None = None,
         mask_mod: Callable | None = None,
         aux_tensors: list | None = None,
+        int8_dot: bool = False,
         **kwargs,
     ):
         assert cu_seqlens_k is not None or seqused_k is not None, (
@@ -1169,6 +1170,9 @@ class xpu_ops:
                 if (meta_cache := fa_meta_cache()) is not None
                 else {}
             ),
+            # INT8 Q.K in the paged decode (int8 KV); only passed when set, so
+            # kernels builds without the argument keep working when it is off.
+            **({"int8_dot": True} if int8_dot else {}),
         )
 
     @staticmethod

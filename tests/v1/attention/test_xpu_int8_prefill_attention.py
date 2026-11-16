@@ -427,6 +427,10 @@ def _impl_stub(
     stub._init_int8_prefill_dot = lambda cfg: FlashAttentionImpl._init_int8_prefill_dot(
         stub, cfg
     )
+    stub._int8_decode_dot = False
+    stub._init_int8_decode_dot = lambda cfg: FlashAttentionImpl._init_int8_decode_dot(
+        stub, cfg
+    )
     return stub
 
 

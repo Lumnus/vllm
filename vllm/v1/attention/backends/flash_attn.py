@@ -1210,6 +1210,30 @@ class FlashAttentionImpl(AttentionImpl):
         self._int8_kv_scratch_dtype = model_dtype
         self._int8_kv_views: tuple[tuple, tuple[torch.Tensor, ...]] | None = None
         self._int8_prefill_dot = 0
+        self._int8_decode_dot = False
+
+    def _init_int8_decode_dot(self, vllm_config: VllmConfig) -> str:
+        """AttentionConfig.int8_decode_dot: the paged decode kernel quantizes
+        Q per (token, head) and runs Q.K as int8 x int8 -> int32. Returns the
+        boot line's decode remark ("" when off)."""
+        from vllm.v1.attention.ops import xpu_int8_per_token_head as int8_kv
+
+        setting = vllm_config.attention_config.int8_decode_dot
+        if setting == "off":
+            return ""
+        reason = int8_kv.int8_dot_decode_supported(
+            self.head_size, self._int8_kv_scratch_dtype
+        )
+        if reason is not None:
+            logger.warning_once(
+                "int8_decode_dot=%s does not apply (%s); decode keeps Q.K on "
+                "the BF16 query over the widened K codes.",
+                setting,
+                reason,
+            )
+            return ""
+        self._int8_decode_dot = True
+        return f"; Q.K int8 x int8 -> int32 (int8_decode_dot={setting})"
 
     def _init_int8_prefill_dot(self, vllm_config: VllmConfig) -> None:
         """AttentionConfig.int8_prefill_dot: attend over the int8 cache in
@@ -1222,6 +1246,7 @@ class FlashAttentionImpl(AttentionImpl):
             check_launch,
         )
 
+        decode_remark = self._init_int8_decode_dot(vllm_config)
         setting = vllm_config.attention_config.int8_prefill_dot
         mode = INT8_PREFILL_DOT_MODES[setting]
         unsupported = []
@@ -1248,19 +1273,21 @@ class FlashAttentionImpl(AttentionImpl):
         if mode:
             logger.info_once(
                 "FlashAttention int8_per_token_head KV cache on XPU: native INT8 "
-                "paged decode (query length <= %d per sequence), native INT8 "
+                "paged decode (query length <= %d per sequence%s), native INT8 "
                 "prefill attention (int8_prefill_dot=%s: Q.K int8 x int8 -> "
                 "int32, P.V %s), no prefill scratch.",
                 int8_kv.decode_max_query_len(),
+                decode_remark,
                 setting,
                 "int8 x int8 -> int32" if mode == 2 else "BF16",
             )
         else:
             logger.info_once(
                 "FlashAttention int8_per_token_head KV cache on XPU: native INT8 "
-                "paged decode (query length <= %d per sequence), prefill through "
-                "a dequantized %s scratch.",
+                "paged decode (query length <= %d per sequence%s), prefill "
+                "through a dequantized %s scratch.",
                 int8_kv.decode_max_query_len(),
+                decode_remark,
                 self._int8_kv_scratch_dtype,
             )
 
@@ -1378,6 +1405,7 @@ class FlashAttentionImpl(AttentionImpl):
                 self.scale,
                 window_size,
                 self.sinks,
+                int8_dot=self._int8_decode_dot,
             )
             return output
 
