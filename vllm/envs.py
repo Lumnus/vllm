@@ -351,6 +351,7 @@ if TYPE_CHECKING:
     VLLM_XPU_MOE_PLACEMENT_TRACE: str = ""
     VLLM_XPU_MOE_EPLB_OP_IDS: bool = False
     VLLM_XPU_HC_UP_FUSED: int = 0
+    VLLM_XPU_MOE_ROUTE_FUSED: bool = False
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2442,6 +2443,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # keeps the linear's own quant, GEMM and the separate gated mix. Read when
     # the weights load.
     "VLLM_XPU_HC_UP_FUSED": lambda: int(os.getenv("VLLM_XPU_HC_UP_FUSED", "0")),
+    # XPU fused MoE with expert parallelism and EPLB: 1 has the router's EPLB
+    # mapping kernel write the experts' unowned sentinel for unrouted ids in
+    # the same launch, so the per-layer sentinel kernel does not run (with a
+    # vllm-xpu-kernels that clears rows_per_expert itself). The ids are the
+    # ones the sentinel kernel writes. 0 (default) keeps that kernel. Read
+    # inside the fused MoE custom op.
+    "VLLM_XPU_MOE_ROUTE_FUSED": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_ROUTE_FUSED", "0"))
+    ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
@@ -2659,6 +2669,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_XPU_MOE_COMBINE",
         "VLLM_XPU_MOE_PLACEMENT_TRACE",
         "VLLM_XPU_MOE_EPLB_OP_IDS",
+        "VLLM_XPU_MOE_ROUTE_FUSED",
         # Read inside the XPU INT8 linear custom op, which the compiled graph
         # calls as an opaque op.
         "VLLM_XPU_INT8_ONEDNN_MIN_ROWS",
