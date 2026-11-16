@@ -8,7 +8,10 @@ from vllm import _custom_ops as ops
 from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
     triton_scaled_mm,
 )
-from vllm.model_executor.layers.quantization.utils import replace_parameter
+from vllm.model_executor.layers.quantization.utils import (
+    entry_rows,
+    replace_parameter,
+)
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     convert_to_channelwise,
 )
@@ -124,6 +127,17 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
         w_q, w_s, i_s, i_zp, azp_adj = self._get_layer_params(layer)
 
         symmetric = azp_adj is None
+        if entry_rows.ACTIVE and symmetric and i_s is None:
+            # XPU MoE entry (see xpu.XPUInt8ScaledMMLinearKernel.apply_weights).
+            hit = entry_rows.int8_input(layer, x)
+            if hit is not None:
+                out, rows = hit
+                if out is not None and bias is None:
+                    return out
+                if rows is not None:
+                    return torch.ops.vllm.int8_scaled_mm_func(
+                        rows[0], w_q, rows[1], w_s, x.dtype, bias
+                    )
         x_q, x_s, x_zp = ops.scaled_int8_quant(
             x.contiguous(), i_s, i_zp, symmetric=symmetric
         )

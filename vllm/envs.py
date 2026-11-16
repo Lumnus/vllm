@@ -353,6 +353,9 @@ if TYPE_CHECKING:
     VLLM_XPU_HC_UP_FUSED: int = 0
     VLLM_XPU_ATTN_META_ONCE: bool = False
     VLLM_XPU_MOE_ROUTE_FUSED: bool = False
+    VLLM_XPU_MOE_ENTRY_QUANT: bool = False
+    VLLM_XPU_MOE_SHARED_IN_GATHER: int = 0
+    VLLM_XPU_MOE_GATES_MERGED: bool = False
     VLLM_ROUTER_INT8_SHADOW: str = ""
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
@@ -2467,6 +2470,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # inside the fused MoE custom op.
     "VLLM_XPU_MOE_ROUTE_FUSED": lambda: bool(
         int(os.getenv("VLLM_XPU_MOE_ROUTE_FUSED", "0"))
+    ),
+    # XPU MoE entry: 1 quantizes the MoE input row once (the per-token int8
+    # op every INT8 consumer runs) and hands those int8 rows and scales to
+    # each consumer of the same row: the shared expert's gate_up, the router
+    # gate and the shared-expert gate when the checkpoint carries them as
+    # INT8 W8A8, and the W4A8 routed experts. Same bits. 0 (default): each
+    # consumer quantizes the row itself. Read when the MoE layers finish
+    # loading.
+    "VLLM_XPU_MOE_ENTRY_QUANT": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_ENTRY_QUANT", "0"))
+    ),
+    # XPU W4A8 MoE with a gated shared expert: 1 adds sigmoid(gate) * shared
+    # to the routed sum inside the routed experts' gather, with the bf16
+    # roundings of the separate multiply and add (same bits), so neither runs.
+    # 2 (tier 2, different bits) does it with one fp32 rounding of
+    # routed + gate * shared. 0 (default): multiply and add as separate ops.
+    "VLLM_XPU_MOE_SHARED_IN_GATHER": lambda: int(
+        os.getenv("VLLM_XPU_MOE_SHARED_IN_GATHER", "0")
+    ),
+    # XPU MoE whose router gate and shared-expert gate are both INT8 W8A8 in
+    # the checkpoint: 1 runs them as one INT8 GEMM (N = experts + 1) where
+    # the INT8 linear runs its Triton GEMM (at most
+    # VLLM_XPU_INT8_ONEDNN_MIN_ROWS rows); each output element is the one
+    # its own GEMM gives. Above that row count both keep their own GEMMs.
+    "VLLM_XPU_MOE_GATES_MERGED": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_GATES_MERGED", "0"))
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
