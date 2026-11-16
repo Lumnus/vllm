@@ -1131,6 +1131,9 @@ class FlashAttentionImpl(AttentionImpl):
                 "Sinks must have the same number of heads as the number of "
                 "heads in the layer"
             )
+        if kv_cache_dtype == "int8_per_token_head":
+            assert vllm_config is not None
+            self._init_int8_prefill_dot(vllm_config)
 
         # FA4's SM90 d512 FP8-KV path consumes native FP16/BF16 Q. Other FA4
         # FP8 paths (notably SM100) require Q, K, and V to share an FP8 dtype.
@@ -1206,13 +1209,60 @@ class FlashAttentionImpl(AttentionImpl):
         self._int8_kv_block_size = vllm_config.cache_config.block_size
         self._int8_kv_scratch_dtype = model_dtype
         self._int8_kv_views: tuple[tuple, tuple[torch.Tensor, ...]] | None = None
-        logger.info_once(
-            "FlashAttention int8_per_token_head KV cache on XPU: native INT8 "
-            "paged decode (query length <= %d per sequence), prefill through "
-            "a dequantized %s scratch.",
-            int8_kv.decode_max_query_len(),
-            model_dtype,
+        self._int8_prefill_dot = 0
+
+    def _init_int8_prefill_dot(self, vllm_config: VllmConfig) -> None:
+        """AttentionConfig.int8_prefill_dot: attend over the int8 cache in
+        place for prefill (no dequantized scratch), on causal layers without a
+        sliding window or sinks."""
+        from vllm.v1.attention.ops import xpu_int8_per_token_head as int8_kv
+        from vllm.v1.attention.ops.xpu_int8_prefill_attention import (
+            _LAUNCH,
+            INT8_PREFILL_DOT_MODES,
+            check_launch,
         )
+
+        setting = vllm_config.attention_config.int8_prefill_dot
+        mode = INT8_PREFILL_DOT_MODES[setting]
+        unsupported = []
+        if self.sliding_window != (-1, -1):
+            unsupported.append("sliding window")
+        if self.sinks is not None:
+            unsupported.append("attention sinks")
+        if mode:
+            try:
+                check_launch(
+                    _LAUNCH, self.head_size, mode == 2, self._int8_kv_block_size
+                )
+            except ValueError as e:
+                unsupported.append(str(e))
+        if mode and unsupported:
+            logger.warning_once(
+                "int8_prefill_dot=%s does not apply to a layer with %s; its "
+                "prefill keeps the dequantized scratch.",
+                setting,
+                " and ".join(unsupported),
+            )
+            mode = 0
+        self._int8_prefill_dot = mode
+        if mode:
+            logger.info_once(
+                "FlashAttention int8_per_token_head KV cache on XPU: native INT8 "
+                "paged decode (query length <= %d per sequence), native INT8 "
+                "prefill attention (int8_prefill_dot=%s: Q.K int8 x int8 -> "
+                "int32, P.V %s), no prefill scratch.",
+                int8_kv.decode_max_query_len(),
+                setting,
+                "int8 x int8 -> int32" if mode == 2 else "BF16",
+            )
+        else:
+            logger.info_once(
+                "FlashAttention int8_per_token_head KV cache on XPU: native INT8 "
+                "paged decode (query length <= %d per sequence), prefill through "
+                "a dequantized %s scratch.",
+                int8_kv.decode_max_query_len(),
+                self._int8_kv_scratch_dtype,
+            )
 
     def _int8_kv_prefill_scratch(
         self, block_size: int
@@ -1254,11 +1304,28 @@ class FlashAttentionImpl(AttentionImpl):
         self, kv_cache: torch.Tensor, block_table: torch.Tensor
     ) -> None:
         """Compile the prefill dequantization for the scratch strides serving
-        takes (kernel warm-up calls this with the layer's KV cache and its KV
+        takes, or the native INT8 prefill attention when int8_prefill_dot is
+        set (kernel warm-up calls this with the layer's KV cache and its KV
         cache group's block table)."""
         from vllm.v1.attention.ops import xpu_int8_per_token_head as int8_kv
 
         key_cache, value_cache, k_scale, v_scale = self._int8_kv_split_views(kv_cache)
+        if self._int8_prefill_dot:
+            from vllm.v1.attention.ops.xpu_int8_prefill_attention import (
+                warmup_int8_prefill_attention,
+            )
+
+            warmup_int8_prefill_attention(
+                key_cache,
+                value_cache,
+                k_scale,
+                v_scale,
+                block_table,
+                self.num_heads,
+                self._int8_kv_scratch_dtype,
+                pv_int8=self._int8_prefill_dot == 2,
+            )
+            return
         key_scratch, value_scratch = self._int8_kv_prefill_scratch(key_cache.shape[1])
         int8_kv.warmup_dequant_blocks(
             key_cache,
@@ -1311,6 +1378,33 @@ class FlashAttentionImpl(AttentionImpl):
                 self.scale,
                 window_size,
                 self.sinks,
+            )
+            return output
+
+        if self._int8_prefill_dot:
+            if not causal:
+                # No scratch was reserved for this layer.
+                raise NotImplementedError(
+                    "FlashAttention int8_per_token_head KV cache: int8_prefill_dot "
+                    "covers causal batches only; got a non-causal batch with max "
+                    f"query length {max_q}."
+                )
+            from vllm.v1.attention.ops.xpu_int8_prefill_attention import (
+                int8_prefill_attention,
+            )
+
+            int8_prefill_attention(
+                query[:n],
+                key_cache,
+                value_cache,
+                k_scale,
+                v_scale,
+                output[:n],
+                attn_metadata.query_start_loc,
+                attn_metadata.seq_lens,
+                attn_metadata.block_table,
+                self.scale,
+                pv_int8=self._int8_prefill_dot == 2,
             )
             return output
 
@@ -1421,7 +1515,10 @@ class FlashAttentionImpl(AttentionImpl):
 
         if attn_metadata is None:
             # Profiling run.
-            if self.kv_cache_dtype == "int8_per_token_head":
+            if (
+                self.kv_cache_dtype == "int8_per_token_head"
+                and not self._int8_prefill_dot
+            ):
                 # Claim the prefill scratch so KV cache sizing accounts for it.
                 self._int8_kv_prefill_scratch(self._int8_kv_block_size)
             return output.fill_(0)

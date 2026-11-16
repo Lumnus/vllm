@@ -101,6 +101,17 @@ class AttentionConfig:
     computes P.V in int8. "off" widens the int8 K/V rows to the query dtype for
     the dots."""
 
+    int8_prefill_dot: Literal["off", "qk", "qk_pv"] = "off"
+    """Prefill and mixed batches over an int8_per_token_head KV cache on the
+    XPU FlashAttention backend: attend over the int8 cache in place instead of
+    dequantizing the referenced blocks into a BF16 scratch. "qk" quantizes the
+    query to int8 per (token, head) and computes Q.K as an int8 x int8 -> int32
+    dot, scaled by the query and K scales afterwards; P.V widens the V codes to
+    BF16 as the decode kernel does. "qk_pv" also quantizes the attention
+    weights per query row of a KV tile and computes P.V in int8. Causal layers
+    without a sliding window or sinks only; "off" (the default) keeps the BF16
+    scratch."""
+
     trtllm_ragged_backend: Literal["trtllm-gen", "cute-dsl"] = "trtllm-gen"
     """Kernel backend for cached-context TRTLLM_RAGGED MLA prefill.
     CuTe DSL requires FP8 queries for head dimension 192 and does not support
@@ -281,10 +292,14 @@ class AttentionConfig:
         excluding anything before input ids/embeddings and after
         the final hidden states.
         """
-        # qsa_int8_dot selects the QSA kernels when set; "off" (the default)
-        # keeps the key of a config without the field, so a def that does not
-        # set it reuses its compiled graphs.
-        ignored = {"qsa_int8_dot"} if self.qsa_int8_dot == "off" else set()
+        # qsa_int8_dot and int8_prefill_dot select attention kernels when set;
+        # "off" (the default) keeps the key of a config without the field, so
+        # a def that does not set it reuses its compiled graphs.
+        ignored = {
+            name
+            for name in ("qsa_int8_dot", "int8_prefill_dot")
+            if getattr(self, name) == "off"
+        }
         return get_compile_factors(self, ignored)
 
     @field_validator("backend", mode="before")

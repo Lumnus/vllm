@@ -21,7 +21,10 @@ per side when the spec pads the slots); the rest stays unused.
 The kernel has no INT8 prefill. Prefill and mixed batches dequantize the blocks
 their sequences reference into a bf16/fp16 paged scratch (one layer, sized to
 `max_model_len`, taken from the workspace manager) and run the stock kernel
-over it. The grouping reads only host copies the scheduler already has.
+over it. The grouping reads only host copies the scheduler already has. With
+`AttentionConfig.int8_prefill_dot` set, causal prefill attends over the int8
+cache in place instead, with int8 dots and no scratch
+(`xpu_int8_prefill_attention`).
 """
 
 import functools
