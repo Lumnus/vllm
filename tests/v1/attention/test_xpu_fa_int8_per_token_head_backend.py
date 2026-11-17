@@ -187,14 +187,116 @@ def test_plan_prefill_groups():
         plan_prefill_groups([641], 64, 10)
 
 
-def test_prefill_scratch_holds_max_model_len():
-    """Sized with the cache block size, the scratch holds a max_model_len
-    sequence in that block size and in any smaller kernel block size."""
-    for max_len, cache_bs in [(262144, 64), (262144, 832), (1000, 64), (999, 4352)]:
-        tokens = prefill_scratch_tokens(max_len, cache_bs)
-        for bs in {64, cache_bs // 2 // 64 * 64 or 64, cache_bs}:
-            groups = plan_prefill_groups([max_len], bs, tokens // bs)
-            assert groups == [(0, 1, -(-max_len // bs))]
+# (max_model_len, layer cache block) of the QFN serving definitions: two cards
+# 131072 in blocks of 6272 (full-attention block grown from 3136 at KV
+# planning), four cards 262144 in blocks of 1600; plus edges around them.
+_SERVING_GRID = [(131072, 6272), (131072, 3136), (262144, 1600), (131072, 1600)]
+_GRID = _SERVING_GRID + [
+    (max_len, bs)
+    for max_len in (1, 999, 1000, 4096, 32768, 125440, 125441, 131071, 262144)
+    for bs in (16, 64, 832, 1024, 1600, 3136, 4352, 6272, 12544)
+]
+
+
+@pytest.mark.parametrize("max_len, block_size", _GRID)
+def test_prefill_scratch_holds_max_model_len(max_len, block_size):
+    """In the layer's cache block, the scratch holds a max_model_len sequence
+    (capacity >= need) and every shorter one, with no spare block."""
+    tokens = prefill_scratch_tokens(max_len, block_size)
+    capacity = tokens // block_size
+    need = -(-max_len // block_size)
+    assert capacity >= need
+    assert tokens == need * block_size  # no spare block
+    for seq_len in {1, max_len // 2 or 1, max_len - 1 or 1, max_len}:
+        assert plan_prefill_groups([seq_len], block_size, capacity) == [
+            (0, 1, max(1, -(-seq_len // block_size)))
+        ]
+
+
+@pytest.mark.parametrize("max_len, block_size", _SERVING_GRID)
+def test_prefill_scratch_holds_max_model_len_in_dividing_blocks(max_len, block_size):
+    """The same scratch holds the sequence in any block that divides the
+    layer's block (a kernel block split from it)."""
+    tokens = prefill_scratch_tokens(max_len, block_size)
+    for kernel_bs in (64, block_size // 2, block_size):
+        if block_size % kernel_bs == 0:
+            assert plan_prefill_groups([max_len], kernel_bs, tokens // kernel_bs)
+
+
+def test_check_prefill_scratch_refuses_a_short_scratch():
+    from vllm.v1.attention.ops.xpu_int8_per_token_head import check_prefill_scratch
+
+    check_prefill_scratch(21, 131072, 6272)
+    check_prefill_scratch(164, 262144, 1600)
+    with pytest.raises(ValueError, match="needs 21"):
+        check_prefill_scratch(20, 131072, 6272)
+
+
+class _MetaWorkspace:
+    """Workspace manager stand-in: meta tensors of the requested shapes."""
+
+    def get_simultaneous(self, *shapes_and_dtypes):
+        return [torch.empty(s, dtype=d, device="meta") for s, d in shapes_and_dtypes]
+
+
+@pytest.mark.parametrize(
+    "max_len, init_bs, aligned_bs, layer_bs, prompt",
+    [
+        # Two cards: the layer is built at the default 64, the platform aligns
+        # the hybrid block to 3136, KV planning grows full attention to 6272;
+        # a 130,000-token prompt is 21 of those blocks.
+        (131072, 64, 3136, 6272, 130000),
+        (131072, 64, 3136, 6272, 131072),
+        # Four cards: 64 -> 1600, a 262,144-token sequence is 164 blocks.
+        (262144, 64, 1600, 1600, 262144),
+    ],
+)
+def test_scratch_follows_the_layer_block_not_the_build_time_block(
+    max_len, init_bs, aligned_bs, layer_bs, prompt
+):
+    """Regression: the scratch was sized with the block size seen when the
+    layer was built (64), which is smaller than the layer's cache block after
+    hybrid alignment and KV planning; 20 blocks of 6272 then held only
+    125,440 tokens and a 130,000-token prompt raised 'a sequence of 21 blocks
+    exceeds the INT8 KV prefill scratch of 20 blocks' in every worker."""
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backend import AttentionType
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+    from vllm.v1.attention.ops import xpu_int8_per_token_head as int8_kv
+
+    impl = SimpleNamespace(
+        attn_type=AttentionType.DECODER,
+        alibi_slopes=None,
+        logits_soft_cap=0,
+        head_size=256,
+        num_kv_heads=1,
+        dcp_world_size=1,
+    )
+    cache_config = SimpleNamespace(block_size=init_bs)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=max_len, dtype=torch.bfloat16),
+        cache_config=cache_config,
+    )
+    with (
+        patch(PLATFORM) as platform,
+        patch.object(int8_kv, "int8_kv_decode_supported", lambda *a: None),
+        patch(
+            "vllm.v1.attention.backends.flash_attn.current_workspace_manager",
+            _MetaWorkspace,
+        ),
+    ):
+        platform.is_xpu.return_value = True
+        FlashAttentionImpl._init_int8_per_token_head_kv(impl, vllm_config)
+        # After the layers are built: hybrid alignment, then KV planning.
+        cache_config.block_size = aligned_bs
+        key_scratch, value_scratch = FlashAttentionImpl._int8_kv_prefill_scratch(
+            impl, layer_bs
+        )
+    assert key_scratch.shape == value_scratch.shape
+    assert key_scratch.shape[1:] == (layer_bs, 1, 256)
+    groups = plan_prefill_groups([prompt], layer_bs, key_scratch.shape[0])
+    assert groups == [(0, 1, -(-prompt // layer_bs))]
 
 
 def _triton_runs_here() -> bool:

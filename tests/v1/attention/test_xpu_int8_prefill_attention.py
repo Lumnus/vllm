@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+
 from vllm.config.attention import AttentionConfig
 from vllm.triton_utils import HAS_TRITON
 from vllm.v1.attention.ops import xpu_int8_prefill_attention as i8p
@@ -409,11 +410,15 @@ def _impl_stub(
         _int8_prefill_dot=mode,
         _int8_kv_scratch_dtype=torch.bfloat16,
         _int8_kv_block_size=block,
+        _int8_kv_cache_config=SimpleNamespace(block_size=block),
+        _int8_kv_max_model_len=4096,
         scratch_claims=0,
+        scratch_block_sizes=[],
     )
 
     def scratch(block_size):
         stub.scratch_claims += 1
+        stub.scratch_block_sizes.append(block_size)
         return None, None
 
     stub._int8_kv_prefill_scratch = scratch
@@ -523,3 +528,39 @@ def test_profile_run_claims_the_scratch_only_without_int8_prefill(mode, claims):
     FlashAttentionImpl.forward(stub, None, out, None, None, None, None, out)
     assert stub.scratch_claims == claims
     assert not out.any()
+
+
+def test_profile_run_claims_the_scratch_in_the_aligned_block_size():
+    """The layer is built before the platform aligns the hybrid block size;
+    the profiling claim reads the aligned size, not the build-time one."""
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+
+    stub = _impl_stub(0, block=64)
+    stub._int8_kv_cache_config.block_size = 3136
+    stub.vllm_flash_attn_version = 2
+    out = torch.ones(4, 6 * HD)
+    FlashAttentionImpl.forward(stub, None, out, None, None, None, None, out)
+    assert stub.scratch_block_sizes == [3136]
+
+
+def test_prefill_plans_with_the_host_bound_capped_at_max_model_len(monkeypatch):
+    """A host upper bound past max_model_len (draft tokens the step rejects)
+    plans no stride the scratch was not sized for."""
+    from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+    from vllm.v1.attention.ops import xpu_int8_per_token_head as int8_kv
+
+    seen = []
+    monkeypatch.setattr(int8_kv, "decode_max_query_len", lambda: 16)
+    monkeypatch.setattr(int8_kv, "is_graph_capturing", lambda: False)
+    monkeypatch.setattr(
+        int8_kv, "forward_prefill", lambda *a, **kw: seen.append(list(a[11]))
+    )
+    stub = _impl_stub(0)
+    stub._int8_kv_max_model_len = 100
+    meta = _metadata(40)
+    meta.seq_lens_cpu_upper_bound = torch.tensor([107], dtype=torch.int32)
+    query = torch.zeros(40, 6, HD, dtype=torch.bfloat16)
+    FlashAttentionImpl._forward_int8_per_token_head(
+        stub, query, None, meta, torch.zeros_like(query)
+    )
+    assert seen == [[100]]
