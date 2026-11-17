@@ -354,6 +354,7 @@ if TYPE_CHECKING:
     VLLM_XPU_MOE_EPLB_OP_IDS: bool = False
     VLLM_XPU_HC_UP_FUSED: int = 0
     VLLM_XPU_HC_UP_TILE: str = ""
+    VLLM_XPU_HC_DOWN_FOLD: int = 0
     VLLM_XPU_ATTN_META_ONCE: bool = False
     VLLM_XPU_MOE_ROUTE_FUSED: bool = False
     VLLM_XPU_MAILBOX_ALLREDUCE: bool = False
@@ -364,7 +365,8 @@ if TYPE_CHECKING:
     VLLM_XPU_MAILBOX_ALLREDUCE_ON_FAIL: Literal["exit", "log"] = "exit"
     VLLM_XPU_MOE_ENTRY_QUANT: bool = False
     VLLM_XPU_MOE_SHARED_IN_GATHER: int = 0
-    VLLM_XPU_MOE_GATES_MERGED: bool = False
+    VLLM_XPU_MOE_SHARED_GATE_IN_GATHER: bool = False
+    VLLM_XPU_MOE_GATES_MERGED: int = 0
     VLLM_XPU_MOE_TOPK_ROUTE: bool = False
     VLLM_ROUTER_INT8_SHADOW: str = ""
     VLLM_SERVING_PROFILES: str = ""
@@ -2478,6 +2480,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Empty (default): 16,128 with 4 warps, 8 at 64 rows. The bits do not
     # depend on it. Read per call.
     "VLLM_XPU_HC_UP_TILE": lambda: os.getenv("VLLM_XPU_HC_UP_TILE", ""),
+    # XPU Qwen4-Exp hyper-connections with an INT8 down projection on the fused
+    # INT8 dense GEMM: the per-token int8 quant of the GEMM's input runs in the
+    # tail of the kernel that writes it (combine + grouped norm), and the GEMM
+    # takes those rows (int8_dense_w8a8_gemm): one launch fewer per module.
+    # The rule is the native quant's with IEEE division (the calibration rule);
+    # the native op's device division is approximate, so codes can differ from
+    # today's on elements at a rounding tie (tier 2). 1: the last stream of a
+    # row recomputes the row (no memory ordering assumed); 2: it re-reads the
+    # stored rows under an acq_rel atomic. 0 (default): the fused GEMM's own
+    # quant. Read when the weights load.
+    "VLLM_XPU_HC_DOWN_FOLD": lambda: int(os.getenv("VLLM_XPU_HC_DOWN_FOLD", "0")),
     # Debug: a MoE router gate loaded as checkpoint INT8 W8A8 also runs a BF16
     # evaluation and logs how many routed slots (top-k experts per token)
     # differ. "dequant" uses the INT8 weight times its scales; a checkpoint
@@ -2546,13 +2559,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_MOE_SHARED_IN_GATHER": lambda: int(
         os.getenv("VLLM_XPU_MOE_SHARED_IN_GATHER", "0")
     ),
+    # With VLLM_XPU_MOE_SHARED_IN_GATHER: 1 hands the gather the shared-expert
+    # gate's logits, and the gather applies the sigmoid (fp32, device exp,
+    # rounded to bf16) instead of torch's sigmoid kernel. Tier 2: the gate
+    # can differ by one bf16 ulp. Needs a vllm-xpu-kernels gather that takes
+    # gate_logits. 0 (default): torch's sigmoid. Read when the MoE layers
+    # finish loading.
+    "VLLM_XPU_MOE_SHARED_GATE_IN_GATHER": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_SHARED_GATE_IN_GATHER", "0"))
+    ),
     # XPU MoE whose router gate and shared-expert gate are both INT8 W8A8 in
     # the checkpoint: 1 runs them as one INT8 GEMM (N = experts + 1) where
     # the INT8 linear runs its Triton GEMM (at most
     # VLLM_XPU_INT8_ONEDNN_MIN_ROWS rows); each output element is the one
     # its own GEMM gives. Above that row count both keep their own GEMMs.
-    "VLLM_XPU_MOE_GATES_MERGED": lambda: bool(
-        int(os.getenv("VLLM_XPU_MOE_GATES_MERGED", "0"))
+    # 2 runs the merged Triton GEMM at every row count: above the split it
+    # replaces the gates' oneDNN GEMMs (tier 2 there: the scales applied in
+    # Triton's order, at most one bf16 ulp from oneDNN's).
+    "VLLM_XPU_MOE_GATES_MERGED": lambda: int(
+        os.getenv("VLLM_XPU_MOE_GATES_MERGED", "0")
     ),
     # XPU MoE with EPLB: 1 runs the softmax top-k with the EPLB logical to
     # physical mapping, the expert-load record and (with

@@ -46,6 +46,8 @@ class EntryRows:
         self.shared_gate: torch.Tensor | None = None
         self.shared_pending: tuple | None = None
         self.single_round = False
+        # The gather applies the sigmoid: shared_gate holds the gate's logits.
+        self.gate_logits = False
         self.folded = False
 
     def holds(self, t: torch.Tensor) -> bool:
@@ -99,7 +101,19 @@ def defer_shared_gate(module: torch.nn.Module, gate: torch.Tensor) -> bool:
     ``gate * out`` later (in the routed experts' gather), so the expert
     returns its output ungated; ``gate`` is the sigmoid column."""
     rows = current()
-    if rows is None or rows.fold_module is not module:
+    if rows is None or rows.fold_module is not module or rows.gate_logits:
         return False
     rows.shared_gate = gate
+    return True
+
+
+def defer_shared_gate_logits(module: torch.nn.Module, logits: torch.Tensor) -> bool:
+    """``defer_shared_gate`` before the sigmoid, when the open scope's gather
+    applies it (VLLM_XPU_MOE_SHARED_GATE_IN_GATHER): True when the expert
+    returns its output ungated and ``logits`` (the expert gate's output) go to
+    the gather."""
+    rows = current()
+    if rows is None or rows.fold_module is not module or not rows.gate_logits:
+        return False
+    rows.shared_gate = logits
     return True

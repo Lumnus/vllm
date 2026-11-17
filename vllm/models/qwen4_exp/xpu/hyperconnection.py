@@ -86,7 +86,7 @@ from ..nvidia.ops.hc import (
     hc_gate_mix,
     hc_silu,
 )
-from . import hc_gemm
+from . import hc_down_fold, hc_gemm
 
 logger = init_logger(__name__)
 
@@ -115,6 +115,21 @@ def int8_down_gemm(
     )
 
 
+def _int8_down(
+    xn: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    xq: torch.Tensor | None,
+    xs: torch.Tensor | None,
+) -> torch.Tensor:
+    """The INT8 down GEMM: on ``xn``'s int8 rows when the norm kernel wrote
+    them (``VLLM_XPU_HC_DOWN_FOLD``), else with its own quant."""
+    if xq is not None:
+        assert xs is not None
+        return hc_down_fold.int8_down_gemm_q(xq, xs, weight, weight_scale)
+    return int8_down_gemm(xn, weight, weight_scale)
+
+
 def _gate_mix_and_inject(
     xn: torch.Tensor,
     down_weight: torch.Tensor,
@@ -123,13 +138,15 @@ def _gate_mix_and_inject(
     lowrank: int,
     batch_invariant: bool = False,
     down_scale: torch.Tensor | None = None,
+    down_xq: torch.Tensor | None = None,
+    down_xs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``xn``: normalized ``[T, hc * n_embd]``. Returns the block input and the
     injection logits, which are empty when ``down_weight`` has no injection rows.
     With ``down_scale``, ``down_weight`` is int8 ``[N, K]`` and the down GEMM runs
-    INT8 W8A8."""
+    INT8 W8A8 (on ``down_xq`` / ``down_xs`` when given)."""
     if down_scale is not None:
-        down = int8_down_gemm(xn, down_weight, down_scale)
+        down = _int8_down(xn, down_weight, down_scale, down_xq, down_xs)
         lora = hc_silu(down[:, :lowrank], hc)
         if batch_invariant and hc_gemm.takes_native_up(lora, up_weight):
             block_input = hc_gemm.native_up_mix(lora, up_weight, xn, xn.shape[1] // hc)
@@ -160,10 +177,18 @@ def hc_mix(
     lowrank: int,
     batch_invariant: bool = False,
     down_scale: torch.Tensor | None = None,
+    down_fold: int = 0,
+    fold_words: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    xn = grouped_gemma_rmsnorm(hidden, norm_weight, eps, hc)
+    xq = xs = None
+    if down_fold and down_scale is not None and fold_words is not None:
+        xn, xq, xs = hc_down_fold.norm_q(
+            hidden, norm_weight, eps, hc, fold_words, down_fold
+        )
+    else:
+        xn = grouped_gemma_rmsnorm(hidden, norm_weight, eps, hc)
     return _gate_mix_and_inject(
-        xn, down_weight, up_weight, hc, lowrank, batch_invariant, down_scale
+        xn, down_weight, up_weight, hc, lowrank, batch_invariant, down_scale, xq, xs
     )
 
 
@@ -179,12 +204,20 @@ def hc_combine_and_mix(
     lowrank: int,
     batch_invariant: bool = False,
     down_scale: torch.Tensor | None = None,
+    down_fold: int = 0,
+    fold_words: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    combined, xn = hc_combine_norm(
-        hidden, block_output, injection, norm_weight, eps, hc
-    )
+    xq = xs = None
+    if down_fold and down_scale is not None and fold_words is not None:
+        combined, xn, xq, xs = hc_down_fold.combine_norm_q(
+            hidden, block_output, injection, norm_weight, eps, hc, fold_words, down_fold
+        )
+    else:
+        combined, xn = hc_combine_norm(
+            hidden, block_output, injection, norm_weight, eps, hc
+        )
     block_input, new_injection = _gate_mix_and_inject(
-        xn, down_weight, up_weight, hc, lowrank, batch_invariant, down_scale
+        xn, down_weight, up_weight, hc, lowrank, batch_invariant, down_scale, xq, xs
     )
     return combined, block_input, new_injection
 
@@ -199,6 +232,8 @@ def _hc_mix_fake(
     lowrank: int,
     batch_invariant: bool = False,
     down_scale: torch.Tensor | None = None,
+    down_fold: int = 0,
+    fold_words: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tokens = hidden.shape[0]
     down = hidden.new_empty((tokens, down_weight.shape[0]))
@@ -219,6 +254,8 @@ def _hc_combine_and_mix_fake(
     lowrank: int,
     batch_invariant: bool = False,
     down_scale: torch.Tensor | None = None,
+    down_fold: int = 0,
+    fold_words: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     block_input, new_injection = _hc_mix_fake(
         hidden, norm_weight, down_weight, up_weight, eps, hc, lowrank
@@ -283,6 +320,36 @@ def hc_combine_then_norm(
     return hc_combine_norm(hidden, block_output, injection, norm_weight, eps, hc)
 
 
+def hc_norm_q(
+    hidden: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc: int,
+    fold_words: torch.Tensor,
+    down_fold: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``hc_norm`` with the INT8 down GEMM's int8 rows and scales of its output
+    (``VLLM_XPU_HC_DOWN_FOLD``): ``(xn, xq, xs)``."""
+    return hc_down_fold.norm_q(hidden, norm_weight, eps, hc, fold_words, down_fold)
+
+
+def hc_combine_then_norm_q(
+    hidden: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc: int,
+    fold_words: torch.Tensor,
+    down_fold: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``hc_combine_then_norm`` with the int8 rows and scales of ``xn``:
+    ``(combined, xn, xq, xs)``."""
+    return hc_down_fold.combine_norm_q(
+        hidden, block_output, injection, norm_weight, eps, hc, fold_words, down_fold
+    )
+
+
 def hc_down_lora(
     xn: torch.Tensor,
     down_weight: torch.Tensor,
@@ -290,12 +357,14 @@ def hc_down_lora(
     lowrank: int,
     batch_invariant: bool = False,
     down_scale: torch.Tensor | None = None,
+    down_xq: torch.Tensor | None = None,
+    down_xs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(hc_silu(lora), injection logits)`` of a BF16 down weight, or of an INT8
-    one with ``down_scale`` on the fused W8A8 GEMM: the down half of
-    ``_gate_mix_and_inject``."""
+    one with ``down_scale`` on the fused W8A8 GEMM (on ``down_xq`` /
+    ``down_xs`` when given): the down half of ``_gate_mix_and_inject``."""
     if down_scale is not None:
-        down = int8_down_gemm(xn, down_weight, down_scale)
+        down = _int8_down(xn, down_weight, down_scale, down_xq, down_xs)
         lora = hc_silu(down[:, :lowrank], hc)
     elif batch_invariant and hc_gemm.takes_parallel_route(xn, down_weight):
         valid = min(down_weight.shape[0], lowrank + hc)
@@ -335,6 +404,8 @@ def hc_down_lora_q(
     lowrank: int,
     batch_invariant: bool = False,
     down_scale: torch.Tensor | None = None,
+    down_xq: torch.Tensor | None = None,
+    down_xs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``hc_down_lora`` with the lora handed on as the int8 rows and fp32
     ``[T, 1]`` scales the up projection's INT8 linear makes of it
@@ -352,7 +423,7 @@ def hc_down_lora_q(
         )
         return q, scale, down[:, lowrank : lowrank + hc]
     lora, inject = hc_down_lora(
-        xn, down_weight, hc, lowrank, batch_invariant, down_scale
+        xn, down_weight, hc, lowrank, batch_invariant, down_scale, down_xq, down_xs
     )
     q, scale, _ = ops.scaled_int8_quant(lora.contiguous(), None, None, True)
     return q, scale, inject
@@ -403,6 +474,8 @@ def _hc_down_lora_q_fake(
     lowrank: int,
     batch_invariant: bool = False,
     down_scale: torch.Tensor | None = None,
+    down_xq: torch.Tensor | None = None,
+    down_xs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     tokens = xn.shape[0]
     down = xn.new_empty((tokens, down_weight.shape[0]))
@@ -443,6 +516,42 @@ def _hc_combine_then_norm_fake(
     return hidden.new_empty(hidden.shape), hidden.new_empty(hidden.shape)
 
 
+def _fold_rows_fake(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    tokens = hidden.shape[0]
+    return (
+        hidden.new_empty(hidden.shape, dtype=torch.int8),
+        hidden.new_empty((tokens, 1), dtype=torch.float32),
+    )
+
+
+def _hc_norm_q_fake(
+    hidden: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc: int,
+    fold_words: torch.Tensor,
+    down_fold: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (hidden.new_empty(hidden.shape), *_fold_rows_fake(hidden))
+
+
+def _hc_combine_then_norm_q_fake(
+    hidden: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    hc: int,
+    fold_words: torch.Tensor,
+    down_fold: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        hidden.new_empty(hidden.shape),
+        hidden.new_empty(hidden.shape),
+        *_fold_rows_fake(hidden),
+    )
+
+
 def _hc_down_lora_fake(
     xn: torch.Tensor,
     down_weight: torch.Tensor,
@@ -450,6 +559,8 @@ def _hc_down_lora_fake(
     lowrank: int,
     batch_invariant: bool = False,
     down_scale: torch.Tensor | None = None,
+    down_xq: torch.Tensor | None = None,
+    down_xs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     tokens = xn.shape[0]
     down = xn.new_empty((tokens, down_weight.shape[0]))
@@ -487,6 +598,12 @@ for _name, _func, _fake in (
     ("qwen4_exp_xpu_hc_up_mix", hc_up_mix, _hc_up_mix_fake),
     ("qwen4_exp_xpu_hc_down_lora_q", hc_down_lora_q, _hc_down_lora_q_fake),
     ("qwen4_exp_xpu_hc_up_mix_q", hc_up_mix_q, _hc_up_mix_q_fake),
+    ("qwen4_exp_xpu_hc_norm_q", hc_norm_q, _hc_norm_q_fake),
+    (
+        "qwen4_exp_xpu_hc_combine_then_norm_q",
+        hc_combine_then_norm_q,
+        _hc_combine_then_norm_q_fake,
+    ),
 ):
     direct_register_custom_op(
         op_name=_name, op_func=_func, mutates_args=[], fake_impl=_fake
@@ -503,6 +620,10 @@ _gate_mix_op = eager_bypass_custom_op("qwen4_exp_xpu_hc_gate_mix", hc_gate_mix_o
 _up_mix_op = eager_bypass_custom_op("qwen4_exp_xpu_hc_up_mix", hc_up_mix)
 _down_lora_q_op = eager_bypass_custom_op("qwen4_exp_xpu_hc_down_lora_q", hc_down_lora_q)
 _up_mix_q_op = eager_bypass_custom_op("qwen4_exp_xpu_hc_up_mix_q", hc_up_mix_q)
+_norm_q_op = eager_bypass_custom_op("qwen4_exp_xpu_hc_norm_q", hc_norm_q)
+_combine_then_norm_q_op = eager_bypass_custom_op(
+    "qwen4_exp_xpu_hc_combine_then_norm_q", hc_combine_then_norm_q
+)
 
 
 def _up_int8_kernel(layer: nn.Module) -> tuple[int, object] | str:
@@ -655,6 +776,12 @@ class HyperConnection(nn.Module):
         # hc_up_mix_q, set when the weights load; None keeps the layer path.
         self._up_fold: tuple[int, object, int] | None = None
         self._up_fold_reason = ""
+        # VLLM_XPU_HC_DOWN_FOLD on the fused INT8 down GEMM: 1 or 2 when the
+        # norm kernel writes xn's int8 rows (hc_down_fold), with the module's
+        # per-row arrival words; set when the weights load.
+        self._down_fold = 0
+        self._down_fold_reason = ""
+        self._fold_words: torch.Tensor | None = None
 
     @property
     def _down_linear(self) -> LinearBase | None:
@@ -691,6 +818,7 @@ class HyperConnection(nn.Module):
         their columns (sliced off) hold no stray values."""
         self._down_path = self._resolve_down_path()
         self._resolve_up_fold()
+        self._resolve_down_fold()
         if self.has_inject and self._down_path != "bf16":
             layer = self.input_mix_weight_down_block_inject
             valid = self.lowrank + self.hc
@@ -728,6 +856,36 @@ class HyperConnection(nn.Module):
         gemm, kernel = found
         self._up_fold = (gemm, kernel, 0 if mode == 2 else mode)
         self._up_fold_reason = "on"
+
+    def _resolve_down_fold(self) -> None:
+        """VLLM_XPU_HC_DOWN_FOLD: the INT8 down GEMM's per-token quant runs in
+        the tail of the kernel that writes ``xn`` (the combine + norm, or the
+        norm of the stack's first mix), and the GEMM takes the pre-quantized
+        rows (hc_down_fold). 1 recomputes the row in its last program, 2
+        re-reads it under acq_rel. Applies to a down projection on the fused
+        INT8 GEMM when the kernels have the pre-quantized entry."""
+        self._down_fold = 0
+        self._fold_words = None
+        mode = envs.VLLM_XPU_HC_DOWN_FOLD
+        if mode not in (1, 2):
+            self._down_fold_reason = "off"
+            return
+        if self.down_path != "fused_int8":
+            self._down_fold_reason = f"down projection {self.down_path}"
+            return
+        if not 1 <= self.hc <= hc_down_fold.MAX_HC:
+            self._down_fold_reason = f"{self.hc} streams"
+            return
+        if not hc_down_fold.gemm_available():
+            self._down_fold_reason = "no int8_dense_w8a8_gemm in vllm-xpu-kernels"
+            return
+        vllm_config = get_current_vllm_config_or_none()
+        sched = getattr(vllm_config, "scheduler_config", None)
+        rows = getattr(sched, "max_num_batched_tokens", None) or 8192
+        device = self.input_mix_weight_down_block_inject.weight.device
+        self._fold_words = hc_down_fold.new_arrival_words(rows, device)
+        self._down_fold = mode
+        self._down_fold_reason = "on"
 
     @property
     def down_path(self) -> str:
@@ -773,15 +931,25 @@ class HyperConnection(nn.Module):
         """Whether the mix runs as ops around a quantized layer's GEMM."""
         return self._up_layer or self.down_path == "layer"
 
-    def _split_mix(self, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _split_mix(
+        self, xn: torch.Tensor, fold_rows: tuple[torch.Tensor, ...] = ()
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """The mix of the normalized ``xn``, with each projection that is a
-        quantized layer run through its own method."""
+        quantized layer run through its own method. ``fold_rows``: ``xn``'s
+        int8 rows and scales for the INT8 down GEMM, when the norm kernel wrote
+        them (``VLLM_XPU_HC_DOWN_FOLD``)."""
         if self._up_fold is not None:
             gemm, kernel, fused = self._up_fold
             up_weight, up_scale = kernel._get_layer_params(self.input_mix_weight_up)[:2]
             down_weight, down_scale = self._down_operands()
             q, scale, inject = _down_lora_q_op(
-                xn, down_weight, self.hc, self.lowrank, self.batch_invariant, down_scale
+                xn,
+                down_weight,
+                self.hc,
+                self.lowrank,
+                self.batch_invariant,
+                down_scale,
+                *fold_rows,
             )
             block_input = _up_mix_q_op(
                 q, scale, up_weight, up_scale, xn, self.hc, gemm, fused
@@ -796,7 +964,13 @@ class HyperConnection(nn.Module):
         else:
             down_weight, down_scale = self._down_operands()
             lora, inject = _down_lora_op(
-                xn, down_weight, self.hc, self.lowrank, self.batch_invariant, down_scale
+                xn,
+                down_weight,
+                self.hc,
+                self.lowrank,
+                self.batch_invariant,
+                down_scale,
+                *fold_rows,
             )
         if self._up_layer:
             block_input = _gate_mix_op(xn, self.input_mix_weight_up(lora), self.hc)
@@ -819,9 +993,20 @@ class HyperConnection(nn.Module):
     def mix(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # x: [T, hc, n_embd]
         if self._split:
+            if self._down_fold:
+                xn, xq, xs = _norm_q_op(
+                    self._flat(x),
+                    self.hc_norm.weight,
+                    self.eps,
+                    self.hc,
+                    self._fold_words,
+                    self._down_fold,
+                )
+                return self._split_mix(xn, (xq, xs))
             xn = _norm_op(self._flat(x), self.hc_norm.weight, self.eps, self.hc)
             return self._split_mix(xn)
         down_weight, down_scale = self._down_operands()
+        fold_args = (self._down_fold, self._fold_words) if self._down_fold else ()
         return _mix_op(
             self._flat(x),
             self.hc_norm.weight,
@@ -832,6 +1017,7 @@ class HyperConnection(nn.Module):
             self.lowrank,
             self.batch_invariant,
             down_scale,
+            *fold_args,
         )
 
     def combine_and_mix(
@@ -842,17 +1028,32 @@ class HyperConnection(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # residual: [T, hc, n_embd]; block_out: [T, n_embd]; inject: [T, hc]
         if self._split:
-            combined, xn = _combine_then_norm_op(
-                self._flat(residual),
-                block_out,
-                inject,
-                self.hc_norm.weight,
-                self.eps,
-                self.hc,
-            )
-            mixed, new_inject = self._split_mix(xn)
+            fold_rows: tuple[torch.Tensor, ...] = ()
+            if self._down_fold:
+                combined, xn, xq, xs = _combine_then_norm_q_op(
+                    self._flat(residual),
+                    block_out,
+                    inject,
+                    self.hc_norm.weight,
+                    self.eps,
+                    self.hc,
+                    self._fold_words,
+                    self._down_fold,
+                )
+                fold_rows = (xq, xs)
+            else:
+                combined, xn = _combine_then_norm_op(
+                    self._flat(residual),
+                    block_out,
+                    inject,
+                    self.hc_norm.weight,
+                    self.eps,
+                    self.hc,
+                )
+            mixed, new_inject = self._split_mix(xn, fold_rows)
             return self._wide(combined), mixed, new_inject
         down_weight, down_scale = self._down_operands()
+        fold_args = (self._down_fold, self._fold_words) if self._down_fold else ()
         combined, mixed, new_inject = _combine_and_mix_op(
             self._flat(residual),
             block_out,
@@ -865,6 +1066,7 @@ class HyperConnection(nn.Module):
             self.lowrank,
             self.batch_invariant,
             down_scale,
+            *fold_args,
         )
         return self._wide(combined), mixed, new_inject
 
@@ -935,5 +1137,22 @@ def log_hc_paths(root: nn.Module, scope: str) -> None:
             )
             if mode in (1, 3)
             else "; the linear's GEMM and the stock gated mix",
+            ", ".join(reasons) or "none",
+        )
+    mode = envs.VLLM_XPU_HC_DOWN_FOLD
+    if mode in (1, 2):
+        folded = [m for m in modules if m._down_fold]
+        reasons = sorted({m._down_fold_reason for m in modules if not m._down_fold})
+        logger.info(
+            "XPU HC down fold (VLLM_XPU_HC_DOWN_FOLD=%d, %s): %d of %d modules; "
+            "the INT8 down GEMM's per-token quant (IEEE 127/amax, the calibration "
+            "rule) runs in the tail of the kernel that writes xn, the last stream "
+            "of each row found by one atomic arrival word (%s), and the GEMM takes "
+            "the rows on int8_dense_w8a8_gemm. Not folded: %s.",
+            mode,
+            scope,
+            len(folded),
+            len(modules),
+            "it recomputes the row" if mode == 1 else "it re-reads xn under acq_rel",
             ", ".join(reasons) or "none",
         )
