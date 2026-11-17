@@ -132,7 +132,11 @@ class Qwen3MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            gate = F.sigmoid(self.expert_gate(x)[0])
+            logits = self.expert_gate(x)[0]
+            if entry_rows.ACTIVE and entry_rows.defer_shared_gate_logits(self, logits):
+                # XPU MoE entry: the gather applies the sigmoid and adds.
+                return out
+            gate = F.sigmoid(logits)
             if entry_rows.ACTIVE and entry_rows.defer_shared_gate(self, gate):
                 # XPU MoE entry: the routed experts' gather adds gate * out.
                 return out

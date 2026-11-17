@@ -21,6 +21,12 @@ is triton_scaled_mm's: the exact int32 dot, ``scale_a * acc`` then
 its own row and column, so the split changes no bit. It runs where the gates'
 INT8 linear runs its Triton GEMM (at most VLLM_XPU_INT8_ONEDNN_MIN_ROWS
 rows on the oneDNN kernel); above that each gate keeps its own GEMM.
+``=2`` runs the merged Triton GEMM at every row count. Above the split it
+stands in for the gates' oneDNN GEMMs, whose epilogue (the order in which
+it applies the two scales to the exact int32 dot) cannot be read on the
+CPU: tier 2 there, at most one bf16 ulp per element when oneDNN applies
+the same two fp32 scale products in another order; the card test measures
+it. At or below the split it is ``=1``.
 
 ``VLLM_XPU_MOE_SHARED_IN_GATHER=1``: the gated shared expert returns its
 output ungated, and the routed W4A8 experts' gather adds
@@ -30,6 +36,14 @@ with ``shared``). Same bits; the multiply and the add do not run. When a call
 cannot fold (another experts path), the MoE op does the multiply and add
 itself, as the layer did. ``=2`` (tier 2, different bits) rounds
 ``routed + gate * shared`` once in fp32.
+
+``VLLM_XPU_MOE_SHARED_GATE_IN_GATHER=1`` (with the fold above; tier 2): the
+shared expert hands the gather its gate's logits, and the gather computes
+``T(1 / (1 + exp(-logit)))`` in fp32 with the device's ``exp`` and rounds it
+to the activation dtype, where torch's sigmoid ran as its own kernel. The
+gate can differ from torch's by one ulp where the two fp32 sigmoids round to
+different sides of a bf16 boundary; nothing else moves. One launch fewer per
+layer. Needs a vllm-xpu-kernels whose gather takes ``gate_logits``.
 
 ``VLLM_XPU_MOE_TOPK_ROUTE=1``: see ``topk_route``.
 
@@ -218,8 +232,14 @@ class EntryPlan:
         self.quant = False
         self.gates: tuple[torch.nn.Module, torch.nn.Module] | None = None
         self.gates_row_limit: int | None = None
+        # VLLM_XPU_MOE_GATES_MERGED=2: the row count above which the merged
+        # GEMM stands in for the gates' oneDNN GEMMs (different bits there).
+        self.gates_tier2_above: int | None = None
         self.fold_module: torch.nn.Module | None = None
         self.single_round = False
+        # VLLM_XPU_MOE_SHARED_GATE_IN_GATHER: the gather takes the expert
+        # gate's logits and applies the sigmoid itself.
+        self.gate_logits = False
         self.logged_readers = False
 
     @property
@@ -253,6 +273,7 @@ class EntryPlan:
             rows.outputs[id(sgate)] = out_g
         rows.fold_module = self.fold_module
         rows.single_round = self.single_round
+        rows.gate_logits = self.gate_logits
         with entry_rows.scope(rows):
             yield rows
         if not self.logged_readers:
@@ -297,6 +318,9 @@ def kernels_take(name: str) -> bool:
         return False
     if name == "x_q":
         return bool(getattr(moe_w4a8, "TAKES_ENTRY_ROWS", False))
+    if name == "gate_logits":
+        probe = getattr(moe_w4a8, "gather_takes_logits", None)
+        return probe is not None and bool(probe())
     return bool(getattr(moe_w4a8, "TAKES_SHARED", False)) and bool(
         moe_w4a8.gather_takes_shared()
     )
@@ -372,7 +396,12 @@ def resolve(runner, force_platform: bool = False) -> EntryPlan | None:
                 if isinstance(kr, XPUInt8ScaledMMLinearKernel) or isinstance(
                     kg, XPUInt8ScaledMMLinearKernel
                 ):
-                    plan.gates_row_limit = XPU_INT8_ONEDNN_MIN_ROWS
+                    if want_gates == 2:
+                        # Tier 2 above the split: the merged Triton GEMM
+                        # replaces the gates' oneDNN GEMMs there.
+                        plan.gates_tier2_above = XPU_INT8_ONEDNN_MIN_ROWS
+                    else:
+                        plan.gates_row_limit = XPU_INT8_ONEDNN_MIN_ROWS
 
     if want_fold:
         from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
@@ -407,6 +436,16 @@ def resolve(runner, force_platform: bool = False) -> EntryPlan | None:
         else:
             plan.fold_module = shared_layer
             plan.single_round = want_fold == 2
+            if envs.VLLM_XPU_MOE_SHARED_GATE_IN_GATHER:
+                if kernels_take("gate_logits"):
+                    plan.gate_logits = True
+                else:
+                    why.append(
+                        "sigmoid in gather: vllm-xpu-kernels' gather takes no "
+                        "gate logits"
+                    )
+    elif envs.VLLM_XPU_MOE_SHARED_GATE_IN_GATHER:
+        why.append("sigmoid in gather: needs VLLM_XPU_MOE_SHARED_IN_GATHER")
 
     logger.info_once(
         "XPU MoE entry (VLLM_XPU_MOE_ENTRY_QUANT=%d, VLLM_XPU_MOE_GATES_MERGED=%d, "
@@ -425,7 +464,13 @@ def resolve(runner, force_platform: bool = False) -> EntryPlan | None:
                 + (
                     f" up to {plan.gates_row_limit} rows"
                     if plan.gates_row_limit is not None
-                    else ""
+                    else (
+                        " at every row count (tier 2 above "
+                        f"{plan.gates_tier2_above} rows: the merged Triton GEMM "
+                        "replaces the gates' oneDNN GEMMs)"
+                        if plan.gates_tier2_above is not None
+                        else ""
+                    )
                 )
                 if plan.gates is not None
                 else "",
@@ -436,6 +481,11 @@ def resolve(runner, force_platform: bool = False) -> EntryPlan | None:
                         " (one fp32 rounding, tier 2)"
                         if plan.single_round
                         else " (bf16 rounding points kept)"
+                    )
+                    + (
+                        "; the gate's sigmoid in the gather (device exp, tier 2)"
+                        if plan.gate_logits
+                        else ""
                     )
                 )
                 if plan.fold_module is not None

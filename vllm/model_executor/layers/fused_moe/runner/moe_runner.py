@@ -771,11 +771,21 @@ class MoERunner(MoERunnerInterface):
             # experts' gather adds gate * output (VLLM_XPU_MOE_SHARED_IN_GATHER).
             assert self._shared_experts is not None
             pending = self._shared_experts._output[self._shared_experts._output_idx]
-            rows.shared_pending = (
-                (pending, rows.shared_gate, True)
-                if rows.single_round
-                else (pending, rows.shared_gate)
-            )
+            if rows.gate_logits:
+                # VLLM_XPU_MOE_SHARED_GATE_IN_GATHER: the gate's logits; the
+                # gather applies the sigmoid.
+                rows.shared_pending = (
+                    pending,
+                    rows.shared_gate,
+                    rows.single_round,
+                    True,
+                )
+            else:
+                rows.shared_pending = (
+                    (pending, rows.shared_gate, True)
+                    if rows.single_round
+                    else (pending, rows.shared_gate)
+                )
 
         if (
             self.routed_experts.quant_method.is_monolithic
@@ -841,7 +851,10 @@ class MoERunner(MoERunnerInterface):
             assert shared_out is not None and isinstance(fused_out, torch.Tensor)
             if rows is None or not rows.folded:
                 if rows is not None and rows.shared_gate is not None:
-                    shared_out = rows.shared_gate * shared_out
+                    gate = rows.shared_gate
+                    if rows.gate_logits:
+                        gate = torch.sigmoid(gate)
+                    shared_out = gate * shared_out
                 fused_out = shared_out + fused_out
             return None, fused_out
         return shared_out, fused_out

@@ -33,6 +33,7 @@ SWITCHES = (
     "VLLM_XPU_MOE_SHARED_IN_GATHER",
     "VLLM_XPU_MOE_GATES_MERGED",
 )
+TIER2_SWITCHES = ("VLLM_XPU_MOE_SHARED_GATE_IN_GATHER",)
 EARLIER = {
     "VLLM_XPU_HC_UP_FUSED": "1",
     "VLLM_XPU_MOE_ROUTE_FUSED": "1",
@@ -47,11 +48,43 @@ VARIANTS = {
     "all": {s: "1" for s in SWITCHES},
     "all+earlier": {**{s: "1" for s in SWITCHES}, **EARLIER},
     "fold2": {"VLLM_XPU_MOE_SHARED_IN_GATHER": "2"},
+    "merged2": {"VLLM_XPU_MOE_GATES_MERGED": "2"},
+    "foldsig": {
+        "VLLM_XPU_MOE_SHARED_IN_GATHER": "1",
+        "VLLM_XPU_MOE_SHARED_GATE_IN_GATHER": "1",
+    },
+    "foldsig2": {
+        "VLLM_XPU_MOE_SHARED_IN_GATHER": "2",
+        "VLLM_XPU_MOE_SHARED_GATE_IN_GATHER": "1",
+    },
 }
+ALL_KEYS = (*SWITCHES, *TIER2_SWITCHES, *EARLIER)
+
+
+def _onednn_lib(counts):
+    """A CPU stand-in for vllm-xpu-kernels' oneDNN INT8 GEMM (the route above
+    VLLM_XPU_INT8_ONEDNN_MIN_ROWS): the exact int32 dot, then the product of
+    the two fp32 scales applied once (one order oneDNN may use; Triton's is
+    (scale_a * acc) * scale_b), rounded to the output dtype."""
+    lib = torch.library.Library("_xpu_C", "FRAGMENT")
+    lib.define(
+        "int8_gemm_w8a8(Tensor x, Tensor x_scale, Tensor? x_zp, Tensor w, "
+        "Tensor w_scale, Tensor? w_zp, int group_size, Tensor? bias, "
+        "ScalarType out_dtype) -> Tensor"
+    )
+
+    def impl(x, xs, xz, w, ws, wz, group, bias, out_dtype):
+        counts["onednn"] += 1
+        acc = (x.long() @ w.long()).float()
+        scale = xs.float().reshape(-1, 1) * ws.float().reshape(1, -1)
+        return (acc * scale).to(out_dtype)
+
+    lib.impl("int8_gemm_w8a8", impl, "CPU")
+    return lib
 
 
 def main() -> None:
-    for k in (*SWITCHES, *EARLIER):
+    for k in ALL_KEYS:
         os.environ.pop(k, None)
 
     import vllm._custom_ops as ops
@@ -67,7 +100,8 @@ def main() -> None:
     from vllm.model_executor.models.qwen3_moe import Qwen3MoeMLP
 
     gen = torch.Generator().manual_seed(7)
-    counts = {"quant": 0, "gemm": 0, "gates_mm": 0}
+    counts = {"quant": 0, "gemm": 0, "gates_mm": 0, "onednn": 0}
+    onednn = _onednn_lib(counts)  # noqa: F841 (kept alive for the run)
 
     # ---- the per-token int8 quant op (one rule, counted) -----------------
     def quant(x, scale=None, azp=None, symmetric=True):
@@ -189,6 +223,9 @@ def main() -> None:
                     output[t] = acc.to(output.dtype)
                     continue
                 gate = shared[1].reshape(-1)[t].float()
+                if len(shared) > 3 and shared[3]:
+                    # The gather's sigmoid: fp32 1 / (1 + exp(-x)), rounded.
+                    gate = (1.0 / (1.0 + torch.exp(-gate))).to(output.dtype).float()
                 srow = shared[0][t].float()
                 if len(shared) > 2 and shared[2]:
                     output[t] = (acc + gate * srow).to(output.dtype)
@@ -383,7 +420,7 @@ def main() -> None:
                 x = (torch.randn((m + 2, 64), generator=gen) / 4).to(torch.bfloat16)
                 x[m:] = float("nan")  # padding rows
                 for name, env in VARIANTS.items():
-                    for k in (*SWITCHES, *EARLIER):
+                    for k in ALL_KEYS:
                         os.environ.pop(k, None)
                     os.environ.update(env)
                     out, c, info, plan = run(r, x)
@@ -400,16 +437,17 @@ def main() -> None:
                             plan.gates is not None,
                             plan.fold_module is not None,
                             plan.single_round,
+                            plan.gate_logits,
                         ],
                     }
-    # Merged gates above the Triton route's rows: 33 and 64 (Triton) and 65
-    # (oneDNN side: separate GEMMs; the oneDNN op is not on CPU, so the
-    # check stops at 64).
-    for m in (33, 64):
+    # Merged gates around the Triton route's rows: 33 and 64 (Triton), 65 and
+    # 128 (oneDNN stand-in): =1 keeps the gates' own GEMMs above 64, =2 runs
+    # the merged Triton GEMM there.
+    for m in (33, 64, 65, 128):
         r = build(True, 1, False, 16, 64, 32, 4)
         x = (torch.randn((m, 64), generator=gen) / 4).to(torch.bfloat16)
-        for name in ("base", "merged", "all"):
-            for k in (*SWITCHES, *EARLIER):
+        for name in ("base", "merged", "merged2", "all"):
+            for k in ALL_KEYS:
                 os.environ.pop(k, None)
             os.environ.update(VARIANTS[name])
             out, c, info, plan = run(r, x)
@@ -418,9 +456,38 @@ def main() -> None:
                 "quant": c["quant"],
                 "gemm": c["gemm"],
                 "gates_mm": c["gates_mm"],
+                "onednn": c["onednn"],
                 **info,
                 "plan": None,
             }
+    # The merged Triton GEMM against the oneDNN stand-in per gate, 65-256
+    # rows, router 512 x 2560 and the 1-column gate: the tier-2 distance.
+    from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
+        _xpu_int8_scaled_mm_func,
+    )
+
+    worst, differ, total = 0, 0, 0
+    k, n1 = 256, 64
+    wr = torch.randint(-127, 128, (n1, k), dtype=torch.int8, generator=gen)
+    wg = torch.randint(-127, 128, (1, k), dtype=torch.int8, generator=gen)
+    sr = (torch.rand((n1,), generator=gen) * 0.004 + 0.001).float()
+    sg = torch.full((1,), 0.0031)
+    for m in (65, 96, 128, 256):
+        xq = torch.randint(-127, 128, (m, k), dtype=torch.int8, generator=gen)
+        xs = (torch.rand((m, 1), generator=gen) * 0.02 + 1e-4).float()
+        r_m, g_m = real_gates(
+            xq, xs, torch.cat([wr, wg]), torch.cat([sr, sg]), n1, torch.bfloat16
+        )
+        for got, w, s in ((r_m, wr, sr), (g_m, wg, sg)):
+            ref = _xpu_int8_scaled_mm_func(xq, w.t(), xs, s, torch.bfloat16)
+            a = got.float().view(-1)
+            b = ref.float().view(-1)
+            ulp = (got.view(torch.int16).int() - ref.view(torch.int16).int()).abs()
+            same_sign = (a >= 0) == (b >= 0)
+            worst = max(worst, int(ulp[same_sign].max()) if same_sign.any() else 0)
+            differ += int((ulp != 0).sum())
+            total += ulp.numel()
+    results["merged2-vs-onednn"] = {"worst_ulp": worst, "differ": differ, "n": total}
     with open(sys.argv[1], "w") as f:
         json.dump(results, f)
     print("XPU-MOE-ENTRY-OK", len(results))
