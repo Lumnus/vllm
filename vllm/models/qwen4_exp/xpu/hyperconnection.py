@@ -366,13 +366,15 @@ def hc_up_mix_q(
     xn: torch.Tensor,
     hc: int,
     gemm: int,
-    fused: bool,
+    fused: int,
 ) -> torch.Tensor:
     """The INT8 up projection on pre-quantized rows and the gated mix. ``gemm``
     names the linear's own GEMM (0: ``int8_scaled_mm_func``, Triton at every
     width; 1: ``xpu_int8_scaled_mm_func``, Triton up to
     ``VLLM_XPU_INT8_ONEDNN_MIN_ROWS`` and oneDNN above). Where that GEMM is
-    Triton and ``fused``, one kernel runs both (``hc_gemm.int8_up_mix``)."""
+    Triton and ``fused`` is set, one kernel runs both: 1 the first fused kernel
+    (``hc_gemm.int8_up_mix``), 3 the fast one (``hc_gemm.int8_up_mix_fast``);
+    0 keeps the GEMM and the gated mix apart."""
     from vllm.model_executor.kernels.linear.scaled_mm import xpu as xpu_mm
 
     rows = q.shape[0]
@@ -381,6 +383,8 @@ def hc_up_mix_q(
         if gemm == 0
         else min(hc_gemm.UP_MIX_I8_MAX_ROWS, xpu_mm.XPU_INT8_ONEDNN_MIN_ROWS)
     )
+    if fused == 3 and rows <= triton_rows:
+        return hc_gemm.int8_up_mix_fast(q, scale, up_weight, up_scale, xn, hc)
     if fused and rows <= triton_rows:
         return hc_gemm.int8_up_mix(q, scale, up_weight, up_scale, xn, hc)
     func = (
@@ -417,7 +421,7 @@ def _hc_up_mix_q_fake(
     xn: torch.Tensor,
     hc: int,
     gemm: int,
-    fused: bool,
+    fused: int,
 ) -> torch.Tensor:
     return xn.new_empty((xn.shape[0], xn.shape[1] // hc))
 
@@ -649,7 +653,7 @@ class HyperConnection(nn.Module):
         self._down_path: str | None = None
         # VLLM_XPU_HC_UP_FUSED on an INT8 up linear: (gemm, kernel, fused) for
         # hc_up_mix_q, set when the weights load; None keeps the layer path.
-        self._up_fold: tuple[int, object, bool] | None = None
+        self._up_fold: tuple[int, object, int] | None = None
         self._up_fold_reason = ""
 
     @property
@@ -702,12 +706,13 @@ class HyperConnection(nn.Module):
         """VLLM_XPU_HC_UP_FUSED: 1 folds the up linear's activation quant into
         the down projection's finish kernel and runs the INT8 up GEMM with the
         gated mix in its epilogue; 2 folds the quant only (the linear's GEMM and
-        the stock gated mix). Applies to an INT8 up linear with dynamic
-        symmetric per-token activations on the Triton INT8 GEMM, next to a
-        down projection that does not run through its own layer."""
+        the stock gated mix); 3 is 1 on the fast fused kernel. Applies to an
+        INT8 up linear with dynamic symmetric per-token activations on the
+        Triton INT8 GEMM, next to a down projection that does not run through
+        its own layer."""
         self._up_fold = None
         mode = envs.VLLM_XPU_HC_UP_FUSED
-        if mode not in (1, 2):
+        if mode not in (1, 2, 3):
             self._up_fold_reason = "off"
             return
         if not self._up_layer:
@@ -721,7 +726,7 @@ class HyperConnection(nn.Module):
             self._up_fold_reason = found
             return
         gemm, kernel = found
-        self._up_fold = (gemm, kernel, mode == 1)
+        self._up_fold = (gemm, kernel, 0 if mode == 2 else mode)
         self._up_fold_reason = "on"
 
     @property
@@ -906,7 +911,7 @@ def log_hc_paths(root: nn.Module, scope: str) -> None:
         ", ".join(methods),
     )
     mode = envs.VLLM_XPU_HC_UP_FUSED
-    if mode in (1, 2):
+    if mode in (1, 2, 3):
         folded = [m for m in modules if m._up_fold is not None]
         reasons = sorted({m._up_fold_reason for m in modules if m._up_fold is None})
         logger.info(
@@ -920,7 +925,15 @@ def log_hc_paths(root: nn.Module, scope: str) -> None:
             len(modules),
             "; INT8 up GEMM + gated mix in one kernel up to "
             f"{hc_gemm.UP_MIX_I8_MAX_ROWS} rows where the linear runs Triton"
-            if mode == 1
+            + (
+                " (fast kernel: tensor-descriptor loads, four streams per K "
+                "step, column tile {}, K tile {}, {} warps)".format(
+                    *hc_gemm._fast_up_tile()
+                )
+                if mode == 3
+                else ""
+            )
+            if mode in (1, 3)
             else "; the linear's GEMM and the stock gated mix",
             ", ".join(reasons) or "none",
         )
