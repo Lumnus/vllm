@@ -1250,6 +1250,7 @@ class FlashAttentionImpl(AttentionImpl):
         from vllm.v1.attention.ops.xpu_int8_prefill_attention import (
             _LAUNCH,
             INT8_PREFILL_DOT_MODES,
+            SYCL_INT8_PREFILL,
             check_launch,
         )
 
@@ -1261,7 +1262,17 @@ class FlashAttentionImpl(AttentionImpl):
             unsupported.append("sliding window")
         if self.sinks is not None:
             unsupported.append("attention sinks")
-        if mode:
+        if mode in SYCL_INT8_PREFILL and not unsupported:
+            # The vllm-xpu-kernels chunk-prefill kernel: probe the build once.
+            reason = int8_kv.int8_prefill_sycl_supported(
+                self.head_size,
+                self._int8_kv_scratch_dtype,
+                SYCL_INT8_PREFILL[mode],
+                self._int8_kv_block_size,
+            )
+            if reason is not None:
+                unsupported.append(reason)
+        elif mode in (1, 2):
             try:
                 check_launch(
                     _LAUNCH, self.head_size, mode == 2, self._int8_kv_block_size
@@ -1277,7 +1288,22 @@ class FlashAttentionImpl(AttentionImpl):
             )
             mode = 0
         self._int8_prefill_dot = mode
-        if mode:
+        if mode in SYCL_INT8_PREFILL:
+            logger.info_once(
+                "FlashAttention int8_per_token_head KV cache on XPU: native INT8 "
+                "paged decode (query length <= %d per sequence%s), native INT8 "
+                "prefill attention in the vllm-xpu-kernels chunk-prefill kernel "
+                "(int8_prefill_dot=%s: %s), no prefill scratch.",
+                int8_kv.decode_max_query_len(),
+                decode_remark,
+                setting,
+                {
+                    3: "Q.K and P.V BF16 over the widened int8 codes",
+                    4: "Q.K int8 x int8 -> int32, P.V BF16",
+                    5: "Q.K int8 x int8 -> int32, P.V int8 x int8 -> int32",
+                }[mode],
+            )
+        elif mode:
             logger.info_once(
                 "FlashAttention int8_per_token_head KV cache on XPU: native INT8 "
                 "paged decode (query length <= %d per sequence%s), native INT8 "
@@ -1346,6 +1372,10 @@ class FlashAttentionImpl(AttentionImpl):
         from vllm.v1.attention.ops import xpu_int8_per_token_head as int8_kv
 
         key_cache, value_cache, k_scale, v_scale = self._int8_kv_split_views(kv_cache)
+        if self._int8_prefill_dot >= 3:
+            # The vllm-xpu-kernels kernel is compiled ahead of time; its probe
+            # at init has run it once.
+            return
         if self._int8_prefill_dot:
             from vllm.v1.attention.ops.xpu_int8_prefill_attention import (
                 warmup_int8_prefill_attention,
@@ -1441,8 +1471,28 @@ class FlashAttentionImpl(AttentionImpl):
                     f"query length {max_q}."
                 )
             from vllm.v1.attention.ops.xpu_int8_prefill_attention import (
+                SYCL_INT8_PREFILL,
                 int8_prefill_attention,
             )
+
+            if self._int8_prefill_dot in SYCL_INT8_PREFILL:
+                int8_kv.forward_prefill_sycl(
+                    query[:n],
+                    key_cache,
+                    value_cache,
+                    k_scale,
+                    v_scale,
+                    output[:n],
+                    attn_metadata.query_start_loc,
+                    max_q,
+                    attn_metadata.seq_lens,
+                    attn_metadata.max_seq_len,
+                    attn_metadata.block_table,
+                    self.scale,
+                    SYCL_INT8_PREFILL[self._int8_prefill_dot],
+                    int8_dot=self._int8_decode_dot,
+                )
+                return output
 
             int8_prefill_attention(
                 query[:n],

@@ -28,8 +28,12 @@ Numerical contract (`pv_int8=False`, AttentionConfig `int8_prefill_dot="qk"`):
    widened to BF16 (exact), FP32 accumulation.
 
 `pv_int8=True` (`"qk_pv"`) also runs P.V in int8: P * v_scale is quantized per
-query row of each KV tile (scale = row max / 127, round half up, P >= 0), the
-dot is int8 x int8 -> int32 and the tile's scale multiplies the int32 result.
+query row of each KV tile (scale = row max / 127 and its inverse exactly
+rounded, codes half up computed exactly, P >= 0), the dot is
+int8 x int8 -> int32 and the tile's scale multiplies the int32 result. With
+`block_n=32` the tiles, and so the P quantization groups, are those of the
+vllm-xpu-kernels chunk-prefill kernel (`int8_prefill_dot="sycl_qk_pv"`), whose
+reference this kernel is.
 
 Against today's dequantize-then-BF16 path the K/V operands are closer to the
 cache (no BF16 rounding of code * scale); the query gains an int8 rounding
@@ -63,8 +67,20 @@ from vllm.v1.attention.ops.triton_attention_helpers import find_seq_idx
 
 logger = init_logger(__name__)
 
-# AttentionConfig.int8_prefill_dot -> kernel mode.
-INT8_PREFILL_DOT_MODES = {"off": 0, "qk": 1, "qk_pv": 2}
+# AttentionConfig.int8_prefill_dot -> mode. 1 and 2 run the Triton kernel of
+# this module (the numerical reference); 3, 4 and 5 run the vllm-xpu-kernels
+# chunk-prefill kernel over the cache in place (SYCL_INT8_PREFILL gives its
+# `int8_prefill` argument: 1 BF16 dots over the widened codes, 2 int8 Q.K,
+# 3 int8 Q.K and P.V).
+INT8_PREFILL_DOT_MODES = {
+    "off": 0,
+    "qk": 1,
+    "qk_pv": 2,
+    "sycl_bf16": 3,
+    "sycl_qk": 4,
+    "sycl_qk_pv": 5,
+}
+SYCL_INT8_PREFILL = {3: 1, 4: 2, 5: 3}
 
 
 class Int8PrefillLaunch(NamedTuple):
@@ -374,10 +390,14 @@ def _int8_prefill_attn_kernel(
         # have P = 0, so their (stale but finite) V codes add nothing.
         pv = p * v_scale[None, :]
         if PV_INT8:
-            p_scale = tl.maximum(tl.max(pv, axis=1) / 127.0, 1.0e-30)
-            pw = tl.minimum(tl.floor(pv * (1.0 / p_scale)[:, None] + 0.5), 127.0).to(
-                tl.int8
-            )
+            # The P rule the SYCL kernel shares (int8_attn_p_scale /
+            # int8_attn_query_code): scale = max(row max / 127, 1e-30) and its
+            # inverse exactly rounded, codes half up computed exactly
+            # ((trunc(2 y) + 1) >> 1; P >= 0), so no fp addition moves a code.
+            p_scale = tl.maximum(tl.math.div_rn(tl.max(pv, axis=1), 127.0), 1.0e-30)
+            y = pv * tl.math.div_rn(1.0, p_scale)[:, None]
+            c = (tl.minimum(y * 2.0, 255.0).to(tl.int32) + 1) >> 1
+            pw = tl.minimum(c, 127).to(tl.int8)
         else:
             p_scale = l_i  # unused
             pw = pv.to(tl.bfloat16)
@@ -599,6 +619,7 @@ def warmup_int8_prefill_attention(
 
 __all__ = [
     "INT8_PREFILL_DOT_MODES",
+    "SYCL_INT8_PREFILL",
     "Int8PrefillLaunch",
     "check_launch",
     "int8_prefill_attention",

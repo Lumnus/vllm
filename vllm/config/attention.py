@@ -101,16 +101,24 @@ class AttentionConfig:
     computes P.V in int8. "off" widens the int8 K/V rows to the query dtype for
     the dots."""
 
-    int8_prefill_dot: Literal["off", "qk", "qk_pv"] = "off"
+    int8_prefill_dot: Literal[
+        "off", "qk", "qk_pv", "sycl_bf16", "sycl_qk", "sycl_qk_pv"
+    ] = "off"
     """Prefill and mixed batches over an int8_per_token_head KV cache on the
     XPU FlashAttention backend: attend over the int8 cache in place instead of
     dequantizing the referenced blocks into a BF16 scratch. "qk" quantizes the
     query to int8 per (token, head) and computes Q.K as an int8 x int8 -> int32
     dot, scaled by the query and K scales afterwards; P.V widens the V codes to
     BF16 as the decode kernel does. "qk_pv" also quantizes the attention
-    weights per query row of a KV tile and computes P.V in int8. Causal layers
-    without a sliding window or sinks only; "off" (the default) keeps the BF16
-    scratch."""
+    weights per query row of a KV tile and computes P.V in int8. Both run the
+    engine's Triton kernel, kept as the numerical reference. The "sycl_*"
+    values run the vllm-xpu-kernels chunk-prefill kernel over the cache in
+    place instead: "sycl_qk" with the same int8 query rule and int8 Q.K,
+    "sycl_qk_pv" with P.V in int8 as well (P quantized per query row of each
+    32-slot KV tile), "sycl_bf16" with BF16 dots over the widened codes (the
+    decode kernel's arithmetic, no int8 query). Causal layers without a
+    sliding window or sinks only (the SYCL kernel: head size 256, BF16 models);
+    "off" (the default) keeps the BF16 scratch."""
 
     int8_decode_dot: Literal["off", "qk"] = "off"
     """Decode and speculative-decode verify rows (query length up to the
