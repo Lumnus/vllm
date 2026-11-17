@@ -482,7 +482,11 @@ def main() -> None:
             ref = _xpu_int8_scaled_mm_func(xq, w.t(), xs, s, torch.bfloat16)
             a = got.float().view(-1)
             b = ref.float().view(-1)
-            ulp = (got.view(torch.int16).int() - ref.view(torch.int16).int()).abs()
+            ulp = (
+                (got.view(torch.int16).int() - ref.view(torch.int16).int())
+                .abs()
+                .view(-1)
+            )
             same_sign = (a >= 0) == (b >= 0)
             worst = max(worst, int(ulp[same_sign].max()) if same_sign.any() else 0)
             differ += int((ulp != 0).sum())
