@@ -124,7 +124,10 @@ def test_mixed_warmup_skips_when_drafting_slots_exhaust_budget():
         is_pooling_model=False,
         max_num_reqs=2,
         max_num_tokens=4,
+        max_model_len=128,
         speculative_config=SimpleNamespace(max_num_new_slots_for_drafting=1),
+        vllm_config=SimpleNamespace(num_scheduled_spec_tokens=0),
+        num_speculative_steps=0,
     )
 
     assert not run_mixed_prefill_decode_warmup(

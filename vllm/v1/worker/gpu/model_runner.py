@@ -96,6 +96,7 @@ from vllm.v1.watermarking.spec_decode import (
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.extensible_kv_cache import (
     ExtensibleKVCache,
+    kv_cache_export_handle_types,
     release_chunk_bytes,
 )
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -672,6 +673,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 kv_cache_config,
                 self.device,
                 self.cache_config.get_resolved_kv_cache_layout(),
+                export_handle_types=kv_cache_export_handle_types(self.vllm_config),
                 release_chunk_bytes=release_chunk_bytes(self.vllm_config),
             )
 
@@ -1214,12 +1216,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         with use_workspace_lane(self._draft_workspace_lane):
                             self.speculator.capture()
                     if self.adaptive_verification is not None and not profile_only:
-                        with self.step_timing.collect() as timings:
-                            for batch in self.adaptive_verification.batches_to_profile(
-                                self.cudagraph_manager.captured_token_counts()
-                            ):
-                                self._dummy_run(**batch)
-                        self.adaptive_verification.set_initial_cost_curves(timings)
+                        self.profile_adaptive_verification()
                         # Release the profiling runs' activations, or the
                         # allocator cache is counted as graph memory below.
                         torch.accelerator.empty_cache()
@@ -1245,6 +1242,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cuda_graph_size / (1 << 30),
         )
         return cuda_graph_size
+
+    @torch.inference_mode()
+    def profile_adaptive_verification(self) -> None:
+        """Seed adaptive verification's cost curves from timed dummy runs, which
+        read KV context from the committed blocks."""
+        assert self.adaptive_verification is not None
+        assert self.cudagraph_manager is not None
+        with self.step_timing.collect() as timings:
+            for batch in self.adaptive_verification.batches_to_profile(
+                self.cudagraph_manager.captured_token_counts()
+            ):
+                self._dummy_run(**batch, skip_eplb=True)
+        self.adaptive_verification.set_initial_cost_curves(timings)
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request

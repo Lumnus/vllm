@@ -47,10 +47,12 @@ class _VirtualBuffer:
         max_bytes: int,
         device_index: int,
         max_chunk_bytes: int | None = None,
+        export_handle_types: int = 0,
     ) -> None:
         self._driver = get_vmm_driver()
         self._driver.ensure_context(device_index)
         self.device_index = device_index
+        self.export_handle_types = export_handle_types
 
         self.granularity: int = granule_size(device_index)
         if max_chunk_bytes is not None and max_chunk_bytes <= 0:
@@ -205,12 +207,12 @@ class _VirtualBuffer:
         driver = self._driver
         driver.ensure_context(self.device_index)
         try:
-            handle = driver.create(size, self.device_index)
+            handle = driver.create(size, self.device_index, self.export_handle_types)
         except RuntimeError:
             # The VMM allocator cannot reuse memory idling in torch's
             # caching allocator; return it to the driver and retry once.
             torch.accelerator.empty_cache()
-            handle = driver.create(size, self.device_index)
+            handle = driver.create(size, self.device_index, self.export_handle_types)
 
         addr = self.base_ptr + offset
         try:
@@ -396,6 +398,9 @@ class ExtensibleTensor:
     start, and `shrink_segments_` gives back the objects that lie wholly above
     the new size. Without it each grow maps one object per contiguous run and
     a shrink can only free objects a grow made small enough.
+
+    Other processes can import the memory through `export_handle_types` (see
+    `VmmDriver.create`).
     """
 
     def __init__(
@@ -405,6 +410,7 @@ class ExtensibleTensor:
         num_segments: int = 1,
         segment_capacities: Sequence[int] | None = None,
         max_chunk_bytes: int | None = None,
+        export_handle_types: int = 0,
     ) -> None:
         if max_num_bytes < 0:
             raise ValueError("max_num_bytes must be non-negative.")
@@ -446,7 +452,10 @@ class ExtensibleTensor:
         )
         self._committed: list[int] = [0] * len(self._segment_capacities)
         self._buffer: _VirtualBuffer = _VirtualBuffer(
-            max_num_bytes, self._device_index, max_chunk_bytes
+            max_num_bytes,
+            self._device_index,
+            max_chunk_bytes=max_chunk_bytes,
+            export_handle_types=export_handle_types,
         )
 
     def full_view(self) -> torch.Tensor:

@@ -113,7 +113,9 @@ from vllm.v1.outputs import (
 from vllm.v1.utils import report_usage_stats
 from vllm.v1.worker.extensible_kv_cache import (
     extend_kv_cache,
+    forget_block_ids_from,
     grow_kv_cache,
+    kv_cache_export_handle_types,
     kv_cache_lent_for_weight_update,
     kv_cache_shrink_plan,
     measure_kv_cache_blocks,
@@ -994,7 +996,7 @@ class Worker(WorkerBase):
     def extensible_kv_cache_unsupported_reason(self) -> str | None:
         # Every rank must reach the same decision: one that keeps the feature
         # would wait in the block-count all-reduces for one that dropped it.
-        reason = vmm_unavailable_reason()
+        reason = vmm_unavailable_reason(kv_cache_export_handle_types(self.vllm_config))
         if all_reduce_int(
             get_world_group().cpu_group, int(reason is not None), ReduceOp.MAX
         ):
@@ -1024,6 +1026,10 @@ class Worker(WorkerBase):
         """Commit the final size of an extensible KV cache."""
         extend_kv_cache(self.model_runner, self._kv_cache_config, num_blocks)
         self.cache_config.num_gpu_blocks = num_blocks
+        if getattr(self.model_runner, "adaptive_verification", None) is not None:
+            # Capture profiled step costs with only a block or two committed,
+            # so their KV reads hit L2; profile again against the final cache.
+            self.model_runner.profile_adaptive_verification()
 
     def resize_kv_cache(self, target_num_blocks: int, restore: bool = False) -> int:
         """Grow an extensible KV cache toward target_num_blocks while serving.
@@ -1142,6 +1148,7 @@ class Worker(WorkerBase):
             # Track the transient peak of the warmup steps themselves; they
             # reach shapes (spec-decode drafts, encoder batches) profiling
             # does not, and `measure_kv_cache_blocks` keeps that peak free.
+            # One-off autotuning is excluded by kernel_warmup.
             torch.accelerator.reset_peak_memory_stats(self.device)
         warmup_sizes: list[int] = []
 
@@ -1195,19 +1202,28 @@ class Worker(WorkerBase):
             # A workspace resize after capture frees what the graphs point at.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
         if self.cache_config.enable_extensible_kv_cache:
+            kv_cache = self.model_runner.extensible_kv_cache
+            assert kv_cache is not None
+            # The blocks warmup_kernels committed hold garbage and can take
+            # nearly all the memory warmup may commit: release them, so the
+            # sizing steps run beside only the blocks they address. The
+            # persistent block tables stop naming them first: a kernel that
+            # loads entries past a row's own blocks faults on an unmapped one.
+            forget_block_ids_from(self.model_runner, kv_cache.min_committed_blocks)
+            kv_cache.commit(kv_cache.min_committed_blocks, shrink=True)
             run_kv_cache_sizing_warmup(
                 self.model_runner, self.execute_model, self.sample_tokens
             )
             # Measure before capture, whose persistent allocations would
             # hide part of the peak from a later peak - current.
-            kv_cache = self.model_runner.extensible_kv_cache
-            assert kv_cache is not None
-            stats = torch.accelerator.memory_stats(self.device)
-            kv_cache.reserved_headroom_bytes = max(
-                kv_cache.reserved_headroom_bytes,
-                stats.get("allocated_bytes.all.peak", 0)
-                - stats.get("allocated_bytes.all.current", 0),
-            )
+            kv_cache.record_transient_peak()
+            if not self.model_config.enforce_eager:
+                # Warmup's blocks hold garbage and capture addresses only the
+                # null block: release them so the graphs fit (encoder graphs
+                # can take GiBs). extend_kv_cache commits the size measured
+                # after capture.
+                forget_block_ids_from(self.model_runner, kv_cache.min_committed_blocks)
+                kv_cache.commit(kv_cache.min_committed_blocks, shrink=True)
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:

@@ -943,6 +943,7 @@ def _measure_startup(monkeypatch, kv_cache, initial_blocks, free_memory):
         torch.xpu, "set_per_process_memory_fraction", lambda fraction, device=None: None
     )
     vllm_config = SimpleNamespace(
+        cache_config=SimpleNamespace(gpu_memory_utilization=None),
         model_config=SimpleNamespace(multimodal_config=None),
         parallel_config=SimpleNamespace(),
     )
