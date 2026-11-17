@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
     ExpertTiers,
     remap_unrouted,
 )
+from vllm.model_executor.layers.quantization.utils import entry_rows
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
@@ -549,6 +550,14 @@ class EPIdsContract(enum.Enum):
 FUSED_MOE_OP_MARKERS = ("HANDLES_UNOWNED_IDS", "CLEARS_ROWS_PER_EXPERT")
 
 
+@functools.cache
+def _apply_takes_entry() -> bool:
+    """Whether XpuFusedMoe.apply takes x_q and shared (and returns whether it
+    folded the shared term)."""
+    params = inspect.signature(XpuFusedMoe.apply).parameters
+    return "x_q" in params and "shared" in params
+
+
 def eplb_route_sentinel(global_num_experts: int) -> int | None:
     """VLLM_XPU_MOE_ROUTE_FUSED: the id this rank's XPU fused MoE writes for
     unrouted (-1) ids under expert parallelism with EPLB, for the router's
@@ -861,7 +870,8 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             )
             self._combine_exact(output, topk_weights, [captured.source()])
             return
-        impl.apply(
+        entry = self._entry_kwargs(hidden_states, a1q_scale)
+        folded = impl.apply(
             output=output,
             hidden_states=hidden_states,
             topk_weights=topk_weights,
@@ -869,7 +879,34 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             a1q_scale=a1q_scale,
             **self.impl_apply_kwargs,
             **ep_kwargs,
+            **entry,
         )
+        if "shared" in entry:
+            rows = entry_rows.current()
+            assert rows is not None
+            rows.folded = folded is True
+
+    def _entry_kwargs(
+        self, hidden_states: torch.Tensor, a1q_scale: torch.Tensor | None
+    ) -> dict:
+        """XPU MoE entry (fused_moe/xpu_moe_entry.py): the token rows already
+        quantized at the MoE entry (x_q) and the shared expert's ungated
+        output with its gate (shared), for a W4A8 apply that takes them."""
+        rows = entry_rows.current()
+        if (
+            rows is None
+            or not self.impl_apply_kwargs.get("w4a8")
+            or a1q_scale is not None
+            or not _apply_takes_entry()
+        ):
+            return {}
+        kw: dict = {}
+        if rows.q is not None and rows.share_rows and rows.holds(hidden_states):
+            kw["x_q"] = (rows.q, rows.s)
+            rows.readers.append("W4A8 routed experts")
+        if rows.shared_pending is not None:
+            kw["shared"] = rows.shared_pending
+        return kw
 
     def _router_wrote_sentinel(self, topk_ids: torch.Tensor, sentinel: int) -> bool:
         """Whether the router's EPLB mapping kernel already wrote ``sentinel``

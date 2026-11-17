@@ -56,6 +56,7 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils import entry_rows
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -131,7 +132,11 @@ class Qwen3MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            out = F.sigmoid(self.expert_gate(x)[0]) * out
+            gate = F.sigmoid(self.expert_gate(x)[0])
+            if entry_rows.ACTIVE and entry_rows.defer_shared_gate(self, gate):
+                # XPU MoE entry: the routed experts' gather adds gate * out.
+                return out
+            out = gate * out
 
         return out
 

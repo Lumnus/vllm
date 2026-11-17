@@ -389,6 +389,17 @@ class BaseRouter(FusedMoERouter):
         # mask; a no-op when it is off)
         router_logits = self._apply_residency_mask(router_logits)
 
+        # VLLM_XPU_MOE_TOPK_ROUTE: steps 2 and 3 (and the XPU sentinel) in one
+        # kernel, when this router and its call allow it.
+        if envs.VLLM_XPU_MOE_TOPK_ROUTE and self.eplb_state is not None:
+            from vllm.model_executor.layers.fused_moe.xpu_moe_entry import (
+                topk_route,
+            )
+
+            routed = topk_route(self, router_logits, topk_indices_dtype)
+            if routed is not None:
+                return routed
+
         # Step 2: Compute routing (delegated to subclass)
         topk_weights, topk_ids = self._compute_routing(
             hidden_states, router_logits, topk_indices_dtype, input_ids=input_ids
