@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.xpu_expert_tiers import (
     ExpertTiers,
     remap_unrouted,
 )
+from vllm.model_executor.layers.quantization.utils import entry_rows
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
@@ -550,6 +551,34 @@ FUSED_MOE_OP_MARKERS = ("HANDLES_UNOWNED_IDS", "CLEARS_ROWS_PER_EXPERT")
 
 
 @functools.cache
+def _apply_takes_entry() -> bool:
+    """Whether XpuFusedMoe.apply takes x_q and shared (and returns whether it
+    folded the shared term)."""
+    params = inspect.signature(XpuFusedMoe.apply).parameters
+    return "x_q" in params and "shared" in params
+
+
+def eplb_route_sentinel(global_num_experts: int) -> int | None:
+    """VLLM_XPU_MOE_ROUTE_FUSED: the id this rank's XPU fused MoE writes for
+    unrouted (-1) ids under expert parallelism with EPLB, for the router's
+    EPLB mapping kernel to write in the same launch: ``global_num_experts - 1``
+    on EP rank 0, else 0, as in ``XPUExperts.apply``. None where the experts
+    pass the ids on as they are (VLLM_XPU_MOE_EPLB_OP_IDS=1 on a kernels build
+    that filters them), without expert parallelism, or with data parallelism
+    (the ids are dispatched between ranks)."""
+    from vllm.distributed import get_dp_group, get_ep_group
+
+    if get_ep_group().world_size <= 1 or get_dp_group().world_size > 1:
+        return None
+    if (
+        fused_moe_ep_contract() is EPIdsContract.OP_HANDLES_IDS
+        and envs.VLLM_XPU_MOE_EPLB_OP_IDS
+    ):
+        return None
+    return global_num_experts - 1 if get_ep_group().rank_in_group == 0 else 0
+
+
+@functools.cache
 def fused_moe_ep_contract() -> EPIdsContract:
     """What the installed XpuFusedMoe does with the routed ids, read once."""
     if all(getattr(XpuFusedMoe, name, False) for name in FUSED_MOE_OP_MARKERS):
@@ -563,14 +592,27 @@ def fused_moe_ep_contract() -> EPIdsContract:
 def ep_ids_contract_for(moe_config: FusedMoEConfig) -> EPIdsContract:
     """The contract an expert-parallel layer uses. With EPLB the layer keeps
     rewriting the ids itself: rebalancing changes which experts a rank owns,
-    and that path was not validated with the op filtering them."""
+    and that path was not validated with the op filtering them.
+    VLLM_XPU_MOE_EPLB_OP_IDS=1 lets the op filter them under EPLB too (no
+    sentinel kernel per layer)."""
     contract = fused_moe_ep_contract()
+    eplb_op_ids = False
     if (
         contract is EPIdsContract.OP_HANDLES_IDS
         and moe_config.moe_parallel_config.enable_eplb
     ):
-        contract = EPIdsContract.IDS_VALID
+        if envs.VLLM_XPU_MOE_EPLB_OP_IDS:
+            eplb_op_ids = True
+        else:
+            contract = EPIdsContract.IDS_VALID
     if moe_config.ep_size <= 1:
+        return contract
+    if eplb_op_ids:
+        logger.info_once(
+            "XPU MoE expert parallelism with EPLB: the fused MoE filters "
+            "unowned ids and clears its expert counts; no sentinel kernel "
+            "(VLLM_XPU_MOE_EPLB_OP_IDS=1)."
+        )
         return contract
     logger.info_once(
         "XPU MoE expert parallelism: %s.",
@@ -801,9 +843,16 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             # MoE skips its padding-row mask.
             sentinel = global_num_experts - 1 if self.moe_config.ep_rank == 0 else 0
             if self.ep_contract is EPIdsContract.IDS_VALID:
-                topk_ids, rows_per_expert = sentinel_ids_and_counts(
-                    topk_ids, sentinel, impl.num_experts
-                )
+                if self._router_wrote_sentinel(topk_ids, sentinel):
+                    # VLLM_XPU_MOE_ROUTE_FUSED: the EPLB mapping kernel wrote
+                    # the sentinel, and the fused MoE clears its counts.
+                    rows_per_expert = torch.empty(
+                        (impl.num_experts,), dtype=torch.int32, device=topk_ids.device
+                    )
+                else:
+                    topk_ids, rows_per_expert = sentinel_ids_and_counts(
+                        topk_ids, sentinel, impl.num_experts
+                    )
                 ep_kwargs = {"ids_valid": True, "rows_per_expert": rows_per_expert}
             else:
                 topk_ids = torch.where(topk_ids < 0, sentinel, topk_ids)
@@ -821,7 +870,8 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             )
             self._combine_exact(output, topk_weights, [captured.source()])
             return
-        impl.apply(
+        entry = self._entry_kwargs(hidden_states, a1q_scale)
+        folded = impl.apply(
             output=output,
             hidden_states=hidden_states,
             topk_weights=topk_weights,
@@ -829,7 +879,57 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             a1q_scale=a1q_scale,
             **self.impl_apply_kwargs,
             **ep_kwargs,
+            **entry,
         )
+        if "shared" in entry:
+            rows = entry_rows.current()
+            assert rows is not None
+            rows.folded = folded is True
+
+    def _entry_kwargs(
+        self, hidden_states: torch.Tensor, a1q_scale: torch.Tensor | None
+    ) -> dict:
+        """XPU MoE entry (fused_moe/xpu_moe_entry.py): the token rows already
+        quantized at the MoE entry (x_q) and the shared expert's ungated
+        output with its gate (shared), for a W4A8 apply that takes them."""
+        rows = entry_rows.current()
+        if (
+            rows is None
+            or not self.impl_apply_kwargs.get("w4a8")
+            or a1q_scale is not None
+            or not _apply_takes_entry()
+        ):
+            return {}
+        kw: dict = {}
+        if rows.q is not None and rows.share_rows and rows.holds(hidden_states):
+            kw["x_q"] = (rows.q, rows.s)
+            rows.readers.append("W4A8 routed experts")
+        if rows.shared_pending is not None:
+            kw["shared"] = rows.shared_pending
+        return kw
+
+    def _router_wrote_sentinel(self, topk_ids: torch.Tensor, sentinel: int) -> bool:
+        """Whether the router's EPLB mapping kernel already wrote ``sentinel``
+        for the unrouted ids (VLLM_XPU_MOE_ROUTE_FUSED) and the fused MoE clears
+        rows_per_expert itself, so the sentinel kernel has nothing left to do."""
+        if not envs.VLLM_XPU_MOE_ROUTE_FUSED:
+            return False
+        marked = getattr(topk_ids, "xpu_ids_sentinel", None) == sentinel
+        clears = fused_moe_ep_contract() is EPIdsContract.OP_HANDLES_IDS
+        if marked and clears:
+            logger.info_once(
+                "XPU MoE routing (VLLM_XPU_MOE_ROUTE_FUSED=1): the EPLB mapping "
+                "kernel writes the unowned sentinel for unrouted ids; no "
+                "sentinel kernel per layer."
+            )
+            return True
+        logger.warning_once(
+            "VLLM_XPU_MOE_ROUTE_FUSED=1, but %s; the sentinel kernel runs.",
+            "the routed ids arrived without the router's sentinel mark"
+            if not marked
+            else "this vllm-xpu-kernels does not clear rows_per_expert itself",
+        )
+        return False
 
     def _combine_mode(self, a1q_scale: torch.Tensor | None = None) -> str:
         """The VLLM_XPU_MOE_COMBINE mode this call runs; raises when a mode
@@ -1196,6 +1296,27 @@ def xpu_w4a8_moe_available() -> bool:
     )
 
 
+def w4a8_prep() -> str:
+    """What the installed vllm-xpu-kernels' W4A8 apply runs around its GEMMs,
+    for the boot log."""
+    try:
+        from vllm_xpu_kernels import moe_w4a8
+    except ImportError:
+        return "unknown (no vllm_xpu_kernels.moe_w4a8)"
+    stock_prep = getattr(moe_w4a8, "stock_prep", None)
+    if stock_prep is None:
+        return (
+            "padding mask, own zeroed counts and a torch re-count of "
+            "rows_per_expert (this vllm-xpu-kernels has no lean prep)"
+        )
+    if stock_prep():
+        return (
+            "padding mask, own zeroed counts and a torch re-count of "
+            "rows_per_expert (VLLM_XPU_W4A8_STOCK_PREP=1)"
+        )
+    return "no padding mask, the remap fills rows_per_expert (lean prep)"
+
+
 class XPUExpertsW4A8Int(XPUExpertsWNA16):
     """INT4 symmetric g128 experts with dynamic per-token INT8 activations.
 
@@ -1235,6 +1356,7 @@ class XPUExpertsW4A8Int(XPUExpertsWNA16):
                 "XPU MoE W4A8: int4 g128 experts with dynamic per-token int8 "
                 "activations (s8 x s4 grouped GEMM)."
             )
+            logger.info_once("XPU MoE W4A8 prep around the GEMMs: %s.", w4a8_prep())
         else:
             logger.warning_once(
                 "XPU MoE W4A8 requested, but %s: this layer keeps W4A16.", reason

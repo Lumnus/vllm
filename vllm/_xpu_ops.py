@@ -8,6 +8,7 @@ import torch
 from vllm_xpu_kernels.flash_attn_interface import flash_attn_varlen_func
 from vllm_xpu_kernels.rotary import apply_rotary_emb
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
@@ -1001,6 +1002,39 @@ def dynamic_per_token_int8_quant_native(
     return q, s
 
 
+def fa_meta_cache() -> dict | None:
+    """VLLM_XPU_ATTN_META_ONCE: the per-forward dict the kernels' attention
+    keeps its spec-decode metadata in (vllm-xpu-kernels with
+    ``SPEC_DECODE_META_CACHE``), so the attention layers of one forward build it
+    once instead of each layer. It lives on the forward context, so a new
+    forward starts empty. None when off, unsupported or outside a forward."""
+    if not envs.VLLM_XPU_ATTN_META_ONCE:
+        return None
+    from vllm_xpu_kernels import flash_attn_interface as fai
+
+    if not getattr(fai, "SPEC_DECODE_META_CACHE", False):
+        logger.warning_once(
+            "VLLM_XPU_ATTN_META_ONCE=1, but this vllm-xpu-kernels has no "
+            "per-forward spec-decode metadata cache; each layer builds it."
+        )
+        return None
+    from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    if not is_forward_context_available():
+        return None
+    ctx = get_forward_context()
+    cache = getattr(ctx, "_xpu_fa_meta_cache", None)
+    if cache is None:
+        cache = {}
+        ctx._xpu_fa_meta_cache = cache
+        logger.info_once(
+            "XPU attention (VLLM_XPU_ATTN_META_ONCE=1): the spec-decode "
+            "metadata is built once per forward and shared by the layers "
+            "that pass the same query starts, KV lengths and block table."
+        )
+    return cache
+
+
 class xpu_ops:
     @staticmethod
     def dynamic_per_token_int8_quant(
@@ -1081,6 +1115,8 @@ class xpu_ops:
         dynamic_causal: torch.Tensor | None = None,
         mask_mod: Callable | None = None,
         aux_tensors: list | None = None,
+        int8_dot: bool = False,
+        int8_prefill: int = 0,
         **kwargs,
     ):
         assert cu_seqlens_k is not None or seqused_k is not None, (
@@ -1130,6 +1166,17 @@ class xpu_ops:
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            **(
+                {"spec_decode_meta_cache": meta_cache}
+                if (meta_cache := fa_meta_cache()) is not None
+                else {}
+            ),
+            # INT8 Q.K in the paged decode (int8 KV); only passed when set, so
+            # kernels builds without the argument keep working when it is off.
+            **({"int8_dot": True} if int8_dot else {}),
+            # INT8 KV prefill in the chunk-prefill kernel (1-3); only passed
+            # when set, as int8_dot.
+            **({"int8_prefill": int8_prefill} if int8_prefill else {}),
         )
 
     @staticmethod

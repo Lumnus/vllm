@@ -12,6 +12,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
     triton_scaled_mm,
 )
+from vllm.model_executor.layers.quantization.utils import entry_rows
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8DynamicTensorSym,
     kFp8DynamicTokenSym,
@@ -420,5 +421,17 @@ class XPUInt8ScaledMMLinearKernel(TritonInt8ScaledMMLinearKernel):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         w_q, w_s, i_s, _, _ = self._get_layer_params(layer)
+        if entry_rows.ACTIVE and i_s is None:
+            # XPU MoE entry: the rows of x quantized once for every consumer
+            # (same call as below), or this layer's output from a merged GEMM.
+            hit = entry_rows.int8_input(layer, x)
+            if hit is not None:
+                out, rows = hit
+                if out is not None and bias is None:
+                    return out
+                if rows is not None:
+                    return torch.ops.vllm.xpu_int8_scaled_mm_func(
+                        rows[0], w_q, rows[1], w_s, x.dtype, bias
+                    )
         x_q, x_s, _ = ops.scaled_int8_quant(x.contiguous(), i_s, None, symmetric=True)
         return torch.ops.vllm.xpu_int8_scaled_mm_func(x_q, w_q, x_s, w_s, x.dtype, bias)

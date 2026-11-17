@@ -56,6 +56,7 @@ from vllm.model_executor.layers.fused_moe.runner.shared_experts import (
     SharedExperts,
     SharedExpertsOrder,
 )
+from vllm.model_executor.layers.quantization.utils import entry_rows
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.model_executor.utils import refill_derived
 from vllm.platforms import current_platform
@@ -157,6 +158,23 @@ def _fixed_address(layer: MoERunnerInterface, result: Any) -> Any:
         "at the address it was captured with."
     )
     return held(result)
+
+
+def can_fuse_gate_weights(
+    gate: torch.nn.Module | None, shared_expert_gate: torch.nn.Module | None
+) -> bool:
+    """Whether the router and shared-expert gate weights can be concatenated
+    into one BF16 GEMM: both present and both unquantized (an INT8 gate keeps
+    its own quantized GEMM)."""
+    if gate is None or shared_expert_gate is None:
+        return False
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
+    return all(
+        isinstance(getattr(m, "quant_method", None), UnquantizedLinearMethod)
+        or getattr(m, "quant_method", None) is None
+        for m in (gate, shared_expert_gate)
+    )
 
 
 def get_layer_from_name(layer_name: str) -> MoERunnerInterface:
@@ -378,7 +396,7 @@ class MoERunner(MoERunnerInterface):
         # GEMM produces combined logits. The topk kernel can then
         # apply routing softmax and shared expert activation (sigmoid)
         # in a single launch.
-        self._fse_fuse_gate = gate is not None and shared_expert_gate is not None
+        self._fse_fuse_gate = can_fuse_gate_weights(gate, shared_expert_gate)
         self._combined_gate_weight: torch.Tensor | None = None
 
         self._shared_experts: SharedExperts | None = None
@@ -393,6 +411,11 @@ class MoERunner(MoERunnerInterface):
 
         # Needed for string -> MoERunner layer lookup in custom ops.
         self.layer_name = layer_name
+
+        # XPU MoE entry (fused_moe/xpu_moe_entry.py): decided at load.
+        # _xpu_shared_folded: the MoE op returns shared + routed itself.
+        self._xpu_entry = None
+        self._xpu_shared_folded = False
 
         self._forward_entry = self._select_forward()
 
@@ -450,6 +473,7 @@ class MoERunner(MoERunnerInterface):
         every load or reload, refilling the fused tensor in place so captured
         CUDA graphs see updated gates.
         """
+        self._resolve_xpu_entry()
         if not self._fse_fuse_gate:
             return
         assert self.gate is not None and self.shared_expert_gate is not None
@@ -457,6 +481,17 @@ class MoERunner(MoERunnerInterface):
             self,
             "_combined_gate_weight",
             torch.cat([self.gate.weight, self.shared_expert_gate.weight], dim=0),
+        )
+
+    def _resolve_xpu_entry(self, force_platform: bool = False) -> None:
+        """The XPU MoE entry plan under its switches (one int8 quant of the
+        MoE input for every INT8 consumer, merged INT8 gates, the shared
+        expert's gate and add in the routed gather)."""
+        from vllm.model_executor.layers.fused_moe import xpu_moe_entry
+
+        self._xpu_entry = xpu_moe_entry.resolve(self, force_platform)
+        self._xpu_shared_folded = (
+            self._xpu_entry is not None and self._xpu_entry.fold_module is not None
         )
 
     @property
@@ -737,6 +772,18 @@ class MoERunner(MoERunnerInterface):
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
         )
+        folded = getattr(self, "_xpu_shared_folded", False)
+        rows = entry_rows.current() if folded else None
+        if rows is not None and rows.shared_gate is not None:
+            # The shared expert returned its output ungated; the routed
+            # experts' gather adds gate * output (VLLM_XPU_MOE_SHARED_IN_GATHER).
+            assert self._shared_experts is not None
+            pending = self._shared_experts._output[self._shared_experts._output_idx]
+            rows.shared_pending = (
+                (pending, rows.shared_gate, True)
+                if rows.single_round
+                else (pending, rows.shared_gate)
+            )
 
         if (
             self.routed_experts.quant_method.is_monolithic
@@ -795,10 +842,19 @@ class MoERunner(MoERunnerInterface):
             assert self._shared_experts is not None
             self._shared_experts.wait()
 
-        return (
-            self._shared_experts.output if self._shared_experts is not None else None,
-            fused_out,
+        shared_out = (
+            self._shared_experts.output if self._shared_experts is not None else None
         )
+        if folded:
+            # The op returns shared + routed: added in the gather, or here with
+            # the ops the layer used (gate * output, then shared + routed).
+            assert shared_out is not None and isinstance(fused_out, torch.Tensor)
+            if rows is None or not rows.folded:
+                if rows is not None and rows.shared_gate is not None:
+                    shared_out = rows.shared_gate * shared_out
+                fused_out = shared_out + fused_out
+            return None, fused_out
+        return shared_out, fused_out
 
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token
@@ -907,6 +963,9 @@ class MoERunner(MoERunnerInterface):
         # Extract outputs from result
         shared_output, fused_output = _unpack(result)
         fused_output = cast(torch.Tensor, fused_output)
+        if getattr(self, "_xpu_shared_folded", False):
+            # The routed output already holds the shared expert's term.
+            shared_output = None
 
         if og_hidden_dim_pre_xform is not None:
             fused_output = fused_output[..., :og_hidden_dim_pre_xform]
@@ -1045,6 +1104,11 @@ class MoERunner(MoERunnerInterface):
                 )
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
 
+        if getattr(self, "_xpu_shared_folded", False):
+            # hidden_states already holds shared + routed; the op's shared
+            # output slot gets an unused tensor (no launch).
+            assert isinstance(hidden_states, torch.Tensor)
+            return torch.empty_like(hidden_states), hidden_states
         if self.shared_experts is not None:
             assert shared_output is not None
             return shared_output, hidden_states
@@ -1086,39 +1150,48 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input
             )
 
-        # If the Runner holds the gate, apply it after the stream sync,
-        # so it can run overlapped with the
-        # NOTE: in future PR, MoE runner will always hold the gate.
-        if self.gate is not None:
-            if self._fse_fuse_gate:
-                router_logits = dispatch_unquantized_gemm()(
-                    self, hidden_states, self._combined_gate_weight, None
+        # XPU MoE entry: the input's int8 rows for every INT8 consumer, the
+        # merged INT8 gates, the shared expert's gate in the routed gather.
+        plan = getattr(self, "_xpu_entry", None)
+        entry = plan.open(self, hidden_states) if plan is not None else nullcontext()
+        with entry:
+            # If the Runner holds the gate, apply it after the stream sync,
+            # so it can run overlapped with the
+            # NOTE: in future PR, MoE runner will always hold the gate.
+            if self.gate is not None:
+                if self._fse_fuse_gate:
+                    router_logits = dispatch_unquantized_gemm()(
+                        self, hidden_states, self._combined_gate_weight, None
+                    )
+                else:
+                    router_logits, _ = self.gate(hidden_states)
+
+            with self._sequence_parallel_context():
+                # TODO(bnell): parts of the dispatch/combine steps will go away
+                # once #32567 lands and the remaining kernels are made MKs.
+                # The PCP code will probably remain
+                (
+                    hidden_states,
+                    router_logits,
+                    hidden_states_scale,
+                ) = self._maybe_dispatch(
+                    hidden_states,
+                    router_logits,
                 )
-            else:
-                router_logits, _ = self.gate(hidden_states)
 
-        with self._sequence_parallel_context():
-            # TODO(bnell): parts of the dispatch/combine steps will go away once
-            # #32567 lands and the remaining kernels are made MKs.  The PCP
-            # code will probably remain
-            hidden_states, router_logits, hidden_states_scale = self._maybe_dispatch(
-                hidden_states,
-                router_logits,
-            )
+                shared_output, hidden_states = self._apply_quant_method(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    shared_experts_input=shared_experts_input,
+                    input_ids=input_ids,
+                    shared_experts_overlapping=shared_experts_overlapping,
+                    hidden_states_scale=hidden_states_scale,
+                )
 
-            shared_output, hidden_states = self._apply_quant_method(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                shared_experts_input=shared_experts_input,
-                input_ids=input_ids,
-                shared_experts_overlapping=shared_experts_overlapping,
-                hidden_states_scale=hidden_states_scale,
-            )
-
-            return self._maybe_combine(
-                shared_output,
-                hidden_states,
-            )
+                return self._maybe_combine(
+                    shared_output,
+                    hidden_states,
+                )
 
     #########################################################
     #

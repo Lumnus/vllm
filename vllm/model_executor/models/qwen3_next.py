@@ -51,6 +51,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils import checkpoint_int8
+from vllm.model_executor.layers.quantization.utils.checkpoint_int8 import (
+    checkpoint_int8_quant_config,
+)
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_quark_ocp_mx_group_size,
 )
@@ -136,6 +140,41 @@ def _should_replicate_misaligned_shared_expert(
     )
 
 
+def build_router_gate(
+    config, quant_config: QuantizationConfig | None, prefix: str
+) -> GateLinear:
+    """The MoE router. BF16 unless the checkpoint carries it as calibrated
+    INT8 W8A8; never rounded at load. Its logits feed the softmax top-k
+    (``num_experts_per_tok`` of ``num_experts``, renormalized when
+    ``norm_topk_prob``), so an INT8 router changes routing only through those
+    logits; ``VLLM_ROUTER_INT8_SHADOW`` counts the routed slots that move."""
+    gate = GateLinear(
+        config.hidden_size,
+        config.num_experts,
+        quant_config=checkpoint_int8_quant_config(quant_config, prefix, "router gate"),
+        prefix=prefix,
+    )
+    gate.enable_routing_shadow(config.num_experts_per_tok)
+    return checkpoint_int8.mark(gate, "router gate")
+
+
+def build_shared_expert_gate(
+    config, quant_config: QuantizationConfig | None, prefix: str
+) -> ReplicatedLinear:
+    """The shared expert's sigmoid gate (N = 1). BF16 unless the checkpoint
+    carries it as calibrated INT8 W8A8; never rounded at load."""
+    layer = ReplicatedLinear(
+        config.hidden_size,
+        1,
+        bias=False,
+        quant_config=checkpoint_int8_quant_config(
+            quant_config, prefix, "shared-expert gate"
+        ),
+        prefix=prefix,
+    )
+    return checkpoint_int8.mark(layer, "shared-expert gate")
+
+
 class Qwen3NextSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -196,18 +235,9 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.n_physical_experts = self.n_logical_experts + self.n_redundant_experts
         self.n_local_physical_experts = self.n_physical_experts // self.ep_size
 
-        self.gate = GateLinear(
-            config.hidden_size,
-            config.num_experts,
-            prefix=f"{prefix}.gate",
-        )
-
-        self.shared_expert_gate = ReplicatedLinear(
-            config.hidden_size,
-            1,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.shared_expert_gate",
+        self.gate = build_router_gate(config, quant_config, f"{prefix}.gate")
+        self.shared_expert_gate = build_shared_expert_gate(
+            config, quant_config, f"{prefix}.shared_expert_gate"
         )
 
         if (

@@ -5,12 +5,18 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import envs
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils import checkpoint_int8
+from vllm.model_executor.layers.quantization.utils.checkpoint_int8 import (
+    checkpoint_int8_quant_config,
+)
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.worker.gpu.spec_decode.dflash2.config import DFlash2SpeculatorConfig
@@ -21,6 +27,11 @@ from .qwen3_dflash import (
     DFlashQwen3Model,
 )
 from .utils import maybe_prefix
+
+logger = init_logger(__name__)
+
+# Read once at import: the device check runs inside compiled forwards.
+XPU_DFLASH2_TRITON = envs.VLLM_XPU_DFLASH2_TRITON
 
 
 @triton.jit
@@ -91,6 +102,7 @@ def dflash2_grouped_conv_impl(
     output = torch.empty_like(x)
     if num_rows == 0:
         return output
+    logger.info_once("DFlash2 grouped convolution: Triton kernel on %s.", x.device.type)
 
     element_block = 1024 if num_rows >= 128 and num_channels % 1024 == 0 else 512
     grid = (num_rows * triton.cdiv(num_channels, element_block),)
@@ -142,6 +154,13 @@ def dflash2_grouped_conv(
     return torch.ops.vllm.dflash2_grouped_conv(x, delta, base, block_size, group_size)
 
 
+def _use_triton(tensor: torch.Tensor) -> bool:
+    """Whether the DFlash2 Triton kernels run for tensors on this device: CUDA,
+    and XPU unless VLLM_XPU_DFLASH2_TRITON=0. Other devices take the torch
+    reference."""
+    return tensor.is_cuda or (tensor.is_xpu and XPU_DFLASH2_TRITON)
+
+
 def _grouped_conv(
     hidden_states: torch.Tensor,
     delta: torch.Tensor,
@@ -151,7 +170,7 @@ def _grouped_conv(
     group_size: int,
     taps: int,
 ) -> torch.Tensor:
-    if hidden_states.is_cuda:
+    if _use_triton(hidden_states):
         return dflash2_grouped_conv(hidden_states, delta, base, block_size, group_size)
 
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
@@ -365,6 +384,10 @@ def dflash2_score_edges_impl(
     if num_reqs * steps == 0:
         return output
     vocab_size, rank = predecessor_table.shape
+    logger.info_once(
+        "DFlash2 candidate edge scoring: Triton kernel on %s.",
+        candidate_ids.device.type,
+    )
     _dflash2_score_edges_kernel[(num_reqs * steps,)](
         predecessor_table,
         successor_table,
@@ -412,7 +435,7 @@ def _score_edges(
     anchor_token_ids: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
-    if candidate_ids.is_cuda:
+    if _use_triton(candidate_ids):
         return torch.ops.vllm.dflash2_score_edges(
             predecessor_table,
             successor_table,
@@ -459,6 +482,32 @@ def _score_edges_reference(
     )
 
 
+def build_selector_projection(
+    hidden_size: int,
+    rank: int,
+    params_dtype: torch.dtype,
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> ReplicatedLinear:
+    """The candidate selector's hidden projection. BF16 unless the drafter
+    checkpoint carries it as calibrated INT8 W8A8; never rounded at load."""
+    layer = ReplicatedLinear(
+        hidden_size,
+        rank,
+        bias=False,
+        params_dtype=params_dtype,
+        quant_config=checkpoint_int8_quant_config(
+            quant_config, prefix, "drafter selector projection"
+        ),
+        prefix=prefix,
+        return_bias=False,
+    )
+    layer = checkpoint_int8.mark(layer, "drafter selector projection")
+    if getattr(layer, checkpoint_int8.INT8_ATTR, False):
+        logger.info_once("DFlash2 candidate selector projection: INT8 W8A8.")
+    return layer
+
+
 @support_torch_compile
 class CandidateSelector(nn.Module):
     def __init__(
@@ -469,6 +518,7 @@ class CandidateSelector(nn.Module):
         top_k: int,
         params_dtype: torch.dtype,
         prefix: str,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.top_k = top_k
@@ -478,14 +528,12 @@ class CandidateSelector(nn.Module):
         self.successor_codebook = nn.Parameter(
             torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
         )
-        self.hidden_projection = ReplicatedLinear(
+        self.hidden_projection = build_selector_projection(
             hidden_size,
             rank,
-            bias=False,
-            params_dtype=params_dtype,
-            quant_config=None,
-            prefix=maybe_prefix(prefix, "hidden_projection"),
-            return_bias=False,
+            params_dtype,
+            quant_config,
+            maybe_prefix(prefix, "hidden_projection"),
         )
 
     def forward(
@@ -535,6 +583,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 top_k=int(draft_config["selector_top_k"]),
                 params_dtype=vllm_config.model_config.dtype,
                 prefix=maybe_prefix(prefix, "candidate_selector"),
+                quant_config=getattr(vllm_config, "quant_config", None),
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

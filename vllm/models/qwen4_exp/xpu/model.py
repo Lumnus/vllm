@@ -68,7 +68,15 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
     is_conv_state_dim_first,
 )
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.quantization.base_config import (
+    QuantizationConfig,
+    QuantizeMethodBase,
+)
+from vllm.model_executor.layers.quantization.utils import checkpoint_int8
+from vllm.model_executor.layers.quantization.utils.checkpoint_int8 import (
+    checkpoint_int8_quant_config,
+    log_checkpoint_int8_parts,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -260,6 +268,29 @@ class _PLETableFinalizer(QuantizeMethodBase):
         layer.finalize_table()
 
 
+def build_ple_kv_proj(
+    embed_dim: int,
+    output_sizes: list[int],
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+) -> MergedColumnParallelLinear:
+    """The PLE key/value projection (one merged GEMM, replicated). INT8 W8A8
+    only when the checkpoint carries ``key_proj`` and ``value_proj`` as INT8
+    (compressed-tensors requires both shards in the same scheme); BF16
+    otherwise. Its input is the gathered n-gram rows (dequantized from the
+    INT8 table), quantized per token by the INT8 layer like any dense input."""
+    layer = MergedColumnParallelLinear(
+        embed_dim,
+        output_sizes,
+        bias=False,
+        quant_config=checkpoint_int8_quant_config(quant_config, prefix, "PLE kv_proj"),
+        prefix=prefix,
+        return_bias=False,
+        disable_tp=True,
+    )
+    return checkpoint_int8.mark(layer, "PLE kv_proj")
+
+
 class Qwen4ExpPLE(nn.Module, MambaBase):
     """Per-Layer Embedding (n-gram table) for Qwen4-Exp, layer 1 only.
 
@@ -328,16 +359,14 @@ class Qwen4ExpPLE(nn.Module, MambaBase):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        # BF16 weights (unquantized in the checkpoints, like HC). The key and
-        # value projections read the same rows, so they run as one GEMM.
-        self.kv_proj = MergedColumnParallelLinear(
+        # The key and value projections read the same rows, so they run as one
+        # GEMM: BF16, or INT8 W8A8 when the checkpoint carries both as
+        # calibrated INT8 (never rounded at load).
+        self.kv_proj = build_ple_kv_proj(
             config.ple_embed_dim,
             [self.hc_dim, self.n_embd],
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.kv_proj",
-            return_bias=False,
-            disable_tp=True,
+            vllm_config.quant_config,
+            f"{prefix}.kv_proj",
         )
         self.conv1d = _WeightContainer([self.hc_dim, 1, self.kern])
         self.norm_key = _WeightContainer([self.hc_dim])
@@ -1454,6 +1483,7 @@ class Qwen4ExpModel(Qwen3NextModel):
     def process_weights_after_loading(self) -> None:
         # Runs after every hyper-connection fixed its paths.
         log_hc_paths(self, "model")
+        log_checkpoint_int8_parts(self, "model")
 
 
 class Qwen4ExpForCausalLM(

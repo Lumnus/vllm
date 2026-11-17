@@ -372,6 +372,12 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             # CPU path they need the router config that only the layer carries.
             self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
+        # Expert slots in tiers (XPU, --cpu-offload-per-expert): the slots off
+        # the card were loaded into CPU twins; lay them out and wire the kernel.
+        tiers = getattr(layer, "expert_tiers", None)
+        if tiers is not None:
+            tiers.finalize(layer, self.moe_kernel)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
             swigluoai_w13_interleave_perm,
@@ -386,6 +392,11 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             layer.w13_weight_packed.size(1),
             layer.w13_weight_packed.device,
         )
+        if perm is not None and getattr(layer, "expert_tiers", None) is not None:
+            raise NotImplementedError(
+                "--cpu-offload-per-expert: the w13 row interleave of this "
+                "activation is not applied to the slots loaded off the card"
+            )
         if perm is not None:
             replace_parameter(
                 layer,

@@ -37,7 +37,9 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         out_size,
         numel,
         num_active_experts,
+        sentinel,
         BLOCK_SIZE: tl.constexpr,
+        SENTINEL: tl.constexpr = False,
     ):
         pid = tl.program_id(0)
         offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -69,6 +71,10 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
             record_enabled_ptr,
             num_unpadded_tokens_ptr,
         )
+        if SENTINEL:
+            # The XPU fused MoE's unowned sentinel for unrouted ids, as its
+            # sentinel_ids_and_counts writes it (VLLM_XPU_MOE_ROUTE_FUSED).
+            physical_id = tl.where(physical_id < 0, sentinel, physical_id)
         tl.store(out_ids_ptr + offs, physical_id, mask=mask)
 
     def _eplb_map_and_record_triton(
@@ -78,6 +84,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         expert_load_view: torch.Tensor,
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None,
+        sentinel: int | None = None,
     ) -> torch.Tensor:
         topk_ids_in = topk_ids.contiguous().to(dtype=torch.int32)
         numel = topk_ids_in.numel()
@@ -100,7 +107,9 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
             expert_load_view.shape[0],
             numel,
             num_active_experts,
+            0 if sentinel is None else sentinel,
             BLOCK_SIZE=256,
+            SENTINEL=sentinel is not None,
         )
         return out_flat.reshape(topk_ids.shape)
 
@@ -111,6 +120,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         logical_replica_count: torch.Tensor,
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
+        sentinel: int | None = None,
     ) -> torch.Tensor:
         # Fused triton implementation: mapping + optional recording in one kernel.
         return _eplb_map_and_record_triton(
@@ -120,6 +130,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
             expert_load_view=expert_load_view,
             record_enabled=record_enabled,
             num_unpadded_tokens=num_unpadded_tokens,
+            sentinel=sentinel,
         )
 else:
 
@@ -130,6 +141,7 @@ else:
         logical_replica_count: torch.Tensor,
         record_enabled: torch.Tensor,
         num_unpadded_tokens: torch.Tensor | None = None,
+        sentinel: int | None = None,
     ) -> torch.Tensor:
         return topk_ids
 
@@ -200,7 +212,8 @@ class BaseRouter(FusedMoERouter):
             assert eplb_state.logical_replica_count is not None
             assert eplb_state.should_record_tensor is not None
             assert eplb_state.num_unpadded_tokens_tensors is not None
-            return eplb_map_to_physical_and_record(
+            sentinel = self._xpu_ids_sentinel()
+            mapped = eplb_map_to_physical_and_record(
                 topk_ids=topk_ids,
                 logical_to_physical_map=eplb_state.logical_to_physical_map,
                 logical_replica_count=eplb_state.logical_replica_count,
@@ -209,8 +222,35 @@ class BaseRouter(FusedMoERouter):
                 num_unpadded_tokens=eplb_state.num_unpadded_tokens_tensors[
                     dbo_current_ubatch_id()
                 ],
+                sentinel=sentinel,
             )
+            if sentinel is not None:
+                # Tells the XPU fused MoE these ids carry its sentinel already,
+                # so it skips its own sentinel kernel (it rewrites them to the
+                # same values when the mark does not reach it).
+                mapped.xpu_ids_sentinel = sentinel
+            return mapped
         return topk_ids
+
+    _XPU_SENTINEL_UNSET = object()
+
+    def _xpu_ids_sentinel(self) -> int | None:
+        """VLLM_XPU_MOE_ROUTE_FUSED: the unowned sentinel the XPU fused MoE
+        writes for unrouted ids under expert parallelism with EPLB (its
+        IDS_VALID contract), written by the mapping kernel instead; None when
+        it does not apply. Fixed on the first call."""
+        cached = getattr(self, "_xpu_sentinel", self._XPU_SENTINEL_UNSET)
+        if cached is not self._XPU_SENTINEL_UNSET:
+            return cached
+        sentinel = None
+        if current_platform.is_xpu() and envs.VLLM_XPU_MOE_ROUTE_FUSED:
+            from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
+                eplb_route_sentinel,
+            )
+
+            sentinel = eplb_route_sentinel(self.global_num_experts)
+        self._xpu_sentinel = sentinel
+        return sentinel
 
     @property
     def supports_residency_mask(self) -> bool:
@@ -348,6 +388,17 @@ class BaseRouter(FusedMoERouter):
         # Step 1b: Keep the router away from masked experts (EPLB residency
         # mask; a no-op when it is off)
         router_logits = self._apply_residency_mask(router_logits)
+
+        # VLLM_XPU_MOE_TOPK_ROUTE: steps 2 and 3 (and the XPU sentinel) in one
+        # kernel, when this router and its call allow it.
+        if envs.VLLM_XPU_MOE_TOPK_ROUTE and self.eplb_state is not None:
+            from vllm.model_executor.layers.fused_moe.xpu_moe_entry import (
+                topk_route,
+            )
+
+            routed = topk_route(self, router_logits, topk_indices_dtype)
+            if routed is not None:
+                return routed
 
         # Step 2: Compute routing (delegated to subclass)
         topk_weights, topk_ids = self._compute_routing(

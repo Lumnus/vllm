@@ -20,8 +20,16 @@ per side when the spec pads the slots); the rest stays unused.
 
 The kernel has no INT8 prefill. Prefill and mixed batches dequantize the blocks
 their sequences reference into a bf16/fp16 paged scratch (one layer, sized to
-`max_model_len`, taken from the workspace manager) and run the stock kernel
-over it. The grouping reads only host copies the scheduler already has.
+`max_model_len` in the layer's own cache block, taken from the workspace
+manager) and run the stock kernel over it. The grouping reads only host copies
+the scheduler already has. With
+`AttentionConfig.int8_prefill_dot` set, causal prefill attends over the int8
+cache in place instead, with int8 dots and no scratch
+(`xpu_int8_prefill_attention`, Triton), or the vllm-xpu-kernels chunk-prefill
+kernel reads it in place (`forward_prefill_sycl`, the "sycl_*" values). With
+`AttentionConfig.int8_decode_dot` set, the
+paged decode kernel quantizes the query itself (the same rule) and runs Q.K as
+an int8 x int8 -> int32 dot (`forward_decode(..., int8_dot=True)`).
 """
 
 import functools
@@ -163,6 +171,113 @@ def int8_kv_decode_supported(head_size: int, dtype: torch.dtype) -> str | None:
             seqused_k=torch.ones((1,), dtype=torch.int32, device=dev),
             k_descale=k_scale,
             v_descale=v_scale,
+        )
+        torch.xpu.synchronize()
+    except Exception as e:  # noqa: BLE001 - any failure means unsupported
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+@functools.cache
+def int8_dot_decode_supported(head_size: int, dtype: torch.dtype) -> str | None:
+    """Run the paged decode once with `int8_dot=True` on a one-block cache.
+    Returns None when it works, else the reason (a vllm-xpu-kernels build
+    without INT8 Q.K at decode, a query dtype other than bfloat16, or a head
+    size the kernel does not cover)."""
+    from vllm._xpu_ops import xpu_ops
+
+    if dtype != torch.bfloat16:
+        return f"query dtype {dtype} (bfloat16 only)"
+    if head_size > 256 or head_size % 64:
+        return f"head size {head_size} (a multiple of 64 up to 256)"
+    try:
+        from vllm_xpu_kernels import flash_attn_interface
+    except ImportError as e:
+        return f"{type(e).__name__}: {e}"
+    if not getattr(flash_attn_interface, "INT8_DOT_DECODE", False):
+        return "the installed vllm-xpu-kernels has no int8_dot decode"
+    try:
+        nkv, block_size = 1, 64
+        content = 2 * (head_size + 4)
+        dev = torch.device("xpu", torch.xpu.current_device())
+        raw = torch.zeros((2, nkv, block_size, content), dtype=torch.int8, device=dev)
+        key, value, k_scale, v_scale = split_layout_views(raw, nkv, head_size)
+        q = torch.zeros((1, nkv, head_size), dtype=dtype, device=dev)
+        out = torch.empty_like(q)
+        xpu_ops.flash_attn_varlen_func(
+            q,
+            key,
+            value,
+            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=dev),
+            max_seqlen_q=1,
+            max_seqlen_k=1,
+            softmax_scale=1.0,
+            causal=True,
+            out=out,
+            block_table=torch.ones((1, 1), dtype=torch.int32, device=dev),
+            seqused_k=torch.ones((1,), dtype=torch.int32, device=dev),
+            k_descale=k_scale,
+            v_descale=v_scale,
+            int8_dot=True,
+        )
+        torch.xpu.synchronize()
+    except Exception as e:  # noqa: BLE001 - any failure means unsupported
+        return f"{type(e).__name__}: {e}"
+    return None
+
+
+# Rows of the probe: above the kernels' spec-decode bound, so the call takes the
+# chunk-prefill kernel, not the paged decode route.
+_SYCL_PROBE_ROWS = 40
+
+
+@functools.cache
+def int8_prefill_sycl_supported(
+    head_size: int, dtype: torch.dtype, mode: int, block_size: int
+) -> str | None:
+    """Run the chunk-prefill kernel once with `int8_prefill=mode` (1, 2 or 3)
+    on a small cache. Returns None when it works, else the reason (a
+    vllm-xpu-kernels build without INT8 KV prefill, or a configuration it
+    does not cover: bfloat16 query, head size 256, cache blocks of 32 or a
+    multiple of 64 slots)."""
+    from vllm._xpu_ops import xpu_ops
+
+    if dtype != torch.bfloat16:
+        return f"query dtype {dtype} (bfloat16 only)"
+    if head_size != 256:
+        return f"head size {head_size} (256 only)"
+    if not (block_size == 32 or block_size % 64 == 0):
+        return f"cache block of {block_size} slots (32 or a multiple of 64)"
+    try:
+        from vllm_xpu_kernels import flash_attn_interface
+    except ImportError as e:
+        return f"{type(e).__name__}: {e}"
+    if mode not in getattr(flash_attn_interface, "INT8_PREFILL_MODES", {}):
+        return f"the installed vllm-xpu-kernels has no int8_prefill={mode}"
+    try:
+        nkv, block = 1, 64
+        content = 2 * (head_size + 4)
+        dev = torch.device("xpu", torch.xpu.current_device())
+        raw = torch.zeros((2, nkv, block, content), dtype=torch.int8, device=dev)
+        key, value, k_scale, v_scale = split_layout_views(raw, nkv, head_size)
+        rows = _SYCL_PROBE_ROWS
+        q = torch.zeros((rows, nkv, head_size), dtype=dtype, device=dev)
+        out = torch.empty_like(q)
+        xpu_ops.flash_attn_varlen_func(
+            q,
+            key,
+            value,
+            cu_seqlens_q=torch.tensor([0, rows], dtype=torch.int32, device=dev),
+            max_seqlen_q=rows,
+            max_seqlen_k=rows,
+            softmax_scale=1.0,
+            causal=True,
+            out=out,
+            block_table=torch.ones((1, 1), dtype=torch.int32, device=dev),
+            seqused_k=torch.tensor([rows], dtype=torch.int32, device=dev),
+            k_descale=k_scale,
+            v_descale=v_scale,
+            int8_prefill=mode,
         )
         torch.xpu.synchronize()
     except Exception as e:  # noqa: BLE001 - any failure means unsupported
@@ -390,10 +505,27 @@ def warmup_dequant_blocks(
 
 
 def prefill_scratch_tokens(max_model_len: int, block_size: int) -> int:
-    """Tokens of one layer's K (or V) prefill scratch: a `max_model_len`
-    sequence in blocks of `block_size` or of any smaller kernel block
-    size."""
-    return (cdiv(max_model_len, block_size) + 1) * block_size
+    """Tokens of one layer's K (or V) prefill scratch: one `max_model_len`
+    sequence in whole blocks of `block_size`, the layer's cache block (the
+    unit `plan_prefill_groups` counts in). It also holds that sequence in
+    any block size dividing `block_size`, never in a larger one."""
+    return cdiv(max_model_len, block_size) * block_size
+
+
+def check_prefill_scratch(
+    capacity_blocks: int, max_model_len: int, block_size: int
+) -> None:
+    """Raise ValueError unless a scratch of `capacity_blocks` blocks of
+    `block_size` holds a `max_model_len` sequence, the longest the scheduler
+    admits. Called once the layer's cache block is known, before serving, so
+    a short scratch fails the boot instead of a request."""
+    need = cdiv(max_model_len, block_size)
+    if capacity_blocks < need:
+        raise ValueError(
+            f"the INT8 KV prefill scratch holds {capacity_blocks} blocks of "
+            f"{block_size} tokens; a max_model_len={max_model_len} sequence "
+            f"needs {need}"
+        )
 
 
 def forward_prefill(
@@ -464,6 +596,49 @@ def forward_prefill(
         )
 
 
+def forward_prefill_sycl(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
+    output: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    max_query_len: int,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    block_table: torch.Tensor,
+    softmax_scale: float,
+    mode: int,
+    int8_dot: bool = False,
+) -> None:
+    """Causal batch with prefill rows over the INT8 cache in place: the
+    vllm-xpu-kernels chunk-prefill kernel with `int8_prefill=mode` (1 BF16
+    dots over the widened codes, 2 int8 Q.K, 3 int8 Q.K and P.V). Decode rows
+    of a mixed batch take the paged decode kernel inside the same call
+    (`int8_dot` as at decode). No scratch, no host reads."""
+    from vllm._xpu_ops import xpu_ops
+
+    xpu_ops.flash_attn_varlen_func(
+        query,
+        key_cache,
+        value_cache,
+        cu_seqlens_q=query_start_loc,
+        max_seqlen_q=max_query_len,
+        max_seqlen_k=max_seq_len,
+        softmax_scale=softmax_scale,
+        causal=True,
+        out=output,
+        block_table=block_table,
+        seqused_k=seq_lens,
+        window_size=[-1, -1],
+        k_descale=k_scale,
+        v_descale=v_scale,
+        int8_dot=int8_dot,
+        int8_prefill=mode,
+    )
+
+
 def forward_decode(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -479,9 +654,11 @@ def forward_decode(
     softmax_scale: float,
     window_size: list[int] | None,
     sinks: torch.Tensor | None,
+    int8_dot: bool = False,
 ) -> None:
     """Causal batch with `max_query_len <= decode_max_query_len()`: the
-    native INT8 paged decode (graph-safe, no host reads)."""
+    native INT8 paged decode (graph-safe, no host reads). `int8_dot`: the
+    kernel quantizes Q per (token, head) and runs Q.K in int8."""
     from vllm._xpu_ops import xpu_ops
 
     xpu_ops.flash_attn_varlen_func(
@@ -500,4 +677,5 @@ def forward_decode(
         k_descale=k_scale,
         v_descale=v_scale,
         s_aux=sinks,
+        int8_dot=int8_dot,
     )

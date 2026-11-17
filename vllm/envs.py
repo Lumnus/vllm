@@ -348,7 +348,25 @@ if TYPE_CHECKING:
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
     VLLM_XPU_MOE_COMBINE: Literal["split", "rank", "exact"] = "split"
     VLLM_XPU_INT8_ONEDNN_MIN_ROWS: int = 64
+    VLLM_XPU_DFLASH_CONTEXT_KV_INT8: bool = True
+    VLLM_XPU_DFLASH2_TRITON: bool = True
     VLLM_XPU_MOE_PLACEMENT_TRACE: str = ""
+    VLLM_XPU_MOE_EPLB_OP_IDS: bool = False
+    VLLM_XPU_HC_UP_FUSED: int = 0
+    VLLM_XPU_HC_UP_TILE: str = ""
+    VLLM_XPU_ATTN_META_ONCE: bool = False
+    VLLM_XPU_MOE_ROUTE_FUSED: bool = False
+    VLLM_XPU_MAILBOX_ALLREDUCE: bool = False
+    VLLM_XPU_MAILBOX_ALLREDUCE_MAX_BYTES: int = 65536
+    VLLM_XPU_MAILBOX_ALLREDUCE_PARTIALS: Literal["fp32", "input"] = "fp32"
+    VLLM_XPU_MAILBOX_ALLREDUCE_ORDER: str = "3,1"
+    VLLM_XPU_MAILBOX_ALLREDUCE_TIMEOUT_S: float = 20.0
+    VLLM_XPU_MAILBOX_ALLREDUCE_ON_FAIL: Literal["exit", "log"] = "exit"
+    VLLM_XPU_MOE_ENTRY_QUANT: bool = False
+    VLLM_XPU_MOE_SHARED_IN_GATHER: int = 0
+    VLLM_XPU_MOE_GATES_MERGED: bool = False
+    VLLM_XPU_MOE_TOPK_ROUTE: bool = False
+    VLLM_ROUTER_INT8_SHADOW: str = ""
     VLLM_SERVING_PROFILES: str = ""
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2407,6 +2425,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_XPU_INT8_ONEDNN_MIN_ROWS": lambda: int(
         os.getenv("VLLM_XPU_INT8_ONEDNN_MIN_ROWS", "64")
     ),
+    # DFlash drafters with compressed-tensors W8A8 INT8 attention (per-channel
+    # weights, dynamic symmetric per-token activations): the context K/V
+    # precompute runs one INT8 GEMM over the K/V rows of every layer instead of
+    # each layer's full QKV GEMM with the Q columns dropped. The K/V values are
+    # the same. 0 keeps the per-layer QKV GEMMs. Read when the drafter is built.
+    "VLLM_XPU_DFLASH_CONTEXT_KV_INT8": lambda: bool(
+        int(os.getenv("VLLM_XPU_DFLASH_CONTEXT_KV_INT8", "1"))
+    ),
+    # DFlash2 drafters on XPU: the grouped convolution and the candidate
+    # selector's edge scoring run their Triton kernels, as on CUDA, instead of
+    # the eager torch reference. 0 keeps the torch reference. Read once at
+    # import.
+    "VLLM_XPU_DFLASH2_TRITON": lambda: bool(
+        int(os.getenv("VLLM_XPU_DFLASH2_TRITON", "1"))
+    ),
     # Serving profiles at start (vllm/v1/engine/serving_profiles.py): a JSON
     # file {"profiles": [...], "boot": "<name>"}; the boot profile is applied
     # in the first steps. Empty (default): none until profile.define.
@@ -2417,6 +2450,116 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Eager steps only: a CUDA/XPU graph replay runs no Python.
     "VLLM_XPU_MOE_PLACEMENT_TRACE": lambda: os.getenv(
         "VLLM_XPU_MOE_PLACEMENT_TRACE", ""
+    ),
+    # XPU expert parallelism with EPLB, on a vllm-xpu-kernels whose fused MoE
+    # filters unowned ids and clears its own expert counts: 1 passes the
+    # routed ids to it as they are, as without EPLB, so the per-layer sentinel
+    # kernel does not run. 0 (default) keeps the sentinel rewrite under EPLB.
+    # Rows of real tokens are the same either way; a padding row (all ids -1)
+    # differs only where the sentinel is an expert the rank owns after a
+    # placement move (the sentinel path computes it, this one returns zeros).
+    # Read when the experts are built.
+    "VLLM_XPU_MOE_EPLB_OP_IDS": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_EPLB_OP_IDS", "0"))
+    ),
+    # XPU Qwen4-Exp hyper-connections with an INT8 up projection (dynamic
+    # symmetric per-token activations on the Triton INT8 GEMM). 1: the up
+    # linear's activation quant runs inside the down projection's finish kernel
+    # and the INT8 up GEMM carries the gated mix in its epilogue (one kernel,
+    # up to 64 rows where the linear runs Triton); 2: the quant fold only; 3:
+    # as 1 with the fast fused kernel (tensor-descriptor loads, the four
+    # streams' weight tiles of a K step in flight together, a narrow column
+    # tile). The int8 rows, scales and outputs are those of the unfused path.
+    # 0 (default) keeps the linear's own quant, GEMM and the separate gated
+    # mix. Read when the weights load.
+    "VLLM_XPU_HC_UP_FUSED": lambda: int(os.getenv("VLLM_XPU_HC_UP_FUSED", "0")),
+    # The fast fused HC up kernel's tile (VLLM_XPU_HC_UP_FUSED=3), for a
+    # measurement: "bn,bk,warps" (column tile per stream, K tile, warps).
+    # Empty (default): 16,128 with 4 warps, 8 at 64 rows. The bits do not
+    # depend on it. Read per call.
+    "VLLM_XPU_HC_UP_TILE": lambda: os.getenv("VLLM_XPU_HC_UP_TILE", ""),
+    # Debug: a MoE router gate loaded as checkpoint INT8 W8A8 also runs a BF16
+    # evaluation and logs how many routed slots (top-k experts per token)
+    # differ. "dequant" uses the INT8 weight times its scales; a checkpoint
+    # directory uses that checkpoint's router of the same layer. Empty
+    # (default) or "0": off. Read at model construction.
+    "VLLM_ROUTER_INT8_SHADOW": lambda: os.getenv("VLLM_ROUTER_INT8_SHADOW", ""),
+    # XPU attention on vllm-xpu-kernels' FA: 1 builds the spec-decode fast
+    # path's metadata (14 small integer kernels) once per forward and shares it
+    # across the attention layers that pass the same query starts, KV lengths
+    # and block table, instead of in every layer. The values are the same. 0
+    # (default) builds it in each layer. Read inside the attention custom op.
+    "VLLM_XPU_ATTN_META_ONCE": lambda: bool(
+        int(os.getenv("VLLM_XPU_ATTN_META_ONCE", "0"))
+    ),
+    # XPU fused MoE with expert parallelism and EPLB: 1 has the router's EPLB
+    # mapping kernel write the experts' unowned sentinel for unrouted ids in
+    # the same launch, so the per-layer sentinel kernel does not run (with a
+    # vllm-xpu-kernels that clears rows_per_expert itself). The ids are the
+    # ones the sentinel kernel writes. 0 (default) keeps that kernel. Read
+    # inside the fused MoE custom op.
+    "VLLM_XPU_MOE_ROUTE_FUSED": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_ROUTE_FUSED", "0"))
+    ),
+    # XPU tensor parallelism on 2 or 4 cards: 1 routes the TP group's
+    # all-reduces of contiguous bf16/fp16 tensors up to _MAX_BYTES through the
+    # mailbox all-reduce kernel (recursive doubling over PCIe peer-to-peer,
+    # one launch per call) instead of XCCL. Every rank computes the same bits;
+    # they differ from XCCL's. _PARTIALS: fp32 sums the tree in fp32 and
+    # rounds once; input rounds the stage-1 sums to the input type. _ORDER:
+    # the two partner masks (stage 1, stage 2) at 4 ranks. A wait longer than
+    # _TIMEOUT_S fails the call; _ON_FAIL=exit stops the process with one
+    # CRITICAL line, log only logs (tests).
+    "VLLM_XPU_MAILBOX_ALLREDUCE": lambda: bool(
+        int(os.getenv("VLLM_XPU_MAILBOX_ALLREDUCE", "0"))
+    ),
+    "VLLM_XPU_MAILBOX_ALLREDUCE_MAX_BYTES": lambda: int(
+        os.getenv("VLLM_XPU_MAILBOX_ALLREDUCE_MAX_BYTES", "65536")
+    ),
+    "VLLM_XPU_MAILBOX_ALLREDUCE_PARTIALS": env_with_choices(
+        "VLLM_XPU_MAILBOX_ALLREDUCE_PARTIALS", "fp32", ["fp32", "input"]
+    ),
+    "VLLM_XPU_MAILBOX_ALLREDUCE_ORDER": lambda: os.getenv(
+        "VLLM_XPU_MAILBOX_ALLREDUCE_ORDER", "3,1"
+    ),
+    "VLLM_XPU_MAILBOX_ALLREDUCE_TIMEOUT_S": lambda: float(
+        os.getenv("VLLM_XPU_MAILBOX_ALLREDUCE_TIMEOUT_S", "20")
+    ),
+    "VLLM_XPU_MAILBOX_ALLREDUCE_ON_FAIL": env_with_choices(
+        "VLLM_XPU_MAILBOX_ALLREDUCE_ON_FAIL", "exit", ["exit", "log"]
+    ),
+    # XPU MoE entry: 1 quantizes the MoE input row once (the per-token int8
+    # op every INT8 consumer runs) and hands those int8 rows and scales to
+    # each consumer of the same row: the shared expert's gate_up, the router
+    # gate and the shared-expert gate when the checkpoint carries them as
+    # INT8 W8A8, and the W4A8 routed experts. Same bits. 0 (default): each
+    # consumer quantizes the row itself. Read when the MoE layers finish
+    # loading.
+    "VLLM_XPU_MOE_ENTRY_QUANT": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_ENTRY_QUANT", "0"))
+    ),
+    # XPU W4A8 MoE with a gated shared expert: 1 adds sigmoid(gate) * shared
+    # to the routed sum inside the routed experts' gather, with the bf16
+    # roundings of the separate multiply and add (same bits), so neither runs.
+    # 2 (tier 2, different bits) does it with one fp32 rounding of
+    # routed + gate * shared. 0 (default): multiply and add as separate ops.
+    "VLLM_XPU_MOE_SHARED_IN_GATHER": lambda: int(
+        os.getenv("VLLM_XPU_MOE_SHARED_IN_GATHER", "0")
+    ),
+    # XPU MoE whose router gate and shared-expert gate are both INT8 W8A8 in
+    # the checkpoint: 1 runs them as one INT8 GEMM (N = experts + 1) where
+    # the INT8 linear runs its Triton GEMM (at most
+    # VLLM_XPU_INT8_ONEDNN_MIN_ROWS rows); each output element is the one
+    # its own GEMM gives. Above that row count both keep their own GEMMs.
+    "VLLM_XPU_MOE_GATES_MERGED": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_GATES_MERGED", "0"))
+    ),
+    # XPU MoE with EPLB: 1 runs the softmax top-k with the EPLB logical to
+    # physical mapping, the expert-load record and (with
+    # VLLM_XPU_MOE_ROUTE_FUSED=1) the unowned sentinel in one kernel
+    # (vllm-xpu-kernels' topk_softmax_route). Same weights, ids and record.
+    "VLLM_XPU_MOE_TOPK_ROUTE": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_TOPK_ROUTE", "0"))
     ),
     # Enable simple KV offload.
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
@@ -2634,6 +2777,19 @@ def compile_factors() -> dict[str, object]:
         # as an opaque op.
         "VLLM_XPU_MOE_COMBINE",
         "VLLM_XPU_MOE_PLACEMENT_TRACE",
+        "VLLM_XPU_MOE_EPLB_OP_IDS",
+        # Read inside the attention custom op at call time.
+        "VLLM_XPU_ATTN_META_ONCE",
+        "VLLM_XPU_MOE_ROUTE_FUSED",
+        # Read when the TP communicator is built; the compiled graph calls
+        # the all-reduce as an opaque op.
+        "VLLM_XPU_MAILBOX_ALLREDUCE",
+        "VLLM_XPU_MAILBOX_ALLREDUCE_MAX_BYTES",
+        "VLLM_XPU_MAILBOX_ALLREDUCE_PARTIALS",
+        "VLLM_XPU_MAILBOX_ALLREDUCE_ORDER",
+        "VLLM_XPU_MAILBOX_ALLREDUCE_TIMEOUT_S",
+        "VLLM_XPU_MAILBOX_ALLREDUCE_ON_FAIL",
+        "VLLM_XPU_MOE_TOPK_ROUTE",
         # Read inside the XPU INT8 linear custom op, which the compiled graph
         # calls as an opaque op.
         "VLLM_XPU_INT8_ONEDNN_MIN_ROWS",

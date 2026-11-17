@@ -11,6 +11,7 @@ from torch import nn
 from transformers import Qwen3Config
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -70,6 +71,56 @@ def _is_mxfp8_linear(layer: nn.Module) -> bool:
     ) and not isinstance(layer.quant_method, UnquantizedLinearMethod)
 
 
+def _is_rowwise_int8_linear(layer: nn.Module | None) -> bool:
+    """Whether `layer` is a compressed-tensors W8A8 INT8 linear whose rows can
+    run as a projection of their own with unchanged results.
+
+    That holds for per-channel weight scales (one per output row) with dynamic,
+    symmetric per-token activation scales (one per input row): every output
+    element is then (int32 dot of its input row and weight row) times the
+    row's activation scale times its weight row's scale, which the other rows
+    of the GEMM do not touch. A static activation scale is the maximum over the
+    fused shards, so it would change with the rows taken, and input transforms
+    run per layer; both keep the per-layer QKV projections.
+    """
+    from compressed_tensors.quantization import QuantizationStrategy
+
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+        CompressedTensorsLinearMethod,
+    )
+    from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW8A8Int8,
+    )
+
+    scheme = getattr(layer, "scheme", None)
+    return (
+        isinstance(scheme, CompressedTensorsW8A8Int8)
+        and isinstance(
+            getattr(layer, "quant_method", None), CompressedTensorsLinearMethod
+        )
+        and scheme.strategy == QuantizationStrategy.CHANNEL
+        and not scheme.is_static_input_scheme
+        and scheme.input_symmetric
+    )
+
+
+def _context_kv_proj_kind(layers_attn: list[nn.Module | None]) -> str | None:
+    """Which K/V-only context projection the layers' QKV projections allow:
+    "mxfp8", "int8" or None (the per-layer QKV projections, or the fused BF16
+    weight for unquantized layers). Every layer must qualify."""
+    projs = [getattr(a, "qkv_proj", None) for a in layers_attn]
+    if all(_is_mxfp8_linear(p) for p in projs):
+        return "mxfp8"
+    if all(_is_rowwise_int8_linear(p) for p in projs):
+        if envs.VLLM_XPU_DFLASH_CONTEXT_KV_INT8:
+            return "int8"
+        logger.info_once(
+            "DFlash context K/V: K/V-only INT8 projection disabled via "
+            "VLLM_XPU_DFLASH_CONTEXT_KV_INT8=0; each layer runs its QKV GEMM."
+        )
+    return None
+
+
 _QKV_PARAM = re.compile(
     r"^layers\.(\d+)\.self_attn\.qkv_proj\.(weight|weight_scale|bias)$"
 )
@@ -78,8 +129,8 @@ _QKV_PARAM = re.compile(
 def _load_context_kv_rows(
     param: torch.Tensor, loaded_weight: torch.Tensor, row_offset: int
 ) -> None:
-    """Weight loader of the MXFP8 context K/V projection: one layer's K or V
-    rows, at their offset in the stacked projection."""
+    """Weight loader of the context K/V projection: one layer's K or V rows,
+    at their offset in the stacked projection."""
     param.data.narrow(0, row_offset, loaded_weight.shape[0]).copy_(loaded_weight)
 
 
@@ -537,8 +588,21 @@ class DFlashQwen3Model(nn.Module):
         )
         layers_attn = [getattr(layer, "self_attn", None) for layer in self.layers]
         self._context_kv_proj: ReplicatedLinear | None = None
-        if all(_is_mxfp8_linear(getattr(a, "qkv_proj", None)) for a in layers_attn):
-            self._context_kv_proj = self._make_mxfp8_context_kv_proj(layers_attn)
+        self._context_kv_kind = _context_kv_proj_kind(layers_attn)
+        if self._context_kv_kind is not None:
+            self._context_kv_proj = self._make_context_kv_proj(layers_attn)
+            if self._context_kv_kind == "int8":
+                first = layers_attn[0].qkv_proj
+                logger.info_once(
+                    "DFlash context K/V: one W8A8 INT8 GEMM over the K/V rows of "
+                    "%d layers [K=%d, N=%d], replacing %d QKV GEMMs of N=%d "
+                    "(VLLM_XPU_DFLASH_CONTEXT_KV_INT8=0 restores them).",
+                    len(layers_attn),
+                    first.input_size,
+                    self._context_kv_proj.output_size,
+                    len(layers_attn),
+                    first.output_size_per_partition,
+                )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         embeds = self.embed_tokens(input_ids)
@@ -559,8 +623,8 @@ class DFlashQwen3Model(nn.Module):
 
         # Quantized linear weights may use packed storage that cannot be
         # consumed by F.linear; then each projection runs through its quant
-        # method (or the MXFP8 context projection, when there is one) and the
-        # fused buffers stay None.
+        # method (or the K/V-only context projection, MXFP8 or W8A8 INT8, when
+        # there is one) and the fused buffers stay None.
         kv_weight = kv_bias = None
         if _reads_raw_weights(self._context_qkv_projs):
             # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
@@ -577,15 +641,16 @@ class DFlashQwen3Model(nn.Module):
         k_norm = torch.stack([a.k_norm.weight.data for a in layers_attn], dim=0)
         refill_derived(self, "_k_norm_weights", k_norm.contiguous())
 
-    def _make_mxfp8_context_kv_proj(
-        self, layers_attn: list[nn.Module]
-    ) -> ReplicatedLinear:
-        """One MXFP8 GEMM over the K/V rows of every layer's QKV projection.
+    def _make_context_kv_proj(self, layers_attn: list[nn.Module]) -> ReplicatedLinear:
+        """One quantized GEMM over the K/V rows of every layer's QKV projection.
 
-        MXFP8 block scales are per output row, so it holds the K/V rows of the
-        checkpoint's weights and scales as-is. They are loaded from the
+        MXFP8 block scales and the per-channel scales of W8A8 INT8 are per
+        output row, so it holds the K/V rows of the checkpoint's weights and
+        scales as-is, under the first layer's quantization scheme (every layer
+        has the same one, `_context_kv_proj_kind`). They are loaded from the
         checkpoint's K/V tensors (`load_weights`), so the projection goes
-        through post-load processing and weight reloads like any other layer.
+        through post-load processing (the kernel's own repacking) and weight
+        reloads like any other layer.
         """
         first = layers_attn[0].qkv_proj
         proj = ReplicatedLinear(
@@ -610,7 +675,7 @@ class DFlashQwen3Model(nn.Module):
         self, layer_idx: int, shard_id: str, param_name: str, weight: torch.Tensor
     ) -> None:
         """Load this rank's rows of a layer's K or V checkpoint tensor into the
-        MXFP8 context projection, sharded as the layer's QKV projection does."""
+        context K/V projection, sharded as the layer's QKV projection does."""
         assert self._context_kv_proj is not None
         attn = self.layers[layer_idx].self_attn
         qkv = attn.qkv_proj
@@ -706,6 +771,11 @@ class DFlashQwen3Model(nn.Module):
             )
             all_kv = all_kv_flat.view(num_ctx, num_layers, 2, num_kv_heads, head_dim)
         elif self._context_kv_proj is not None:
+            if getattr(self, "_context_kv_kind", None) == "int8":
+                logger.info_once(
+                    "DFlash context K/V: K/V-only INT8 projection runs (%d rows).",
+                    num_ctx,
+                )
             all_kv = self._context_kv_proj(normed_context_states).view(
                 num_ctx, num_layers, 2, num_kv_heads, head_dim
             )

@@ -65,6 +65,8 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen4ExpTextConfig
 
+import vllm.envs as envs
+from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config_or_none
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
@@ -326,6 +328,104 @@ def hc_up_mix(
     return hc_gate_mix(xn, F.linear(lora, up_weight), hc)
 
 
+def hc_down_lora_q(
+    xn: torch.Tensor,
+    down_weight: torch.Tensor,
+    hc: int,
+    lowrank: int,
+    batch_invariant: bool = False,
+    down_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``hc_down_lora`` with the lora handed on as the int8 rows and fp32
+    ``[T, 1]`` scales the up projection's INT8 linear makes of it
+    (``ops.scaled_int8_quant``). On the split-K route the quant runs inside the
+    finish kernel (``hc_gemm.parallel_hc_gemm_silu_quant``); elsewhere the
+    linear's own quant op runs on the lora. Returns ``(q, scale, inject)``."""
+    if (
+        down_scale is None
+        and batch_invariant
+        and hc_gemm.takes_parallel_route(xn, down_weight)
+    ):
+        valid = min(down_weight.shape[0], lowrank + hc)
+        down, q, scale = hc_gemm.parallel_hc_gemm_silu_quant(
+            xn, down_weight, valid, lowrank, hc
+        )
+        return q, scale, down[:, lowrank : lowrank + hc]
+    lora, inject = hc_down_lora(
+        xn, down_weight, hc, lowrank, batch_invariant, down_scale
+    )
+    q, scale, _ = ops.scaled_int8_quant(lora.contiguous(), None, None, True)
+    return q, scale, inject
+
+
+def hc_up_mix_q(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_scale: torch.Tensor,
+    xn: torch.Tensor,
+    hc: int,
+    gemm: int,
+    fused: int,
+) -> torch.Tensor:
+    """The INT8 up projection on pre-quantized rows and the gated mix. ``gemm``
+    names the linear's own GEMM (0: ``int8_scaled_mm_func``, Triton at every
+    width; 1: ``xpu_int8_scaled_mm_func``, Triton up to
+    ``VLLM_XPU_INT8_ONEDNN_MIN_ROWS`` and oneDNN above). Where that GEMM is
+    Triton and ``fused`` is set, one kernel runs both: 1 the first fused kernel
+    (``hc_gemm.int8_up_mix``), 3 the fast one (``hc_gemm.int8_up_mix_fast``);
+    0 keeps the GEMM and the gated mix apart."""
+    from vllm.model_executor.kernels.linear.scaled_mm import xpu as xpu_mm
+
+    rows = q.shape[0]
+    triton_rows = (
+        hc_gemm.UP_MIX_I8_MAX_ROWS
+        if gemm == 0
+        else min(hc_gemm.UP_MIX_I8_MAX_ROWS, xpu_mm.XPU_INT8_ONEDNN_MIN_ROWS)
+    )
+    if fused == 3 and rows <= triton_rows:
+        return hc_gemm.int8_up_mix_fast(q, scale, up_weight, up_scale, xn, hc)
+    if fused and rows <= triton_rows:
+        return hc_gemm.int8_up_mix(q, scale, up_weight, up_scale, xn, hc)
+    func = (
+        torch.ops.vllm.int8_scaled_mm_func
+        if gemm == 0
+        else torch.ops.vllm.xpu_int8_scaled_mm_func
+    )
+    gate = func(q, up_weight, scale, up_scale, xn.dtype, None)
+    return hc_gate_mix(xn, gate, hc)
+
+
+def _hc_down_lora_q_fake(
+    xn: torch.Tensor,
+    down_weight: torch.Tensor,
+    hc: int,
+    lowrank: int,
+    batch_invariant: bool = False,
+    down_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    tokens = xn.shape[0]
+    down = xn.new_empty((tokens, down_weight.shape[0]))
+    return (
+        xn.new_empty((tokens, lowrank), dtype=torch.int8),
+        xn.new_empty((tokens, 1), dtype=torch.float32),
+        down[:, lowrank : lowrank + hc],
+    )
+
+
+def _hc_up_mix_q_fake(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    up_weight: torch.Tensor,
+    up_scale: torch.Tensor,
+    xn: torch.Tensor,
+    hc: int,
+    gemm: int,
+    fused: int,
+) -> torch.Tensor:
+    return xn.new_empty((xn.shape[0], xn.shape[1] // hc))
+
+
 def _hc_norm_fake(
     hidden: torch.Tensor, norm_weight: torch.Tensor, eps: float, hc: int
 ) -> torch.Tensor:
@@ -385,6 +485,8 @@ for _name, _func, _fake in (
     ("qwen4_exp_xpu_hc_lowrank_silu", hc_lowrank_silu, _hc_lowrank_silu_fake),
     ("qwen4_exp_xpu_hc_gate_mix", hc_gate_mix_op, _hc_gate_mix_fake),
     ("qwen4_exp_xpu_hc_up_mix", hc_up_mix, _hc_up_mix_fake),
+    ("qwen4_exp_xpu_hc_down_lora_q", hc_down_lora_q, _hc_down_lora_q_fake),
+    ("qwen4_exp_xpu_hc_up_mix_q", hc_up_mix_q, _hc_up_mix_q_fake),
 ):
     direct_register_custom_op(
         op_name=_name, op_func=_func, mutates_args=[], fake_impl=_fake
@@ -399,6 +501,37 @@ _lowrank_silu_op = eager_bypass_custom_op(
 )
 _gate_mix_op = eager_bypass_custom_op("qwen4_exp_xpu_hc_gate_mix", hc_gate_mix_op)
 _up_mix_op = eager_bypass_custom_op("qwen4_exp_xpu_hc_up_mix", hc_up_mix)
+_down_lora_q_op = eager_bypass_custom_op("qwen4_exp_xpu_hc_down_lora_q", hc_down_lora_q)
+_up_mix_q_op = eager_bypass_custom_op("qwen4_exp_xpu_hc_up_mix_q", hc_up_mix_q)
+
+
+def _up_int8_kernel(layer: nn.Module) -> tuple[int, object] | str:
+    """``(gemm, kernel)`` of an INT8 up linear whose method quantizes its input
+    per token, symmetric and dynamic, then runs a Triton INT8 GEMM (``gemm`` as
+    in ``hc_up_mix_q``); else why the fold does not apply. The kernel's
+    ``_get_layer_params`` gives the ``[K, N]`` weight and its scales."""
+    from vllm.model_executor.kernels.linear.scaled_mm.triton import (
+        TritonInt8ScaledMMLinearKernel,
+    )
+    from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
+        XPUInt8ScaledMMLinearKernel,
+    )
+
+    method = layer.quant_method
+    kernel = getattr(getattr(layer, "scheme", None), "kernel", None) or getattr(
+        method, "int8_linear", None
+    )
+    if not isinstance(kernel, TritonInt8ScaledMMLinearKernel):
+        return f"up linear kernel {type(kernel).__name__}"
+    w_q, w_s, i_s, i_zp, azp_adj = kernel._get_layer_params(layer)
+    if i_s is not None or i_zp is not None or azp_adj is not None:
+        return "static or asymmetric input quantization"
+    if getattr(layer, "bias", None) is not None:
+        return "bias"
+    if w_q.dtype != torch.int8 or w_s.numel() not in (1, w_q.shape[1]):
+        return f"weight {w_q.dtype}, scale {tuple(w_s.shape)}"
+    gemm = 1 if isinstance(kernel, XPUInt8ScaledMMLinearKernel) else 0
+    return gemm, kernel
 
 
 def _quantized_linear(
@@ -518,6 +651,10 @@ class HyperConnection(nn.Module):
         # "bf16", "fused_int8" (int8_dense_w8a8_fused_gemm) or "layer" (the down
         # layer's own method); set when the weights load.
         self._down_path: str | None = None
+        # VLLM_XPU_HC_UP_FUSED on an INT8 up linear: (gemm, kernel, fused) for
+        # hc_up_mix_q, set when the weights load; None keeps the layer path.
+        self._up_fold: tuple[int, object, int] | None = None
+        self._up_fold_reason = ""
 
     @property
     def _down_linear(self) -> LinearBase | None:
@@ -553,6 +690,7 @@ class HyperConnection(nn.Module):
         padding rows have no checkpoint source: zero them, with unit scales, so
         their columns (sliced off) hold no stray values."""
         self._down_path = self._resolve_down_path()
+        self._resolve_up_fold()
         if self.has_inject and self._down_path != "bf16":
             layer = self.input_mix_weight_down_block_inject
             valid = self.lowrank + self.hc
@@ -563,6 +701,33 @@ class HyperConnection(nn.Module):
                 scale = layer.weight_scale.data
                 if scale.numel() == rows.shape[0]:
                     scale.view(-1)[valid:] = 1.0
+
+    def _resolve_up_fold(self) -> None:
+        """VLLM_XPU_HC_UP_FUSED: 1 folds the up linear's activation quant into
+        the down projection's finish kernel and runs the INT8 up GEMM with the
+        gated mix in its epilogue; 2 folds the quant only (the linear's GEMM and
+        the stock gated mix); 3 is 1 on the fast fused kernel. Applies to an
+        INT8 up linear with dynamic symmetric per-token activations on the
+        Triton INT8 GEMM, next to a down projection that does not run through
+        its own layer."""
+        self._up_fold = None
+        mode = envs.VLLM_XPU_HC_UP_FUSED
+        if mode not in (1, 2, 3):
+            self._up_fold_reason = "off"
+            return
+        if not self._up_layer:
+            self._up_fold_reason = "up projection is BF16"
+            return
+        if self._down_path == "layer":
+            self._up_fold_reason = "down projection runs through its layer"
+            return
+        found = _up_int8_kernel(self.input_mix_weight_up)
+        if isinstance(found, str):
+            self._up_fold_reason = found
+            return
+        gemm, kernel = found
+        self._up_fold = (gemm, kernel, 0 if mode == 2 else mode)
+        self._up_fold_reason = "on"
 
     @property
     def down_path(self) -> str:
@@ -611,6 +776,17 @@ class HyperConnection(nn.Module):
     def _split_mix(self, xn: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """The mix of the normalized ``xn``, with each projection that is a
         quantized layer run through its own method."""
+        if self._up_fold is not None:
+            gemm, kernel, fused = self._up_fold
+            up_weight, up_scale = kernel._get_layer_params(self.input_mix_weight_up)[:2]
+            down_weight, down_scale = self._down_operands()
+            q, scale, inject = _down_lora_q_op(
+                xn, down_weight, self.hc, self.lowrank, self.batch_invariant, down_scale
+            )
+            block_input = _up_mix_q_op(
+                q, scale, up_weight, up_scale, xn, self.hc, gemm, fused
+            )
+            return block_input, inject
         if self.down_path == "layer":
             down_linear = self._down_linear
             assert down_linear is not None
@@ -734,3 +910,30 @@ def log_hc_paths(root: nn.Module, scope: str) -> None:
         sum(1 for m in layer if not m.has_inject),
         ", ".join(methods),
     )
+    mode = envs.VLLM_XPU_HC_UP_FUSED
+    if mode in (1, 2, 3):
+        folded = [m for m in modules if m._up_fold is not None]
+        reasons = sorted({m._up_fold_reason for m in modules if m._up_fold is None})
+        logger.info(
+            "XPU HC up fused (VLLM_XPU_HC_UP_FUSED=%d, %s): %d of %d modules; "
+            "the up projection's per-token int8 quant runs inside the down "
+            "projection's finish kernel (split-K route) or on the lora (other "
+            "routes)%s. Not folded: %s.",
+            mode,
+            scope,
+            len(folded),
+            len(modules),
+            "; INT8 up GEMM + gated mix in one kernel up to "
+            f"{hc_gemm.UP_MIX_I8_MAX_ROWS} rows where the linear runs Triton"
+            + (
+                " (fast kernel: tensor-descriptor loads, four streams per K "
+                "step, column tile {}, K tile {}, {} warps)".format(
+                    *hc_gemm._fast_up_tile()
+                )
+                if mode == 3
+                else ""
+            )
+            if mode in (1, 3)
+            else "; the linear's GEMM and the stock gated mix",
+            ", ".join(reasons) or "none",
+        )
