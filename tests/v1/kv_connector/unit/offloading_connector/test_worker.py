@@ -628,6 +628,13 @@ def test_register_kv_caches(backend):
             assert actual.mapping is not None
 
 
+@pytest.fixture
+def _b70_mamba_physical_stride(monkeypatch):
+    # vllm#64140 rides this line behind B70_OFFLOAD_MAMBA_PHYSICAL_STRIDE.
+    monkeypatch.setenv("B70_OFFLOAD_MAMBA_PHYSICAL_STRIDE", "1")
+
+
+@pytest.mark.usefixtures("_b70_mamba_physical_stride")
 @pytest.mark.parametrize("layout", [KVCacheLayout.LBNHC, KVCacheLayout.BLHNC])
 @pytest.mark.parametrize("padding", [0, 8])
 def test_register_mamba_block_bytes(layout: KVCacheLayout, padding: int):
@@ -647,7 +654,7 @@ def test_register_mamba_block_bytes(layout: KVCacheLayout, padding: int):
     packed = layout.is_block_outermost
     config = KVCacheConfig(
         num_blocks=num_blocks,
-        kv_cache_groups=[make_kv_cache_group(layers, mamba)],
+        kv_cache_groups=[KVCacheGroupSpec(layers, mamba)],
         kv_cache_tensors=[
             KVCacheTensor(
                 size=num_blocks * row,

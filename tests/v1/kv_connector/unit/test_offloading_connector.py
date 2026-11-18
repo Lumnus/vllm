@@ -402,6 +402,13 @@ def test_cpu_offloading_sliding_window_partial_chunk() -> None:
         del llm
 
 
+@pytest.fixture
+def _b70_mamba_physical_stride(monkeypatch):
+    # vllm#64140 rides this line behind B70_OFFLOAD_MAMBA_PHYSICAL_STRIDE.
+    monkeypatch.setenv("B70_OFFLOAD_MAMBA_PHYSICAL_STRIDE", "1")
+
+
+@pytest.mark.usefixtures("_b70_mamba_physical_stride")
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 def test_mamba_packed_layout_cpu_reload(
     vllm_runner, monkeypatch, enable_pickle
