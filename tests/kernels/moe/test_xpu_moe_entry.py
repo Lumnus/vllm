@@ -11,6 +11,9 @@
 2. The merged gate GEMM against triton_scaled_mm per gate, bitwise.
 3. VLLM_XPU_MOE_TOPK_ROUTE against today's top-k + EPLB mapping kernel
    (xpu_topk_route_check.py).
+4. The entry scope on inference tensors (the engine's forwards run under
+   torch.inference_mode): the layer check of 1 in that mode, and the scope's
+   rows proof (same tensor, unchanged) with and without a version counter.
 
 The Triton kernels run under the interpreter in subprocesses, so the
 interpreter setting stays out of this session."""
@@ -78,11 +81,16 @@ def _bf16(bits):
     return torch.tensor(bits, dtype=torch.int16).view(torch.bfloat16)
 
 
-def test_moe_entry_layer_bit_identical(tmp_path):
+@pytest.mark.parametrize("mode", ["grad", "inference"])
+def test_moe_entry_layer_bit_identical(tmp_path, mode):
     out = tmp_path / "entry.json"
-    _run("xpu_moe_entry_check.py", str(out), marker="XPU-MOE-ENTRY-OK")
+    _run("xpu_moe_entry_check.py", str(out), mode, marker="XPU-MOE-ENTRY-OK")
     with open(out) as f:
         res = json.load(f)
+    # Outside inference mode no forward writes its input in place: the
+    # proof the entry rows rely on where the input has no version counter.
+    written = [k for k, v in res.items() if v.get("input_written")]
+    assert not written, written
     tier2_gates = res.pop("merged2-vs-onednn")
     cases = sorted({k.split("|")[0] for k in res})
     # 2 checkpoints x 3 EP layouts x 7 row counts, + 4 merged-gate shapes
@@ -211,6 +219,58 @@ def test_topk_route_matches_topk_and_eplb_map():
     out = _run("xpu_topk_route_check.py", marker="XPU-TOPK-ROUTE-OK")
     n = int(out.split("XPU-TOPK-ROUTE-OK")[1].split()[0])
     assert n == 3 * 8 * 2 * 2 * 3, n
+
+
+def test_entry_rows_proof_with_version_counter():
+    from vllm.model_executor.layers.quantization.utils import entry_rows
+
+    x = torch.randn(4, 8, dtype=torch.bfloat16)
+    rows = entry_rows.EntryRows(x, None, None)
+    assert rows.holds(x) and rows.holds(x.view(4, 8))
+    assert not rows.holds(x.clone()) and not rows.holds(x[:2])
+    x.add_(1)  # written since it was quantized
+    assert not rows.holds(x)
+
+
+def test_entry_scope_under_inference_mode():
+    """The 0.34 profile run's crash: EntryPlan.open on an inference tensor
+    read ``x._version`` ("Inference tensors do not track version counter").
+    The scope opens, the rows are found for the very input only, and an INT8
+    consumer takes them."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.layers.fused_moe.xpu_moe_entry import EntryPlan
+    from vllm.model_executor.layers.quantization.utils import entry_rows
+
+    plan = EntryPlan()
+    plan.fold_module = torch.nn.Identity()  # opens the scope, quantizes nothing
+    runner = SimpleNamespace(layer_name="layers.0.mlp.experts")
+    layer = torch.nn.Identity()
+    with torch.inference_mode():
+        x = torch.randn(6, 16, dtype=torch.bfloat16)
+        assert x.is_inference()
+        with plan.open(runner, x) as rows:
+            assert entry_rows.current() is rows
+            assert rows.holds(x) and rows.holds(x[:]) and rows.holds(x.view(6, 16))
+            for other in (x.clone(), x[:3], x.t(), x.float(), x.view(3, 32)):
+                assert not rows.holds(other)
+            q = torch.zeros(6, 16, dtype=torch.int8)
+            s = torch.ones(6, 1)
+            rows.q, rows.s, rows.share_rows = q, s, True  # as ENTRY_QUANT sets
+            got = entry_rows.int8_input(layer, x)
+            assert got is not None and got[0] is None
+            assert got[1][0] is q and got[1][1] is s
+            assert entry_rows.int8_input(layer, x.clone()) is None
+        assert entry_rows.current() is None
+    # A normal tensor's view taken in inference mode keeps the version
+    # counter: the proof stays the counter's.
+    normal = torch.randn(6, 16, dtype=torch.bfloat16)
+    rows = entry_rows.EntryRows(normal, None, None)
+    with torch.inference_mode():
+        alias = normal.view(6, 16)
+    assert not alias.is_inference() and rows.holds(alias)
+    normal.mul_(2)
+    assert not rows.holds(alias)
 
 
 def test_switches_default_off():

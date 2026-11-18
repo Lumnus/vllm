@@ -18,7 +18,12 @@ For every case it runs the layer with all switches off (today's path) and
 under each switch alone, all together, and all together with the earlier
 fusion switches, and writes per run the output bits, the quant calls, the
 GEMM calls, whether the shared term was added in the gather and which
-consumers read the entry rows."""
+consumers read the entry rows.
+
+With ``inference`` as the second argument every forward runs as the engine
+runs it, under ``torch.inference_mode`` on an inference-tensor input (no
+version counter); otherwise each run records whether the forward wrote its
+input in place (version counter), which the entry's proof relies on."""
 
 import json
 import os
@@ -81,6 +86,9 @@ def _onednn_lib(counts):
 
     lib.impl("int8_gemm_w8a8", impl, "CPU")
     return lib
+
+
+INFERENCE = len(sys.argv) > 2 and sys.argv[2] == "inference"
 
 
 def main() -> None:
@@ -399,11 +407,21 @@ def main() -> None:
         for k in counts:
             counts[k] = 0
         seen_rows.clear()
-        out = r.forward(x, x)
+        if INFERENCE:
+            with torch.inference_mode():
+                xi = x.clone()
+                assert xi.is_inference()
+                out = r.forward(xi, xi)
+            written = None
+        else:
+            v = x._version
+            out = r.forward(x, x)
+            written = x._version != v
         rows = seen_rows[-1] if seen_rows else None
         info = {
             "folded": bool(rows is not None and rows.folded),
             "readers": [] if rows is None else list(rows.readers),
+            "input_written": written,
         }
         return out, dict(counts), info, r._xpu_entry
 

@@ -12,8 +12,16 @@ have. A scope can also hold a layer's whole output, computed ahead by a
 merged GEMM of the same rows (``outputs``).
 
 The tensor must be the very input (same storage, shape, strides, dtype)
-and unchanged since it was quantized (``_version``); anything else
-quantizes as before."""
+and unchanged since it was quantized; anything else quantizes as before.
+"Unchanged" is proved by the version counter where the tensor has one. The
+engine's forwards (profile run, graph capture, every serving step) run under
+``torch.inference_mode``, whose tensors carry no version counter: there the
+proof is the scope itself. It holds the input, so its storage cannot be freed
+and reused while consumers look for it; consumers find the rows only inside
+the forward that made them; and nothing in the scope writes its input in place
+(the CPU check runs the layer with version counting on and asserts that the
+input's version does not move). A normal tensor never matches an inference
+one, or the other way round."""
 
 from contextlib import contextmanager
 
@@ -21,6 +29,12 @@ import torch
 
 # Open scopes, innermost last. Empty outside the XPU MoE entry.
 ACTIVE: list["EntryRows"] = []
+
+
+def _version(t: torch.Tensor) -> int | None:
+    """``t``'s version counter; None for an inference tensor, which has
+    none (reading ``_version`` raises)."""
+    return None if t.is_inference() else t._version
 
 
 class EntryRows:
@@ -31,7 +45,7 @@ class EntryRows:
         s: torch.Tensor | None,
     ) -> None:
         self.x = x
-        self.version = x._version
+        self.version = _version(x)
         self.q = q
         self.s = s
         # Whether consumers other than a merged GEMM read q / s.
@@ -61,7 +75,7 @@ class EntryRows:
                 and t.dtype == x.dtype
                 and t.device == x.device
             )
-        ) and t._version == self.version
+        ) and _version(t) == self.version
 
 
 def current() -> EntryRows | None:
