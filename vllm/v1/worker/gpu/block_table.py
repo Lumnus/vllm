@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 
 import torch
@@ -12,6 +13,13 @@ from vllm.v1.worker.gpu.buffer_utils import (
     UvaBackedTensor,
     _load_ptr,
 )
+
+# B70_BLOCK_TABLES_SKIP_NOOP_FLUSH=1 (opt-in, default off; vllm#65880): skip
+# the num_blocks flush on steps that appended no blocks. Unset, every step
+# flushes as on the previous line. Read once.
+_B70_SKIP_NOOP_FLUSH = os.environ.get(
+    "B70_BLOCK_TABLES_SKIP_NOOP_FLUSH", "0"
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 class BlockTables:
@@ -175,7 +183,7 @@ class BlockTables:
             self.fused_writer.apply(
                 self.block_tables, self.block_table_ptrs, self.block_table_strides
             )
-        if self._num_blocks_dirty:
+        if self._num_blocks_dirty or not _B70_SKIP_NOOP_FLUSH:
             self.num_blocks.copy_to_uva()
             self._num_blocks_dirty = False
 

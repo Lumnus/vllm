@@ -401,6 +401,13 @@ def test_shared_block_tables_clear_rows_from_larger_batch(
                 torch.testing.assert_close(view[:num_reqs], expected.to(torch.int32))
 
 
+@pytest.fixture
+def _b70_skip_noop_flush(monkeypatch):
+    # vllm#65880 rides this line behind B70_BLOCK_TABLES_SKIP_NOOP_FLUSH.
+    monkeypatch.setattr("vllm.v1.worker.gpu.block_table._B70_SKIP_NOOP_FLUSH", True)
+
+
+@pytest.mark.usefixtures("_b70_skip_noop_flush")
 def test_num_blocks_flush_skipped_when_clean():
     """No-op steps must not copy num_blocks to the device.
 
