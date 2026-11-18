@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -1039,6 +1040,16 @@ def fa_meta_cache() -> dict | None:
 
 _XPU_NUM_XE_CORES: dict[int, int] = {}
 
+# B70_GRAPH_KV_SPLITS=1 (opt-in, default off; riceharvest
+# hunt-xpu-graph-kv-splits): pick the decode split-K count from batch and KV
+# heads while an XPU graph is captured. Read once.
+_B70_GRAPH_KV_SPLITS = os.environ.get("B70_GRAPH_KV_SPLITS", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 
 def _xpu_num_xe_cores(device: torch.device) -> int:
     """Number of Xe cores (= subslices) of an XPU device, cached; 0 if unknown.
@@ -1087,9 +1098,12 @@ def _graph_decode_num_kv_splits(
     heuristic (a single split there measured up to 35% slower). Eager calls
     and sliding-window layers (whose split count already comes from the
     window, not max_model_len) are not affected.
+
+    B70: only with B70_GRAPH_KV_SPLITS=1 (read once, default off).
     """
     if (
-        max_seqlen_q != 1
+        not _B70_GRAPH_KV_SPLITS
+        or max_seqlen_q != 1
         or block_table is None
         or seqused_k is None
         or window_size != (-1, -1)
@@ -1100,6 +1114,11 @@ def _graph_decode_num_kv_splits(
     wgs_per_split = (cu_seqlens_q.numel() - 1) * k.size(2)
     if num_xe_cores <= 0 or wgs_per_split <= 0 or wgs_per_split > num_xe_cores:
         return None
+    logger.info_once(
+        "B70_GRAPH_KV_SPLITS=1: captured XPU decode attention takes num_splits_kv "
+        "= Xe cores (%d) / (batch * KV heads)",
+        num_xe_cores,
+    )
     return min(32, num_xe_cores // wgs_per_split)
 
 
