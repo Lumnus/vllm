@@ -12,7 +12,9 @@
    zero after every launch (the next launch and graph replay start clean).
 2. The same for the folded grouped norm against ``grouped_gemma_rmsnorm``.
 3. The rule on rows built to sit on its corners: exact half ties, zero, tiny
-   (127 / amax overflows), huge, NaN and inf elements.
+   (127 / amax overflows), huge, NaN and inf elements; and its ``127 / amax``
+   (integer arithmetic, since ``tl.div_rn`` is not IEEE on the XPU backend)
+   bitwise to IEEE division on every positive bf16 amax.
 4. The folded ops compose: the fused mix / combine-and-mix and the split ops
    on the pre-quantized GEMM equal the unfolded ops on the fused GEMM (whose
    CPU stand-in runs the same rule), bit for bit.
@@ -39,6 +41,7 @@ pytestmark = pytest.mark.skipif(not HAS_TRITON, reason="requires Triton")
 if HAS_TRITON:
     from vllm.models.qwen4_exp.xpu.hc_down_fold import (
         _bf16_bits,
+        _ieee_127_over,
         _q127,
         _row_scale,
         _stored_abs,
@@ -57,6 +60,19 @@ if HAS_TRITON:
         inv, xs = _row_scale(full, 1, INV127)
         tl.store(q + row * N + cols, _q127(v, inv), mask)
         tl.store(s + row, xs)
+
+    @triton.jit
+    def _inv_of_bits(m_ptr, inv_ptr, div_ptr, N, BLOCK: tl.constexpr):
+        """``127 / amax`` for bf16 bit patterns ``m``: the fold's integer form,
+        and ``tl.div_rn`` beside it (what the fold used before; the device
+        check prints how often the two differ)."""
+        offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        m = tl.load(m_ptr + offs, mask, other=1)
+        tl.store(inv_ptr + offs, _ieee_127_over(m), mask)
+        amax = (m.to(tl.int32) << 16).to(tl.float32, bitcast=True)
+        num = tl.full([BLOCK], 127.0, tl.float32)
+        tl.store(div_ptr + offs, tl.div_rn(num, amax), mask)
 
 
 HC = 4
@@ -263,6 +279,28 @@ def _check_rule_corners() -> None:
     print("rule corners: ties, zero, overflowing inv, huge, NaN, inf: bitwise")
 
 
+def _ieee_inv_ref() -> tuple[torch.Tensor, torch.Tensor]:
+    """Every positive bf16 pattern up to +inf (int64) and numpy's fp32
+    ``127 / x`` of it (IEEE, round to nearest even), as int32 bits."""
+    import numpy as np
+
+    m = np.arange(1, 0x7F81, dtype=np.int64)
+    x = (m.astype(np.uint32) << 16).view(np.float32)
+    with np.errstate(all="ignore"):
+        ref = (np.float32(127) / x).astype(np.float32)
+    return torch.from_numpy(m), torch.from_numpy(ref.view(np.int32))
+
+
+def _check_inv_every_bf16() -> None:
+    m, ref = _ieee_inv_ref()
+    inv = torch.empty(m.numel(), dtype=torch.float32)
+    div = torch.empty_like(inv)
+    _inv_of_bits[(triton.cdiv(m.numel(), 1024),)](m, inv, div, m.numel(), 1024)
+    bad = (inv.view(torch.int32) != ref).nonzero()[:, 0]
+    assert bad.numel() == 0, [(hex(int(m[i])), float(inv[i])) for i in bad[:8]]
+    print(f"127 / amax: integer form bitwise to IEEE on all {m.numel()} bf16 values")
+
+
 _FUSED_SCHEMA = (
     "int8_dense_w8a8_fused_gemm(Tensor x, Tensor w, Tensor w_scale, Tensor? bias) "
     "-> Tensor"
@@ -380,6 +418,10 @@ def test_norm_folds_the_quant() -> None:
 
 def test_rule_corners() -> None:
     _run("_check_rule_corners")
+
+
+def test_inv_every_bf16_amax() -> None:
+    _run("_check_inv_every_bf16")
 
 
 def test_folded_ops_equal_unfolded() -> None:
@@ -524,24 +566,40 @@ def test_device_bits(rows: int, mode: int) -> None:
         t.to(dev) if t is not None else None
         for t in _inputs(rows, QFN_EMBD, rows, False, torch.bfloat16, True)
     )
+
+    def ndiff(a, b) -> int:
+        return int((_bits(a.cpu()) != _bits(b.cpu())).sum())
+
+    def rows_off(a, b) -> int:
+        return int((_bits(a.cpu()) != _bits(b.cpu())).any(dim=1).sum())
+
     words = hc_down_fold.new_arrival_words(max(rows, 8192), dev)
     out_ref, y_ref = hc_combine_norm(residual, block, injection, norm, eps, HC)
     out, y, q, s = hc_down_fold.combine_norm_q(
         residual, block, injection, norm, eps, HC, words, mode
     )
     torch.xpu.synchronize()
-    assert torch.equal(_bits(out), _bits(out_ref))
-    assert torch.equal(_bits(y), _bits(y_ref))
     q_ref, s_ref = rule_ref(y.cpu())
-    assert torch.equal(q.cpu(), q_ref), int((q.cpu() != q_ref).sum())
-    assert torch.equal(_bits(s.cpu()), _bits(s_ref))
-    assert int(words.abs().sum()) == 0
-
+    found = {
+        "out": ndiff(out, out_ref),
+        "xn": ndiff(y, y_ref),
+        "xn_rows": rows_off(y, y_ref),
+        "codes": int((q.cpu() != q_ref).sum()),
+        "scales": ndiff(s, s_ref),
+        "words": int(words.abs().sum()),
+    }
     yn_ref = grouped_gemma_rmsnorm(residual, norm, eps, HC)
     yn, qn, sn = hc_down_fold.norm_q(residual, norm, eps, HC, words, mode)
-    assert torch.equal(_bits(yn), _bits(yn_ref))
+    torch.xpu.synchronize()
     qn_ref, sn_ref = rule_ref(yn.cpu())
-    assert torch.equal(qn.cpu(), qn_ref) and torch.equal(_bits(sn.cpu()), _bits(sn_ref))
+    found.update(
+        norm_xn=ndiff(yn, yn_ref),
+        norm_xn_rows=rows_off(yn, yn_ref),
+        norm_codes=int((qn.cpu() != qn_ref).sum()),
+        norm_scales=ndiff(sn, sn_ref),
+        norm_words=int(words.abs().sum()),
+    )
+    print(f"HCDOWNFOLD-BITS rows {rows} mode {mode}: {found}")
 
     # Against the native op through the same GEMM.
     w = torch.randint(-127, 128, (336, HC * QFN_EMBD), dtype=torch.int8, device=dev)
@@ -573,5 +631,30 @@ def test_device_bits(rows: int, mode: int) -> None:
                 (_bits(gs.cpu()) != _bits(rs)).sum()
             )
     torch.xpu.synchronize()
+    left = int(words.abs().sum())
+    print(
+        f"HCDOWNFOLD-REPLAY rows {rows} mode {mode}: 1000 replays, "
+        f"bad {bad}, words {left}"
+    )
+    found.update(replay_bad=bad, replay_words=left)
+    assert all(v == 0 for v in found.values()), found
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="needs an XPU card")
+def test_device_inv_every_bf16() -> None:
+    """On the card: the fold's integer ``127 / amax`` equals IEEE division on
+    every positive bf16 amax; and how many of them ``tl.div_rn`` (the fold's
+    division before, a plain OpFDiv on this backend) gets wrong."""
+    m, ref = _ieee_inv_ref()
+    m = m.to("xpu")
+    inv = torch.empty(m.numel(), dtype=torch.float32, device="xpu")
+    div = torch.empty_like(inv)
+    _inv_of_bits[(triton.cdiv(m.numel(), 1024),)](m, inv, div, m.numel(), 1024)
+    torch.xpu.synchronize()
+    bad = int((inv.cpu().view(torch.int32) != ref).sum())
+    div_bad = int((div.cpu().view(torch.int32) != ref).sum())
+    print(
+        f"HCDOWNFOLD-INV integer form differs from IEEE on {bad} of {m.numel()}; "
+        f"tl.div_rn differs on {div_bad}"
+    )
     assert bad == 0, bad
-    assert int(words.abs().sum()) == 0

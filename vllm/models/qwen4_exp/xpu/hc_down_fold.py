@@ -36,6 +36,11 @@ the calibration rule of the INT8 HC down pass):
   mx = max |x| over the bf16 row (NaN ignored), inv = mx > 0 ? 127 / mx : 0
   (IEEE), xs = mx * fp32(1 / 127), q = clamp(rint(x * inv), -127, 127),
   NaN -> -127.
+The IEEE quotient is computed in integer arithmetic from the bf16 amax
+(``_ieee_127_over``): ``tl.div_rn`` reaches the device as a plain division,
+which is not correctly rounded there. The int8 stores are hinted to 8 codes
+per thread (``Q_VEC``) so the norm compiles in the reference kernels' layout
+and sums its squares in their order (``out`` and ``xn`` bitwise).
 The native op's device division is not compiled IEEE (its file does not get
 the precise-division flag), so against today's device codes the fold moves a
 rounding point on the elements where that division differs: a stated
@@ -59,6 +64,14 @@ IDENTITY_ORDER = 0b11100100
 INV127_BITS = int(
     (torch.ones((), dtype=torch.float32) / torch.full((), 127.0)).view(torch.int32)
 )
+
+# The int8 rows are stored 8 codes per thread. The coalescing pass gives every
+# load the widest vector of the memory ops in its slice; an unhinted int8
+# store (16 codes in 16 bytes) would widen the bf16 loads from 8 to 16
+# elements per thread and so change the layout, and with it the order of the
+# RMSNorm's sum of squares, against hc_combine_norm and grouped_gemma_rmsnorm
+# (8 bf16 per thread). At 8 the norm compiles in the reference's layout.
+Q_VEC = tl.constexpr(8)
 
 _logged_first = False
 
@@ -210,15 +223,60 @@ def _arrive(word_ptr, row, stream, amax_bits, HC: tl.constexpr, SEM: tl.constexp
 
 
 @triton.jit
+def _ieee_127_over(m):
+    """IEEE ``127 / amax`` (round to nearest even) for the bf16 bit pattern
+    ``m`` (int64, sign clear, amax > 0) of the row's absmax, in integer
+    arithmetic.
+
+    ``tl.div_rn`` is not correctly rounded on the XPU backend: its quotient
+    reaches the SPIR-V as a plain ``OpFDiv`` (no rounding-mode decoration, no
+    ``-cl-fp32-correctly-rounded-divide-sqrt`` on a non-LTS driver), which IGC
+    compiles to its default fp32 division. A bf16 amax has an 8-bit
+    significand ``M`` (amax = M * 2**ea), so the quotient is
+    ``(127 * 2**41 / M) * 2**(-41 - ea)``: one exact int64 division, the
+    rounding done on the integer quotient with the remainder as sticky bit,
+    and the fp32 bits assembled by hand. The result never falls below the
+    fp32 normal range (127 / bf16 max is 3.7e-37); a subnormal amax can push
+    it past fp32 max, which gives inf, as IEEE division does. amax = inf
+    gives 0."""
+    e = m >> 7
+    f = m & 0x7F
+    sig = tl.where(e == 0, f, f + 128)
+    ea = tl.where(e == 0, -133, e - 134)
+    sig = tl.where(sig == 0, 1, sig)
+    num = tl.full([], 127, tl.int64) << 41
+    quo = num // sig
+    rem = num - quo * sig
+    # quo is in [2**39, 2**48): its bit length.
+    nbits = tl.full([], 39, tl.int64)
+    for k in tl.static_range(39, 48):
+        nbits += (quo >= (tl.full([], 1, tl.int64) << k)).to(tl.int64)
+    shift = nbits - 24
+    mant = quo >> shift
+    low = quo - (mant << shift)
+    half = tl.full([], 1, tl.int64) << (shift - 1)
+    up = (low > half) | ((low == half) & ((rem != 0) | ((mant & 1) == 1)))
+    mant += up.to(tl.int64)
+    carry = mant >> 24
+    mant = mant >> carry
+    expo = nbits + carry - 1 - 41 - ea + 127
+    bits = tl.where(
+        expo >= 255,
+        tl.full([], 0x7F800000, tl.int64),
+        (expo << 23) | (mant - (1 << 23)),
+    )
+    inv = bits.to(tl.int32).to(tl.float32, bitcast=True)
+    return tl.where(e == 255, 0.0, inv)
+
+
+@triton.jit
 def _row_scale(full, HC: tl.constexpr, INV127: tl.constexpr):
     """The row's absmax from the complete word, and ``(inv, xs)``."""
     m = full & 0x7FFF
     for s in tl.static_range(1, HC):
         m = tl.maximum(m, (full >> (15 * s)) & 0x7FFF)
     amax = (m.to(tl.int32) << 16).to(tl.float32, bitcast=True)
-    pos = amax > 0.0
-    num = tl.full([], 127.0, tl.float32)
-    inv = tl.where(pos, tl.div_rn(num, tl.where(pos, amax, 1.0)), 0.0)
+    inv = tl.where(m > 0, _ieee_127_over(m), 0.0)
     xs = amax * tl.full([], INV127, tl.int32).to(tl.float32, bitcast=True)
     return inv, xs
 
@@ -306,9 +364,10 @@ def _hc_combine_norm_q_kernel(
                     False,
                 )
                 ys = yr.to(tl.bfloat16).to(tl.float32)
-            tl.store(
-                q_ptr + row * stride_q + s * HC_DIM + offs_inner, _q127(ys, inv), mask
+            q_at = tl.max_contiguous(
+                q_ptr + row * stride_q + s * HC_DIM + offs_inner, [1, Q_VEC]
             )
+            tl.store(q_at, _q127(ys, inv), mask)
         tl.store(s_ptr + row, xs)
         tl.atomic_xchg(word_ptr + row, tl.zeros([], tl.int64), sem="relaxed")
 
@@ -376,9 +435,10 @@ def _hc_norm_q_kernel(
                     False,
                 )
                 ys = yr.to(tl.bfloat16).to(tl.float32)
-            tl.store(
-                q_ptr + row * stride_q + s * GROUP_DIM + offs_g, _q127(ys, inv), mask
+            q_at = tl.max_contiguous(
+                q_ptr + row * stride_q + s * GROUP_DIM + offs_g, Q_VEC
             )
+            tl.store(q_at, _q127(ys, inv), mask)
         tl.store(s_ptr + row, xs)
         tl.atomic_xchg(word_ptr + row, tl.zeros([], tl.int64), sem="relaxed")
 
