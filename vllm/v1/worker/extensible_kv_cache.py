@@ -74,6 +74,18 @@ KV_CACHE_MARGIN_FLOOR_BYTES = (
     else 1 << 30
 )
 KV_CACHE_MARGIN_FRACTION = 0.0 if current_platform.is_xpu() else 0.75
+# Whether sizing keeps free the growth of torch's reservation over a sizing
+# step from an emptied cache when it exceeds the allocated transient peak.
+# The growth includes segments the allocator holds cached at the peak; under
+# the cap set after sizing the allocator releases those before growing, so
+# what serving needs lies between the two. XPU keeps the allocated peak, as
+# its zero margin above does: on Arc Pro B70 (4 cards, the hybrid MoE at
+# tensor parallel 4, BF16 experts, INT8 KV) the growth read 1.93 GiB against
+# a 1.63 GiB peak, 0.3 GiB of KV per card (6,232 against 6,637 blocks), and
+# the same body sized by the peak alone passed its gates (simultaneous
+# bursts with and without prefix hits, structured output, needles at 32K and
+# 120K, spec decode at 7 drafts) without an allocation failure.
+KV_CACHE_KEEP_RESERVE_GROWTH = not current_platform.is_xpu()
 # Part of the margin kept for allocations outside torch's caching allocator
 # (kernel scratch, NCCL/RCCL buffers, lazily loaded code objects); the
 # allocator is capped to leave it free. The rest absorbs torch's fragmentation,
@@ -920,6 +932,7 @@ def measure_kv_cache_bytes(
     margin_floor_bytes: int = KV_CACHE_MARGIN_FLOOR_BYTES,
     margin_fraction: float = KV_CACHE_MARGIN_FRACTION,
     margin_peak_bytes: int | None = None,
+    keep_reserve_growth: bool = KV_CACHE_KEEP_RESERVE_GROWTH,
 ) -> int:
     """Bytes the KV cache may occupy given the memory measured after warmup.
 
@@ -927,9 +940,10 @@ def measure_kv_cache_bytes(
     the cache gets the rest of the budget, capped by the device headroom (free
     memory plus the committed prefix) less a margin of
     `max(margin_floor_bytes, margin_fraction * transient_peak_bytes)`. The
-    larger of transient_peak_bytes and torch_reserve_growth_bytes is then kept
-    free in full. The margin guards physical memory, so it never reduces an
-    explicit budget that already leaves that much free.
+    larger of transient_peak_bytes and torch_reserve_growth_bytes (only the
+    former without keep_reserve_growth) is then kept free in full. The margin
+    guards physical memory, so it never reduces an explicit budget that
+    already leaves that much free.
     """
     non_kv_used = init_free_memory - free_memory - committed_bytes
     headroom = free_memory + committed_bytes
@@ -939,8 +953,21 @@ def measure_kv_cache_bytes(
         margin_peak_bytes = transient_peak_bytes
     margin = max(margin_floor_bytes, int(margin_peak_bytes * margin_fraction))
     available = min(requested_memory - non_kv_used, headroom - margin)
-    available -= max(transient_peak_bytes, torch_reserve_growth_bytes)
+    available -= kept_transient_bytes(
+        transient_peak_bytes, torch_reserve_growth_bytes, keep_reserve_growth
+    )
     return max(available, 0)
+
+
+def kept_transient_bytes(
+    transient_peak_bytes: int,
+    torch_reserve_growth_bytes: int,
+    keep_reserve_growth: bool = KV_CACHE_KEEP_RESERVE_GROWTH,
+) -> int:
+    """Bytes sizing keeps free for transient activations."""
+    if not keep_reserve_growth:
+        return transient_peak_bytes
+    return max(transient_peak_bytes, torch_reserve_growth_bytes)
 
 
 class _KVCacheMeasurement(NamedTuple):
@@ -1082,7 +1109,9 @@ def measure_kv_cache_blocks(
         "fit within the requested %s GiB. Torch may reserve up to %s GiB.",
         format_gib(free_memory),
         format_gib(kv_cache.physical_bytes),
-        format_gib(max(transient_peak, kv_cache.torch_reserve_growth_bytes)),
+        format_gib(
+            kept_transient_bytes(transient_peak, kv_cache.torch_reserve_growth_bytes)
+        ),
         format_gib(transient_peak),
         format_gib(kv_cache.torch_reserve_growth_bytes),
         num_blocks,
