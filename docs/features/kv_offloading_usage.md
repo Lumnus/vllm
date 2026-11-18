@@ -105,13 +105,14 @@ Secondary tiers are not supported yet on engines whose workers span several node
 | `cpu_bytes_to_use` | yes | — | both | Total bytes of host memory reserved for the CPU tier across all workers (not per-worker). |
 | `block_size` | no | GPU block size | both | Offloaded block size in tokens; must be a multiple of the GPU block size. Mutually exclusive with `blocks_per_chunk`. |
 | `blocks_per_chunk` | no | `1` | both | Offloaded chunk size in GPU blocks; must be > 0. Alternative to `block_size` for models whose KV cache groups have different block sizes. |
-| `eviction_policy` | no | `lru` | both | Primary tier policy: built-in `lru`/`arc`, or a custom `CachePolicy` name (see [Custom Eviction Policies](#custom-eviction-policies)). |
+| `eviction_policy` | no | `lru` | both | Primary tier policy: built-in `lru`/`arc`/`mamba_aware_lru` (see [Hybrid Mamba Models](#hybrid-mamba-models)), or a custom `CachePolicy` name (see [Custom Eviction Policies](#custom-eviction-policies)). |
 | `cache_policy_module_path` | no | — | both | Python import path for a custom `CachePolicy` not in the built-in registry. Required only when `eviction_policy` is not built-in and wasn't pre-registered via `CachePolicyFactory` (advanced). |
 | `store_threshold` | no | `0` | single-tier | Min lookups before a block is offloaded. Values ≥ 2 are rejected by `TieringOffloadingSpec`. |
 | `max_tracker_size` | no | `64000` | single-tier | Max entries in the lookup tracker. |
 | `secondary_tiers` | no | `[]` | multi-tier | List of secondary tier configs (see below). |
 | `tier_poll_interval_s` | no | `0.001` | multi-tier | Pause between tier-poll rounds for tiers that must be serviced between engine steps (currently `p2p`). See [Threading model](#threading-model). Set to `0` to disable the thread and service those tiers once per engine step instead. |
 | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |
+| `retain_running_prefixes` | no | `false` | both | Hybrid (Mamba) models in align mode: a running request keeps the Mamba state at the deepest prompt boundary it reached in the CPU tier until it finishes, and on finish stores again the prompt chunks evicted while it ran, so the conversation's next turn still has a prefix to resume from. The `vllm:kv_offload_retention_*` counters report retained states, finished requests by how much state they retained, and chunks stored again. |
 | `sync_load_budget_bytes` | no | `0` | both | Per-step budget of KV bytes (per GPU) loaded within the same step, so those requests run immediately instead of waiting a step for an async load. Hits that don't fit the remaining budget, or would leave nothing to compute, stay async. `0` disables. |
 | `self_describing_kv_events` | no | `false` | both | Opt-in. When `true` *and* KV cache events are enabled (`--kv-events-config` with `enable_kv_cache_events`), the connector emits self-describing block-granular `BlockStored`/`BlockRemoved` payloads (constituent block hashes, whole-chunk `token_ids`, per-block `block_size`, parent hash, LoRA + group/cache-spec metadata) instead of the placeholder fallback, so external KV-event consumers can index offloaded blocks. Inert unless events are enabled. With `TieringOffloadingSpec`, a CPU promotion is self-describing when a local request observes its primary-tier `HIT` before event translation; otherwise its stored event may retain the placeholder, while a later `HIT` can backfill metadata for removal. Pending-removal/re-promotion races and externally initiated promotions may also produce placeholders, and consumers must ignore removals for unknown hashes. Recurrent (Mamba / linear-attention) state groups announce state checkpoints, with `kv_cache_spec_kind` `mamba`: an offloaded chunk or partial tail holds one recurrent state, valid at its last hash, so its `BlockStored` carries that single hash, its parent hash and an empty `token_ids`. Consumers align it by hash with the attention group's blocks; a hybrid prefix is reusable only up to a boundary where every group has a residency. Sliding-window and chunked-local attention chunks keep the placeholder fallback. In chunk mode (`block_size` > GPU block size, or `blocks_per_chunk` > 1), overlapping chunks re-announce shared per-block hashes, so consumers must reference-count (deduplicate) repeated store/remove announcements. |
 | `spec_module_path` | no | — | both | Python import path for a custom `OffloadingSpec` not in the built-in registry. Required only when `spec_name` is not built-in (advanced). |
@@ -174,9 +175,19 @@ The spec declares the label names in the API server process, and the manager fil
 
 A manager adds a label with `config_info_keys()` of its spec and `config_info()` of its own class. A name that a manager fills and the spec does not declare is dropped, and the engine log then holds one warning line.
 
+## Hybrid Mamba Models
+
+For hybrid models that mix attention with Mamba (state-space or linear-attention) layers, set `"eviction_policy": "mamba_aware_lru"`. The default stays `lru`.
+
+Such a model offloads one Mamba state for each Mamba group at the deepest boundary that a request stores, its tip. The next turn of the conversation stores a newer tip further along the same prefix. After that, later turns resume from the newer tip, and the older tip helps only requests that branch off between the two, such as a regenerated turn or a forked sub-task. Plain `lru` still counts the older tip as recently used, because the next turn loads it. `mamba_aware_lru` is `lru`, except that when a request finishes, the older tips on its prefix are evicted before any other block. Attention blocks, the newest tip, and states that a request stores below its own tip, such as shared-prefix checkpoints, keep their `lru` order. A tip that a request loads again regains its `lru` order.
+
+The policy changes only which blocks stay in the CPU tier, never the outputs. Workloads that often resume from older turns (regenerate, rewind, tree search) can lose more cache hits than with `lru`. For a model without Mamba layers, `mamba_aware_lru` behaves exactly like `lru`.
+
 ## Custom Eviction Policies
 
-`eviction_policy` resolves through `CachePolicyFactory` (`vllm/v1/kv_offload/cpu/policies/factory.py`), which pre-registers the built-in `lru` and `arc` policies.
+`eviction_policy` resolves through `CachePolicyFactory` (`vllm/v1/kv_offload/cpu/policies/factory.py`), which pre-registers the built-in `lru`, `arc` and `mamba_aware_lru` policies.
+
+The manager constructs a policy with `cache_capacity` (in chunks). If the constructor also declares a `mamba_group_ids` parameter, it receives the KV cache group indices of the Mamba groups, as encoded in each `OffloadKey`.
 
 ### Out-of-tree (recommended)
 

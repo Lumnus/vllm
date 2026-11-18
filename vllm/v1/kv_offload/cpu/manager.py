@@ -9,6 +9,7 @@ from typing_extensions import override
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
+from vllm.utils.func_utils import supports_kw
 from vllm.v1.kv_offload.base import (
     ConfigInfoMapping,
     LoadStoreSpec,
@@ -52,8 +53,9 @@ class _RequestCacheAccess:
 
 class CPUOffloadingManager(OffloadingManager):
     """An OffloadingManager with a pluggable CachePolicy, resolved by name via
-    CachePolicyFactory (built in: "lru", "arc"; external policies can either
-    register their own or be loaded out-of-tree via cache_policy_module_path).
+    CachePolicyFactory (built in: "lru", "arc", "mamba_aware_lru"; external
+    policies can either register their own or be loaded out-of-tree via
+    cache_policy_module_path).
 
     The manager owns all shared logic: ref-counting, event emission,
     chunk pool management, and the prepare_store/complete_store skeletons.
@@ -70,6 +72,7 @@ class CPUOffloadingManager(OffloadingManager):
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
         info: CPUOffloadingInfo | None = None,
+        mamba_group_ids: Collection[int] = (),
     ):
         self.medium: Medium = Medium.CPU
         self._num_chunks: int = num_chunks
@@ -82,7 +85,12 @@ class CPUOffloadingManager(OffloadingManager):
         policy_cls = CachePolicyFactory.get_cache_policy_cls(
             cache_policy, cache_policy_module_path
         )
-        self._policy: CachePolicy = policy_cls(cache_capacity=num_chunks)
+        policy_kwargs = {}
+        if supports_kw(policy_cls, "mamba_group_ids", allow_var_kwargs=False):
+            policy_kwargs["mamba_group_ids"] = mamba_group_ids
+        self._policy: CachePolicy = policy_cls(
+            cache_capacity=num_chunks, **policy_kwargs
+        )
         # Track the number of chunks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
@@ -250,6 +258,20 @@ class CPUOffloadingManager(OffloadingManager):
         if record_access:
             self._record_request_cache_access(keys, req_context, reused_keys=keys)
         return self._get_load_store_spec(keys, chunks)
+
+    @override
+    def retain(self, keys: Collection[OffloadKey], req_context: ReqContext) -> bool:
+        for key in keys:
+            chunk = self._policy.get(key)
+            if chunk is None or not chunk.is_ready:
+                return False
+        # A load pin with no transfer.
+        self._prepare_load(keys, req_context, record_access=True)
+        return True
+
+    @override
+    def release(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        self.complete_load(keys, req_context)
 
     @override
     def complete_load(

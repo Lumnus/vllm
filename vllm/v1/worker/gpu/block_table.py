@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable
 
 import torch
@@ -12,6 +13,13 @@ from vllm.v1.worker.gpu.buffer_utils import (
     UvaBackedTensor,
     _load_ptr,
 )
+
+# B70_BLOCK_TABLES_SKIP_NOOP_FLUSH=1 (opt-in, default off; vllm#65880): skip
+# the num_blocks flush on steps that appended no blocks. Unset, every step
+# flushes as on the previous line. Read once.
+_B70_SKIP_NOOP_FLUSH = os.environ.get(
+    "B70_BLOCK_TABLES_SKIP_NOOP_FLUSH", "0"
+).strip().lower() in ("1", "true", "yes", "on")
 
 
 class BlockTables:
@@ -73,6 +81,7 @@ class BlockTables:
         self.num_blocks = UvaBackedTensor(
             (self.num_kv_cache_groups, self.max_num_reqs), dtype=torch.int32
         )
+        self._num_blocks_dirty = False
         self.fused_writer: FusedStagedWriter | None = None
         if self.num_kv_cache_groups > 1:
             # Only the multi-group path uses the fused writer.
@@ -160,6 +169,7 @@ class BlockTables:
                 )
             self.block_tables[i].stage_write(req_index, start, block_ids)
             self.num_blocks.np[i, req_index] = end
+            self._num_blocks_dirty = True
 
     def apply_staged_writes(self) -> None:
         if self.num_kv_cache_groups == 0:
@@ -173,7 +183,9 @@ class BlockTables:
             self.fused_writer.apply(
                 self.block_tables, self.block_table_ptrs, self.block_table_strides
             )
-        self.num_blocks.copy_to_uva()
+        if self._num_blocks_dirty or not _B70_SKIP_NOOP_FLUSH:
+            self.num_blocks.copy_to_uva()
+            self._num_blocks_dirty = False
 
     def gather_block_tables(
         self,

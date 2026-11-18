@@ -40,6 +40,23 @@ from vllm.v1.kv_offload.pointer_utils import resolve_device_pointers
 logger = init_logger(__name__)
 
 
+def b70_mamba_physical_stride() -> bool:
+    """B70_OFFLOAD_MAMBA_PHYSICAL_STRIDE=1 (opt-in, default off; vllm#64140):
+    register non-attention (Mamba) cache views with the allocator's physical
+    block stride. Unset, they use page_size_bytes as on the previous line."""
+    import os
+
+    enabled = os.environ.get(
+        "B70_OFFLOAD_MAMBA_PHYSICAL_STRIDE", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    if enabled:
+        logger.info_once(
+            "B70_OFFLOAD_MAMBA_PHYSICAL_STRIDE=1: Mamba offload views use the "
+            "physical block stride (vllm#64140)"
+        )
+    return enabled
+
+
 class OffloadingConnectorWorker:
     """Implementation of Worker side methods."""
 
@@ -138,12 +155,12 @@ class OffloadingConnectorWorker:
                 page = layer_kv_cache_spec.page_size_bytes
                 elem_size = ref.element_size()
                 byte_offset = ref.storage_offset() * elem_size
-                # Packed layouts (e.g. DSv4) interleave layers per block, so the
-                # attention tensor's stride(0) (the manager-block stride) exceeds
-                # page_size_bytes; other layouts have stride(0) == page_size_bytes.
+                # Packed layouts interleave layers per block, so a layer's
+                # manager-block stride can exceed its page size.
                 block_stride_bytes = (
                     ref.stride(0) * elem_size
                     if isinstance(layer_kv_cache_spec, AttentionSpec)
+                    or b70_mamba_physical_stride()
                     else page
                 )
                 tensors_per_block[layer_name] = (

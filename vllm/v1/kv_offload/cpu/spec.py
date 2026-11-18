@@ -145,6 +145,9 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.cache_policy_module_path: str | None = self.extra_config.get(
             "cache_policy_module_path"
         )
+        self.mamba_group_ids = tuple(
+            group.group_id for group in config.groups if group.is_mamba
+        )
 
     @classmethod
     @override
@@ -172,6 +175,7 @@ class CPUOffloadingSpec(OffloadingSpec):
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
                 info=self.cpu_info,
+                mamba_group_ids=self.mamba_group_ids,
             )
         return self._manager
 

@@ -134,6 +134,7 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
         cache_policy_module_path: str | None = None,
         enable_events: bool = False,
         info: CPUOffloadingInfo | None = None,
+        mamba_group_ids: Collection[int] = (),
     ):
         super().__init__(
             num_chunks=num_chunks,
@@ -141,6 +142,7 @@ class CPUPrimaryTierOffloadingManager(CPUOffloadingManager):
             cache_policy_module_path=cache_policy_module_path,
             enable_events=enable_events,
             info=info,
+            mamba_group_ids=mamba_group_ids,
         )
         self._mmap_region = mmap_region
         # read/write is for CPU<->secondary transfers,
@@ -906,6 +908,32 @@ class TieringOffloadingManager(OffloadingManager):
 
         """
         self.primary_tier.complete_load(keys, req_context)
+
+    @override
+    def retain(self, keys: Collection[OffloadKey], req_context: ReqContext) -> bool:
+        """Protect chunks in the primary tier from eviction until release().
+
+        Args:
+            keys: Chunks to retain.
+            req_context: Per-request context.
+
+        Returns:
+            True if every chunk was ready in the primary tier and is now
+            retained; False otherwise, retaining none.
+
+        """
+        return self.primary_tier.retain(keys, req_context)
+
+    @override
+    def release(self, keys: Collection[OffloadKey], req_context: ReqContext):
+        """End a successful retain() of chunks in the primary tier.
+
+        Args:
+            keys: Chunks to release.
+            req_context: Per-request context.
+
+        """
+        self.primary_tier.release(keys, req_context)
 
     @override
     def prepare_store(

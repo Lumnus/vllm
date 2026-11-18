@@ -231,6 +231,7 @@ def test_swa_offload_window_covers_unaligned_hit(
         blocks_per_chunk=4,
         offload_prompt_only=True,
         extra_config={},
+        retain_running_prefixes=False,
         kv_events_config=OffloadingKVEventsConfig(
             enable_kv_cache_events=False, self_describing_kv_events=False
         ),
@@ -493,6 +494,38 @@ def test_aligned_boundary_store_uses_exact_source_with_partial_tail():
     assert src_spec.block_ids.tolist() == [98]
     assert src_spec.group_sizes == [0, 1]
     assert src_spec.block_indices == [0, 0]
+
+
+def test_partial_tail_store_skips_ambiguous_boundaries():
+    """An ambiguous request is dropped without affecting other requests."""
+    scheduler = _make_partial_tail_scheduler()
+    _make_partial_tail_request(scheduler, request_id="ambiguous")
+    _make_partial_tail_request(scheduler, request_id="clean")
+    for req_id in ("ambiguous", "clean"):
+        req_status = scheduler._req_status[req_id]
+        req_status.group_states[0].block_ids[:] = [11, 12]
+        req_status.group_states[1].block_ids[:] = [0, 21]
+    _as_mock(scheduler.manager.prepare_store).side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    def build(boundary_state_offloads):
+        output = SimpleNamespace(
+            kv_connector_block_state=KVConnectorBlockState(
+                req_ids=set(),
+                resolve_block_ids={}.__getitem__,
+                boundary_state_offloads=boundary_state_offloads,
+            )
+        )
+        return scheduler._build_partial_tail_store_jobs(output)
+
+    ambiguous_entries = [(1, 99, 28), (1, 98, 20)]
+    clean_entries = [(1, 99, 28)]
+    assert build({"ambiguous": ambiguous_entries}) == {}
+    expected = len(build({"clean": clean_entries}))
+    assert expected > 0
+    mixed = build({"ambiguous": ambiguous_entries, "clean": clean_entries})
+    assert len(mixed) == expected
 
 
 def test_aligned_boundary_store_maps_sparse_group_id_to_dense_transfer_slot():
@@ -6828,18 +6861,18 @@ class TestSharedGroupMTPOffload:
         )
 
 
-class TestMambaHybridOffloadServing:
-    """Store->finish->lookup flows on a full-attention + mamba-align hybrid,
-    with a manager that only HITs keys that were actually stored. Guards the
-    two collapse routes of issue #52735."""
+class _MambaHybridScheduler:
+    """Builds a scheduler for a full-attention + mamba-align hybrid."""
 
     BLOCK = 4
     MAMBA_BLOCK = 16
     PROMPT_TOKENS = 28  # 7 hash blocks; 1 full mamba chunk
 
-    def _make_scheduler(self, speculative_config, mamba_eagle=False):
+    def _make_scheduler(
+        self, speculative_config=None, mamba_eagle=False, **extra_config
+    ):
         vllm_config = _make_vllm_config(
-            extra_config={"self_describing_kv_events": True}
+            extra_config={"self_describing_kv_events": True, **extra_config}
         )
         vllm_config.cache_config.block_size = self.BLOCK
         vllm_config.cache_config.prefix_match_unit = self.BLOCK
@@ -6874,6 +6907,12 @@ class TestMambaHybridOffloadServing:
         )
         spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
         return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+
+class TestMambaHybridOffloadServing(_MambaHybridScheduler):
+    """Store->finish->lookup flows on a full-attention + mamba-align hybrid,
+    with a manager that only HITs keys that were actually stored. Guards the
+    two collapse routes of issue #52735."""
 
     def _roundtrip_served_tokens(self, scheduler) -> int:
         """Request A: prompt-only store, finish; request A2: served tokens."""
@@ -7079,3 +7118,425 @@ def test_lookahead_partial_store_uses_checkpoint_hash(lookahead):
         make_offload_key(request.block_hashes[boundary // 4 - 1], g) in offered
         for g in [0, 1]
     )
+
+
+@pytest.fixture
+def _b70_partial_tail_chunks(monkeypatch):
+    # vllm#58413 rides this line behind B70_OFFLOAD_PARTIAL_TAIL_CHUNKS.
+    monkeypatch.setenv("B70_OFFLOAD_PARTIAL_TAIL_CHUNKS", "1")
+
+
+def _make_multi_block_chunk_scheduler(
+    blocks_per_chunk: int = 4,
+) -> OffloadingConnectorScheduler:
+    """Qwen3.5-style hybrid geometry: full-attention and align-mode Mamba
+    groups with identical block sizes where one hash fills a block exactly
+    and an offload chunk spans several blocks (tokens_per_block ==
+    tokens_per_hash == 16, blocks_per_chunk = 4)."""
+    vllm_config = _make_vllm_config(extra_config={"blocks_per_chunk": blocks_per_chunk})
+    vllm_config.cache_config.prefix_match_unit = 16
+    vllm_config.speculative_config = None
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=True, publisher="null"
+    )
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+
+def _make_multi_block_chunk_request(
+    scheduler: OffloadingConnectorScheduler, num_tokens: int = 64
+) -> MagicMock:
+    request = MagicMock()
+    request.request_id = "req"
+    request.kv_transfer_params = None
+    request.kv_hints = None
+    request.num_prompt_tokens = num_tokens
+    request.num_tokens = num_tokens
+    request.block_hashes = [
+        BlockHash(f"b{i}".encode()) for i in range(num_tokens // 16)
+    ]
+    request.all_token_ids = list(range(num_tokens))
+    request.lora_request = None
+    request.skip_reading_external_kv = False
+    request.is_finished.return_value = False
+    scheduler.on_new_request(request)
+    return request
+
+
+@pytest.mark.cpu_test
+@pytest.mark.usefixtures("_b70_partial_tail_chunks")
+def test_multi_block_chunk_hybrid_supports_partial_tail():
+    scheduler = _make_multi_block_chunk_scheduler()
+    full, mamba = scheduler.config.kv_group_configs
+
+    # Geometry sanity: identical block sizes, hash fills one block exactly.
+    assert full.tokens_per_block == mamba.tokens_per_block == 16
+    # The group geometry is unchanged: every group offloads 4-block chunks,
+    # so a hash boundary inside a chunk is a partial tail, never a chunk key.
+    assert full.tokens_per_chunk == mamba.tokens_per_chunk == 64
+    assert scheduler.config.supports_partial_tail
+    assert scheduler._partial_tail_block_size == 16
+    assert scheduler._partial_tail_chunk_tokens == 64
+    # A hash unit equal to the block size with one block per chunk leaves no
+    # gap between the hash and chunk grids: every hash boundary is a chunk
+    # boundary, so the aligned hand-off path covers everything.
+    assert not _make_multi_block_chunk_scheduler(
+        blocks_per_chunk=1
+    ).config.supports_partial_tail
+
+
+@pytest.mark.cpu_test
+@pytest.mark.usefixtures("_b70_partial_tail_chunks")
+def test_off_chunk_grid_mamba_handoff_is_stored():
+    """The final mamba hand-off under MTP/EAGLE prefill lookahead is
+    hash-aligned but off the blocks_per_chunk grid (48 here vs the 64-token
+    chunk); it must be stored together with the full-attention blocks of its
+    chunk, otherwise the sliding-window lookup can never hit and the whole
+    request adopts zero external KV (issue #52735)."""
+    scheduler = _make_multi_block_chunk_scheduler()
+    _make_multi_block_chunk_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.group_states[0].block_ids[:] = [31, 32, 33, 34]
+    req_status.group_states[1].block_ids[:] = [0, 0, 43, 44]
+    req_status.update_offload_keys()
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    output = SimpleNamespace(
+        kv_connector_block_state=KVConnectorBlockState(
+            req_ids=set(),
+            resolve_block_ids={}.__getitem__,
+            boundary_state_offloads={
+                "req": [
+                    (0, 88, 64),  # full attention: chunk-aligned, stored
+                    (1, 99, 48),  # mamba: hash-aligned, off the chunk grid
+                ]
+            },
+        )
+    )
+    jobs = scheduler._build_partial_tail_store_jobs(output)
+
+    req_context = req_status.req_context
+    by_boundary = {}
+    for job_id, job in jobs.items():
+        for key in scheduler._jobs[job_id].keys:
+            by_boundary[req_context.get_offload_key_position(key)] = job
+
+    # Full-attention hand-off on the chunk grid: unchanged aligned path.
+    assert 64 in by_boundary
+    # The MTP-shifted mamba hand-off must survive the chunk-grid filter and
+    # carry the chunk's three full-attention blocks with it.
+    tail_job = by_boundary[48]
+    src_spec = tail_job.src_spec
+    assert src_spec.block_ids.tolist() == [31, 32, 33, 99]
+    assert src_spec.group_sizes == [3, 1]
+    # Full-attention blocks 0-2 of chunk 0; mamba CoW state at block 2.
+    assert src_spec.block_indices == [0, 2]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.usefixtures("_b70_partial_tail_chunks")
+def test_update_state_after_alloc_loads_confirmed_multi_block_tail():
+    """The load must slice each group's keys with the group's own chunk
+    geometry and place a confirmed tail at its in-chunk block position, so
+    the worker's sub-block mapping (block_indices % blocks_per_chunk) can
+    re-align the stored tail with the freshly allocated GPU blocks."""
+    scheduler = _make_multi_block_chunk_scheduler()
+    request = _make_multi_block_chunk_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+
+    def lookup(key, req_context):
+        return (
+            LookupResult.HIT
+            if req_context.get_offload_key_position(key) == 48
+            else LookupResult.MISS
+        )
+
+    scheduler.manager.lookup.side_effect = lookup
+    assert scheduler._lookup(req_status) == 48
+    assert req_status.partial_tail_boundary == 48
+
+    scheduler.update_state_after_alloc(
+        request,
+        KVCacheBlocks(
+            (
+                [KVCacheBlock(31), KVCacheBlock(32), KVCacheBlock(33)],
+                [
+                    KVCacheBlock(0, is_null=True),
+                    KVCacheBlock(0, is_null=True),
+                    KVCacheBlock(43),
+                ],
+            )
+        ),
+        num_external_tokens=48,
+    )
+    [job_id] = scheduler._current_batch_load_jobs
+    load_job = scheduler._current_batch_load_jobs[job_id]
+    keys = scheduler._jobs[job_id].keys
+    assert [req_status.req_context.get_offload_key_position(key) for key in keys] == [
+        48,
+        48,
+    ]
+    dst = load_job.dst_spec
+    assert dst.block_ids.tolist() == [31, 32, 33, 43]
+    assert dst.group_sizes == [3, 1]
+    assert dst.block_indices == [0, 2]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.usefixtures("_b70_partial_tail_chunks")
+def test_partial_lookup_serves_off_chunk_grid_handoff():
+    """End-to-end lookup: with only a hash-aligned mamba hand-off stored
+    (176 = 16 x 11, off the 64-token chunk grid) and full-attention chunks
+    stored on the 64-token grid, the request must still adopt up to the
+    hand-off. Before partial tails were generalized to blocks_per_chunk > 1
+    the mamba key grid missed 176 entirely and the hit collapsed."""
+    scheduler = _make_multi_block_chunk_scheduler()
+    _make_multi_block_chunk_request(scheduler, num_tokens=208)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+
+    def lookup(key, req_context):
+        if get_offload_group_idx(key) == 1 and (
+            req_context.get_offload_key_position(key) != 176
+        ):
+            return LookupResult.MISS  # only the 176 hand-off is stored
+        return LookupResult.HIT
+
+    scheduler.manager.lookup.side_effect = lookup
+    assert scheduler._lookup(req_status) == 176
+    assert req_status.partial_tail_boundary == 176
+
+
+class TestRetainRunningPrefixes(_MambaHybridScheduler):
+    """retain_running_prefixes on a full-attention + mamba-align hybrid with a
+    real CPU tier that turns over while a request runs."""
+
+    MAMBA_GROUP = 1
+
+    def _make_cpu_tier_scheduler(
+        self, retain: bool, num_chunks: int = 9
+    ) -> OffloadingConnectorScheduler:
+        scheduler = self._make_scheduler(retain_running_prefixes=retain)
+        # By default, room for one prompt (7 attention chunks and 1 state
+        # chunk) plus one more chunk.
+        scheduler.manager = CPUOffloadingManager(num_chunks=num_chunks)
+        return scheduler
+
+    def _new_request(self, scheduler, req_id: str, num_tokens: int) -> MagicMock:
+        request = MagicMock()
+        request.request_id = req_id
+        request.kv_transfer_params = None
+        request.kv_hints = None
+        request.num_prompt_tokens = num_tokens
+        request.num_tokens = num_tokens
+        request.num_computed_tokens = 0
+        # A conversation's turns share hashes: the req id's first letter names
+        # the conversation, so "A" and its next turn "A2" share a prefix.
+        request.block_hashes = [
+            BlockHash(f"{req_id[0]}{i}".encode())
+            for i in range(num_tokens // self.BLOCK)
+        ]
+        request.all_token_ids = list(range(num_tokens))
+        request.lora_request = None
+        request.skip_reading_external_kv = False
+        request.is_finished.return_value = False
+        request.status = RequestStatus.RUNNING
+        scheduler.on_new_request(request)
+        scheduler._req_status[req_id].update_offload_keys()
+        return request
+
+    @staticmethod
+    def _complete_jobs(scheduler) -> None:
+        job_ids = list(scheduler._jobs)
+        if job_ids:
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=OffloadingWorkerMetadata(
+                        completed_jobs={job_id: 1 for job_id in job_ids}
+                    )
+                )
+            )
+
+    def _prefill(
+        self,
+        scheduler,
+        request,
+        first_block_id: int,
+        state_boundaries: tuple[int, ...] = (_MambaHybridScheduler.MAMBA_BLOCK,),
+    ) -> None:
+        """Compute the prompt; each recurrent state at state_boundaries is
+        handed off."""
+        req_status = scheduler._req_status[request.request_id]
+        num_blocks = request.num_prompt_tokens // self.BLOCK
+        state_block_id = first_block_id + num_blocks
+        req_status.group_states[0].block_ids[:] = list(
+            range(first_block_id, state_block_id)
+        )
+        req_status.group_states[1].block_ids[:] = [state_block_id]
+        output = SchedulerOutput.make_empty()
+        output.num_scheduled_tokens = {request.request_id: request.num_prompt_tokens}
+        output.kv_connector_block_state = KVConnectorBlockState(
+            req_ids=set(),
+            resolve_block_ids={}.__getitem__,
+            boundary_state_offloads={
+                request.request_id: [
+                    (self.MAMBA_GROUP, state_block_id + i, boundary)
+                    for i, boundary in enumerate(state_boundaries)
+                ]
+            },
+        )
+        scheduler.build_connector_meta(output)
+        request.num_computed_tokens = request.num_prompt_tokens
+
+    def _finish(self, scheduler, request, status) -> OffloadingConnectorMetadata:
+        request.is_finished.return_value = True
+        request.status = status
+        request.num_tokens = request.num_prompt_tokens + 1
+        scheduler.request_finished(request)
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = {request.request_id}
+        meta = scheduler.build_connector_meta(output)
+        assert isinstance(meta, OffloadingConnectorMetadata)
+        return meta
+
+    def _next_turn_hit_tokens(self, scheduler) -> int:
+        self._new_request(scheduler, "A2", self.PROMPT_TOKENS + self.BLOCK)
+        req_status = scheduler._req_status["A2"]
+        return scheduler._lookup(req_status) or 0
+
+    @staticmethod
+    def _state_key(scheduler, request, chunk_idx: int = 0):
+        req_status = scheduler._req_status[request.request_id]
+        return req_status.group_states[1].offload_keys[chunk_idx]
+
+    @pytest.mark.parametrize("retain", [False, True])
+    def test_long_running_turn_keeps_its_prefix(self, retain: bool):
+        scheduler = self._make_cpu_tier_scheduler(retain)
+        request = self._new_request(scheduler, "A", self.PROMPT_TOKENS)
+        self._prefill(scheduler, request, first_block_id=1)
+        req_status = scheduler._req_status["A"]
+        # The state is retained as soon as its store completes.
+        self._complete_jobs(scheduler)
+        state_key = self._state_key(scheduler, request)
+        assert req_status.retained_keys == ((state_key,) if retain else ())
+
+        # Another conversation fills the tier while "A" decodes.
+        other = self._new_request(scheduler, "B", self.PROMPT_TOKENS)
+        self._prefill(scheduler, other, first_block_id=20)
+        self._complete_jobs(scheduler)
+        assert scheduler.manager.lookup(state_key, req_status.req_context) is (
+            LookupResult.HIT if retain else LookupResult.MISS
+        )
+
+        meta = self._finish(scheduler, request, RequestStatus.FINISHED_STOPPED)
+        self._complete_jobs(scheduler)
+        stored_block_ids = {
+            block_id
+            for job in meta.store_jobs.values()
+            for block_id in job.src_spec.block_ids.tolist()
+        }
+        if retain:
+            # The attention chunks evicted during the run are stored again
+            # from their GPU blocks, and the state is released.
+            assert stored_block_ids == set(range(1, 8))
+            chunk = scheduler.manager._policy.get(state_key)
+            assert chunk is not None and chunk.ref_cnt == 0
+            stats = scheduler.get_stats()
+            assert stats is not None
+            values = stats.data["data"]
+            assert values[_ConnectorMetricName.RETENTION_STATES][()] == 2  # A, B
+            assert values[_ConnectorMetricName.RETENTION_FINISHED_REQUESTS] == {
+                ("full",): 1
+            }
+            assert values[_ConnectorMetricName.RETENTION_RESTORED_CHUNKS][()] == 7
+        else:
+            assert stored_block_ids == set()
+        assert self._next_turn_hit_tokens(scheduler) == (
+            self.MAMBA_BLOCK if retain else 0
+        )
+
+    def test_deeper_state_replaces_the_retained_one(self):
+        scheduler = self._make_cpu_tier_scheduler(retain=True, num_chunks=16)
+        request = self._new_request(scheduler, "C", 40)
+        self._prefill(scheduler, request, first_block_id=1, state_boundaries=(16,))
+        self._complete_jobs(scheduler)
+        shallow = self._state_key(scheduler, request, chunk_idx=0)
+        req_status = scheduler._req_status["C"]
+        assert req_status.retained_keys == (shallow,)
+
+        self._prefill(scheduler, request, first_block_id=1, state_boundaries=(32,))
+        self._complete_jobs(scheduler)
+        deep = self._state_key(scheduler, request, chunk_idx=1)
+        assert (req_status.retained_keys, req_status.retained_boundary) == (
+            (deep,),
+            32,
+        )
+        chunk = scheduler.manager._policy.get(shallow)
+        assert chunk is not None and chunk.ref_cnt == 0
+
+    @pytest.mark.parametrize("from_gpu_cache", [False, True])
+    def test_resumed_state_is_retained(self, from_gpu_cache: bool):
+        scheduler = self._make_cpu_tier_scheduler(retain=True, num_chunks=16)
+        request = self._new_request(scheduler, "A", self.PROMPT_TOKENS)
+        self._prefill(scheduler, request, first_block_id=1)
+        self._complete_jobs(scheduler)
+        state_key = self._state_key(scheduler, request)
+        self._finish(scheduler, request, RequestStatus.FINISHED_STOPPED)
+        self._complete_jobs(scheduler)
+
+        # The next turn adds less than a recurrent block, so the state it
+        # resumes from is the deepest one its prompt reaches. It either loads
+        # that state from the tier or resumes from the GPU prefix cache.
+        next_turn = self._new_request(scheduler, "A2", self.PROMPT_TOKENS + 2)
+        num_hit_tokens, _ = scheduler.get_num_new_matched_tokens(
+            next_turn, self.MAMBA_BLOCK if from_gpu_cache else 0
+        )
+        assert num_hit_tokens == (0 if from_gpu_cache else self.MAMBA_BLOCK)
+        blocks = (
+            KVCacheBlocks(([], []))
+            if from_gpu_cache
+            else KVCacheBlocks(
+                ([KVCacheBlock(50 + i) for i in range(4)], [KVCacheBlock(60)])
+            )
+        )
+        scheduler.update_state_after_alloc(
+            next_turn, blocks, num_external_tokens=num_hit_tokens
+        )
+        assert scheduler._req_status["A2"].retained_keys == (state_key,)
+        self._complete_jobs(scheduler)
+        chunk = scheduler.manager._policy.get(state_key)
+        assert chunk is not None and chunk.ref_cnt == 1
+
+    def test_aborted_request_releases_but_is_not_reoffered(self):
+        scheduler = self._make_cpu_tier_scheduler(retain=True)
+        request = self._new_request(scheduler, "A", self.PROMPT_TOKENS)
+        self._prefill(scheduler, request, first_block_id=1)
+        self._complete_jobs(scheduler)
+        state_key = self._state_key(scheduler, request)
+        # Another conversation evicts A's attention chunks, so re-offering them
+        # would store them again.
+        other = self._new_request(scheduler, "B", self.PROMPT_TOKENS)
+        self._prefill(scheduler, other, first_block_id=20)
+        self._complete_jobs(scheduler)
+
+        meta = self._finish(scheduler, request, RequestStatus.FINISHED_ABORTED)
+        assert meta.store_jobs == {}
+        chunk = scheduler.manager._policy.get(state_key)
+        assert chunk is not None and chunk.ref_cnt == 0
+
+    def test_reset_cache_drops_retained_state(self):
+        scheduler = self._make_cpu_tier_scheduler(retain=True)
+        request = self._new_request(scheduler, "A", self.PROMPT_TOKENS)
+        self._prefill(scheduler, request, first_block_id=1)
+        self._complete_jobs(scheduler)
+        req_status = scheduler._req_status["A"]
+        assert req_status.retained_keys
+
+        scheduler.reset_cache()
+        assert req_status.retained_keys == ()
+        # Finishing after the reset must not release chunks it no longer holds.
+        self._finish(scheduler, request, RequestStatus.FINISHED_STOPPED)
