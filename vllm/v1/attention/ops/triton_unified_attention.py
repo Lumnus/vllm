@@ -1198,11 +1198,11 @@ def unified_attention(
     # and pitch and return wrong data otherwise (measured on B70: cos 0.22
     # against an fp32 reference, 0.9998 with the pointer path).  Use the
     # pointer path for K/V loads in these modes; Q/O descriptors stay.
-    # B70_PTH_TD_GUARD=0 restores the old behaviour (A/B only).
+    # Off by default on this line; B70_PTH_TD_GUARD=1 turns the guard on.
     if (
         use_td
         and kv_quant_mode.is_per_token_head
-        and os.environ.get("B70_PTH_TD_GUARD", "1") != "0"
+        and os.environ.get("B70_PTH_TD_GUARD", "0") == "1"
     ):
         use_td = False
         global _B70_PTH_TD_LOGGED

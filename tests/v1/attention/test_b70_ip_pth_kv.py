@@ -3,7 +3,7 @@
 
 K1: unified_attention launches the kernel with USE_TD=False for per-token-head
     KV (inline fp32 scales make the K/V pitch unaligned for Xe2 2D block
-    reads), unless B70_PTH_TD_GUARD=0.
+    reads), when B70_PTH_TD_GUARD=1.
 K2: building the scale views does not write the cache (hybrid models share the
     pages with GDN state; vllm#63944).
 """
@@ -25,6 +25,8 @@ def test_scale_views_leave_cache_bytes_unchanged():
     impl._k_scale_cache = None
     impl._v_scale_cache = None
     impl._kv_quant_mode = KVQuantMode.INT8_PER_TOKEN_HEAD
+    impl.head_size = hs
+    impl._set_kv_ptr_range = False
     impl._ensure_scale_caches(cache)
     assert torch.equal(cache, before)
     # the views address the inline scale bytes
@@ -53,7 +55,9 @@ def _call(monkeypatch, mode, use_td):
     monkeypatch.setattr(ua, "kernel_unified_attention", fake)
     # With no device, vllm.triton_utils hands out a placeholder module.
     monkeypatch.setattr(
-        ua.triton, "next_power_of_2", lambda n: 1 << (n - 1).bit_length(),
+        ua.triton,
+        "next_power_of_2",
+        lambda n: 1 << (n - 1).bit_length(),
         raising=False,
     )
     monkeypatch.setattr(ua.triton, "cdiv", lambda a, b: -(-a // b), raising=False)
@@ -65,26 +69,39 @@ def _call(monkeypatch, mode, use_td):
     scale = torch.ones(8, bs, nkv) if pth else None
     one = torch.ones(1)
     ua.unified_attention(
-        q=q, k=kv[..., :hs], v=kv[..., :hs], out=torch.empty_like(q),
-        cu_seqlens_q=torch.tensor([0, 3], dtype=torch.int32), max_seqlen_q=3,
-        seqused_k=torch.tensor([3], dtype=torch.int32), max_seqlen_k=3,
-        softmax_scale=0.125, causal=True, alibi_slopes=None,
-        window_size=(-1, -1), block_table=torch.zeros(1, 1, dtype=torch.int32),
-        softcap=0, q_descale=None, k_descale=one.expand(1, nkv),
-        v_descale=one.expand(1, nkv), kv_quant_mode=mode,
-        k_scale_cache=scale, v_scale_cache=scale, use_td=use_td,
+        q=q,
+        k=kv[..., :hs],
+        v=kv[..., :hs],
+        out=torch.empty_like(q),
+        cu_seqlens_q=torch.tensor([0, 3], dtype=torch.int32),
+        max_seqlen_q=3,
+        seqused_k=torch.tensor([3], dtype=torch.int32),
+        max_seqlen_k=3,
+        softmax_scale=0.125,
+        causal=True,
+        alibi_slopes=None,
+        window_size=(-1, -1),
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        softcap=0,
+        q_descale=None,
+        k_descale=one.expand(1, nkv),
+        v_descale=one.expand(1, nkv),
+        kv_quant_mode=mode,
+        k_scale_cache=scale,
+        v_scale_cache=scale,
+        use_td=use_td,
     )
     return fake.kwargs
 
 
-@pytest.mark.parametrize("guard", [None, "0"])
+@pytest.mark.parametrize("guard", [None, "0", "1"])
 def test_td_guard_per_token_head(monkeypatch, guard):
     if guard is None:
         monkeypatch.delenv("B70_PTH_TD_GUARD", raising=False)
     else:
         monkeypatch.setenv("B70_PTH_TD_GUARD", guard)
     kw = _call(monkeypatch, KVQuantMode.INT8_PER_TOKEN_HEAD, use_td=True)
-    assert kw["USE_TD"] is (guard == "0")
+    assert kw["USE_TD"] is (guard != "1")
 
 
 def test_td_untouched_without_per_token_head(monkeypatch):
