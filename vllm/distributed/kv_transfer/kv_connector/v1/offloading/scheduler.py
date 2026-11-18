@@ -156,6 +156,24 @@ def resolve_mamba_align_size(
     return mamba_align_size
 
 
+def b70_partial_tail_chunks() -> bool:
+    """B70_OFFLOAD_PARTIAL_TAIL_CHUNKS=1 (opt-in, default off; vllm#58413):
+    partial tails also for blocks_per_chunk > 1. Unset, partial tails need
+    one block per chunk, as on the previous line; with one block per chunk
+    the generalised lookup and store reduce to the previous arithmetic."""
+    import os
+
+    enabled = os.environ.get(
+        "B70_OFFLOAD_PARTIAL_TAIL_CHUNKS", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    if enabled:
+        logger.info_once(
+            "B70_OFFLOAD_PARTIAL_TAIL_CHUNKS=1: offload partial tails also "
+            "for blocks_per_chunk > 1 (vllm#58413)"
+        )
+    return enabled
+
+
 class SchedulerOffloadConfig(NamedTuple):
     kv_group_configs: tuple[GroupOffloadConfig, ...]
     blocks_per_chunk: int
@@ -282,7 +300,8 @@ class SchedulerOffloadConfig(NamedTuple):
         # partial tail at a proof position past the boundary. DCP needs
         # additional hand-off semantics.
         supports_partial_tail = (
-            len(group_block_sizes) == 1
+            (spec.blocks_per_chunk == 1 or b70_partial_tail_chunks())
+            and len(group_block_sizes) == 1
             and has_partial_recurrent_group
             and all(
                 config.sliding_window_size_in_chunks is None

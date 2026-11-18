@@ -7113,6 +7113,12 @@ def test_lookahead_partial_store_uses_checkpoint_hash(lookahead):
     )
 
 
+@pytest.fixture
+def _b70_partial_tail_chunks(monkeypatch):
+    # vllm#58413 rides this line behind B70_OFFLOAD_PARTIAL_TAIL_CHUNKS.
+    monkeypatch.setenv("B70_OFFLOAD_PARTIAL_TAIL_CHUNKS", "1")
+
+
 def _make_multi_block_chunk_scheduler(
     blocks_per_chunk: int = 4,
 ) -> OffloadingConnectorScheduler:
@@ -7152,6 +7158,7 @@ def _make_multi_block_chunk_request(
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("_b70_partial_tail_chunks")
 def test_multi_block_chunk_hybrid_supports_partial_tail():
     scheduler = _make_multi_block_chunk_scheduler()
     full, mamba = scheduler.config.kv_group_configs
@@ -7173,6 +7180,7 @@ def test_multi_block_chunk_hybrid_supports_partial_tail():
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("_b70_partial_tail_chunks")
 def test_off_chunk_grid_mamba_handoff_is_stored():
     """The final mamba hand-off under MTP/EAGLE prefill lookahead is
     hash-aligned but off the blocks_per_chunk grid (48 here vs the 64-token
@@ -7222,6 +7230,7 @@ def test_off_chunk_grid_mamba_handoff_is_stored():
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("_b70_partial_tail_chunks")
 def test_update_state_after_alloc_loads_confirmed_multi_block_tail():
     """The load must slice each group's keys with the group's own chunk
     geometry and place a confirmed tail at its in-chunk block position, so
@@ -7271,6 +7280,7 @@ def test_update_state_after_alloc_loads_confirmed_multi_block_tail():
 
 
 @pytest.mark.cpu_test
+@pytest.mark.usefixtures("_b70_partial_tail_chunks")
 def test_partial_lookup_serves_off_chunk_grid_handoff():
     """End-to-end lookup: with only a hash-aligned mamba hand-off stored
     (176 = 16 x 11, off the 64-token chunk grid) and full-attention chunks
