@@ -124,6 +124,11 @@ class TritonInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if x.dim() > 2:
+            # The GEMM ops take [M, K] rows: fold the leading dims (the MTP fc
+            # stage hands fc_hidden a [T, hc, K] activation) and restore them.
+            out = self.apply_weights(layer, x.reshape(-1, x.shape[-1]), bias)
+            return out.view(*x.shape[:-1], out.shape[-1])
         w_q, w_s, i_s, i_zp, azp_adj = self._get_layer_params(layer)
 
         symmetric = azp_adj is None
