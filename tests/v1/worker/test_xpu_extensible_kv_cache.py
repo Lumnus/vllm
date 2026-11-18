@@ -386,6 +386,9 @@ def test_margin_constants_follow_the_platform(monkeypatch, platform):
     reserve_bytes = (2 if platform == "rocm" else 1) << 29
     assert reserve_bytes == module.KV_CACHE_NON_TORCH_RESERVE_BYTES
     assert module.KV_CACHE_WARMUP_RESERVE_FRACTION == 0.1
+    # XPU keeps the allocated peak, not the torch reservation growth.
+    assert module.KV_CACHE_KEEP_RESERVE_GROWTH is (platform != "xpu")
+    assert defaults["keep_reserve_growth"] is (platform != "xpu")
 
 
 @pytest.mark.parametrize("platform", list(PLATFORM_MARGINS))
@@ -439,6 +442,38 @@ def test_xpu_margin_gives_the_larger_cache(monkeypatch):
     assert sizes["xpu"] > sizes["cuda"] > sizes["rocm"]
     # The transient peak is still kept free in full on XPU.
     assert sizes["xpu"] <= int(28.18 * gib) - kwargs["transient_peak_bytes"]
+
+
+@pytest.mark.parametrize("platform", list(PLATFORM_MARGINS))
+def test_reserve_growth_at_the_card_log_numbers(monkeypatch, platform):
+    """Rank 0 of the D16Di boot on four Arc Pro B70 cards: 7.28 GiB free,
+    nothing committed, 1.63 GiB allocated at peak, 1.93 GiB of torch
+    reservation growth, 30.3 GiB requested, 28.64 GiB free at init."""
+    module = _import_with_platform(
+        monkeypatch, rocm=platform == "rocm", xpu=platform == "xpu"
+    )
+    gib = 1 << 30
+    peak, growth = int(1.63 * gib), int(1.93 * gib)
+    kwargs = dict(
+        init_free_memory=int(28.64 * gib),
+        free_memory=int(7.28 * gib),
+        committed_bytes=0,
+        requested_memory=int(30.3 * gib),
+        transient_peak_bytes=peak,
+    )
+    without = module.measure_kv_cache_bytes(**kwargs)
+    result = module.measure_kv_cache_bytes(**kwargs, torch_reserve_growth_bytes=growth)
+    if platform == "xpu":
+        # The growth above the peak does not reduce the cache.
+        assert result == without == int(7.28 * gib) - peak
+        assert module.kept_transient_bytes(peak, growth) == peak
+    else:
+        assert without - result == growth - peak
+        assert module.kept_transient_bytes(peak, growth) == growth
+    # Explicitly either way, on every platform.
+    assert module.kept_transient_bytes(peak, growth, False) == peak
+    assert module.kept_transient_bytes(peak, growth, True) == growth
+    assert module.kept_transient_bytes(growth, peak, True) == growth
 
 
 @pytest.mark.parametrize("requested", [None, True, False])
