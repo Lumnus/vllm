@@ -48,6 +48,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             "activations declared by the checkpoint) on XPU: WNA16 weights with "
             "%s activations.",
             "the user's override of the" if user_set else "int8 per-token",
+            scope="process",
         )
         with layer_target_spec_scope(spec) if spec is not None else nullcontext():
             return CompressedTensorsWNA16MoEMethod(

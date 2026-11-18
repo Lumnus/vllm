@@ -914,7 +914,8 @@ class HyperConnection(nn.Module):
             )
         logger.info_once(
             "XPU HC down projection: INT8 W8A8 (per-token int8 activations, "
-            "exact int32 accumulation)."
+            "exact int32 accumulation).",
+            scope="process",
         )
         # The INT8 linear kernels keep the weight as a [K, N] view of [N, K] rows.
         weight = layer.weight

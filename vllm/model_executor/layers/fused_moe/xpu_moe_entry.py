@@ -292,6 +292,7 @@ class EntryPlan:
                     if self.fold_module is not None
                     else ""
                 ),
+                scope="process",
             )
 
 
@@ -495,6 +496,7 @@ def resolve(runner, force_platform: bool = False) -> EntryPlan | None:
         )
         or "nothing applies",
         (". Not applied: " + "; ".join(why)) if why else "",
+        scope="process",
     )
     return plan if plan.active else None
 
@@ -575,12 +577,14 @@ def topk_route(
                     " and the unowned sentinel"
                     if router._xpu_ids_sentinel() is not None
                     else "",
+                    scope="process",
                 )
             else:
                 logger.warning_once(
                     "VLLM_XPU_MOE_TOPK_ROUTE=1, but %s: top-k and the EPLB "
                     "mapping run as before.",
                     why,
+                    scope="process",
                 )
     if why is not None:
         return None

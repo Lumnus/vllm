@@ -412,6 +412,7 @@ class XPUInt8ScaledMMLinearKernel(TritonInt8ScaledMMLinearKernel):
         logger.info_once(
             "XPU INT8 GEMM: oneDNN above %d rows, Triton at or below.",
             XPU_INT8_ONEDNN_MIN_ROWS,
+            scope="process",
         )
 
     def apply_weights(

@@ -1015,7 +1015,8 @@ def fa_meta_cache() -> dict | None:
     if not getattr(fai, "SPEC_DECODE_META_CACHE", False):
         logger.warning_once(
             "VLLM_XPU_ATTN_META_ONCE=1, but this vllm-xpu-kernels has no "
-            "per-forward spec-decode metadata cache; each layer builds it."
+            "per-forward spec-decode metadata cache; each layer builds it.",
+            scope="process",
         )
         return None
     from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -1030,7 +1031,8 @@ def fa_meta_cache() -> dict | None:
         logger.info_once(
             "XPU attention (VLLM_XPU_ATTN_META_ONCE=1): the spec-decode "
             "metadata is built once per forward and shared by the layers "
-            "that pass the same query starts, KV lengths and block table."
+            "that pass the same query starts, KV lengths and block table.",
+            scope="process",
         )
     return cache
 

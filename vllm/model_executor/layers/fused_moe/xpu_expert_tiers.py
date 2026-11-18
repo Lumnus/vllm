@@ -190,7 +190,8 @@ def selects_expert_tiers(offload_config: "OffloadConfig") -> bool:
     if uva.cpu_offload_per_expert and not current_platform.is_xpu():
         logger.warning_once(
             "--cpu-offload-per-expert is supported on XPU only; offloading "
-            "parameters in module order"
+            "parameters in module order",
+            scope="process",
         )
     return bool(selected)
 
