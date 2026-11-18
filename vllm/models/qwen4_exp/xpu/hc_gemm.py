@@ -166,6 +166,7 @@ def parallel_hc_gemm_silu(
 # lora, the per-token rule of vllm-xpu-kernels' int8_quant_math.h written out
 # step for step (it is the rule of ``xpu_ops.dynamic_per_token_int8_quant_ref``):
 #   scale = bf16_rne(max(absmax / 127, 1e-5))   IEEE division, RNE in integers
+#                                               (the division itself in integers too)
 #   q     = clamp(round_half_even(x / scale), -128, 127)
 # The rounding does not trust the quotient at a tie. The native kernel's note:
 # on Xe2 quotients that are exactly q + 0.5 came out just under it, which is
@@ -175,8 +176,52 @@ def parallel_hc_gemm_silu(
 
 
 @triton.jit
+def _ieee_over_127(amax):
+    """IEEE ``amax / 127`` (round to nearest even) for a non-negative bf16 value
+    ``amax`` held in fp32, in integer arithmetic; the same form as the HC down
+    fold's ``_ieee_127_over``.
+
+    ``tl.div_rn`` is not correctly rounded on the XPU backend: its quotient
+    reaches the SPIR-V as a plain ``OpFDiv`` (no rounding-mode decoration, no
+    ``-cl-fp32-correctly-rounded-divide-sqrt`` on a non-LTS driver), which IGC
+    compiles to its default fp32 division. A bf16 amax has an 8-bit
+    significand ``M`` (amax = M * 2**ea), so the quotient is
+    ``(M * 2**40 // 127) * 2**(ea - 40)``: one exact int64 division, the
+    rounding done on the integer quotient with the remainder as sticky bit,
+    and the fp32 bits assembled by hand. A quotient below the fp32 normal range
+    (amax under 1.5e-36) returns 0, which the caller's 1e-5 floor replaces
+    either way. inf and NaN come back unchanged, as IEEE division gives them."""
+    m = (amax.to(tl.int32, bitcast=True) >> 16).to(tl.int64) & 0x7FFF
+    e = m >> 7
+    f = m & 0x7F
+    sig = tl.where(e == 0, f, f + 128)
+    ea = tl.where(e == 0, -133, e - 134)
+    sig = tl.where(sig == 0, 1, sig)
+    num = sig << 40
+    quo = num // 127
+    rem = num - quo * 127
+    # quo is in [2**33, 2**42): its bit length.
+    nbits = tl.full([], 33, tl.int64)
+    for k in tl.static_range(33, 42):
+        nbits += (quo >= (tl.full([], 1, tl.int64) << k)).to(tl.int64)
+    shift = nbits - 24
+    mant = quo >> shift
+    low = quo - (mant << shift)
+    half = tl.full([], 1, tl.int64) << (shift - 1)
+    up = (low > half) | ((low == half) & ((rem != 0) | ((mant & 1) == 1)))
+    mant += up.to(tl.int64)
+    carry = mant >> 24
+    mant = mant >> carry
+    expo = nbits + carry - 1 + ea - 40 + 127
+    bits = tl.where(expo >= 1, (expo << 23) | (mant - (1 << 23)), 0)
+    quotient = bits.to(tl.int32).to(tl.float32, bitcast=True)
+    quotient = tl.where(m == 0, 0.0, quotient)
+    return tl.where(e == 255, amax, quotient)
+
+
+@triton.jit
 def _i8_scale_bf16(amax):
-    s = tl.div_rn(amax, 127.0)
+    s = _ieee_over_127(amax)
     # torch.clamp(min=1e-5) keeps NaN; (NaN < 1e-5) is False, so does this.
     s = tl.where(s < 1e-5, 1e-5, s)
     u = s.to(tl.uint32, bitcast=True)
