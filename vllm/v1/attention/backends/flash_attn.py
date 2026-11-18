@@ -1302,6 +1302,7 @@ class FlashAttentionImpl(AttentionImpl):
                     4: "Q.K int8 x int8 -> int32, P.V BF16",
                     5: "Q.K int8 x int8 -> int32, P.V int8 x int8 -> int32",
                 }[mode],
+                scope="process",
             )
         elif mode:
             logger.info_once(
@@ -1313,6 +1314,7 @@ class FlashAttentionImpl(AttentionImpl):
                 decode_remark,
                 setting,
                 "int8 x int8 -> int32" if mode == 2 else "BF16",
+                scope="process",
             )
         else:
             logger.info_once(
@@ -1322,6 +1324,7 @@ class FlashAttentionImpl(AttentionImpl):
                 int8_kv.decode_max_query_len(),
                 decode_remark,
                 self._int8_kv_scratch_dtype,
+                scope="process",
             )
 
     def _int8_kv_prefill_scratch(

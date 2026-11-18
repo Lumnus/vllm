@@ -1466,7 +1466,8 @@ class CpuExpertRuntime:
                 "kernel's arithmetic per call instead (cpu_arith fast, within the "
                 "floor): a small "
                 "share of an expert's values differ from the card's in the last "
-                "bit, so a tier move can change outputs."
+                "bit, so a tier move can change outputs.",
+                scope="process",
             )
             return
         table = capture_card_silu_table()

@@ -611,7 +611,8 @@ def ep_ids_contract_for(moe_config: FusedMoEConfig) -> EPIdsContract:
         logger.info_once(
             "XPU MoE expert parallelism with EPLB: the fused MoE filters "
             "unowned ids and clears its expert counts; no sentinel kernel "
-            "(VLLM_XPU_MOE_EPLB_OP_IDS=1)."
+            "(VLLM_XPU_MOE_EPLB_OP_IDS=1).",
+            scope="process",
         )
         return contract
     logger.info_once(
@@ -625,6 +626,7 @@ def ep_ids_contract_for(moe_config: FusedMoEConfig) -> EPIdsContract:
             "no ids_valid / rows_per_expert; the fused MoE keeps its padding-row "
             "mask",
         }[contract],
+        scope="process",
     )
     return contract
 
@@ -920,7 +922,8 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             logger.info_once(
                 "XPU MoE routing (VLLM_XPU_MOE_ROUTE_FUSED=1): the EPLB mapping "
                 "kernel writes the unowned sentinel for unrouted ids; no "
-                "sentinel kernel per layer."
+                "sentinel kernel per layer.",
+                scope="process",
             )
             return True
         logger.warning_once(
@@ -928,6 +931,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             "the routed ids arrived without the router's sentinel mark"
             if not marked
             else "this vllm-xpu-kernels does not clear rows_per_expert itself",
+            scope="process",
         )
         return False
 
@@ -949,6 +953,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
             else "Per-expert outputs exchanged between the expert-parallel "
             "ranks and summed once in top-k order: independent of the rank "
             "and tier of every expert.",
+            scope="process",
         )
         return mode
 
@@ -987,12 +992,14 @@ class XPUExperts(mk.FusedMoEExpertsModular):
                 "per tier (%s), so a token's result depends on which tier holds "
                 "each of its experts.",
                 why,
+                scope="process",
             )
             return "split"
         logger.info_once(
             "XPU MoE with experts computed on the CPU: one sum per rank over "
             "the card's, the pinned rows' and the CPU's experts, in top-k order "
-            "(VLLM_XPU_MOE_COMBINE unset; =split keeps the per-tier sums)."
+            "(VLLM_XPU_MOE_COMBINE unset; =split keeps the per-tier sums).",
+            scope="process",
         )
         return "rank"
 
@@ -1354,12 +1361,17 @@ class XPUExpertsW4A8Int(XPUExpertsWNA16):
         if reason is None:
             logger.info_once(
                 "XPU MoE W4A8: int4 g128 experts with dynamic per-token int8 "
-                "activations (s8 x s4 grouped GEMM)."
+                "activations (s8 x s4 grouped GEMM).",
+                scope="process",
             )
-            logger.info_once("XPU MoE W4A8 prep around the GEMMs: %s.", w4a8_prep())
+            logger.info_once(
+                "XPU MoE W4A8 prep around the GEMMs: %s.", w4a8_prep(), scope="process"
+            )
         else:
             logger.warning_once(
-                "XPU MoE W4A8 requested, but %s: this layer keeps W4A16.", reason
+                "XPU MoE W4A8 requested, but %s: this layer keeps W4A16.",
+                reason,
+                scope="process",
             )
 
 
