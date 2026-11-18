@@ -70,13 +70,19 @@ def _onednn_lib(counts):
     """A CPU stand-in for vllm-xpu-kernels' oneDNN INT8 GEMM (the route above
     VLLM_XPU_INT8_ONEDNN_MIN_ROWS): the exact int32 dot, then the product of
     the two fp32 scales applied once (one order oneDNN may use; Triton's is
-    (scale_a * acc) * scale_b), rounded to the output dtype."""
-    lib = torch.library.Library("_xpu_C", "FRAGMENT")
-    lib.define(
-        "int8_gemm_w8a8(Tensor x, Tensor x_scale, Tensor? x_zp, Tensor w, "
-        "Tensor w_scale, Tensor? w_zp, int group_size, Tensor? bias, "
-        "ScalarType out_dtype) -> Tensor"
-    )
+    (scale_a * acc) * scale_b), rounded to the output dtype.
+
+    When an installed vllm-xpu-kernels wheel already registers the op, its
+    schema stands and only the CPU kernel is added to it (a second definition
+    is a registration error)."""
+    registered = hasattr(torch.ops._xpu_C, "int8_gemm_w8a8")
+    lib = torch.library.Library("_xpu_C", "IMPL" if registered else "FRAGMENT")
+    if not registered:
+        lib.define(
+            "int8_gemm_w8a8(Tensor x, Tensor x_scale, Tensor? x_zp, Tensor w, "
+            "Tensor w_scale, Tensor? w_zp, int group_size, Tensor? bias, "
+            "ScalarType out_dtype) -> Tensor"
+        )
 
     def impl(x, xs, xz, w, ws, wz, group, bias, out_dtype):
         counts["onednn"] += 1
