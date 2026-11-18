@@ -1037,6 +1037,72 @@ def fa_meta_cache() -> dict | None:
     return cache
 
 
+_XPU_NUM_XE_CORES: dict[int, int] = {}
+
+
+def _xpu_num_xe_cores(device: torch.device) -> int:
+    """Number of Xe cores (= subslices) of an XPU device, cached; 0 if unknown.
+
+    torch exposes it as ``gpu_subslice_count`` (32 on Arc Pro B70). Note that
+    vllm_xpu_kernels' ``_infer_num_xe_cores`` looks for gpu_slices /
+    subslices_per_slice, which torch 2.14 does not expose, and falls back to
+    20 there.
+    """
+    idx = device.index if device.index is not None else torch.xpu.current_device()
+    n = _XPU_NUM_XE_CORES.get(idx)
+    if n is None:
+        try:
+            props = torch.xpu.get_device_properties(idx)
+            n = int(getattr(props, "gpu_subslice_count", 0) or 0)
+        except Exception:
+            n = 0
+        _XPU_NUM_XE_CORES[idx] = n
+    return n
+
+
+def _xpu_stream_capturing() -> bool:
+    is_capturing = getattr(torch.xpu, "is_current_stream_capturing", None)
+    return bool(is_capturing()) if is_capturing is not None else False
+
+
+def _graph_decode_num_kv_splits(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+    block_table: torch.Tensor | None,
+    seqused_k: torch.Tensor | None,
+    window_size: tuple[int, int],
+) -> int | None:
+    """Split-K count for paged decode while an XPU graph is being captured.
+
+    Without an explicit count the vllm-xpu-kernels op derives num_kv_splits on
+    the host from max_seqlen_k, which is max_model_len at capture time, and
+    the graph then replays that long-context split count at every real
+    context length (1.1-2.2x slower decode attention at short/medium ctx on
+    B70). A fixed count of num_xe_cores / (batch * num_kv_heads), i.e. one
+    decode work-group per Xe core, was the best context-independent choice
+    in a B70 sweep (ctx 2K-32K, Hkv 2/4/8, batch 1-8). It is only used when
+    batch * num_kv_heads <= num_xe_cores; larger batches keep the kernel's
+    heuristic (a single split there measured up to 35% slower). Eager calls
+    and sliding-window layers (whose split count already comes from the
+    window, not max_model_len) are not affected.
+    """
+    if (
+        max_seqlen_q != 1
+        or block_table is None
+        or seqused_k is None
+        or window_size != (-1, -1)
+        or not _xpu_stream_capturing()
+    ):
+        return None
+    num_xe_cores = _xpu_num_xe_cores(q.device)
+    wgs_per_split = (cu_seqlens_q.numel() - 1) * k.size(2)
+    if num_xe_cores <= 0 or wgs_per_split <= 0 or wgs_per_split > num_xe_cores:
+        return None
+    return min(32, num_xe_cores // wgs_per_split)
+
+
 class xpu_ops:
     @staticmethod
     def dynamic_per_token_int8_quant(
@@ -1146,12 +1212,24 @@ class xpu_ops:
             assert len(window_size) == 2
             real_window_size = (window_size[0], window_size[1])  # noqa: F841
 
+        # An explicit caller count wins over the capture-time pick.
+        num_splits_kv = num_splits if num_splits > 0 else None
+        if num_splits_kv is None:
+            num_splits_kv = _graph_decode_num_kv_splits(
+                q,
+                k,
+                cu_seqlens_q,
+                max_seqlen_q,
+                block_table,
+                seqused_k,
+                real_window_size,
+            )
         return flash_attn_varlen_func(
             out=out,
             q=q,
             k=k,
             v=v,
-            num_splits_kv=num_splits if num_splits > 0 else None,
+            num_splits_kv=num_splits_kv,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seqused_k=seqused_k,
