@@ -134,7 +134,9 @@ def test_auto_off_logs_id_rule_role_no_text(lines):
     b70_cjk.chat_extra_args({}, USER_HAN, None, "req-1")
     assert len(lines) == 1
     assert (
-        "req-1" in lines[0] and "rule=auto-han" in lines[0] and "role=user" in lines[0]
+        "req-1" in lines[0]
+        and "rule=auto-latest-user-han" in lines[0]
+        and "role=user" in lines[0]
     )
     assert "服" not in lines[0] and "напомни" not in lines[0]
 
