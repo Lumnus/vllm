@@ -163,7 +163,7 @@ def apply(app_state: Any, args: dict[str, Any]) -> dict[str, Any]:
     for key, value in args.items():
         if key == CJK_KEY:
             old = b70_cjk.default_mode()
-            new = "auto" if value is None else value
+            new = b70_cjk.start_default_mode() if value is None else value
             b70_cjk.set_default_mode(new)
             if old != new:
                 changes[key] = [old, new]

@@ -794,7 +794,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if b70_cjk.enabled():  # B70-CJK: per-request Han-mask gate
             try:
                 extra_args = b70_cjk.chat_extra_args(
-                    extra_args, self.messages, self.model_extra
+                    extra_args, self.messages, self.model_extra, self.request_id
                 )
             except ValueError as e:
                 raise VLLMValidationError(str(e), parameter=b70_cjk.XARG) from e
