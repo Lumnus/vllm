@@ -13,6 +13,18 @@ Per-request gate. The mask is ON for a request unless
      does not switch the mask off); for other endpoints, the prompt tokens.
 The decision lands in ``SamplingParams.extra_args["cjk_mask"]`` as a bool.
 
+Server default. A chat request without an explicit flag follows the server
+default: "auto" (the rule above), "on" (always masked) or "off". It starts at
+``B70_CJK_MASK_DEFAULT`` (auto when unset or invalid) and the runtime control
+surface changes it live. Agent clients inject recalled memories into the user
+turn, and a memory that quotes Han switches "auto" off for that request, so
+serving definitions set "on".
+
+Decision log. A request whose mask is off (explicit flag, server default off,
+or Han found by the auto rule) logs one INFO line: request id, rule, role.
+Never the text. The lines are rate-limited; the excess is counted and the next
+window opens with a summary line.
+
 Vocabulary mask. A token is masked when
   1. its byte-level text contains a Han code point (U+3400-4DBF, U+4E00-9FFF,
      U+F900-FAFF), or
@@ -34,10 +46,17 @@ from __future__ import annotations
 import contextlib
 import os
 import re
-from collections.abc import Iterable, Mapping
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 ENV = "B70_CJK_MASK"
+ENV_DEFAULT = "B70_CJK_MASK_DEFAULT"
 XARG = "cjk_mask"
 
 HAN_RANGES = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF))
@@ -58,7 +77,30 @@ def enabled() -> bool:
 # prompt has Han), "on" or "off". This process's value; the runtime control
 # surface changes it (`defaults.set {"cjk_mask_default": ...}`).
 DEFAULT_MODES = ("auto", "on", "off")
-_DEFAULT_MODE = "auto"
+
+
+def default_from_env(environ: Mapping[str, str] | None = None) -> str:
+    """Startup default from ``B70_CJK_MASK_DEFAULT``; "auto" when unset, and
+    (with a warning) when not one of DEFAULT_MODES."""
+    raw = (os.environ if environ is None else environ).get(ENV_DEFAULT)
+    if raw is None or not raw.strip():
+        return "auto"
+    mode = raw.strip().lower()
+    if mode in DEFAULT_MODES:
+        return mode
+    logger.warning(
+        "%s=%r is not one of %s; using 'auto'", ENV_DEFAULT, raw[:32], DEFAULT_MODES
+    )
+    return "auto"
+
+
+_START_MODE = default_from_env()
+_DEFAULT_MODE = _START_MODE
+
+
+def start_default_mode() -> str:
+    """The default this process started with (what ``null`` resets to)."""
+    return _START_MODE
 
 
 def default_mode() -> str:
@@ -116,33 +158,106 @@ def _content_texts(content: Any) -> Iterable[str]:
                     yield text
 
 
-def messages_have_han(messages: Iterable[Any], roles=_PROMPT_ROLES) -> bool:
-    """Han in the text of the system / developer / user turns."""
+def han_roles(messages: Iterable[Any], roles=_PROMPT_ROLES) -> tuple[str, ...]:
+    """Roles (system / developer / user, in order of first sight) whose text
+    carries Han."""
+    found: list[str] = []
     for msg in messages:
         if isinstance(msg, Mapping):
             role, content = msg.get("role"), msg.get("content")
         else:
             role, content = getattr(msg, "role", None), getattr(msg, "content", None)
-        if role not in roles:
+        if role not in roles or role in found:
             continue
         if any(has_han(t) for t in _content_texts(content)):
-            return True
-    return False
+            found.append(role)
+    return tuple(found)
+
+
+def messages_have_han(messages: Iterable[Any], roles=_PROMPT_ROLES) -> bool:
+    """Han in the text of the system / developer / user turns."""
+    return bool(han_roles(messages, roles))
+
+
+class OffLog:
+    """INFO lines for requests whose mask is off, rate-limited.
+
+    At most ``burst`` per-request lines per ``window`` seconds; the excess is
+    counted by rule, and the first off-request of the next window logs one
+    summary line (this window's excess plus the totals since start). Nothing
+    but the request id, the rule and the role is ever logged: no prompt text.
+    """
+
+    def __init__(
+        self,
+        burst: int = 5,
+        window: float = 10.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.burst, self.window, self.clock = burst, window, clock
+        self._lock = threading.Lock()
+        self._start: float | None = None
+        self._emitted = 0
+        self.suppressed: dict[str, int] = {}
+        self.totals: dict[str, int] = {}
+
+    def record(self, request_id: str | None, rule: str, role: str | None) -> None:
+        now = self.clock()
+        with self._lock:
+            self.totals[rule] = self.totals.get(rule, 0) + 1
+            summary = None
+            if self._start is None or now - self._start >= self.window:
+                if self.suppressed:
+                    summary = (dict(self.suppressed), dict(self.totals))
+                self._start, self._emitted, self.suppressed = now, 0, {}
+            if self._emitted >= self.burst:
+                self.suppressed[rule] = self.suppressed.get(rule, 0) + 1
+                return
+            self._emitted += 1
+        if summary is not None:
+            more, totals = summary
+            logger.info(
+                "B70-CJK mask off, not listed in the last window: %s; "
+                "totals since start: %s",
+                ", ".join(f"{k}={v}" for k, v in sorted(more.items())),
+                ", ".join(f"{k}={v}" for k, v in sorted(totals.items())),
+            )
+        rid = (request_id or "-")[:64]
+        logger.info(
+            "B70-CJK mask off for request %r: rule=%s role=%s", rid, rule, role or "-"
+        )
+
+
+_OFF_LOG = OffLog()
 
 
 def chat_extra_args(
-    extra_args: dict[str, Any], messages: Iterable[Any], model_extra: Any
+    extra_args: dict[str, Any],
+    messages: Iterable[Any],
+    model_extra: Any,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
-    """Resolve the chat request's flag into ``extra_args`` (a new dict)."""
+    """Resolve the chat request's flag into ``extra_args`` (a new dict).
+
+    Rules, first match wins: "explicit" (the request's own flag), the server
+    default "on" / "off" ("default-off" when off), "auto-han" (auto mode found
+    Han in a system / developer / user turn)."""
     explicit = extra_args.get(XARG)
     if explicit is None and isinstance(model_extra, Mapping):
         explicit = model_extra.get(XARG)
+    rule, role = None, None
     if explicit is not None:
         flag = resolve(explicit, False)
+        rule = "explicit"
     elif _DEFAULT_MODE != "auto":
         flag = _DEFAULT_MODE == "on"
+        rule = "default-off"
     else:
-        flag = not messages_have_han(messages)
+        roles = han_roles(messages)
+        flag = not roles
+        rule, role = "auto-han", ",".join(roles)
+    if not flag:
+        _OFF_LOG.record(request_id, rule, role)
     out = dict(extra_args)
     out[XARG] = flag
     return out
