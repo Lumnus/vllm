@@ -8,22 +8,27 @@ the mask applies, the worker uses it to build the vocabulary mask.
 Per-request gate. The mask is ON for a request unless
   1. the request sets ``cjk_mask`` explicitly (``vllm_xargs`` or a top-level
      extra body field; false / 0 / "off" turn it off, true forces it on), or
-  2. its prompt carries Han: for chat, the system / developer / user turns
-     (earlier assistant turns are not scanned, so a Han leak in the history
-     does not switch the mask off); for other endpoints, the prompt tokens.
+  2. the server default is "auto" and the latest user message asks for
+     Chinese in the user's own words: its text carries Han, or asks in words
+     for Chinese output (a short Bulgarian and English pattern list,
+     ``asked_for_chinese``). Blocks an agent client injects into the turn
+     (Hermes recalled memory, OpenClaw inbound context, reminder wrappers;
+     ``user_own_text``) are cut before the scan. Earlier user turns and the
+     system and developer turns do not count: recalled memories, pasted logs
+     and old questions carry Han the user is not asking for now, and a system
+     prompt that wants Chinese sends ``cjk_mask: false``.
+  For other endpoints (no chat turns) the prompt tokens are scanned.
 The decision lands in ``SamplingParams.extra_args["cjk_mask"]`` as a bool.
 
 Server default. A chat request without an explicit flag follows the server
 default: "auto" (the rule above), "on" (always masked) or "off". It starts at
 ``B70_CJK_MASK_DEFAULT`` (auto when unset or invalid) and the runtime control
-surface changes it live. Agent clients inject recalled memories into the user
-turn, and a memory that quotes Han switches "auto" off for that request, so
-serving definitions set "on".
+surface changes it live.
 
-Decision log. A request whose mask is off (explicit flag, server default off,
-or Han found by the auto rule) logs one INFO line: request id, rule, role.
-Never the text. The lines are rate-limited; the excess is counted and the next
-window opens with a summary line.
+Decision log. A request whose mask is off logs one INFO line: request id,
+rule (``explicit``, ``default-off``, ``auto-latest-user-han``,
+``auto-asked-chinese``) and role. Never the text. The lines are rate-limited;
+the excess is counted and the next window opens with a summary line.
 
 Vocabulary mask. A token is masked when
   1. its byte-level text contains a Han code point (U+3400-4DBF, U+4E00-9FFF,
@@ -163,10 +168,7 @@ def han_roles(messages: Iterable[Any], roles=_PROMPT_ROLES) -> tuple[str, ...]:
     carries Han."""
     found: list[str] = []
     for msg in messages:
-        if isinstance(msg, Mapping):
-            role, content = msg.get("role"), msg.get("content")
-        else:
-            role, content = getattr(msg, "role", None), getattr(msg, "content", None)
+        role, content = _role_content(msg)
         if role not in roles or role in found:
             continue
         if any(has_han(t) for t in _content_texts(content)):
@@ -177,6 +179,186 @@ def han_roles(messages: Iterable[Any], roles=_PROMPT_ROLES) -> tuple[str, ...]:
 def messages_have_han(messages: Iterable[Any], roles=_PROMPT_ROLES) -> bool:
     """Han in the text of the system / developer / user turns."""
     return bool(han_roles(messages, roles))
+
+
+# ------------------------------------------- the auto rule: the user's own words
+
+# Blocks an agent client puts into a user turn that the user did not type,
+# with the delimiters the clients write:
+#   Hermes agent (agent/memory_context.py, build_memory_context_block):
+#     recalled memory appended to the turn as "<memory-context>", the note
+#     "[System note: The following is recalled memory context, NOT new user
+#     input. Treat as ...]" (its text is configurable), the memories, then
+#     "</memory-context>".
+#   OpenClaw (auto-reply/reply/strip-inbound-meta, inbound-context-marker):
+#     a header line ending in the marker U+27E6 "openclaw:ctx" U+27E7 opens a
+#     block (a ```json fence, else the lines up to the first blank line);
+#     "Context: <marker>" opens the trailing context, to the end of the turn;
+#     "Context:" over an <active_memory_plugin> block is recalled memory.
+#     Older transcripts write "<label> (untrusted metadata):", "<label>
+#     (untrusted, ...):" and "Untrusted context (metadata, ...):".
+#   Reminder wrappers: <system-reminder> ... </system-reminder>.
+# An unterminated tag block runs to the end of the turn, as Hermes's own
+# scrubber reads it. Every cut errs towards the mask staying on.
+_TAG_BLOCK_RE = re.compile(
+    r"<\s*(memory-context|system-reminder|active_memory_plugin)\s*>"
+    r"[\s\S]*?(?:<\s*/\s*\1\s*>|\Z)",
+    re.IGNORECASE,
+)
+_HERMES_NOTE_RE = re.compile(
+    r"\[System note:\s*The following is recalled memory context,[^\]]*\]",
+    re.IGNORECASE,
+)
+OPENCLAW_MARKER = "⟦openclaw:ctx⟧"
+_OC_TRAILING = f"Context: {OPENCLAW_MARKER}"
+_OC_LEGACY_BLOCK_RE = re.compile(
+    r"\((?:untrusted metadata|untrusted, [^)\n]*)\):$", re.IGNORECASE
+)
+_OC_LEGACY_TRAILING_RE = re.compile(
+    r"^Untrusted context \(metadata[^)\n]*\):$", re.IGNORECASE
+)
+_ACTIVE_MEMORY_OPEN = "<active_memory_plugin>"
+
+
+def _openclaw_block_end(lines: list[str], i: int) -> int:
+    """Index after the block whose header is lines[i]."""
+    i += 1
+    if i < len(lines) and lines[i].strip() == "```json":
+        i += 1
+        while i < len(lines) and lines[i].strip() != "```":
+            i += 1
+        return i + 1
+    while i < len(lines) and lines[i].strip():
+        i += 1
+    return i
+
+
+def _strip_openclaw(text: str) -> str:
+    low = text.lower()
+    if OPENCLAW_MARKER not in text and "untrusted" not in low and "context:" not in low:
+        return text
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        nxt = lines[i + 1].strip().lower() if i + 1 < len(lines) else ""
+        legacy_trailing = _OC_LEGACY_TRAILING_RE.match(s) is not None
+        if (s == "Context:" or legacy_trailing) and nxt == _ACTIVE_MEMORY_OPEN:
+            i += 1  # header of an active-memory block; the tag pass cuts the block
+            continue
+        if s == _OC_TRAILING or legacy_trailing:
+            break  # trailing inbound context, to the end of the turn
+        if (len(s) > 14 and s.endswith(OPENCLAW_MARKER)) or (
+            _OC_LEGACY_BLOCK_RE.search(s) is not None
+        ):
+            i = _openclaw_block_end(lines, i)
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+def user_own_text(content: Any) -> str:
+    """The text of a user turn with the client-injected blocks cut out."""
+    text = "\n".join(_content_texts(content))
+    text = _TAG_BLOCK_RE.sub("", _strip_openclaw(text))
+    return _HERMES_NOTE_RE.sub("", text)
+
+
+# A request in words for Chinese output, Bulgarian and English. Conservative:
+# an imperative (or "can you ...", "how do you say ...") that opens a clause,
+# then within the same clause "на китайски" / "in Chinese" and their kin,
+# where the target ends the clause or is followed by a word that keeps it
+# about the language ("език", "characters", "please", ...); or a line that is
+# only the target ("А на китайски?", "In Chinese, please."). A negation right
+# before the target ("не на китайски", "not in Chinese", "rather than in
+# Chinese") does not count. Talk about Chinese ("защо пишеш на китайски",
+# "китайски философи", "in Chinese philosophy") does not match; neither does
+# a target that opens the clause before its verb ("на китайски напиши").
+_BG_IMPERATIVE = (
+    r"(?:на)?пиши(?:те)?|изпиши(?:те)?|запиши(?:те)?|преведи(?:те)?"
+    r"|превеждай(?:те)?|отговори(?:те)?|отговаряй(?:те)?|кажи(?:те)?"
+    r"|говори(?:те)?|продължи(?:те)?|продължавай(?:те)?|обясни(?:те)?"
+    r"|разкажи(?:те)?|покажи(?:те)?|дай(?:те)?"
+)
+_BG_2SG = (
+    r"(?:на)?пишеш|изпишеш|запишеш|преведеш|отговориш|кажеш|говориш"
+    r"|продължиш|обясниш|разкажеш|покажеш|дадеш"
+)
+_EN_VERB = (
+    r"write|translate|answer|reply|respond|say|speak|continue|explain"
+    r"|rewrite|tell\s+me|give\s+me|show\s+me|put\s+it"
+)
+_OPENERS = (
+    rf"(?:{_BG_IMPERATIVE}"
+    rf"|(?:можеш|можете)\s+ли\s+да\s+(?:(?:ми|ни|го|я|ги)\s+)*(?:{_BG_2SG})"
+    r"|как\s+се\s+(?:казва|пише|изписва|превежда|произнася)"
+    rf"|(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?(?:{_EN_VERB})"
+    r"|how\s+(?:do|would|can|should)\s+(?:you|i|we|one)\s+"
+    r"(?:say|write|spell|translate))\b"
+)
+_FILLERS = (
+    r"(?:(?:моля(?:\s+(?:те|ви))?|добре|ок|ok|okay|хайде|сега|и|а|ами|also"
+    r"|please|pls|kindly|now|and|then|so)[\s,]+)*"
+)
+_NOT_BEFORE = (
+    r"(?<!\bне\s)(?<!\bnot\s)(?<!\bno\s)(?<!\bnever\s)(?<!\bникога\s)"
+    r"(?<!\bthan\s)(?<!\bвместо\s)"
+)
+_BG_TARGET = (
+    r"(?:на\s+(?:китайски(?:я)?|мандарин(?:ски)?)"
+    r"(?=\s*(?:$|[^\w\s-]|(?:език|езика|йероглифи|символи|моля|ли|също"
+    r"|сега|отново|пак)\b))"
+    r"|по-китайски\b"
+    r"|с(?:ъс)?\s+(?:китайски\s+)?йероглифи\b"
+    r"|с(?:ъс)?\s+китайски\s+(?:символи|знаци)\b)"
+)
+_EN_TARGET = (
+    r"(?:(?:in|into|to)\s+(?:simplified\s+|traditional\s+)?"
+    r"(?:chinese|mandarin|cantonese)"
+    r"(?=\s*(?:$|[^\w\s]|(?:please|language|script|characters|too|only"
+    r"|instead|again|now|and|then|as|for|with)\b))"
+    r"|(?:with|using|in)\s+(?:chinese|han)\s+characters\b"
+    r"|in\s+hanzi\b)"
+)
+_TARGET = rf"\b{_NOT_BEFORE}(?:{_BG_TARGET}|{_EN_TARGET})"
+_ASK_RE = re.compile(
+    rf"(?:^|[.!?;:,])\s*{_FILLERS}{_OPENERS}[^.!?;:,\n]{{0,80}}?{_TARGET}"
+    rf"|^\s*{_FILLERS}{_TARGET}\s*(?:,?\s*(?:моля|please))?\s*[.!?]*\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def asked_for_chinese(text: str) -> bool:
+    """The text asks in words for an answer in Chinese (see ``_ASK_RE``)."""
+    return _ASK_RE.search(text) is not None
+
+
+def _role_content(msg: Any) -> tuple[Any, Any]:
+    if isinstance(msg, Mapping):
+        return msg.get("role"), msg.get("content")
+    return getattr(msg, "role", None), getattr(msg, "content", None)
+
+
+def latest_user_text(messages: Iterable[Any]) -> str:
+    """The user's own text in the latest user message ("" when none)."""
+    last = None
+    for msg in messages:
+        role, content = _role_content(msg)
+        if role == "user":
+            last = content
+    return "" if last is None else user_own_text(last)
+
+
+def auto_rule(messages: Iterable[Any]) -> str | None:
+    """Why "auto" turns the mask off for this chat, or None (mask on)."""
+    text = latest_user_text(messages)
+    if has_han(text):
+        return "auto-latest-user-han"
+    if asked_for_chinese(text):
+        return "auto-asked-chinese"
+    return None
 
 
 class OffLog:
@@ -240,8 +422,9 @@ def chat_extra_args(
     """Resolve the chat request's flag into ``extra_args`` (a new dict).
 
     Rules, first match wins: "explicit" (the request's own flag), the server
-    default "on" / "off" ("default-off" when off), "auto-han" (auto mode found
-    Han in a system / developer / user turn)."""
+    default "on" / "off" ("default-off" when off), and in "auto" the latest
+    user message in the user's own words: "auto-latest-user-han" (it carries
+    Han) or "auto-asked-chinese" (it asks for Chinese in words)."""
     explicit = extra_args.get(XARG)
     if explicit is None and isinstance(model_extra, Mapping):
         explicit = model_extra.get(XARG)
@@ -253,9 +436,8 @@ def chat_extra_args(
         flag = _DEFAULT_MODE == "on"
         rule = "default-off"
     else:
-        roles = han_roles(messages)
-        flag = not roles
-        rule, role = "auto-han", ",".join(roles)
+        rule = auto_rule(messages)
+        flag, role = rule is None, "user"
     if not flag:
         _OFF_LOG.record(request_id, rule, role)
     out = dict(extra_args)
