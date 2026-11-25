@@ -20,6 +20,14 @@ that copy on one worker, in four steps, each an RPC from the engine core:
 * `release()` takes the tower out of the model and drops it.
 * `discard()` forgets a staging that will not be committed.
 
+The copy is built and loaded in a memory pool of its own on the accelerator
+(`tower_memory_pool`), and the pool is dropped with it. In the allocator's
+shared pool its tensors would sit in segments beside allocations made while
+it is resident, and after `release` those segments stay reserved for as long
+as their other blocks live: torch's reservation would not come back down to
+its allocation, and a KV cache that lent the memory could not grow back.
+Dropping the copy's own pool returns its segments whole.
+
 None of the steps is a collective, so a failure on one rank never leaves
 another waiting; each can be repeated, and `release` and `discard` never
 raise on a half-built copy.
@@ -83,6 +91,58 @@ def tower_paths(model: nn.Module, tower_name: str) -> list[str]:
     ]
 
 
+class TowerMemoryPool:
+    """A memory pool of the copy's own on `device`: `allocating()` routes the
+    current thread's allocations to it, and `drop()` gives its segments back
+    once the copy's tensors are gone."""
+
+    def __init__(self, pool: Any, use: Callable[..., Any], device: torch.device):
+        self._pool: Any = pool
+        self._use = use
+        self._device = device
+
+    def allocating(self) -> AbstractContextManager[Any]:
+        assert self._pool is not None
+        return self._use(self._pool, device=self._device)
+
+    def drop(self) -> None:
+        """Drop the pool; its free segments go back to the device. Never
+        raises."""
+        if self._pool is None:
+            return
+        self._pool = None
+        gc.collect()
+        try:
+            torch.accelerator.empty_cache()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Emptying torch's cache after dropping a tower's memory pool "
+                "on %s failed; the next empty_cache returns its segments.",
+                self._device,
+                exc_info=True,
+            )
+
+
+def tower_memory_pool(device: torch.device) -> TowerMemoryPool | None:
+    """A memory pool of the copy's own on `device`, or None where the device's
+    allocator has none (CPU, meta, a torch without memory pools)."""
+    if device.type in ("cpu", "meta"):
+        return None
+    module = torch.get_device_module(device)
+    memory = getattr(module, "memory", module)
+    pool_cls = getattr(memory, "MemPool", None) or getattr(module, "MemPool", None)
+    use = getattr(memory, "use_mem_pool", None) or getattr(module, "use_mem_pool", None)
+    if pool_cls is None or use is None:
+        logger.warning_once(
+            "Towers on %s are built in the allocator's shared pool (no memory "
+            "pools in this torch): after a tower leaves, torch may keep part "
+            "of its memory reserved.",
+            device.type,
+        )
+        return None
+    return TowerMemoryPool(pool_cls(), use, device)
+
+
 def _set_submodule(root: nn.Module, path: str, module: nn.Module) -> None:
     parent_path, _, name = path.rpartition(".")
     parent = root.get_submodule(parent_path) if parent_path else root
@@ -114,6 +174,8 @@ class CardTower:
             finishes it (post-processing); called on the main thread.
         build_context: Entered around `build` and `load` (the model-parallel
             groups a whole replica is built with).
+        memory_pool: `memory_pool(device)` gives the pool the copy is built
+            and loaded in, dropped with the copy (None: the shared pool).
 
     """
 
@@ -128,6 +190,9 @@ class CardTower:
         stream: Callable[[], Iterator[tuple[str, torch.Tensor]]],
         load: Callable[[nn.Module, Iterator[tuple[str, torch.Tensor]]], None],
         build_context: Callable[[], AbstractContextManager[Any]] = nullcontext,
+        memory_pool: Callable[
+            [torch.device], TowerMemoryPool | None
+        ] = tower_memory_pool,
     ) -> None:
         self.name = name
         self._model = model
@@ -137,6 +202,9 @@ class CardTower:
         self._stream = stream
         self._load = load
         self._build_context = build_context
+        self._memory_pool = memory_pool
+        # The pool the copy on the accelerator lives in, while it lives.
+        self._pool: TowerMemoryPool | None = None
 
         # The staging: what the copy needs, and the page-cache warm up.
         self._staged: dict[str, int] | None = None
@@ -253,8 +321,14 @@ class CardTower:
         if self._warmer is not None:
             self._warmer.join(wait_s)
         start = time.perf_counter()
+        module: nn.Module | None = None
+        copies: dict[str, nn.Module | None] = {}
         try:
-            with self._build_context():
+            self._pool = self._memory_pool(self._device)
+            with (
+                self._build_context(),
+                nullcontext() if self._pool is None else self._pool.allocating(),
+            ):
                 module = self._build(self._device)
                 self._module = module
                 self._load(module, self._stream())
@@ -279,19 +353,24 @@ class CardTower:
                 self._placeholders[path] = placeholder
         except BaseException:
             self._put_placeholders_back()
+            # Nothing here may keep the copy's tensors (and its pool) alive.
+            module = None
+            copies = {}
             self._module = None
             self.discard()
             raise
         self._staged = None
         self._token = None  # a warm up still running stops
+        assert module is not None
         nbytes = module_bytes(module)
         seconds = time.perf_counter() - start
         logger.info(
-            "Tower %s: copy on %s in place (%s GiB, committed in %.2f s, "
+            "Tower %s: copy on %s in place (%s GiB in %s, committed in %.2f s, "
             "%.2f s after staging began).",
             self.name,
             self._device,
             format_gib(nbytes),
+            "its own memory pool" if self._pool is not None else "the shared pool",
             seconds,
             time.perf_counter() - self._staged_at,
         )
@@ -328,6 +407,9 @@ class CardTower:
         self._token = None
         self._module = None
         gc.collect()
+        if self._pool is not None:
+            pool, self._pool = self._pool, None
+            pool.drop()
 
     def _put_placeholders_back(self) -> None:
         for path, placeholder in list(self._placeholders.items()):
