@@ -493,7 +493,11 @@ class TowerResidency:
         if self._num_blocks() >= target:
             return
         try:
-            self._engine.resize_kv_cache(target)
+            # A restore: the tower took these blocks' memory and gave all of
+            # it back. The workers map them back as far as torch's floor
+            # allows, past the room measurement, which would also hold torch
+            # to more under its cap than the cache started serving with.
+            self._engine.resize_kv_cache(target, restore=True)
         except Exception as e:
             logger.warning(
                 "Tower %s: the KV cache could not grow back to %d blocks: %s",

@@ -6,6 +6,7 @@ of the model's placeholder, taken out, and what is left after a failure at
 each step. CPU stands in for the accelerator."""
 
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +18,9 @@ from vllm.model_executor.models.utils import StageMissingLayer
 from vllm.multimodal.card_tower import (
     CardTower,
     CheckpointTowerTensors,
+    TowerMemoryPool,
     module_bytes,
+    tower_memory_pool,
     tower_paths,
 )
 
@@ -233,6 +236,121 @@ def test_a_failed_load_leaves_the_model_as_it_was_and_release_is_quiet():
     assert tower._module is None
     assert tower.release() == {"bytes": 0}
     tower.discard()
+
+
+class Pools:
+    """A device's memory pools as far as the copy uses them: which pool
+    allocations go to now, which pools live, and empty_cache calls."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.active: object | None = None
+        self.alive: list[object] = []
+        self.empties = 0
+        monkeypatch.setattr(torch.accelerator, "empty_cache", self.empty_cache)
+
+    def empty_cache(self) -> None:
+        self.empties += 1
+
+    @contextmanager
+    def use(self, pool, device=None):
+        self.active = pool
+        try:
+            yield
+        finally:
+            self.active = None
+
+    def factory(self, device: torch.device) -> TowerMemoryPool:
+        return FakePool(self, device)
+
+
+class FakePool(TowerMemoryPool):
+    def __init__(self, pools: Pools, device: torch.device) -> None:
+        super().__init__(object(), pools.use, device)
+        self.pools = pools
+        pools.alive.append(self._pool)
+
+    def drop(self) -> None:
+        if self._pool is not None:
+            self.pools.alive.remove(self._pool)
+        super().drop()
+
+
+def test_the_copy_lives_in_its_own_pool_and_the_pool_leaves_with_it(monkeypatch):
+    pools = Pools(monkeypatch)
+    seen = []
+
+    def build(device):
+        seen.append(("build", pools.active))
+        return _build(device)
+
+    def load(module, tensors):
+        seen.append(("load", pools.active))
+        _load(module, tensors)
+
+    model = Model()
+    x = torch.randn(3, 4)
+    tower = CardTower(
+        TOWER,
+        model=model,
+        device=torch.device("cpu"),
+        build=build,
+        tensors=_sizes,
+        stream=_stream(),
+        load=load,
+        memory_pool=pools.factory,
+    )
+    tower.stage()
+    _wait_staged(tower)
+    assert pools.alive == [] and seen == [("build", None)]  # staging: meta only
+
+    tower.commit()
+    (pool,) = pools.alive
+    assert seen[1:] == [("build", pool), ("load", pool)]
+    assert pools.active is None  # serving allocates in the shared pool
+    assert torch.equal(model.embed(x), _expected(x))
+    assert pools.empties == 0
+
+    tower.release()
+    assert pools.alive == [] and pools.empties == 1
+    assert isinstance(model.visual, StageMissingLayer)
+
+    # A second round trip builds a new pool.
+    tower.stage()
+    _wait_staged(tower)
+    tower.commit()
+    assert len(pools.alive) == 1 and pools.alive[0] is not pool
+    tower.release()
+    assert pools.alive == [] and pools.empties == 2
+
+
+def test_a_failed_load_drops_the_copys_pool(monkeypatch):
+    pools = Pools(monkeypatch)
+
+    def load(module, tensors):
+        raise RuntimeError("bad tensor")
+
+    tower = CardTower(
+        TOWER,
+        model=Model(),
+        device=torch.device("cpu"),
+        build=_build,
+        tensors=_sizes,
+        stream=_stream(),
+        load=load,
+        memory_pool=pools.factory,
+    )
+    tower.stage()
+    _wait_staged(tower)
+    with pytest.raises(RuntimeError, match="bad tensor"):
+        tower.commit()
+    assert pools.alive == [] and pools.empties == 1
+    assert tower.release() == {"bytes": 0}
+    assert pools.empties == 1
+
+
+def test_no_pool_where_the_device_has_none():
+    assert tower_memory_pool(torch.device("cpu")) is None
+    assert tower_memory_pool(torch.device("meta")) is None
 
 
 def test_a_slow_warm_up_does_not_stop_the_commit():
