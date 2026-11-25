@@ -212,6 +212,10 @@ class ExtensibleKVCache:
         # measurements taken later while serving; None until then.
         self.torch_reserved_at_sizing: int | None = None
         self.torch_allocated_at_sizing: int | None = None
+        # What torch could still reserve under its cap when the cache took its
+        # startup size (`extend_kv_cache`); None until then. The grow floor
+        # holds no grow to more than that (`grow_cap_floor_bytes`).
+        self.startup_torch_cap_room: int | None = None
         self.buffer = ExtensibleTensor(
             self.size,
             device=device,
@@ -916,6 +920,11 @@ def extend_kv_cache(
     rebind_committed_views(runner)
     # The cap measured for this size holds from now on; resizes recompute it.
     kv_cache.anchor_torch_memory_budget()
+    if kv_cache.torch_memory_limit is not None:
+        kv_cache.startup_torch_cap_room = (
+            kv_cache.torch_memory_limit
+            - torch.accelerator.memory_reserved(kv_cache.buffer.device)
+        )
     runner.kv_connector = get_kv_connector(
         runner.vllm_config, runner.kv_caches_by_layer
     )
@@ -1323,6 +1332,8 @@ class GrowFloor(NamedTuple):
     floor: int
     # Where the floor comes from: "setting" or "transient".
     source: str
+    # The part of the floor held under torch's cap (`grow_cap_floor_bytes`).
+    cap_floor: int
     allocated: int
     reserved: int
     # Torch's cap after a grow to `asked` blocks (None: no cap) and the
@@ -1360,6 +1371,23 @@ def grow_torch_floor_bytes(
         return int(setting) << 20, "setting"
     serving = _serving_transient(kv_cache, allocated, peak)
     return max(kv_cache.reserved_headroom_bytes, serving, 0), "transient"
+
+
+def grow_cap_floor_bytes(kv_cache: ExtensibleKVCache, floor: int, source: str) -> int:
+    """The headroom the floor holds under torch's cap: the floor, less what
+    startup sizing itself kept outside the cap. Sizing caps torch at what
+    stays free once the cache is extended, less the memory kept for
+    allocations outside torch (`measure_kv_cache_blocks`), so a cache sized
+    by the device leaves torch less than its startup transient under the cap:
+    `startup_torch_cap_room`. Holding a grow to the whole transient under the
+    cap would refuse the very size the cache started serving at, with torch
+    holding what it held then. A floor set by hand is held as it is, and a
+    reservation torch keeps beyond its startup one still counts as taken."""
+    room = getattr(kv_cache, "startup_torch_cap_room", None)
+    if source != "transient" or room is None:
+        return floor
+    shortfall = max(kv_cache.reserved_headroom_bytes - room, 0)
+    return max(floor - shortfall, 0)
 
 
 def grow_floor(
@@ -1409,10 +1437,11 @@ def _grow_floor_at(
         # What is mapped stays mapped (granules of a failed attempt included).
         return max(kv_cache.physical_bytes_for(n), mapped)
 
+    cap_floor = grow_cap_floor_bytes(kv_cache, floor, source)
     # The largest mapped size that keeps the floor.
     limits = [free_memory + max(reserved - allocated, 0) + mapped - floor]
     if budget is not None:
-        limits.append(budget - external - reserved - floor)
+        limits.append(budget - external - reserved - cap_floor)
     max_mapped = min(limits)
     max_blocks = kv_cache.num_committed_blocks
     if max_mapped >= mapped:
@@ -1420,6 +1449,7 @@ def _grow_floor_at(
     return GrowFloor(
         floor=floor,
         source=source,
+        cap_floor=cap_floor,
         allocated=allocated,
         reserved=reserved,
         cap_after=(
@@ -1613,6 +1643,7 @@ def grow_kv_cache(
             "vote_blocks": vote,
             "floor_bytes": floor.floor,
             "floor_source": floor.source,
+            "cap_floor_bytes": floor.cap_floor,
             "startup_transient_bytes": kv_cache.reserved_headroom_bytes,
             "serving_transient_bytes": serving,
             "torch_allocated_bytes": floor.allocated,
@@ -1627,10 +1658,10 @@ def grow_kv_cache(
         log = logger.warning if vote < asked and not restore else logger.info
         log(
             "KV cache grow floor: torch keeps at least %s GiB it can still "
-            "reserve (%s); allocated %s GiB, reserved %s GiB; a grow to %d "
-            "blocks would leave %s GiB (cap after: %s; device free after %s "
-            "GiB). %d blocks keep the floor; the measurement fits %d; voting "
-            "%d.",
+            "reserve (%s), %s GiB of it under its cap; allocated %s GiB, "
+            "reserved %s GiB; a grow to %d blocks would leave %s GiB (cap "
+            "after: %s; device free after %s GiB). %d blocks keep the floor; "
+            "the measurement fits %d; voting %d.",
             format_gib(floor.floor),
             "kv_cache_grow_torch_floor_mib"
             if floor.source == "setting"
@@ -1638,6 +1669,7 @@ def grow_kv_cache(
                 f"startup transient {format_gib(kv_cache.reserved_headroom_bytes)} "
                 f"GiB, serving transient {format_gib(serving)} GiB"
             ),
+            format_gib(floor.cap_floor),
             format_gib(floor.allocated),
             format_gib(floor.reserved),
             floor.asked,

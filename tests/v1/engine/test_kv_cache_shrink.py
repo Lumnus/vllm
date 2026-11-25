@@ -70,8 +70,8 @@ class ShrinkExecutor:
         self.committed = num_blocks
         return [released, released + MIB]
 
-    def resize_kv_cache(self, target_num_blocks: int) -> int:
-        self.calls.append(f"grow:{target_num_blocks}")
+    def resize_kv_cache(self, target_num_blocks: int, restore: bool = False) -> int:
+        self.calls.append(f"{'restore' if restore else 'grow'}:{target_num_blocks}")
         return target_num_blocks
 
     def sleep(self, level: int) -> None:

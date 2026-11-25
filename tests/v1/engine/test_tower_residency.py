@@ -307,7 +307,7 @@ def test_a_demotion_routes_back_first_then_releases_then_grows(caplog):
     _step(env, 1001 + 1800)
 
     assert env.delegate.flips == [True, False]
-    assert env.executor.calls == ["release", "grow:100"]
+    assert env.executor.calls == ["release", "restore:100"]
     assert env.ranks.state == ["none", "none"]
     assert env.core.vllm_config.cache_config.num_gpu_blocks == 100
     assert env.tower.place == TowerPlace.HOST
@@ -410,7 +410,7 @@ def test_a_failed_copy_on_one_rank_releases_every_rank_and_grows_back():
     assert env.delegate.flips == []
     assert env.tower.place == TowerPlace.HOST
     assert env.ranks.state == ["none", "none"]
-    assert env.executor.calls[-4:] == ["commit", "release", "discard", "grow:100"]
+    assert env.executor.calls[-4:] == ["commit", "release", "discard", "restore:100"]
     assert env.core.vllm_config.cache_config.num_gpu_blocks == 100
 
 
